@@ -1,0 +1,62 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+
+  // ---------------------------------------------------------------------------
+  // Base configuration.
+  //
+  // This top-level block is NOT a deployable environment. Per spec section 16,
+  // testnet and production are two fully separate deployments with separate
+  // Worker names and separate config -- never one deployment with a flag.
+  //
+  // All deploys must pass `--env testnet` or `--env production` explicitly.
+  // The npm scripts in package.json always do. If someone runs a bare
+  // `wrangler deploy` by mistake, it deploys a Worker named "trading-bot"
+  // whose /health reports ENVIRONMENT "unconfigured" -- a loud, harmless
+  // signal that the wrong command was run. It cannot overwrite either
+  // real environment, because those use different Worker names.
+  // ---------------------------------------------------------------------------
+  "name": "trading-bot",
+  "main": "src/workers/api.ts",
+  "compatibility_date": "2026-07-14",
+
+  // No "nodejs_compat" flag. Spec section 2 requires native fetch and the Web
+  // Crypto API with no third-party exchange library, specifically to avoid
+  // Node-compatibility risk. Nothing here should need a Node shim.
+
+  "observability": {
+    "enabled": true
+  },
+
+  "vars": {
+    "ENVIRONMENT": "unconfigured"
+  },
+
+  // ---------------------------------------------------------------------------
+  // Environments.
+  //
+  // Resource bindings (D1, KV, R2, Queues, Durable Objects) are intentionally
+  // absent for now. They are added per environment in the build-order step that
+  // introduces them (section 19): D1 at step 4, Durable Objects at step 6,
+  // Queues alongside order execution, KV at step 8, R2 at step 12. Each will be
+  // declared separately under both testnet and production -- like "vars",
+  // binding keys are non-inheritable, so there is no way to accidentally point
+  // both environments at one database.
+  // ---------------------------------------------------------------------------
+  "env": {
+    "testnet": {
+      "name": "trading-bot-testnet",
+      "workers_dev": true,
+      "vars": {
+        "ENVIRONMENT": "testnet"
+      }
+    },
+
+    "production": {
+      "name": "trading-bot-production",
+      "workers_dev": true,
+      "vars": {
+        "ENVIRONMENT": "production"
+      }
+    }
+  }
+}

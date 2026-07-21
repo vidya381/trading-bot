@@ -1,0 +1,35 @@
+# Project internal documentation files
+docs/
+
+# Dependencies
+node_modules/
+
+# Secrets.
+# Exchange API keys are set with `wrangler secret put --env <environment>`
+# and never live in a file in this repository (spec section 16.1).
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+
+# Wrangler / Cloudflare local state
+.wrangler/
+dist/
+.mf/
+
+# Test and build output
+coverage/
+*.tsbuildinfo
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
