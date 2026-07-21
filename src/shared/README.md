@@ -7,6 +7,7 @@ Built before any strategy logic and fully unit tested first
 | --- | --- | --- |
 | [`money.ts`](./money.ts) | 5.2 | Fixed-point arithmetic on `bigint` at scale 8 |
 | [`exchange-client.ts`](./exchange-client.ts) | 4.1 | The `ExchangeClient` interface and its types. Type-only |
+| | | Split at step 3 into `RestExchangeClient` + the price feed; every method now returns an `ExchangeOutcome` |
 | [`order-state.ts`](./order-state.ts) | 5.3 | Order lifecycle and partial-fill accounting |
 | [`idempotency.ts`](./idempotency.ts) | 5.1 | Deterministic `clientOrderId`s and attempt records |
 | [`rate-limiter.ts`](./rate-limiter.ts) | 5.4 | Rolling request-weight budget with priority |
@@ -16,6 +17,11 @@ Built before any strategy logic and fully unit tested first
 None of these perform I/O, read a clock, or touch storage. Time is passed in as
 a parameter and storage is injected as a port, so all of it is testable without
 a Durable Object and reusable unchanged in backtest mode (section 13).
+
+That guarantee is why the Binance client lives in [`../exchange`](../exchange)
+rather than here: it does perform I/O. Only the interface it implements is in
+this folder, because strategy code depends on the interface and must never
+depend on a specific exchange.
 
 ## The money convention
 
@@ -49,7 +55,8 @@ rather than rounding.
 
 ## What is deliberately absent
 
-- Binance request signing, endpoints, and payload shapes (section 4, step 3)
+- Binance request signing, endpoints, and payload shapes — delivered at step 3,
+  in [`../exchange`](../exchange)
 - Durable Object classes and storage implementations (step 6)
 - Strategy logic, including average entry price and grid ladder maths
   (sections 6.2 and 6.3, steps 6 and 9)
