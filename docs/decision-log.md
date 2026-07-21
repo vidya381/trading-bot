@@ -862,3 +862,339 @@ New:
    — consistent with step 2's decision 4, and `compareWithExchange` only looks at
    `state` and `filledQuantity`, so the two agree. Worth re-checking at step 6
    when the halt path actually drives `closeOrder` from this value.
+
+---
+
+## Step 4: D1 schema and migrations
+Date: 2026-07-21
+
+### What was built
+
+`migrations/0001_initial_schema.sql`: the eight tables of section 8.2, plus 18
+indexes. Every table `STRICT`; every money column `INTEGER`.
+
+`/src/db/`: `columns.ts` (column kinds and their codecs), `table.ts`
+(`defineTable` and `Repository`), `schema.ts` (the eight tables as typed specs),
+`database.ts` (`Database`, which owns the binding), `index.ts`,
+`test-helpers.ts`, and a folder README.
+
+146 new tests across six files (591 in total across the project), all passing,
+typecheck clean. Every one runs against real D1 in the Workers runtime, not a
+mock — which mattered, see decision 9.
+
+`docs/d1-provisioning.md`: the exact command sequence to create the real
+databases, checked against wrangler 4.112.0's own `--help` rather than recalled.
+**Not run.** No Cloudflare resource was created and no `database_id` was written
+into `wrangler.jsonc` this session, per the session's scope.
+
+### Schema questions asked before writing anything
+
+Five columns in section 8.2 were missing something a later step needs. All were
+put to the account owner and all were confirmed additive rather than kept
+literal. Recording what each is for, since the reasons are not obvious from the
+column names:
+
+1. **`trades.exchange_trade_id`** (UNIQUE with `order_id`) **and
+   `trades.bot_instance_id`.** Section 5.1 says queue messages get redelivered.
+   Without a unique key on the exchange's own fill id, a redelivered fill
+   inserts a second row and realized PnL doubles. This is the database-level
+   counterpart of `order-state.ts`'s `duplicate_fill` code — two independent
+   layers, because the consequence is a silently wrong money figure.
+2. **`trades.fee_reporting_amount`, `fee_reporting_asset`, `fee_conversion_rate`.**
+   Section 5.5 requires fees converted at the price *at time of fill*. That
+   price is not recoverable afterwards, so a table storing only the raw fee
+   makes realized PnL uncomputable from D1 alone — a later recomputation would
+   silently use a different rate than the figure the dashboard already showed.
+   The rate is stored, not just the result, so a disputed PnL number can be
+   explained rather than only asserted.
+3. **`manual_adjustments.reconciled_at`.** Section 8.6 says reconciliation
+   subtracts *unreconciled* adjustments. With nothing to mark one consumed,
+   every run subtracts every adjustment ever logged. The discrepancy maths is
+   wrong from the second run onward and drifts further with each entry. Of the
+   five this is the only one I would call a spec bug rather than a preference.
+4. **`alerts.bot_instance_id`, `alert_type`, `category`.** Section 10 keys the
+   KV notification cooldown on (alert type + bot instance) and requires the two
+   alert kinds to be visually distinguishable on the dashboard. None of the
+   three existed as a column; `source` was free text doing all three jobs.
+5. **`bot_instances.halt_reason` + `halted_at`.** Section 7.2 step 3 says a halt
+   marks the instance halted "with a recorded reason". Without a column, a
+   halted bot cannot explain itself to the human review section 7.2 requires
+   before any resume.
+6. **`balance_snapshots.reconciliation_run_id` + `classification`**, and
+   **`capital_ledger.asset`.** The first groups one reconciliation pass's
+   per-asset rows so the dashboard can say "this run found X". The second closes
+   a gap where `balance_snapshots` was per-asset and `capital_ledger` was not,
+   leaving the reporting currency as an assumption nothing recorded.
+
+### Decisions made
+
+**1. No D1 binding in `wrangler.jsonc`; tests get one from vitest's miniflare
+options instead.**
+
+`vitest.config.ts` passes `miniflare: { d1Databases: ["DB"] }`. Miniflare needs
+only a binding name to spin up local SQLite; a `d1_databases` block in
+`wrangler.jsonc` additionally needs a real `database_id`.
+
+*A placeholder `database_id` — rejected*, consistent with step 1's decision 1.
+`wrangler deploy` fails until it is replaced, and a fake UUID in a config file
+is easy to mistake for a real one later.
+
+The cost is that the binding is declared in two places for as long as this state
+lasts, and `docs/d1-provisioning.md` step 5 exists to make sure it does not
+outlive the real database. Recorded as open question 4 below.
+
+**2. Every table is `STRICT`. (My call, not asked. The strongest thing in this
+session.)**
+
+Probed against D1's SQLite in the real runtime, because the decision rested on
+storage behaviour I was not willing to assert from memory:
+
+| bind into an INTEGER column | non-strict | STRICT |
+| --- | --- | --- |
+| `"100000000000000001"` | stored, `typeof` = integer | stored, `typeof` = integer |
+| `"not-a-number"` | **stored, `typeof` = text** | rejected, `SQLITE_CONSTRAINT_DATATYPE` |
+| `"1.5"` | stored as REAL | rejected, "cannot store REAL value" |
+
+The middle row is the reason. Without `STRICT`, a money column that received a
+raw string accepts it silently, `SUM()` and `ORDER BY` stop meaning anything for
+that row onward, and it surfaces much later as a wrong balance. The third row
+catches a specific, plausible accident: binding `toDecimalString` (the
+human-readable `"1234.50000000"`) where `toStorageString` was meant. Both are
+now write failures.
+
+This is a layer *beneath* the type system, so it survives any bug in the type
+system. That is the whole argument for it.
+
+*Relying on the access layer's encoders alone — rejected.* They are the primary
+guard and they are good, but the session's brief was correctness by
+construction, and "the only code that writes money is correct" is a weaker claim
+than "an incorrect write is rejected by storage".
+
+**3. One migration file, not eight.**
+
+*Splitting per table or per concern — rejected.* The eight tables are created
+together, deployed together, and have foreign keys between them. Separate files
+would imply an independence that does not exist, and would have to be applied in
+a fixed order anyway.
+
+Worth knowing for later: `d1_migrations` records applied migrations **by
+filename**. Editing `0001` after it has been applied anywhere does nothing on
+that database. Nothing is deployed yet, so this session edited `0001` freely
+(and deleted `.wrangler/state` to re-apply locally). After step 5, every schema
+change is a new numbered file.
+
+**4. The access layer offers no SQL surface at all.**
+
+`Repository` has no method taking SQL and no method taking bind values.
+Statements are generated from the declared columns. Four things make the money
+convention structural rather than remembered:
+
+- **Encoders are typed to return `Bindable` (`string | number | null`)**, which
+  excludes `bigint`. A money encoder that forgot to stringify would not compile.
+  This is the type-level version of the runtime `D1_TYPE_ERROR` step 2 found.
+- **Select lists are generated**, so money columns are always
+  `CAST(col AS TEXT) AS col`. There is no `select(sql)` to route around.
+- **`decode` throws on a number** rather than accepting it, naming the missing
+  CAST. Unreachable through the layer; it is the backstop for a future refactor.
+- **`no-raw-d1.test.ts` fails the build** if any file outside `/src/db` calls
+  `.prepare(`, names `D1Database`, or touches `env.DB`.
+
+That last one is the honest part. The first three make the unsafe path
+non-existent *within* the layer; nothing in TypeScript can stop a call site
+reaching around it to the binding. So it is checked mechanically instead, by
+globbing the source with Vite's `?raw` and scanning it. The test also asserts it
+found more than twenty files, because a glob that silently returned nothing
+would make every other assertion in it pass vacuously.
+
+*A lint rule — considered.* Equivalent in effect, but there is no ESLint in this
+project yet and adding one to enforce a single rule is a larger commitment than
+a test.
+
+**5. No `delete` method, and no unfiltered `UPDATE`.**
+
+Section 8.7 retains all data indefinitely. A layer with no delete method cannot
+violate that by accident, so there is not one. `test-helpers.ts` empties tables
+with raw SQL and is the only place that does.
+
+Separately, `update` raises `empty_statement` if given no `WHERE`, because an
+unfiltered `UPDATE` rewrites every row in the table and that is never what a
+caller meant to type.
+
+**6. Every column is required at insert time. There is no `.withDefault()`.**
+
+A nullable column must be passed an explicit `null`. SQL `DEFAULT`s still exist
+in the migration but nothing in the layer relies on them.
+
+*Making columns with SQL defaults optional — rejected.* It reads better at the
+call site, but an omitted field then becomes a silent NULL or zero, and in a
+table of money values and order states a slightly longer insert call is the
+better trade. `filled_quantity: ZERO` at insert says something; an absent
+`filled_quantity` does not.
+
+**7. CHECK constraints encode the spec's rules, not just column types.**
+
+Five that do real work:
+
+- `strategy_type <> 'dca' OR take_profit_pct IS NOT NULL` — section 6.3 makes
+  take-profit mandatory for DCA because it defines the cycle's exit.
+- `status <> 'halted' OR halt_reason IS NOT NULL` — section 7.2 step 3.
+  Deliberately one-directional: a halted row must carry a reason, a resumed row
+  may keep the last one. Forcing it cleared on resume would make step 6 null two
+  columns on every restart to discard occasionally useful information.
+- `filled_quantity <= quantity` — the counterpart of `order-state.ts`'s
+  `overfill`.
+- `id GLOB '[a-z0-9]*' AND length(id) BETWEEN 1 AND 20` on `bot_instances` —
+  step 2's decision 6 requires short parseable slugs, and step 2's open question
+  4 specifically warned that step 6 would reach for `crypto.randomUUID()`. A
+  UUID is 36 characters, so it now fails at the database. SQLite has no regex;
+  `GLOB` plus a length bound covers the two ways to get it wrong that matter.
+- The fee triple is all-NULL or all-present, matching step 2's decision 9.
+
+The cost is real: a CHECK cannot be altered in SQLite without rebuilding the
+table, so adding an order state or a bot status later is a migration rather than
+a code change. Accepted, because every one of these guards a value that is
+either money or a risk control.
+
+**8. `trades.bot_instance_id` is denormalized but cannot drift.**
+
+Denormalizing normally means the copy can disagree with the original. A
+composite foreign key on `trades (order_id, bot_instance_id)` referencing
+`orders (id, bot_instance_id)` makes a trade that names a different bot than its
+own order a rejected write. That required adding a redundant
+`UNIQUE (id, bot_instance_id)` to `orders` — redundant because `id` is already
+the primary key — since SQLite requires a UNIQUE constraint on the exact parent
+column list.
+
+I added the denormalized column first and the composite key second, after
+noticing while writing the log that nothing tied the two together. It is the
+kind of gap that would have produced a per-bot PnL figure quietly attributed to
+the wrong bot.
+
+**9. `ORDER BY` is emitted qualified, and that was a bug I wrote.**
+
+The first version emitted `ORDER BY "price"`. SQLite resolves a bare identifier
+in `ORDER BY` against the **output column aliases** before the table's columns.
+Since the select list aliases every money column back to its own name
+(`CAST("price" AS TEXT) AS "price"`), the sort bound to the TEXT result and went
+lexicographic: `1000000000` sorted before `80000000`.
+
+This is precisely the failure decimal.js was rejected for in step 2 — numeric
+ordering lost — reintroduced by the fix for the *other* half of the same
+problem. It was caught by a test asserting real ordering against real D1 with
+values chosen so that string and numeric order disagree. A mocked database would
+have passed it, and it would have surfaced as a grid ladder processed in the
+wrong order.
+
+Now emitted as `ORDER BY "orders"."price"`. `WHERE` is unaffected — SQLite does
+not resolve aliases there — and there is a test for that too.
+
+**10. `capital_ledger` deliberately has no `total_allocated <= total_balance`
+check.**
+
+A balance can legitimately fall below what is already allocated: a losing
+position, or funds moved manually on the exchange. An over-allocated account is
+a real state section 9 reconciliation must be able to record and alert on, not
+one the database should refuse to represent. The check that matters guards
+*new* allocations and belongs in step 5, where it can raise a useful error.
+
+**11. Routine, for completeness.** The `Repository` filter/order/limit builder,
+the eight table specs, the fixture builders and the barrel file are ordinary
+implementation with no decision behind them worth recording. The schema-drift
+test (`schema.test.ts`, comparing each spec against `PRAGMA table_info` on the
+live database) is the only part of that group with a real rationale: the
+migration and `schema.ts` describe the same thing twice, and nothing but that
+test keeps them honest.
+
+### Deviations from the spec
+
+- **Section 8.2's column list is missing eleven columns** that later steps need.
+  All eleven listed above, all confirmed before writing.
+- **`capital_ledger` is not a ledger.** Section 8.5's wording ("update
+  `total_allocated` when bots are created, closed, or resized") describes one
+  mutable row per account, not an append-only entry log. Kept as specified, with
+  `UNIQUE (account_label, asset)` so the row is addressable; allocation history
+  lives in `audit_log`. The name is misleading and was kept anyway, because
+  renaming a table mid-build is worse than a misleading name.
+- **`balance_snapshots.classification` is nullable and section 9 has no word for
+  what NULL means.** Section 9 names three drift classes and no clean-run case.
+  Nullable rather than inventing a fourth value. Step 7 owns this; see open
+  question 3.
+- **`alerts.severity` values (`info`/`warning`/`critical`) were chosen by me.**
+  The spec never enumerates them. Section 17 refers to "critical alerts", which
+  is the only anchor.
+- **No Cloudflare resources exist.** Section 16 requires separate D1 databases
+  per environment. The separation is real in the config's shape but there is
+  still nothing behind it. Same status as step 1's decision 1, now with an exact
+  runbook attached.
+- **`ProvidedEnv` does not exist in `@cloudflare/vitest-pool-workers` 0.18.6.**
+  Step 1 added a `declare module "cloudflare:test" { interface ProvidedEnv
+  extends Env {} }` block to `vitest-env.d.ts`, following Cloudflare's docs. It
+  compiled and did nothing: in this version `env` is typed as `Cloudflare.Env`
+  directly, and nothing named `ProvidedEnv` is exported. Rewritten to augment
+  the `Cloudflare.Env` namespace, deliberately not the global `Env`, so the test
+  bindings stay invisible to the Worker's own handler. This is the third time
+  the published docs have described an API this version does not have
+  (`defineWorkersConfig`, `fetchMock`, now `ProvidedEnv`) — worth assuming, at
+  this point, that any pool API taken from the docs needs checking against
+  `dist/` before use.
+- **`readD1Migrations` is exported from the package root**, not the documented
+  `@cloudflare/vitest-pool-workers/config` subpath, which does not exist in the
+  exports map. Same class of problem as step 1's `defineWorkersConfig` finding.
+- **D1 blocks some SQLite introspection.** `sqlite_version()` and the
+  `pragma_*` table-valued functions both return `SQLITE_AUTH`. `PRAGMA
+  table_info`, `index_list`, `index_info` and `foreign_key_list` all work as
+  ordinary statements, which is enough for the drift test; it just cannot join
+  them in one query.
+
+### Open questions carried forward
+
+Still open from earlier steps: coverage measurement is unresolved (2.6, and now
+more pressing since this session added six test files whose coverage nobody can
+measure); `realizedPnl` and `roundToStep` module placement (2.7); no integration
+test exercises two modules together (2.8, still true — the D1 layer is tested
+against itself and the money module, not against the order state machine); the
+client reports rate-limit weight but does not gate on it (3.2); `Retry-After` is
+parsed but unused (3.3); a `tradeId` of `-1` would break fill deduplication
+(3.4, and now also collides with `trades.exchange_trade_id`'s UNIQUE
+constraint); `recvWindow` and the clock bias are untested against real latency
+(3.5); nothing verifies the API key lacks withdrawal permission (3.6); and the
+`state` of a cancelled partial fill comes from the exchange rather than the fill
+maths (3.1.1).
+
+Resolved from step 2: open question 5, the D1 layer enforcing CAST-on-read
+centrally, is what this session built. Step 2's open question 4 (bot instance
+ids must be short slugs) is now enforced by the schema rather than only
+documented, though step 6 still has to honour it when minting them.
+
+New:
+
+1. **Nothing writes to these tables yet, so none of the schema has met real
+   data.** Every constraint here is reasoned from the spec and tested against
+   values I chose. Step 6 is the first time a Durable Object mirrors real state
+   into D1, and that is when a CHECK constraint being slightly too strict will
+   show up — as a rejected write in a path that was mid-trade at the time.
+2. **`bot_instances` mirrors Durable Object state, and nothing defines when.**
+   Section 8.2 calls this data "mirrored from Durable Object storage" and says
+   nothing about whether the mirror is written in the same operation as the
+   authoritative state, or asynchronously, or reconciled. The two can therefore
+   disagree, and section 9's reconciliation compares the exchange against "what
+   each relevant Durable Object **and D1** believe is true" — three sources, not
+   two. Worth settling before step 6 rather than during it.
+3. **`balance_snapshots.classification` semantics on a clean run.** NULL was
+   chosen over inventing a `'none'` value. Step 7 should confirm that, or add
+   the value, before the first row is written.
+4. **The `DB` binding is declared in two places** until the real database
+   exists: `vitest.config.ts` for tests and, eventually, `wrangler.jsonc` for
+   deploys. `docs/d1-provisioning.md` step 5 says exactly what to delete.
+5. **`orders` has no `cumulative_quote_quantity`.** Step 3 found it is the only
+   route to an average fill price for an order read back from the status
+   endpoints, since those never return a fills array. `trades` covers this for
+   any fill this system recorded itself; it does not cover an order
+   reconciliation discovers after the fact. Not added, because nothing needs it
+   before step 7, and it is cheap to add while the tables are still empty —
+   which will stop being true.
+6. **`audit_log.details_json` and `strategy_params_json` are typed `unknown`.**
+   Deliberate: the shapes are step 5's and step 6's to define, and typing them
+   as a guess now would let a stored row claim a shape nothing validated. They
+   should be narrowed when those steps define the shapes, not left as `unknown`
+   permanently.

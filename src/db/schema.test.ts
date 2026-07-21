@@ -1,0 +1,195 @@
+/**
+ * Drift guard: the TypeScript table specs versus the real migrated database.
+ *
+ * The migration is authoritative -- it is what a deploy runs. schema.ts is how
+ * TypeScript sees it. Nothing keeps the two in step except this file, which
+ * reads the live schema out of D1 and compares it column by column.
+ *
+ * The failure mode it exists for: someone adds a column to the migration and
+ * not to the spec (invisible to the layer, so silently unwritable) or to the
+ * spec and not the migration (a runtime "no such column" at the worst moment).
+ */
+
+import { beforeAll, describe, expect, it } from "vitest";
+import type { ColumnKind } from "./columns";
+import { ALL_TABLES } from "./schema";
+import { freshDatabase, rawD1 } from "./test-helpers";
+
+interface TableInfoRow {
+  cid: number;
+  name: string;
+  type: string;
+  notnull: number;
+  pk: number;
+}
+
+/** The SQLite declared type each column kind must map to. */
+const EXPECTED_SQL_TYPE: Record<ColumnKind, string> = {
+  money: "INTEGER",
+  integer: "INTEGER",
+  boolean: "INTEGER",
+  text: "TEXT",
+  json: "TEXT",
+};
+
+beforeAll(async () => {
+  await freshDatabase();
+});
+
+async function tableInfo(table: string): Promise<TableInfoRow[]> {
+  const result = await rawD1().prepare(`PRAGMA table_info("${table}")`).all<TableInfoRow>();
+  return result.results;
+}
+
+async function createSql(table: string): Promise<string> {
+  const row = await rawD1()
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .bind(table)
+    .first<{ sql: string }>();
+  return row?.sql ?? "";
+}
+
+describe.each(Object.values(ALL_TABLES).map((spec) => [spec.name, spec] as const))(
+  "%s",
+  (name, spec) => {
+    it("exists", async () => {
+      expect(await createSql(name)).not.toBe("");
+    });
+
+    it("has exactly the columns the spec declares, in the same order", async () => {
+      const live = (await tableInfo(name)).map((column) => column.name);
+      expect(live).toEqual(Object.keys(spec.columns));
+    });
+
+    it("stores each column as the SQLite type its kind requires", async () => {
+      const live = await tableInfo(name);
+      const actual = Object.fromEntries(live.map((column) => [column.name, column.type]));
+      const expected = Object.fromEntries(
+        Object.entries(spec.columns).map(([column, definition]) => [
+          column,
+          EXPECTED_SQL_TYPE[definition.kind as ColumnKind],
+        ]),
+      );
+      expect(actual).toEqual(expected);
+    });
+
+    it("agrees with the spec on which columns are nullable", async () => {
+      const live = await tableInfo(name);
+      const actual = Object.fromEntries(
+        // A PRIMARY KEY column is NOT NULL in a STRICT table regardless of
+        // how it was declared, so read nullability from both flags.
+        live.map((column) => [column.name, column.notnull === 0 && column.pk === 0]),
+      );
+      const expected = Object.fromEntries(
+        Object.entries(spec.columns).map(([column, definition]) => [
+          column,
+          definition.nullable,
+        ]),
+      );
+      expect(actual).toEqual(expected);
+    });
+
+    it("is a STRICT table", async () => {
+      // Without STRICT, an INTEGER money column accepts and silently stores a
+      // TEXT value. Asserted per table so a table added later cannot omit it.
+      expect(await createSql(name)).toMatch(/\)\s*STRICT$/);
+    });
+  },
+);
+
+describe("the schema as a whole", () => {
+  it("declares all eight tables from section 8.2", async () => {
+    const result = await rawD1()
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table'
+           AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'd1_%' AND name NOT LIKE '_cf_%'
+         ORDER BY name`,
+      )
+      .all<{ name: string }>();
+
+    expect(result.results.map((row) => row.name)).toEqual([
+      "alerts",
+      "audit_log",
+      "balance_snapshots",
+      "bot_instances",
+      "capital_ledger",
+      "manual_adjustments",
+      "orders",
+      "trades",
+    ]);
+  });
+
+  it("has a money column wherever the spec describes a monetary value", async () => {
+    // Named explicitly rather than derived, so adding a money column to the
+    // migration without adding it here is a visible diff rather than a silent
+    // pass. Every one of these must be INTEGER, never TEXT and never REAL.
+    const expected: Record<string, readonly string[]> = {
+      bot_instances: ["stop_loss_pct", "take_profit_pct", "allocated_capital"],
+      capital_ledger: ["total_balance", "total_allocated"],
+      orders: ["price", "quantity", "filled_quantity"],
+      trades: [
+        "price",
+        "quantity",
+        "fee_amount",
+        "fee_reporting_amount",
+        "fee_conversion_rate",
+      ],
+      balance_snapshots: [
+        "exchange_reported_balance",
+        "internal_calculated_balance",
+        "discrepancy",
+      ],
+      manual_adjustments: ["amount"],
+      audit_log: [],
+      alerts: [],
+    };
+
+    for (const spec of Object.values(ALL_TABLES)) {
+      const declared = Object.entries(spec.columns)
+        .filter(([, definition]) => definition.kind === "money")
+        .map(([column]) => column);
+      expect({ [spec.name]: declared }).toEqual({ [spec.name]: expected[spec.name] });
+
+      const live = await tableInfo(spec.name);
+      for (const column of declared) {
+        expect(live.find((info) => info.name === column)?.type).toBe("INTEGER");
+      }
+    }
+  });
+
+  it("indexes the child side of every foreign key", async () => {
+    // SQLite indexes the parent's key automatically but not the child's, so an
+    // unindexed FK column means a full scan of a table that section 8.7 never
+    // prunes, on every join.
+    //
+    // D1 refuses the pragma_* table-valued functions (SQLITE_AUTH), so this
+    // walks index_list/index_info per table instead of joining them.
+    for (const table of ["orders", "trades", "audit_log", "alerts"]) {
+      const indexes = await rawD1()
+        .prepare(`PRAGMA index_list("${table}")`)
+        .all<{ name: string }>();
+
+      const leadingColumns = new Set<string>();
+      for (const index of indexes.results) {
+        const info = await rawD1()
+          .prepare(`PRAGMA index_info("${index.name}")`)
+          .all<{ seqno: number; name: string | null }>();
+        for (const column of info.results) {
+          // Only the leading column: an index on (b, c) does not help a lookup
+          // on c alone.
+          if (column.seqno === 0 && column.name !== null) leadingColumns.add(column.name);
+        }
+      }
+
+      const foreignKeys = await rawD1()
+        .prepare(`PRAGMA foreign_key_list("${table}")`)
+        .all<{ from: string }>();
+      expect(foreignKeys.results.length).toBeGreaterThan(0);
+      for (const key of foreignKeys.results) {
+        expect(`${table}: ${key.from} indexed`).toBe(
+          `${table}: ${leadingColumns.has(key.from) ? key.from : "MISSING"} indexed`,
+        );
+      }
+    }
+  });
+});
