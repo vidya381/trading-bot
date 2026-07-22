@@ -5,25 +5,23 @@
 // Cloudflare's docs (and this file, until step 4) tell you to augment does not
 // exist in this version -- augmenting it compiled fine and did nothing.
 //
-// Augmenting `Cloudflare.Env` rather than the global `Env` is deliberate: the
-// global `Env` is what the Worker's fetch handler sees, and neither binding
-// below exists in a deployed Worker yet. Only tests should be able to see them.
+// Only TEST_MIGRATIONS is declared here now. `DB` used to be too, because
+// wrangler.jsonc could not declare a D1 binding without a real database_id;
+// the databases exist as of step 4.1, so `DB` comes from `wrangler types` via
+// worker-configuration.d.ts and must NOT be repeated here. Two declarations
+// that can disagree is worse than one.
 //
-//  - DB: supplied by vitest.config.ts's miniflare options, because
-//    wrangler.jsonc cannot declare a D1 binding without a real database_id.
-//    Once the real database is provisioned (docs/d1-provisioning.md), the
-//    binding belongs in wrangler.jsonc, `wrangler types` will emit it into
-//    both `Env` and `Cloudflare.Env`, and this line must be DELETED so there
-//    is one declaration of DB rather than two that can disagree.
-//  - TEST_MIGRATIONS: the migration set, for applyD1Migrations. Test-only
-//    permanently; no Worker ever reads it.
+// TEST_MIGRATIONS is test-only permanently: it is the migration set that
+// `applyD1Migrations` needs, supplied by vitest.config.ts's miniflare options.
+// No Worker ever reads it, which is why it augments `Cloudflare.Env` (what
+// `env` from "cloudflare:test" is typed as) rather than the global `Env` (what
+// the Worker's own fetch handler sees).
 //
-// Written with inline `import(...)` types so this file stays a global script.
+// Written with an inline `import(...)` type so this file stays a global script.
 // A top-level `import` would turn it into a module and the namespace
 // declaration would stop merging.
 declare namespace Cloudflare {
   interface Env {
-    DB: D1Database;
     TEST_MIGRATIONS: import("@cloudflare/vitest-pool-workers").D1Migration[];
   }
 }

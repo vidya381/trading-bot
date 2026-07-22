@@ -870,8 +870,10 @@ Date: 2026-07-21
 
 ### What was built
 
-`migrations/0001_initial_schema.sql`: the eight tables of section 8.2, plus 18
-indexes. Every table `STRICT`; every money column `INTEGER`.
+`migrations/0001_initial_schema.sql`: the eight tables of section 8.2, plus 17
+explicit indexes (this said 18 when first written; corrected during step 4.1
+against the real database, which reports 17). Every table `STRICT`; every money
+column `INTEGER`.
 
 `/src/db/`: `columns.ts` (column kinds and their codecs), `table.ts`
 (`defineTable` and `Repository`), `schema.ts` (the eight tables as typed specs),
@@ -1198,3 +1200,150 @@ New:
    as a guess now would let a stored row claim a shape nothing validated. They
    should be narrowed when those steps define the shapes, not left as `unknown`
    permanently.
+
+---
+
+## Step 4.1: D1 databases provisioned
+Date: 2026-07-22
+
+Completes step 4. Not a build-order step of its own — step 4 deliberately
+stopped short of creating real Cloudflare resources, and this is that one
+remaining action, plus two facts about ownership that turned out to matter more
+than the provisioning did.
+
+### What was done
+
+Both databases created in the Cloudflare account `Vidya`
+(`991af2ea1a58d7a2bb148f7269f635b9`), region `WNAM`:
+
+| Environment | Database | `database_id` | Schema |
+| --- | --- | --- | --- |
+| testnet | `trading-bot-testnet` | `3f01f245-12b3-4b20-acf7-75b655da2bd7` | applied |
+| production | `trading-bot-production` | `4038bdd3-9715-4366-a6b4-d3b007df6258` | **none, deliberately** |
+
+Both `d1_databases` blocks added to `wrangler.jsonc` under their own
+environments, binding `DB` in each. Migration `0001_initial_schema.sql` applied
+to testnet, local first then remote: 26 commands, 8 tables, 17 indexes, all 8
+tables confirmed `STRICT` on the real database.
+
+Production is created and bound and contains no schema at all — only D1's
+internal `_cf_KV`. That is a safety property, not an oversight: nothing can
+write real trading data there, whatever else goes wrong, until someone
+deliberately runs the migration.
+
+Both cleanup edits made, so the `DB` binding is declared once. 591 tests still
+passing, typecheck clean.
+
+### Decisions made
+
+**1. The Cloudflare account is the builder's own, not a delegated one.**
+
+The originally planned account (a family member's) turned out to already be in
+use for other purposes, so this project is hosted on the builder's own
+Cloudflare account, authenticated with `wrangler login` (OAuth) rather than a
+scoped API token.
+
+Spec section 18 prefers a scoped token specifically because it is revocable
+independently of the main login — an argument about *delegated* access. With the
+account being the builder's own there is currently nobody to revoke it from, so
+the preference does not apply as written. Recorded rather than silently skipped,
+because the moment anyone else needs access this reverts to being the right
+answer.
+
+*Note this does not resolve the question below; it makes it sharper.* Owning the
+infrastructure account is now decoupled from owning the money, and those two
+things being the same person was an unstated assumption running through sections
+11.2 and 18.
+
+**2. Whose exchange account and funds will be used in production is undecided.**
+
+It may be the builder's own Binance India account, or a family member's.
+Undecided as of this entry, and nothing in the system depends on it yet —
+exchange API keys are not needed until the testnet-to-production transition
+(section 18), so this can stay open through steps 5 to 13 without blocking
+anything.
+
+**3. Authority over production follows the money, not the infrastructure.**
+
+The principle, to be settled explicitly before production is used:
+
+> Whoever's real capital is actually at risk in production holds final authority
+> over that environment's Cloudflare Access allow-list (section 11.3) and the
+> global kill switch (section 7.4) — not whoever happens to own the Cloudflare
+> account hosting the infrastructure.
+
+Section 11.2 already says the account owner has final say over the production
+allow-list, and that the builder should not assume their own email belongs on
+it. What section 11.2 does not anticipate is the two roles coming apart. It uses
+"the account owner" for both the Cloudflare account holder and the person whose
+funds are at risk, because it was written assuming one person. Decision 1 has
+made that assumption false for the Cloudflare half, and decision 2 leaves the
+exchange half open.
+
+The resolution is that "account owner" in sections 11.2, 11.3 and 18 should be
+read as **the person whose funds are at risk**, in every case where the two
+readings differ. Holding the Cloudflare credentials is an implementation detail;
+being the one who loses money is not.
+
+*Deciding it the other way — infrastructure owner holds authority — rejected.*
+It would mean whoever set up the hosting can add themselves to the production
+allow-list and trade someone else's capital. Technically true today regardless,
+since the Cloudflare account holder can change any Access policy. That is
+exactly why it has to be an explicit agreement rather than a technical control:
+the technical control does not exist and cannot be built at this layer.
+
+*Revisit if:* the exchange account decision (2) lands on the builder's own
+account, in which case the two roles recombine and this becomes moot — but it
+should be recorded as settled here even then, not left implied.
+
+### Deviations from the spec
+
+- **Section 18's scoped API token was not used** (decision 1). OAuth via
+  `wrangler login`, on the builder's own account.
+- **Section 17's go-live checklist was amended.** A ninth item was added, per
+  decision 3 — see below. This is the first time this project has edited
+  `planning/spec.md` rather than recording a deviation against it; flagged here
+  because it changes the source of truth rather than annotating it.
+- **`_cf_KV`, not `_cf_METADATA`.** The runbook guessed the name of D1's own
+  internal table. Corrected against real output.
+- **The step 4 entry said 18 indexes; there are 17.** Corrected in place. Miscount
+  when writing the entry, not a change to the migration — the local test suite
+  had reported 17 all along.
+
+### Go-live checklist amendment
+
+Added to spec section 17, and repeated here because a checklist item that lives
+only in a spec file nobody re-reads at 2am is not a control:
+
+> - Ownership and authority explicitly settled and recorded in the decision log:
+>   whose exchange account and funds are being used, and confirmation that that
+>   person — not the Cloudflare account holder, if they differ — holds final
+>   authority over the production Access allow-list and the global kill switch.
+
+The checklist's own preamble says these must be "explicitly satisfied, not
+assumed", and this is the item most likely to be assumed, because it is the only
+one that is a conversation between people rather than an observation about the
+system. It cannot be satisfied by anything the code does.
+
+### Open questions carried forward
+
+All of step 4's open questions stand. Question 4 (the `DB` binding declared in
+two places) is resolved here.
+
+New:
+
+1. **Whose exchange account and funds** (decision 2). Not blocking until the
+   testnet-to-production transition, but it gates the go-live checklist item
+   above, and therefore gates production entirely.
+2. **The production allow-list still has no names on it**, and now cannot until
+   question 1 is answered, since decision 3 makes the answer determine who
+   decides. This was step 1's open question 5, still open, and now with a
+   prerequisite in front of it.
+3. **Nothing enforces the empty production database.** It is empty because
+   nobody ran one command. A deploy pipeline that runs migrations automatically
+   would fill it without anyone deciding to; if CI ever grows a migration step
+   at step 13, it must be testnet-only.
+4. **Backups.** D1 captures a backup on `migrations apply`, per wrangler's own
+   output, but nothing in the spec or this project defines a backup or restore
+   posture for real trading data under section 8.7's retain-everything rule.
+   Worth deciding before production, separately from go-live.

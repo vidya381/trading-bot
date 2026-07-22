@@ -34,21 +34,41 @@ const TABLES_CHILDREN_FIRST = [
 ] as const;
 
 /**
+ * The raw binding, for tests that must deliberately bypass the access layer.
+ *
+ * `wrangler types` emits `DB?: D1Database` on the base env, correctly: the base
+ * config block in wrangler.jsonc has no D1 binding, so a Worker deployed
+ * without `--env` genuinely has no database. Only the two named environments
+ * declare one.
+ *
+ * Tests are pinned to the testnet environment (step 1, decision 6), where the
+ * binding is always present. This is the single place that narrowing happens,
+ * and it checks rather than asserts -- if the pinning is ever lost, this says
+ * so in one line instead of surfacing as a null dereference somewhere further
+ * in.
+ */
+export function rawD1(): D1Database {
+  const binding = env.DB;
+  if (binding === undefined) {
+    throw new Error(
+      "no DB binding in the test environment. vitest.config.ts pins tests to " +
+        "the testnet environment, which declares one in wrangler.jsonc; check " +
+        "that pinning is still in place.",
+    );
+  }
+  return binding;
+}
+
+/**
  * Apply the real migrations to the real (local) D1 database and empty every
  * table. `applyD1Migrations` records what it has run, so repeated calls after
  * the first do nothing.
  */
 export async function freshDatabase(): Promise<Database> {
-  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
-  await env.DB.batch(
-    TABLES_CHILDREN_FIRST.map((table) => env.DB.prepare(`DELETE FROM ${table}`)),
-  );
-  return new Database(env.DB);
-}
-
-/** The raw binding, for tests that must deliberately bypass the access layer. */
-export function rawD1(): D1Database {
-  return env.DB;
+  const d1 = rawD1();
+  await applyD1Migrations(d1, env.TEST_MIGRATIONS);
+  await d1.batch(TABLES_CHILDREN_FIRST.map((table) => d1.prepare(`DELETE FROM ${table}`)));
+  return new Database(d1);
 }
 
 const T0 = 1_760_000_000_000;

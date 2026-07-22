@@ -34,13 +34,22 @@
   // ---------------------------------------------------------------------------
   // Environments.
   //
-  // Resource bindings (D1, KV, R2, Queues, Durable Objects) are intentionally
-  // absent for now. They are added per environment in the build-order step that
-  // introduces them (section 19): D1 at step 4, Durable Objects at step 6,
-  // Queues alongside order execution, KV at step 8, R2 at step 12. Each will be
-  // declared separately under both testnet and production -- like "vars",
-  // binding keys are non-inheritable, so there is no way to accidentally point
-  // both environments at one database.
+  // Remaining resource bindings (KV, R2, Queues, Durable Objects) are
+  // intentionally absent. They are added per environment in the build-order
+  // step that introduces them (section 19): Durable Objects at step 6, Queues
+  // alongside order execution, KV at step 8, R2 at step 12. D1 arrived at step
+  // 4 and is below.
+  //
+  // Each binding is declared separately under both testnet and production --
+  // like "vars", binding keys are non-inheritable, so there is no way to
+  // accidentally point both environments at one database. The two
+  // "database_id" values below are different databases and must stay that way;
+  // that is the whole of section 16's separation, expressed as two UUIDs.
+  //
+  // The base config block above has NO D1 binding, deliberately. A bare
+  // `wrangler deploy` with no --env already reports ENVIRONMENT
+  // "unconfigured"; having no database either means it cannot touch real
+  // trading data at all.
   // ---------------------------------------------------------------------------
   "env": {
     "testnet": {
@@ -48,7 +57,15 @@
       "workers_dev": true,
       "vars": {
         "ENVIRONMENT": "testnet"
-      }
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "trading-bot-testnet",
+          "database_id": "3f01f245-12b3-4b20-acf7-75b655da2bd7",
+          "migrations_dir": "migrations"
+        }
+      ]
     },
 
     "production": {
@@ -56,7 +73,20 @@
       "workers_dev": true,
       "vars": {
         "ENVIRONMENT": "production"
-      }
+      },
+      // Created, bound, and deliberately EMPTY. Migrations have not been
+      // applied here and must not be until go-live (section 16.1). Applying
+      // them is one command -- `wrangler d1 migrations apply DB --env
+      // production --remote` -- and it belongs with the first production
+      // deploy, not with provisioning.
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "trading-bot-production",
+          "database_id": "4038bdd3-9715-4366-a6b4-d3b007df6258",
+          "migrations_dir": "migrations"
+        }
+      ]
     }
   }
 }

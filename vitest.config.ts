@@ -28,14 +28,12 @@ export default defineConfig({
         environment: "testnet",
       },
       miniflare: {
-        // The D1 binding is declared HERE rather than in wrangler.jsonc, on
-        // purpose. Miniflare only needs a binding name to spin up a local
-        // SQLite database; a `d1_databases` block in wrangler.jsonc would
-        // additionally need a real `database_id`, and step 1's decision 1
-        // rejected placeholder resource IDs as too easy to mistake for real
-        // ones. See docs/d1-provisioning.md for the exact commands that add
-        // the real binding once a scoped API token exists.
-        d1Databases: ["DB"],
+        // No `d1Databases` here. The DB binding comes from wrangler.jsonc's
+        // testnet environment as of step 4.1, and the pool picks it up from
+        // there. Tests still run against a LOCAL SQLite database that
+        // miniflare creates from that binding -- declaring the binding does
+        // not point tests at the remote database, and nothing in the suite
+        // touches Cloudflare.
         bindings: {
           // Not application config: the migration set, handed to the test
           // runtime so `applyD1Migrations` can run it. No Worker reads this.
