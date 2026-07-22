@@ -188,6 +188,36 @@ Recorded results: `strict_tables` 8, `idx` 17, `d1_migrations` holding exactly
 
 ---
 
+## 3.1 Migration 0002 — NOT YET APPLIED TO REMOTE TESTNET
+
+Step 5 added `migrations/0002_bot_instances_capital_asset.sql`, which adds
+`bot_instances.capital_asset` and one index. Step 5 did **not** run it against
+the remote testnet database, because applying a migration to a real Cloudflare
+database is a deliberate act, not a side effect of writing code.
+
+So as of the end of step 5 the remote testnet database is one migration behind
+this repository. Nothing is broken by that — nothing deploys yet, and the test
+suite applies migrations to a local database it creates itself — but it must be
+run before anything is deployed to testnet:
+
+```sh
+npx wrangler d1 migrations apply DB --env testnet --local
+npx wrangler d1 migrations apply DB --env testnet --remote
+```
+
+Afterwards the numbers above become: 8 tables still, **18** explicit indexes,
+and `d1_migrations` holding two rows.
+
+```sh
+npx wrangler d1 execute DB --env testnet --remote \
+  --command "SELECT name FROM pragma_table_info('bot_instances') WHERE name = 'capital_asset'"
+```
+
+Production is unaffected: it still has no schema at all, deliberately, and
+section 4 below is still the only thing that would change that.
+
+---
+
 ## 4. Production — NOT YET
 
 Deliberately not done. Section 16 requires testnet first, always. The production

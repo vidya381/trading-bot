@@ -52,6 +52,14 @@ export const botInstances = defineTable("bot_instances", {
   schema_version: integer(),
   created_at: integer(),
   updated_at: integer(),
+  // Last on purpose. Added by migration 0002, and ALTER TABLE ADD COLUMN
+  // appends; schema.test.ts compares column ORDER against the live database,
+  // so moving this up to sit beside account_label would fail the drift guard.
+  //
+  // The asset this bot's capital is denominated in, and therefore which
+  // capital_ledger row (account_label, asset) its allocation lives in. Not the
+  // pair's quote asset by definition, though in practice it will be.
+  capital_asset: text(),
 });
 
 export const capitalLedger = defineTable("capital_ledger", {

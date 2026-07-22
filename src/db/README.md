@@ -17,9 +17,12 @@ dashboard read.
 | `database.ts` | `Database`: wraps the binding, exposes one repository per table. |
 | `test-helpers.ts` | Test-only. Applies migrations, empties tables, builds fixture rows. |
 
-The migration itself lives in `/migrations`, not here. It is authoritative —
-it is what a deploy runs — and `schema.test.ts` compares it against `schema.ts`
-column by column so the two cannot drift.
+The migrations themselves live in `/migrations`, not here. They are
+authoritative — they are what a deploy runs — and `schema.test.ts` compares them
+against `schema.ts` column by column, including column *order*, so the two
+cannot drift. That order check is why `bot_instances.capital_asset`, added by
+migration 0002 for step 5, sits last in the spec rather than beside
+`account_label`: `ALTER TABLE ADD COLUMN` appends.
 
 ## Using it
 

@@ -90,6 +90,7 @@ export function botInstanceRow(overrides: Partial<BotInstanceRow> = {}): BotInst
     schema_version: 1,
     created_at: T0,
     updated_at: T0,
+    capital_asset: "USDT",
     ...overrides,
   };
 }
