@@ -1623,3 +1623,468 @@ New:
    this, or this drives status and the DO follows. Two writers to one status
    column with no agreement between them is how a halted bot ends up marked
    stopped, or worse, a stopped bot marked running.
+
+---
+
+## Step 6: DCA BotInstance Durable Object
+Date: 2026-07-22
+
+### What was built
+
+`/src/strategies/` (new): `dca.ts`, the whole of section 6.3 as pure functions,
+plus `index.ts` and a folder README.
+
+`/src/durable-objects/`: `bot-instance.ts` (the object), `attempt-store.ts` (the
+real `AttemptStore`), `fake-exchange.ts` and `test-helpers.ts` (test-only,
+neither exported from the barrel), `index.ts`, and a rewritten README.
+
+`wrangler.jsonc` gained a `BOT_INSTANCE` binding and a `new_sqlite_classes`
+migration under both environments. `src/workers/api.ts` re-exports the class,
+because a Durable Object must be exported from the Worker named by `main`.
+`src/db/database.ts` gained `databaseFrom`.
+
+108 new tests across four files (771 in total across the project), all passing,
+typecheck clean. Real D1 and real Durable Object storage in the Workers runtime;
+the exchange is the only thing mocked.
+
+This is the first code in the project where step 2, step 3, step 4 and step 5
+all run together. Step 2's open question 8 -- "no integration test yet exercises
+two modules together" -- is closed by `bot-instance.test.ts`.
+
+### The two decisions taken as settled going in
+
+Both were genuinely open in this log, and both are now answered. Recording that
+they were open, because step 5's entry had to note the opposite situation.
+
+**A. This object calls `createBotInstanceWithCapital` and never writes its own
+`bot_instances` row.** Step 5's deviations already said "Step 6 must call this
+to be born rather than writing that row itself, or there will be two writers for
+one row." Confirmed and implemented.
+
+**B. Status ownership splits by transition.** This closes step 5's open question
+5, which asked exactly this and warned that "two writers to one status column
+with no agreement between them is how a halted bot ends up marked stopped". The
+split: this object owns `running` and `halted`; `stopped` is written only by
+`releaseBotCapital`. `#mirrorStatus` carries the guarantee mechanically -- every
+status write it makes is conditional on `status <> 'stopped'`, so the object
+cannot write that value even by mistake, and cannot overwrite it either.
+
+Step 4's open question 2 (nothing defines when the D1 mirror is written) is also
+closed here for mid-trade state, which is the half step 5 left open: the mirror
+is written by the same pipeline that processes the event.
+
+### Three questions asked before writing anything
+
+**1. Take-profit is a cycle completion, not a section 7.2 halt.** *(asked,
+confirmed)*
+
+Section 7.2's header lists take-profit among the halt triggers and says a halt
+never auto-resumes. Section 6.3 step 6 says that after a take-profit exit the
+bot may auto-restart a fresh cycle. Those cannot both be true, and the session
+brief inherited the tension -- it put "optional auto-restart" after halt in the
+same arrow chain.
+
+Resolved as: 6.3 step 6 is the specific rule for DCA and 7.2's list is the
+general one. `autoRestart` on begins a fresh cycle with status staying
+`running`; `autoRestart` off halts with reason `take_profit_reached`. That keeps
+7.2's "never auto-resume" true for every path that does not have 6.3 step 6's
+explicit permission, rather than making it a rule with an undocumented hole.
+
+Either way the capital reservation is untouched. *Releasing capital on a
+completed cycle -- considered, rejected.* It would return capital to the ledger
+with no human in the loop, and a bot that has finished a cycle profitably is the
+last thing that should quietly close itself.
+
+**2. Exhausting max buys is not its own halt trigger.** *(asked, confirmed)*
+
+Section 6.3 step 5 halts when "maximum buys are exhausted and price continues
+falling", and defines "continues falling" nowhere. The mandatory stop-loss,
+measured from average entry, already is that threshold.
+
+*A separate post-exhaustion threshold -- rejected.* It would mean two downside
+thresholds where the spec funds one, and the second would have to be invented
+from nothing. The bot now stops buying, keeps watching, and halts on the
+stop-loss.
+
+**3. `subscribeToPriceFeed` deferred to its own session.** *(asked, confirmed)*
+
+Section 4.6 deferred it to this step. It is not built, and the reason is more
+than session size: **the section 4.1 signature does not fit the Hibernation
+API.** `subscribeToPriceFeed(pair, onUpdate)` returns a handle synchronously and
+holds a callback closure. Hibernation requires `ctx.acceptWebSocket()` plus
+`webSocketMessage` handlers on the class, precisely so the connection can
+outlive the isolate -- and a callback closure cannot survive the object being
+evicted. So building it means redesigning that signature, which is its own
+design problem rather than a wiring job.
+
+The object exposes `onPriceUpdate(price)` instead, which is what the feed will
+call, and is also exactly what section 13's backtest mode needs.
+
+### Decisions made
+
+**1. Strategy logic lives in `/src/strategies`, pure, separate from the object.**
+
+`decide()` takes a config, a position and a price, and returns an action. The
+Durable Object carries it out.
+
+Section 13 requires backtesting to run "the same strategy code ... without
+duplication" against historical candles. That is only possible if the strategy
+does not depend on the machinery that talks to an exchange. Putting the state
+machine inside the object would have made the backtest either a second
+implementation or a fake Durable Object.
+
+This is a second new top-level folder, after step 3's `/src/exchange`, and the
+same trade: step 1's decision 9 preferred not to invent folders, and a module
+with a genuinely different dependency profile is worth one.
+
+**2. The halt marks the bot halted BEFORE cancelling, inverting section 7.2's
+listed order.**
+
+Section 7.2 lists cancellation first and "mark the bot instance status as
+halted" third. Implemented the other way round, and this is the most deliberate
+deviation in the session.
+
+The list's step 2 is "stop placing any new orders", and that is only in force
+once the status says so *durably*. Cancelling first means a crash partway
+through leaves a bot still marked `running` with some orders cancelled -- and
+the next price update will happily add to it. Marking first means a crash leaves
+a halted bot with orders still live: visible, alerted on, and safe, because
+nothing will trade against them.
+
+The cancellations are unchanged and still immediate; only the persistence
+ordering moved. Read as implementing 7.2's intent rather than its sequence.
+
+**3. A fill discovered at cancellation is alerted, never applied.** *(resolves
+step 3.1's open question 1)*
+
+Step 3.1 returned `OrderStatus` from `cancelOrder` specifically so the halt path
+would know the filled quantity at the instant of cancellation, and its open
+question asked to re-check that "when the halt path actually drives `closeOrder`
+from this value". Doing so surfaced something step 3.1 did not anticipate.
+
+When the exchange reports MORE filled at cancellation than this bot knew about
+-- a resting order filling in the window before the cancel lands -- that
+quantity cannot be folded into the position. A cancellation response carries no
+fills array and therefore **no `tradeId`**, and `applyFill` deduplicates on
+exactly that id. Synthesising one would mean that when the real fill later
+arrives from the account trade list, it either double-counts or is silently
+swallowed by the fake id.
+
+So the position is left understating what the bot holds, both numbers go into a
+`cancel_fill_discrepancy` alert, and section 9's reconciliation closes it. That
+is not a workaround; reconciling the exchange against what the bot believes is
+the job section 9 exists for. But it does mean **step 3.1's stated benefit is
+only half-realised**: the number arrives, and it cannot be used where it
+matters. The honest summary is that the filled quantity at cancellation is
+usable for the ORDER record and not for the POSITION.
+
+*Synthesising a fill id such as `cancel:{clientOrderId}` -- rejected*, for the
+double-count above. *Following each cancel with a `getOrderStatus` -- rejected*:
+it is what step 3.1 removed, and it would not help, since the status endpoints
+also return no fills array.
+
+**4. Durable Object storage keeps `bigint`; D1 does not. Two conventions, each
+matched to what its storage can represent.**
+
+Probed rather than assumed, following steps 2 and 4. `storage-probe.test.ts`
+measures, in the real runtime:
+
+| | Durable Object storage | D1 |
+| --- | --- | --- |
+| `bigint` write | stored as bigint | `.bind()` throws outright |
+| read past 2^53 | exact | silently truncated |
+| `get` after `put` | fresh structure | n/a |
+| two `get`s of one key | two structures | n/a |
+
+So DO state stores `Money` as the bigint it is, and the decimal-string encoding
+is applied only at the D1 boundary. The probe was kept as a test rather than
+deleted, unlike step 2's D1 probe, because `DurableObjectAttemptStore` is built
+on these results and a runtime change should fail here rather than as a
+corrupted idempotency record.
+
+**5. The reference-leak bug from step 2 does not exist in the real store, and
+that is now measured.**
+
+Step 2's decision 12 fixed an `InMemoryAttemptStore` that copied on write but
+not on read, and asserted that "the persisted implementation at step 6 will not
+share references either". That was a reasonable expectation, not a fact, and DO
+storage keeps an in-memory write cache in front of SQLite -- which is exactly
+where a shared reference could have survived.
+
+It does not. Storage returns a fresh structure from every `get`, both after a
+`put` in the same context and across two reads. `DurableObjectAttemptStore`
+therefore needs no defensive copying, and `attempt-store.test.ts` runs the same
+mutation tests against it that caught the original bug.
+
+**6. `AttemptStore.list()` is a full scan, so the sequence counter moved into
+the object's state.**
+
+The port returns every attempt, and both `highestSequence()` and
+`unresolvedAttempts()` filter it in JavaScript. That is free for a `Map` and is
+not free for storage that, under section 8.7's retain-everything rule, grows for
+the life of the bot -- and `highestSequence()` would have sat on the
+order-placing path.
+
+`BotRuntimeState.nextSequence` is persisted with everything else, so the scan
+happens only on the recovery path, where reading every unresolved attempt is the
+actual point.
+
+*Widening the port with narrower query methods -- rejected for now.* It would
+have to be implemented by the in-memory store and by whatever backtesting uses,
+for a problem the object can avoid entirely. Recorded as friction rather than
+fixed; see open question 2.
+
+**7. The sequence number is persisted BEFORE the attempt record.**
+
+Both orderings lose something on a crash in the gap. Persisting the sequence
+first burns a sequence number, which costs nothing. The reverse lets a crash
+re-use a sequence whose attempt record already exists, at which point
+`beginAttempt` answers `recover` for an order that was never placed -- a bot
+stuck waiting to reconcile an order that does not exist.
+
+**8. A definite refusal from the exchange halts; a transport failure does not.**
+
+`placeOrder` returning `exchange_error` marks the attempt failed and halts with
+`order_rejected`: a validly constructed order the exchange refused outright is
+not something to retry into.
+
+`transport` leaves the attempt `attempting`, returns `unresolved`, and halts
+nothing. Section 5.6 and 5.1 together: the order may be resting on the book, and
+it must be recovered by lookup, never re-sent. The sequence is spent either way,
+so the next attempt uses a fresh id -- there is a test asserting the retry
+places `v1-{id}-1` rather than re-sending `v1-{id}-0`.
+
+**9. `strategy_params_json` is decimal strings, and that is forced, not
+stylistic.** *(answers step 4's open question 6, strategy half)*
+
+`JSON.stringify` throws on a `bigint`, so a `DcaParams` cannot be written to a
+JSON column at all -- the D1 layer's codec would wrap it as `encode_failed`.
+`encodeDcaParams` / `decodeDcaParams` are the gate, using `toDecimalString` to
+match step 5's `AllocationAuditDetails`. `decodeDcaParams` validates rather than
+casts, including the `strategy: "dca"` discriminator, because the column is
+`unknown` by design and grid will write a different shape at step 9.
+
+The column stays `unknown` in `schema.ts` for that reason.
+
+**10. Order sizes are denominated in the quote asset, and a config must fund its
+own ladder.**
+
+Section 6.3 says "base order size" and never says in what. Quote, because
+`allocated_capital` and the whole capital ledger are denominated that way, so a
+size can be checked against the allocation directly; a size in base could not
+be, without a price that does not exist at configuration time.
+
+The check itself is new: section 6.1 checks the requested allocation against the
+account's free balance, and **nothing anywhere checked that a bot's own
+parameters fit inside its own allocation.** Without it, a bot allocated 100 with
+five 50-unit buys configured is created happily and fails at the exchange on its
+third buy, mid-cycle, with a position open -- which section 7.5 turns into a
+halt. `validateDcaParams` refuses it at creation, before any capital is
+reserved.
+
+`plannedTotalSpend` sums exactly the values `additionalOrderSizeFor` returns,
+rather than recomputing the compounding, so the check and the run-time request
+cannot disagree by a rounding step.
+
+**11. `orders.id` is the `clientOrderId`, and `trades.id` is
+`{clientOrderId}:{fillId}`.**
+
+Deterministic on purpose. These rows are written from a pipeline section 5.1
+says can be redelivered, and a generated id would insert a second row on a
+replay. With deterministic ids the replay collides with the PRIMARY KEY, which
+is the same protection `client_order_id UNIQUE` and
+`UNIQUE (order_id, exchange_trade_id)` already give, extended to the identity
+column.
+
+**12. Fee conversion uses the fill itself as the rate source, or writes
+nothing.**
+
+Fee in the quote asset: no rate needed. Fee in the base asset: the fill's own
+price. Anything else -- a fee in the exchange's own token, which is the common
+third case -- has no rate available in this object, and step 2's decision 9
+applies: all three reporting columns are NULL rather than guessed. Migration
+0001's `fee_conversion_all_or_nothing` CHECK enforces the triple.
+
+This is a real gap, not a complete implementation of section 5.5. See open
+question 3.
+
+**13. There is no default exchange client, and the object refuses to trade
+without one.**
+
+`attach()` defaults the database from the environment and deliberately does not
+default the exchange. Building a Binance client needs live API credentials, and
+step 4.1's decision 2 recorded that whose exchange account will be used is still
+undecided. A default would be a client constructed against credentials that do
+not exist, failing at the first signed request with an authentication error that
+says nothing about the real cause.
+
+**14. `sellOnStopLoss` exists in the config and is REJECTED if set to true.**
+
+Section 6.3 step 5 requires that any auto-sell at a loss be "an explicit,
+configured behavior the account owner has chosen", so the option belongs in the
+model. The selling half is not built.
+
+A field that reads as a risk control and silently does nothing is worse than an
+absent field: someone sets it and believes the position will be closed. So
+`validateDcaParams` refuses `true` with a message saying why. This was caught
+while writing this entry, not while writing the code -- the field had been
+sitting there accepted and inert.
+
+**15. `databaseFrom(env)` was added to `/src/db`.**
+
+Step 4's `no-raw-d1.test.ts` fails the build on any `env.DB` outside `/src/db`,
+and its message says "construct a `Database` once and pass that" -- which needs
+one sanctioned place to do the constructing. The guard did its job here: the
+first version of the object reached for `this.env.DB` directly and the test
+caught it.
+
+**16. Routine, for completeness.** The `PipelineResult` shape, the storage key
+prefixes, the barrel files and the READMEs are ordinary implementation with no
+decision behind them worth recording. `FakeExchange` implements the interface
+rather than being a loose object of `vi.fn()`s, which is the one part of the
+test scaffolding with a reason: when step 3.1 changed `cancelOrder` from `void`
+to `ExchangeOutcome<OrderStatus>`, a structural mock would have kept compiling
+against the old shape.
+
+### Integration friction found between existing modules
+
+The session brief asked for this explicitly. Six, in rough order of how much
+they matter.
+
+1. **`cancelOrder`'s filled quantity cannot reach the position** (decision 3).
+   The most consequential. Step 3.1's whole argument for returning `OrderStatus`
+   was that the filled quantity at cancellation "is the number that says what
+   the bot still owns" -- and the missing `tradeId` means it cannot be applied
+   there. It reaches the order record and stops.
+
+2. **`AttemptStore.list()` does not survive contact with persistent storage**
+   (decision 6). The port was designed against a `Map`. Worked around in the
+   object rather than in the port.
+
+3. **`JSON.stringify` cannot serialize the money types the whole codebase uses**
+   (decision 9). Every module produces `bigint`; the one JSON column in the
+   schema cannot hold one. Nothing had hit this before because nothing had
+   written a strategy's own parameters.
+
+4. **`RateLookup` is synchronous and pure, and the rate is not available**
+   (decision 12). `fees.ts` was deliberately built so converting a fee performs
+   no I/O, with rates "gathered in advance". Nothing gathers them. For a fee in
+   a third asset the object would have to fetch a price mid-fill, which the
+   interface correctly refuses to let it do -- so it writes NULL.
+
+5. **`ExchangeOutcome`'s failure carries `message`, not `reason`.** Trivial, and
+   noted only because the first draft of the object used `reason` throughout and
+   compiled fine everywhere the value was interpolated into a template string.
+   Caught by typecheck, not by tests.
+
+6. **`BotInstance extends DurableObject<Env>` does not satisfy
+   `runInDurableObject`'s constraint**, which is typed against `Cloudflare.Env`.
+   That is a consequence of step 4's deliberate choice to augment the
+   `Cloudflare.Env` namespace rather than the global `Env`, so test-only
+   bindings stay invisible while typechecking Worker source. The property is
+   worth keeping; the cast is isolated in `inBot`.
+
+None of these were "fixed" by quietly changing an existing module. The only
+edits outside the new folders were adding `databaseFrom` and one error code to
+`/src/db`, and re-exporting the class from `api.ts`.
+
+### Deviations from the spec
+
+- **Section 7.2's step order is inverted** (decision 2). Halted is marked before
+  orders are cancelled.
+- **Section 7.2 lists take-profit as a halt trigger; section 6.3 step 6 lets it
+  auto-restart.** Resolved in favour of 6.3 step 6 for DCA (question 1). This is
+  a genuine contradiction in the spec, not an ambiguity, and the spec has not
+  been edited to record it -- only this log.
+- **Section 6.3 step 5's "maximum buys are exhausted and price continues
+  falling" is not implemented as a distinct trigger** (question 2).
+- **Section 6.3 step 5's configurable auto-sell is refused, not implemented**
+  (decision 14).
+- **Section 4.1's `subscribeToPriceFeed` is still not built** (question 3). The
+  interface split from step 3's decision 2 held up well: the object depends on
+  `RestExchangeClient`, so the gap is visible at compile time rather than as a
+  method that throws.
+- **Section 5.4's rate limiter still does not gate anything.** `WeightBudget`
+  exists and the client reports into it; nothing asks permission. A halt that
+  cancels many orders issues them unthrottled, which is the worst moment for it.
+  This was step 3's open question 2 and was expected to close at step 6; it did
+  not, because the RateLimiter object was out of scope.
+- **Section 10's outbound notification does not exist.** Alerts are written to
+  D1 on every path that section 7.2 requires, and nothing sends a Discord or
+  Telegram message. That is step 8, and until then a halt is silent unless
+  someone looks.
+- **Section 9's reconciliation is relied on by three paths here** (the
+  cancellation discrepancy, an unknown-order fill, and an order-state drift
+  halt) **and does not exist yet.** Those alerts currently go into a table
+  nobody reads automatically.
+- **Section 8.1's "order history" is stored twice**, once in the object and once
+  in D1. That is what "mirrored" means, but worth stating: the object's copy is
+  authoritative and the D1 copy is what every other component reads.
+- **No live network call anywhere in the suite**, per section 14. Binance's
+  testnet remains a separate manual step.
+
+### Open questions carried forward
+
+Still open from earlier steps: coverage measurement (2.6); `realizedPnl` and
+`roundToStep` module placement (2.7); the client reports rate-limit weight but
+does not gate on it (3.2); `Retry-After` parsed but unused (3.3); a `tradeId` of
+`-1` (3.4); `recvWindow` and clock bias untested against real latency (3.5);
+nothing verifies the API key lacks withdrawal permission (3.6);
+`balance_snapshots.classification` on a clean run (4.3); `orders` has no
+`cumulative_quote_quantity` (4.5); whose exchange account and funds (4.1.1); the
+production allow-list is empty (4.1.2); nothing enforces the empty production
+database (4.1.3); backups (4.1.4); an audit entry can be lost on the
+capital-releasing paths (5.1); nothing reconciles
+`sum(allocated_capital)` against `total_allocated` (5.2);
+`MAX_ALLOCATION_ATTEMPTS` untested under real contention (5.3); nothing prevents
+a bot created against an unauthorised placeholder balance (5.4).
+
+Resolved: step 2's open question 8 (no integration test across modules) -- this
+step's tests drive four modules together. Step 3.1's open question 1 (the state
+of a cancelled partial fill) -- re-checked as it asked, and the answer is
+decision 3, which is less useful than step 3.1 hoped. Step 4's open question 1
+(no schema had met real data) -- it has now, and no CHECK constraint turned out
+to be too strict; the one that fired during development was
+`alerts.id`'s PRIMARY KEY, from a test that supplied a constant id generator.
+Step 4's open question 6 is half-resolved: `strategy_params_json` has a defined
+shape for DCA (decision 9); `audit_log.details_json` gained four more actions
+here but is still typed `unknown`. Step 5's open question 5 (status ownership)
+-- settled, see B above.
+
+New:
+
+1. **The position understates what the bot holds after a halt that raced a
+   fill** (decision 3). Nothing closes the gap until section 9 exists. A halted
+   bot is not trading, so the exposure is bounded, but a human closing that bot
+   manually will see a smaller position than the exchange does.
+2. **`AttemptStore` has one implementation that scans and one that cannot avoid
+   scanning** (decision 6). The port should probably grow a
+   `listUnresolved()` and a `highestSequence()` before a third implementation
+   exists. Cheap now, three call sites later.
+3. **Fees in a third asset are never converted** (decision 12), so realized PnL
+   is incomplete for any account paying fees in the exchange's own token --
+   which is the default for most Binance accounts, and is exactly the case
+   section 5.5 says never to assume away. Needs a rate source gathered before
+   the fill is processed, which is a shape `fees.ts` already anticipates and
+   nothing supplies.
+4. **`sellOnStopLoss` is refused rather than implemented** (decision 14).
+   Section 6.3 step 5 offers it; a bot cannot currently be configured to close a
+   losing position automatically.
+5. **Nothing drives `onPriceUpdate` yet.** The state machine is complete and has
+   no input in production: the WebSocket feed is deferred, and no cron or queue
+   calls it either. The object is fully built and, deployed today, would sit
+   idle.
+6. **`create()` can leave a bot row with no Durable Object state.** Capital is
+   reserved and the row written before this object's storage is written (per
+   step 5's ordering rule), so a crash in that gap leaves a `created` bot whose
+   object is empty -- and a retry of `create` fails with
+   `duplicate_bot_instance` rather than completing it. Over-reserved and safe,
+   which is the right direction, but the recovery is manual and undocumented.
+7. **A halt cancels orders one at a time, sequentially.** For DCA that is at
+   most one open order, so it does not matter. For step 9's grid, a halt cancels
+   a full ladder, and doing that serially with no rate-limit budget is the exact
+   scenario step 2's decision 10 reserved budget for.
+8. **Nothing tests two concurrent events on one object.** Durable Objects
+   serialize by default, so the interleavings step 5 had to test for do not
+   arise here -- but that is an assumption about the runtime this session did not
+   probe, unlike the storage questions it did.

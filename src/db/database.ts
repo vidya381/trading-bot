@@ -11,6 +11,7 @@
  * `no-raw-d1.test.ts` fails the build if any file outside /src/db does it.
  */
 
+import { DatabaseError } from "./columns";
 import { Repository } from "./table";
 import {
   alerts,
@@ -62,4 +63,29 @@ export class Database {
     if (statements.length === 0) return;
     await this.#d1.batch(statements as D1PreparedStatement[]);
   }
+}
+
+/**
+ * Build a `Database` from a Worker or Durable Object's environment.
+ *
+ * This exists so that nothing outside /src/db has to name the binding.
+ * `no-raw-d1.test.ts` fails the build on any `env.DB` elsewhere, and its
+ * message says "construct a `Database` once and pass that" -- which needs one
+ * sanctioned place to do the constructing. This is that place.
+ *
+ * The binding is optional on the base env for a real reason (step 4's
+ * `test-helpers.rawD1` documents it): the base config block in wrangler.jsonc
+ * declares no database, so a Worker deployed without `--env` genuinely has
+ * none. Checking rather than asserting means that mistake says so in one line.
+ */
+export function databaseFrom(env: { readonly DB?: D1Database }): Database {
+  if (env.DB === undefined) {
+    throw new DatabaseError(
+      "missing_binding",
+      "no DB binding in this environment. Only the testnet and production " +
+        "environments in wrangler.jsonc declare one; a deploy with no --env has " +
+        "no database at all, deliberately.",
+    );
+  }
+  return new Database(env.DB);
 }

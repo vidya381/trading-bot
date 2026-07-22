@@ -65,6 +65,25 @@
           "database_id": "3f01f245-12b3-4b20-acf7-75b655da2bd7",
           "migrations_dir": "migrations"
         }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "BOT_INSTANCE",
+            "class_name": "BotInstance"
+          }
+        ]
+      },
+      // SQLite storage backend, per spec section 2 ("Durable Objects with
+      // SQLite storage backend"). `new_sqlite_classes` rather than
+      // `new_classes` is what selects it, and it cannot be changed after the
+      // class has been deployed -- a class created on the key-value backend
+      // stays on it forever.
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": ["BotInstance"]
+        }
       ]
     },
 
@@ -85,6 +104,24 @@
           "database_name": "trading-bot-production",
           "database_id": "4038bdd3-9715-4366-a6b4-d3b007df6258",
           "migrations_dir": "migrations"
+        }
+      ],
+      // Declared identically to testnet. Durable Object namespaces are scoped
+      // to the Worker, and the two environments are separate Workers, so these
+      // are two distinct namespaces despite the identical text -- the same
+      // separation the two database_id values above express explicitly.
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "BOT_INSTANCE",
+            "class_name": "BotInstance"
+          }
+        ]
+      },
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": ["BotInstance"]
         }
       ]
     }

@@ -1,5 +1,10 @@
 import { version } from "../../package.json";
 
+// Durable Object classes must be exported from the Worker named by `main` in
+// wrangler.jsonc, which is this file. Re-exported rather than defined here so
+// the class keeps its own module.
+export { BotInstance } from "../durable-objects/bot-instance";
+
 /**
  * Main API Worker (placeholder).
  *

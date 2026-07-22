@@ -58,7 +58,9 @@ export type DatabaseErrorCode =
   /** A filter shape the query builder cannot express. */
   | "unsupported_filter"
   /** An update or insert with nothing in it. */
-  | "empty_statement";
+  | "empty_statement"
+  /** The environment declares no `DB` binding. See `databaseFrom`. */
+  | "missing_binding";
 
 export interface ColumnDefinition<
   TKind extends ColumnKind,
