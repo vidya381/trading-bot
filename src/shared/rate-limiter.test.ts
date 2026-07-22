@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  admit,
   prioritize,
   RateLimiterError,
   WeightBudget,
@@ -272,76 +271,89 @@ describe("prioritize", () => {
   });
 });
 
-describe("admit", () => {
-  function request(
-    priority: RequestPriority,
-    weight: number,
-    label: string,
-    queuedAt = AT,
-  ): PendingRequest<string> {
-    return { weight, priority, queuedAt, payload: label };
-  }
+/*
+ * The `admit` tests that stood here went with the function at step 8. Every
+ * behaviour they pinned is now asserted against the RateLimiter Durable Object
+ * instead, where the claim-based rule that replaced it actually lives:
+ * risk-exit served before an earlier routine request, a small request not
+ * overtaking a larger waiting one, a request too big to ever fit set aside
+ * without stalling the queue, and the ceiling refusing once spent. See
+ * `src/durable-objects/rate-limiter.test.ts`.
+ */
 
-  it("admits what fits and defers the rest", () => {
+// ---------------------------------------------------------------------------
+// Added at step 8, when the budget moved inside a Durable Object
+// ---------------------------------------------------------------------------
+
+describe("snapshot and restore", () => {
+  it("round-trips the spent window", () => {
+    const source = budget();
+    source.consume(30, "routine", AT);
+    source.consume(10, "routine", AT + 1000);
+
+    const restored = budget();
+    restored.restore(source.snapshot());
+
+    expect(restored.usedWeight(AT + 2000)).toBe(40);
+    // And the entries kept their individual timestamps, so they still expire
+    // one at a time rather than all at once -- which is the whole difference
+    // between a sliding window and a fixed one.
+    expect(restored.usedWeight(AT + WINDOW + 1)).toBe(10);
+    expect(restored.usedWeight(AT + WINDOW + 1001)).toBe(0);
+  });
+
+  it("round-trips the exchange's own reported figure", () => {
+    const source = budget();
+    source.syncFromExchange(85, AT);
+
+    const restored = budget();
+    restored.restore(source.snapshot());
+    // An object that forgot this on eviction would wake believing the account
+    // idle when the exchange had just said otherwise.
+    expect(restored.usedWeight(AT)).toBe(85);
+  });
+
+  it("copies rather than sharing, so a restored budget cannot corrupt its source", () => {
+    const source = budget();
+    source.consume(30, "routine", AT);
+
+    const snapshot = source.snapshot();
+    const restored = budget();
+    restored.restore(snapshot);
+    restored.consume(10, "routine", AT);
+
+    // Step 2's decision 12 in another form: the in-memory attempt store's bug
+    // was exactly a caller mutating something it had been handed.
+    expect(source.usedWeight(AT)).toBe(30);
+    expect(restored.usedWeight(AT)).toBe(40);
+  });
+});
+
+describe("waitFor", () => {
+  it("is zero when the weight already fits", () => {
+    expect(budget().waitFor(50, "routine", AT)).toBe(0);
+  });
+
+  it("reports when enough weight will have aged out", () => {
     const b = budget();
-    const { admitted, deferred } = admit(
-      b,
-      [
-        request("routine", 50, "a"),
-        request("routine", 40, "b"),
-        request("routine", 10, "c"),
-      ],
-      AT,
-    );
+    b.consume(40, "routine", AT);
+    b.consume(40, "routine", AT + 10_000);
 
-    expect(admitted.map((r) => r.payload)).toEqual(["a"]);
-    expect(deferred.map((r) => r.payload)).toEqual(["b", "c"]);
+    // Routine ceiling is 80 and all of it is spent. 40 frees when the first
+    // entry leaves the window.
+    expect(b.waitFor(40, "routine", AT + 20_000)).toBe(AT + WINDOW - (AT + 20_000));
   });
 
-  it("serves risk-exit first even when routine requests queued earlier", () => {
-    const b = budget({ limit: 30, reserveForRiskExit: 10 });
-    const { admitted } = admit(
-      b,
-      [
-        request("routine", 20, "routine-first", AT),
-        request("risk-exit", 20, "stop-loss", AT + 1000),
-      ],
-      AT,
-    );
-    expect(admitted.map((r) => r.payload)).toEqual(["stop-loss"]);
-  });
-
-  it("does not let a small request jump a deferred larger one", () => {
-    // Head-of-line blocking is deliberate: otherwise a stream of cheap routine
-    // requests could starve an expensive one indefinitely.
+  it("answers for more than the ceiling as 'wait for the whole ceiling'", () => {
     const b = budget();
-    b.consume(40, "routine", AT); // 40 of the routine ceiling of 80 left
-
-    // "big" is under the ceiling, so it is merely waiting rather than
-    // impossible. "small" would fit right now, but must not overtake it.
-    const { admitted, deferred } = admit(
-      b,
-      [request("routine", 70, "big", AT), request("routine", 5, "small", AT + 1)],
-      AT,
-    );
-    expect(admitted).toEqual([]);
-    expect(deferred.map((r) => r.payload)).toEqual(["big", "small"]);
+    b.consume(80, "routine", AT);
+    // Asking to wait for 200 against a ceiling of 80 can never be satisfied.
+    // The longest honest answer beats a misleadingly short one: a caller that
+    // waits too long retries; one that waits too little spins.
+    expect(b.waitFor(200, "routine", AT + 1)).toBeGreaterThan(0);
   });
 
-  it("sets aside an impossible request without stalling the queue behind it", () => {
-    const b = budget();
-    const { admitted, deferred } = admit(
-      b,
-      [request("routine", 500, "impossible", AT), request("routine", 10, "fine", AT + 1)],
-      AT,
-    );
-    expect(admitted.map((r) => r.payload)).toEqual(["fine"]);
-    expect(deferred.map((r) => r.payload)).toEqual(["impossible"]);
-  });
-
-  it("admits nothing from an empty queue", () => {
-    const { admitted, deferred } = admit(budget(), [], AT);
-    expect(admitted).toEqual([]);
-    expect(deferred).toEqual([]);
+  it("rejects a non-positive weight", () => {
+    expect(() => budget().waitFor(0, "routine", AT)).toThrow(RateLimiterError);
   });
 });

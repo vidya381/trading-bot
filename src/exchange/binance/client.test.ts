@@ -884,6 +884,81 @@ describe("rate-limit reporting (section 5.4)", () => {
     expect(budget.remainingFor("risk-exit", AT)).toBe(500);
   });
 
+  it("reports the account's weight LIMIT from an exchangeInfo body", async () => {
+    // Section 5.4 names two sources for the budget: response headers, tested
+    // above, and `exchangeInfo`. Only the first existed until step 8.
+    const limits: { limit: number; windowMs: number }[] = [];
+    const client = new BinanceClient({
+      baseUrl: BASE,
+      credentials: fakeCredentialProvider(),
+      now: () => AT,
+      rateLimiter: {
+        syncFromExchange: () => undefined,
+        syncLimit: (limit, windowMs) => {
+          limits.push({ limit, windowMs });
+        },
+      },
+      fetch: async () =>
+        json({
+          rateLimits: [
+            { rateLimitType: "REQUEST_WEIGHT", interval: "MINUTE", intervalNum: 1, limit: 6000 },
+            { rateLimitType: "ORDERS", interval: "SECOND", intervalNum: 10, limit: 100 },
+          ],
+          symbols: [SYMBOL_ENTRY],
+        }),
+    });
+
+    await client.getSymbolFilters("BTCUSDT");
+
+    // Read off a request the system had to make anyway: the filter cache
+    // expires hourly per section 4.3, so the ceiling is refreshed on that same
+    // schedule for no additional weight.
+    expect(limits).toEqual([{ limit: 6000, windowMs: 60_000 }]);
+  });
+
+  it("says nothing about the limit when exchangeInfo carries no rateLimits block", async () => {
+    const limits: unknown[] = [];
+    const client = new BinanceClient({
+      baseUrl: BASE,
+      credentials: fakeCredentialProvider(),
+      now: () => AT,
+      rateLimiter: {
+        syncFromExchange: () => undefined,
+        syncLimit: (limit, windowMs) => {
+          limits.push({ limit, windowMs });
+        },
+      },
+      fetch: async () => json({ symbols: [SYMBOL_ENTRY] }),
+    });
+
+    await client.getSymbolFilters("BTCUSDT");
+
+    // Silence rather than a guess. The limiter keeps whatever limit it had.
+    expect(limits).toEqual([]);
+  });
+
+  it("tolerates a reporter that has no syncLimit at all", async () => {
+    // `WeightBudget` is exactly this: constructed with its limit, with no way
+    // to be told a new one. The method is optional so it still satisfies the
+    // reporter interface unchanged.
+    const budget = new WeightBudget({ limit: 6000, windowMs: 60_000, reserveForRiskExit: 1000 });
+    const client = new BinanceClient({
+      baseUrl: BASE,
+      credentials: fakeCredentialProvider(),
+      now: () => AT,
+      rateLimiter: budget,
+      fetch: async () =>
+        json({
+          rateLimits: [
+            { rateLimitType: "REQUEST_WEIGHT", interval: "MINUTE", intervalNum: 1, limit: 6000 },
+          ],
+          symbols: [SYMBOL_ENTRY],
+        }),
+    });
+
+    await expect(client.getSymbolFilters("BTCUSDT")).resolves.toMatchObject({ ok: true });
+  });
+
   it("works without a rate limiter attached", async () => {
     const client = new BinanceClient({
       baseUrl: BASE,

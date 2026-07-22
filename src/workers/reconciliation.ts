@@ -39,6 +39,7 @@
 
 import { databaseFrom, type Database } from "../db";
 import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
+import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import {
   reconcileAccount,
   type DriftThresholds,
@@ -61,6 +62,15 @@ export interface ScheduledOptions {
   readonly now?: () => Timestamp;
   readonly newId?: () => string;
   readonly thresholds?: DriftThresholds;
+  /**
+   * The `RateLimiter` Durable Object for an account (section 5.4).
+   *
+   * Defaults to the `RATE_LIMITER` binding. Overridable for tests only; there
+   * is deliberately no way to ask for no limiter at all.
+   */
+  readonly limiterFor?: (accountLabel: string) => RateLimiterPort;
+  /** How the rate-limit wait is performed. Injected so tests need no delay. */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 /** No credentials exist yet, in either environment. See the file header. */
@@ -106,6 +116,25 @@ export async function runScheduledReconciliation(
   const now = options.now ?? (() => Date.now());
   const newId = options.newId ?? (() => crypto.randomUUID());
 
+  const limiterNamespace = env.RATE_LIMITER;
+  if (limiterNamespace === undefined && options.limiterFor === undefined) {
+    // Same reasoning as the `BOT_INSTANCE` check below, and the same reasoning
+    // `BotInstance` uses for its own limiter: an environment with no budget to
+    // spend against is not one to reconcile ungated. Refusing is the safe
+    // default for a risk control.
+    return {
+      ran: false,
+      reason:
+        "no RATE_LIMITER binding in this environment, so section 5.4's budget " +
+        "cannot be enforced. Only testnet and production declare one.",
+      runs: [],
+    };
+  }
+  const limiterFor =
+    options.limiterFor ??
+    ((accountLabel: string): RateLimiterPort =>
+      limiterNamespace!.get(limiterNamespace!.idFromName(accountLabel)));
+
   const namespace = env.BOT_INSTANCE;
   if (namespace === undefined) {
     // The base config block declares no Durable Object binding, so a Worker
@@ -136,11 +165,35 @@ export async function runScheduledReconciliation(
     const stubFor = (botInstanceId: string) =>
       namespace.get(namespace.idFromName(botInstanceId)) as DurableObjectStub<BotInstance>;
 
+    // Section 5.4, wired here rather than inside `/src/reconciliation`. That
+    // folder takes every dependency as a parameter and knows nothing about
+    // bindings (step 7, decision 8), so the limiter is a binding concern and
+    // belongs on this side of the line -- and wrapping here means `reconcile.ts`
+    // needed no change at all to be routed through the budget.
+    //
+    // ROUTINE priority for the whole pass. Every exchange call reconciliation
+    // makes is a READ, and step 7 measured the cost at roughly 20 weight plus
+    // 26 per distinct pair per five minutes against 1200/minute. Tagging a
+    // periodic audit as risk-exit would let it draw on the slice reserved for
+    // getting out of positions, to buy nothing: if the budget is that tight,
+    // the correct outcome is that this run is throttled and reports what it
+    // could not check, which it already knows how to do.
+    //
+    // Note the halts this job performs are NOT routine, and are not affected:
+    // they go through `haltBot` into the bot's own object, which uses its own
+    // risk-exit view for the cancellations.
+    const gatedExchange = withRateLimit(exchange, limiterFor(accountLabel), {
+      priority: "routine",
+      now,
+      label: `reconciliation ${accountLabel}`,
+      ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
+    });
+
     runs.push(
       await reconcileAccount(
         {
           db,
-          exchange,
+          exchange: gatedExchange,
           now,
           newId,
           thresholds: options.thresholds,

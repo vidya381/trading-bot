@@ -9,8 +9,28 @@ The Binance implementation of the interface in
 | [`credentials.ts`](./credentials.ts) | 4.4 | Injectable API key/secret port, plus a fake for tests |
 | [`binance/signing.ts`](./binance/signing.ts) | 4.2 | HMAC-SHA256 via Web Crypto, and the clock-drift offset |
 | [`binance/filters.ts`](./binance/filters.ts) | 4.3 | `exchangeInfo` parsing, order validation and rounding, filter cache |
-| [`binance/parse.ts`](./binance/parse.ts) | 4.1, 5.4 | Payload parsing, weight headers, error classification |
+| [`binance/parse.ts`](./binance/parse.ts) | 4.1, 5.4 | Payload parsing, weight headers and limits, error classification |
 | [`binance/client.ts`](./binance/client.ts) | 4.1 | The eight REST methods, each wrapped in downtime detection |
+| [`rate-limited.ts`](./rate-limited.ts) | 5.4 | Gate: asks the account's `RateLimiter` for budget before every call |
+
+## The gate (`rate-limited.ts`, step 8)
+
+`BinanceClient` reports weight; it does not ask permission. `RateLimitedExchange`
+wraps any `RestExchangeClient` and requests budget from the account's
+`RateLimiter` Durable Object before each call, so no path reaches the exchange
+without a grant. It lives here rather than in `/src/shared` because it carries
+Binance's per-endpoint weight table and because it performs I/O.
+
+**Priority is chosen by which view a call site holds**, not by which method it
+calls: `withPriority("risk-exit")` returns a second view over the same client
+and the same budget. Deriving it from the verb — "every cancellation is
+risk-exit" — was rejected because it makes the tag a property of the operation
+rather than of the intent, so ordinary rebalancing would draw on the slice
+reserved for stop-losses.
+
+A refusal returns a `rate_limited` failure, which means precisely that **nothing
+was sent** — a third thing from "sent, outcome unknown" (`transport`) and "sent,
+refused" (`exchange_error`), and the reason it needed its own `FailureKind`.
 
 ## Why this is not in `/src/shared`
 

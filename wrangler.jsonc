@@ -71,6 +71,15 @@
           {
             "name": "BOT_INSTANCE",
             "class_name": "BotInstance"
+          },
+          // Spec section 5.4, step 8. One instance per exchange account,
+          // addressed by `idFromName(accountLabel)`. Every exchange call from
+          // every bot on an account passes through its instance, so this
+          // binding is what makes section 5.4's budget account-wide rather
+          // than per-caller.
+          {
+            "name": "RATE_LIMITER",
+            "class_name": "RateLimiter"
           }
         ]
       },
@@ -83,6 +92,10 @@
         {
           "tag": "v1",
           "new_sqlite_classes": ["BotInstance"]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": ["RateLimiter"]
         }
       ],
       // Spec section 9's suggested interval. The handler is `scheduled` in
@@ -122,6 +135,10 @@
           {
             "name": "BOT_INSTANCE",
             "class_name": "BotInstance"
+          },
+          {
+            "name": "RATE_LIMITER",
+            "class_name": "RateLimiter"
           }
         ]
       },
@@ -129,6 +146,10 @@
         {
           "tag": "v1",
           "new_sqlite_classes": ["BotInstance"]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": ["RateLimiter"]
         }
       ],
       // Declared identically to testnet so the two environments do not differ

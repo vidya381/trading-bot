@@ -75,6 +75,69 @@ export function parseUsedWeight(
 }
 
 /**
+ * How long each documented interval unit lasts, in milliseconds.
+ *
+ * The exchange spells the unit out in `interval` and gives a multiplier in
+ * `intervalNum`, so a limit is "6000 per 1 MINUTE" rather than a raw duration.
+ */
+const INTERVAL_MS: Readonly<Record<string, number>> = {
+  SECOND: 1_000,
+  MINUTE: 60_000,
+  HOUR: 3_600_000,
+  DAY: 86_400_000,
+};
+
+/** A request-weight ceiling and the window it applies over. */
+export interface RequestWeightLimit {
+  readonly limit: number;
+  readonly windowMs: number;
+}
+
+/**
+ * The REQUEST_WEIGHT limit from an `exchangeInfo` body (section 5.4).
+ *
+ * This is the other half of "read from response headers and `exchangeInfo`".
+ * `parseUsedWeight` above reads how much has been SPENT; this reads how much
+ * there is to spend, which nothing had ever read.
+ *
+ * Returns `undefined` rather than throwing, on the same reasoning as
+ * `parseUsedWeight`: the caller already has a valid `exchangeInfo` response it
+ * asked for in order to get symbol filters, and failing that request because a
+ * rate-limit block was shaped unexpectedly would turn a budget refinement into
+ * an outage. The RateLimiter keeps its previous limit when this is absent.
+ *
+ * The SHORTEST window is chosen when several REQUEST_WEIGHT limits are
+ * published. That is the binding constraint over any burst, and it is the one
+ * `parseUsedWeight` reports usage for -- pairing a per-minute usage figure with
+ * a per-day ceiling would let a minute's traffic look like nothing at all.
+ */
+export function parseRequestWeightLimit(body: unknown): RequestWeightLimit | undefined {
+  const limits = (body as Record<string, unknown> | null)?.["rateLimits"];
+  if (!Array.isArray(limits)) return undefined;
+
+  let best: RequestWeightLimit | undefined;
+
+  for (const entry of limits) {
+    const record = entry as Record<string, unknown>;
+    if (record["rateLimitType"] !== "REQUEST_WEIGHT") continue;
+
+    const unitMs = INTERVAL_MS[String(record["interval"])];
+    const intervalNum = Number(record["intervalNum"]);
+    const limit = Number(record["limit"]);
+    if (unitMs === undefined) continue;
+    if (!Number.isFinite(intervalNum) || intervalNum <= 0) continue;
+    if (!Number.isFinite(limit) || limit <= 0) continue;
+
+    const windowMs = unitMs * intervalNum;
+    if (best === undefined || windowMs < best.windowMs) {
+      best = { limit, windowMs };
+    }
+  }
+
+  return best;
+}
+
+/**
  * `Retry-After`, converted from seconds to milliseconds.
  *
  * Sent with a 429 to say how long to wait to avoid a ban, and with a 418 to say

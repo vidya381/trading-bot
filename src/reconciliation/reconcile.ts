@@ -56,14 +56,22 @@
  * would be a silent one.
  *
  * ---------------------------------------------------------------------------
- * NO RATE LIMITING
+ * RATE LIMITING
  * ---------------------------------------------------------------------------
- * Section 5.4's RateLimiter Durable Object still does not exist. One pass
- * costs roughly 20 weight for balances plus 26 per distinct pair, every 5
- * minutes, against a 1200/minute budget -- so this job cannot meaningfully
- * starve a running bot. The exposure that does exist is a severe-drift trip
- * cancelling many orders at once, which is step 6's open question 7 and gets
- * materially worse at step 9's grid, not here.
+ * Nothing in this file knows about section 5.4's budget, and that is by
+ * design rather than by omission. `ReconciliationPorts.exchange` is supplied by
+ * `/src/workers/reconciliation.ts`, which wraps it in the account's
+ * `RateLimiter` Durable Object at ROUTINE priority before calling in. So every
+ * exchange read below is gated, and this module still takes its dependencies as
+ * parameters and knows nothing about bindings.
+ *
+ * Routine because every call here is a read on a schedule: one pass costs
+ * roughly 20 weight for balances plus 26 per distinct pair, every 5 minutes,
+ * against 1200/minute. This job was never the exposure. The exposure is a
+ * severe-drift trip cancelling many orders at once -- and those cancellations
+ * do not happen here either. They happen inside each bot's own object, through
+ * `haltBot`, at RISK-EXIT priority, drawing on the slice reserved for exactly
+ * that.
  */
 
 import type { Database } from "../db/database";

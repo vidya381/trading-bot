@@ -10,9 +10,9 @@ Built before any strategy logic and fully unit tested first
 | | | Split at step 3 into `RestExchangeClient` + the price feed; every method now returns an `ExchangeOutcome` |
 | [`order-state.ts`](./order-state.ts) | 5.3 | Order lifecycle and partial-fill accounting |
 | [`idempotency.ts`](./idempotency.ts) | 5.1 | Deterministic `clientOrderId`s and attempt records |
-| [`rate-limiter.ts`](./rate-limiter.ts) | 5.4 | Rolling request-weight budget with priority |
+| [`rate-limiter.ts`](./rate-limiter.ts) | 5.4 | Rolling request-weight budget with priority, snapshot/restore |
 | [`fees.ts`](./fees.ts) | 5.5 | Fee conversion to the reporting currency, realized PnL |
-| [`downtime.ts`](./downtime.ts) | 5.6 | Transport failure vs. valid response, retry with backoff |
+| [`downtime.ts`](./downtime.ts) | 5.6 | Transport failure vs. refusal vs. never-sent, retry with backoff |
 
 None of these perform I/O, read a clock, or touch storage. Time is passed in as
 a parameter and storage is injected as a port, so all of it is testable without

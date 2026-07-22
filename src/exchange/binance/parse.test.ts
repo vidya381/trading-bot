@@ -13,6 +13,7 @@ import {
   parseOrderStatus,
   parseOrderStatusList,
   parsePrice,
+  parseRequestWeightLimit,
   parseRetryAfterMs,
   parseServerTime,
   parseUsedWeight,
@@ -629,5 +630,83 @@ describe("parseBalances", () => {
     expect(() =>
       parseBalances({ balances: [{ asset: "BTC", free: "1.0", locked: 0 }] }),
     ).toThrow(/balance 0.*locked/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The other half of section 5.4's "read from response headers and exchangeInfo"
+// ---------------------------------------------------------------------------
+
+describe("parseRequestWeightLimit", () => {
+  /** An exchangeInfo body carries rateLimits alongside its symbols. */
+  function body(rateLimits: unknown): unknown {
+    return { timezone: "UTC", serverTime: 1_760_000_000_000, rateLimits, symbols: [] };
+  }
+
+  it("reads the REQUEST_WEIGHT limit and converts its interval to milliseconds", () => {
+    expect(
+      parseRequestWeightLimit(
+        body([
+          { rateLimitType: "REQUEST_WEIGHT", interval: "MINUTE", intervalNum: 1, limit: 6000 },
+        ]),
+      ),
+    ).toEqual({ limit: 6000, windowMs: 60_000 });
+  });
+
+  it("multiplies the interval by intervalNum", () => {
+    expect(
+      parseRequestWeightLimit(
+        body([
+          { rateLimitType: "REQUEST_WEIGHT", interval: "SECOND", intervalNum: 10, limit: 50 },
+        ]),
+      ),
+    ).toEqual({ limit: 50, windowMs: 10_000 });
+  });
+
+  it("ignores limits that are not about request weight", () => {
+    // ORDERS limits are a different budget with a different meaning, and
+    // spending one against the other would be wrong in both directions.
+    expect(
+      parseRequestWeightLimit(
+        body([
+          { rateLimitType: "ORDERS", interval: "SECOND", intervalNum: 10, limit: 100 },
+          { rateLimitType: "RAW_REQUESTS", interval: "MINUTE", intervalNum: 5, limit: 61_000 },
+        ]),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("takes the SHORTEST window when several are published", () => {
+    // The binding constraint over any burst, and the one `parseUsedWeight`
+    // reports against. Pairing a per-minute usage figure with a per-day ceiling
+    // would make a minute's traffic look like nothing at all.
+    expect(
+      parseRequestWeightLimit(
+        body([
+          { rateLimitType: "REQUEST_WEIGHT", interval: "DAY", intervalNum: 1, limit: 500_000 },
+          { rateLimitType: "REQUEST_WEIGHT", interval: "MINUTE", intervalNum: 1, limit: 6000 },
+        ]),
+      ),
+    ).toEqual({ limit: 6000, windowMs: 60_000 });
+  });
+
+  it("returns undefined rather than throwing on anything it cannot read", () => {
+    // Deliberately lenient, unlike the order parsers. The caller already has a
+    // valid exchangeInfo response it asked for in order to get symbol filters;
+    // failing that request because a rate-limit block was shaped unexpectedly
+    // would turn a budget refinement into an outage.
+    expect(parseRequestWeightLimit(body(undefined))).toBeUndefined();
+    expect(parseRequestWeightLimit({})).toBeUndefined();
+    expect(parseRequestWeightLimit(null)).toBeUndefined();
+    expect(
+      parseRequestWeightLimit(
+        body([{ rateLimitType: "REQUEST_WEIGHT", interval: "FORTNIGHT", intervalNum: 1, limit: 5 }]),
+      ),
+    ).toBeUndefined();
+    expect(
+      parseRequestWeightLimit(
+        body([{ rateLimitType: "REQUEST_WEIGHT", interval: "MINUTE", intervalNum: 1, limit: 0 }]),
+      ),
+    ).toBeUndefined();
   });
 });

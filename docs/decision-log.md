@@ -2534,3 +2534,355 @@ New:
    applied to remote testnet and confirmed on 2026-07-22. The claim came from
    reading section 3.1's stale status rather than querying the database — the
    exact mistake that section now carries a standing convention against.)*
+
+---
+
+## Step 8: RateLimiter Durable Object
+Date: 2026-07-22
+
+Out of build-order. Section 19 puts alerts at step 8 and the grid at step 9;
+this is section 5.4's rate limiter, taken first because the grid is what makes
+its absence dangerous — step 6's open question 7 and step 7's own measurement
+both point at a grid halt cancelling a full ladder serially, and building that
+ladder before the thing that throttles it would mean shipping the exposure and
+then fixing it. Alerts (step 8 proper) and the grid (step 9) both still stand.
+
+### What was built
+
+`src/durable-objects/rate-limiter.ts`: the `RateLimiter` Durable Object, one per
+exchange account. `src/exchange/rate-limited.ts`: `RateLimitedExchange`, the
+decorator that asks it for budget before every call.
+
+Edits outside those two files, all listed so none is invisible:
+`src/shared/downtime.ts` gained a third `FailureKind`; `src/shared/rate-limiter.ts`
+gained `snapshot`/`restore` and a public `waitFor`; `src/exchange/binance/parse.ts`
+gained `parseRequestWeightLimit`; `src/exchange/binance/client.ts`'s
+`WeightReporter` became awaitable and gained an optional `syncLimit`, and
+`getSymbolFilters` now reports the account's ceiling; `bot-instance.ts` routes
+every exchange call through the limiter and handles a refusal explicitly;
+`src/workers/reconciliation.ts` wraps its client the same way; `api.ts`
+re-exports the class; `wrangler.jsonc` gained a `RATE_LIMITER` binding and a
+`v2` migration under both environments; four folder READMEs corrected.
+
+71 new tests (923 in total across the project), all passing, typecheck clean.
+Real Durable Object storage and real D1 in the Workers runtime; the exchange is
+still the only thing mocked, per section 14.
+
+### First, the thing that was asked for explicitly
+
+**The `syncFromExchange` wiring did not reach anything, and it was worse than
+"goes nowhere".** The session brief asked me to confirm whether the Binance
+client's header parsing actually reaches this object. It did not, and neither
+end existed: `BinanceClient` parses `X-MBX-USED-WEIGHT-1M` and calls
+`syncFromExchange` correctly, but **nothing in `src/` constructs a
+`BinanceClient` outside `client.test.ts`**. There is no production exchange
+client at all — step 6's decision 13 and step 7's decision 9 both declined to
+build one without credentials — so the reporting path ran only in its own tests,
+into a `WeightBudget` the test created.
+
+That is now fixed at both ends in shape, and still unexercised in fact. See
+decision 8 and open question 1: the limiter is wired, and nothing has ever made
+a real exchange call through it.
+
+### Four questions asked before writing anything
+
+All four were put up front and all four confirmed the recommended reading.
+
+**1. What a refused budget means for an order.** *(asked, confirmed)*
+
+Step 6's decision 8 halts a bot on any failure that is not `transport`. A budget
+refusal is neither of the two existing kinds, and both available answers were
+wrong: as `transport` the attempt record sits `attempting` forever waiting to
+reconcile an order that was never sent; as `exchange_error` a busy minute halts
+bots, requiring a human to undo per section 7.2 step 5. Resolved by adding a
+third kind. See decision 1.
+
+**2. What counts as risk-exit.** *(asked, confirmed)*
+
+Halt-path cancellations, the take-profit exit sell, and the filter read that
+exit needs. Entries, their filter reads, and every reconciliation read are
+routine. Rejected: tagging by METHOD ("every cancellation is risk-exit"), which
+makes priority a property of the verb rather than of the intent.
+
+**3. The bootstrap limit.** *(asked, confirmed)*
+
+Assume 1200/minute, correct from the first `exchangeInfo`. Rejected: refusing
+all traffic until the real limit is known, which needs an exemption for the call
+that learns it — the assumed default under another name.
+
+**4. How a caller waits.** *(asked, confirmed)*
+
+A ticketed queue in the object; the caller sleeps and re-presents. Rejected:
+stateless deny-and-retry, which leaves ordering to whoever retries first and
+turns a storm into a thundering herd.
+
+### Decisions made
+
+**1. `rate_limited` is a third `FailureKind`, and this is the widest change in
+the session.**
+
+`ExchangeOutcome`'s failure union has meant two things since step 3: the request
+was sent and its effect is unknown (`transport`), or it was sent and refused
+(`exchange_error`). A budget refusal is a third thing — **it was never sent** —
+and every consequence downstream turns on that.
+
+Because the order provably does not exist, `#placeBuy` marks the idempotency
+attempt `failed` rather than leaving it unresolved. Section 5.1's recovery-by-
+lookup exists for orders that might be resting on the book; there is nothing to
+look up here, and leaving it `attempting` would have reconciliation chasing a
+ghost.
+
+*Reusing `transport` — rejected*, for exactly that.
+*Reusing `exchange_error` — rejected*: the exchange refused nothing. This system
+declined to ask. Turning backpressure into a halted bot needing human review is
+a worse outcome than the throttling it was reacting to.
+
+The cost is real and worth stating: this widened a type every module in the
+project handles. Typecheck found the call sites that switch exhaustively; it
+could NOT find the two `outcome.kind === "transport"` comparisons in
+`bot-instance.ts`, which still compile and would silently have taken the
+else-branch into a halt. Those were found by reading, and are now pinned by
+tests.
+
+**2. Priority is two mechanisms, and the reservation is the load-bearing one.**
+
+Step 2's decision 10 already argued this and now it is enforced. The reserved
+slice handles the case ordering CANNOT touch — routine traffic spending the
+whole budget before the stop-loss exists, so there is nothing to order it
+against. The queue handles the case ordering is for.
+
+Worth being precise about which does the work: with a reserve, a risk-exit
+request is only ever blocked by other risk-exit traffic or by weight the
+exchange reported that this system did not spend. The queue matters within a
+cancellation storm, not between routine and risk-exit traffic.
+
+**3. Priority is chosen by which client VIEW a call site holds.**
+
+`withPriority("risk-exit")` returns a second `RestExchangeClient` over the same
+budget and the same inner client, and it returns the narrow type deliberately —
+a call site that has chosen cannot choose again, and a
+`riskExchange.withPriority("routine")` in a halt path would be easy to miss.
+
+*An options argument on all eight interface methods — rejected.* It would put a
+rate-limiting concern into section 4.1's surface, which no implementation of
+that interface shares.
+*Deriving priority from the method — rejected*, per question 2.
+
+**4. The bot object wraps its own exchange client. A caller cannot hand it an
+ungated one.**
+
+`attach()` takes the RAW client and `#exchange(config, priority)` is the only
+route to the exchange in the file. Had `attach` simply accepted an
+already-limited client, routing through the budget would be a property of how
+each caller happened to wire its dependencies — true in the wiring someone
+remembered and false in the one they did not, with nothing failing.
+
+Same reasoning gives `#limiterFromEnv` its refusal: no `RATE_LIMITER` binding
+means no trading, not ungated trading. The safe default for a risk control is to
+stop.
+
+**5. Tickets, not promises.**
+
+The obvious API is `await limiter.acquire(...)` with the object holding the
+caller until budget frees. That puts unresolved promises and a timer inside a
+Durable Object: state that cannot be persisted, a wait that dies silently on
+eviction, and a drain loop whose behaviour depends on a real clock — meaning the
+priority ordering, a risk control, could only be tested by waiting for it.
+
+A refusal returns a ticket instead. The object holds no timers and every
+decision is a pure function of (budget, live tickets, clock), so `acquire` is
+driven directly in tests at chosen timestamps. An unknown ticket is treated as a
+new arrival rather than an error, which is the ordinary consequence of eviction
+or of the TTL: it costs a queue place and never grants weight nobody asked for.
+
+**6. A waiting ticket CLAIMS its weight, which turns out to be better than
+step 2's `admit()`.**
+
+`admit()` defers everything behind a request that does not fit. The object
+instead counts the weight claimed by everything ahead of a request and grants
+only if this request fits IN ADDITION. Same protection against a small request
+overtaking a large one, without needlessly blocking a later request when there
+is genuinely room for both.
+
+I found this out from a failing test rather than by design: the head-of-line
+test asserted a small request would be deferred, and it was granted, because the
+window had freed enough for both. The behaviour was right and the test was
+wrong. **Consequence worth recording: `admit()` is now dead code in production**
+— only `prioritize` is used — and it is still covered by its own unit tests,
+which is the shape that makes dead code look maintained.
+
+**7. The window is persisted; the queue is not.**
+
+A DO is evicted after a short idle period and the window is 60 seconds. An
+object that forgot its entries would wake with an apparently untouched budget
+and permit a second full limit inside one window — the double-rate failure that
+made this a sliding window rather than a fixed one. So every grant costs one
+storage write.
+
+Tickets are deliberately NOT persisted. A ticket represents a caller currently
+sleeping; persisting it would mean an evicted object waking to enforce claims on
+behalf of callers that no longer exist, holding budget for nobody.
+
+Verified rather than assumed, following steps 2, 4 and 6: `state.abort()` really
+does tear the instance down, and the restore path really does run. The test
+distinguishes the two cases by leaving a QUEUED TICKET behind as well as spent
+budget — the ticket is memory-only, so its absence after the teardown is what
+proves a new instance was constructed. Without that discriminator the test would
+have passed vacuously had `abort` been a no-op.
+
+Also worth recording against three previous sessions' findings: the pool's
+`abort` behaves as documented. That is the first time in this project a
+Cloudflare API has.
+
+**8. Both existing callers are routed, and this is the part to check rather than
+believe.**
+
+- **The DCA `BotInstance`**: `#deps().exchange` appears in exactly one place,
+  inside `#exchange()`. Tested by attaching NO limiter and asserting the real
+  Durable Object named after the ACCOUNT recorded 21 weight (one `exchangeInfo`
+  at 20, one `placeOrder` at 1) after a base order.
+- **The reconciliation worker**: `runScheduledReconciliation` wraps the client
+  before `reconcileAccount` sees it, so `/src/reconciliation` needed no change
+  and still knows nothing about bindings. Tested the same way, including that
+  the whole pass is routine and that its total cost is exactly the balance read.
+
+That second test exists because `reconcile.ts` would behave identically with an
+ungated client and its own 81 tests would still pass. "Reconciliation is rate
+limited" is a property of the WORKER file, so it has to be asserted there.
+
+**9. A bug I introduced, caught by the tests, worth recording because it is the
+exact failure mode question 1 was asked to avoid.**
+
+The first version routed `#ensureFilters` through the limiter and stopped there.
+`#ensureFilters` throws when it cannot read filters and has no cache, and
+section 7.5 turns an unhandled exception into a halt — so a throttled FILTER
+read halted the bot, having carefully avoided halting on a throttled ORDER.
+
+Fixed with a `throttled` error code and a branch in `onPriceUpdate`'s catch,
+following step 2's decision 8: typed errors with codes exist precisely so a
+routine condition does not reach section 7.5's escalation.
+
+Two tests came out of it that were not planned, both pinning where in a pass the
+refusal lands: on the filter read it costs nothing at all (no sequence taken, no
+attempt record); on the placement the sequence is already spent and the attempt
+is marked failed.
+
+**10. `WeightReporter` became awaitable.**
+
+`syncFromExchange` was declared `void` and synchronous, which was correct when
+the only implementation was an in-memory budget. Reporting into a Durable Object
+is an RPC call, and the old signature left the client either dropping the
+promise — a floating promise in a Worker can be cancelled when the request ends,
+losing precisely the correction that follows a 429 — or lying about having
+recorded it. `syncLimit` is optional so `WeightBudget` still satisfies the
+interface unchanged.
+
+**11. The reserve is a FRACTION of the limit, not a fixed number.**
+
+One sixth: 200 of 1200. A fixed 200 would have become a proportionally smaller
+margin the moment `syncLimit` raised the ceiling — the one direction nobody
+would notice. `syncLimit` also carries the already-spent weight across, since a
+limit change is not a reason to hand an account a second budget inside one
+window.
+
+**12. Reading the limit from `exchangeInfo` costs nothing extra.**
+
+`getSymbolFilters` already fetches that body for section 4.3, and the ceiling is
+in it. The filter cache expires hourly, so the limit is re-read on the same
+schedule for no additional weight. `parseRequestWeightLimit` returns `undefined`
+rather than throwing on anything it cannot read — deliberately more lenient than
+the order parsers, because failing a filter request over a malformed rate-limit
+block would turn a budget refinement into an outage. It takes the SHORTEST
+published window, which is the binding constraint and the one the used-weight
+header reports against.
+
+### Deviations from the spec
+
+- **Section 5.4 says requests are "tagged with a priority level"; the tag is
+  carried by the client view, not by the request.** Same effect, different
+  shape, and the reason is decision 3.
+- **Section 5.4 says "all order-execution requests ... request budget".** Every
+  exchange call now does, not only order execution — a status poll spends weight
+  too, and exempting reads would leave the budget wrong.
+- **The default limit is 1200/minute.** That is what this project's earlier
+  entries assume; Binance's published spot figure has been higher for some time.
+  It is corrected by the first `exchangeInfo`, so the number matters only until
+  the first filter read.
+- **`admit()` from step 2 is now unused in production** (decision 6).
+- **Section 19's step 8 is alerts; this is not that.** Section 10's outbound
+  Discord/Telegram notification still does not exist, so every alert this
+  session adds — `order_throttled`, `exit_order_throttled` — is silent unless
+  someone looks at the table, exactly as step 6's and step 7's are.
+- **`ENDPOINT_WEIGHTS` are the documented figures, not measured ones.** The
+  budget consumes the estimate; the response header corrects it afterwards. A
+  weight judged too low over-grants until the next response arrives.
+- **No live network call anywhere in the suite**, per section 14.
+
+### Open questions carried forward
+
+Still open from earlier steps: coverage measurement (2.6); `realizedPnl` and
+`roundToStep` module placement (2.7); `Retry-After` parsed but unused (3.3, and
+now more pointed — the limiter computes its own `retryAfterMs` and still nothing
+consumes the exchange's stated wait); a `tradeId` of `-1` (3.4); `recvWindow`
+and clock bias untested against real latency (3.5); nothing verifies the API key
+lacks withdrawal permission (3.6); whose exchange account and funds (4.1.1); the
+production allow-list is empty (4.1.2); nothing enforces the empty production
+database (4.1.3); backups (4.1.4); an audit entry can be lost on the
+capital-releasing paths (5.1); `MAX_ALLOCATION_ATTEMPTS` untested under real
+contention (5.3); the position understates what the bot holds after a halt that
+raced a fill (6.1); `AttemptStore` needs `listUnresolved()` (6.2); fees in a
+third asset are never converted (6.3); `sellOnStopLoss` is refused rather than
+implemented (6.4); nothing drives `onPriceUpdate` (6.5); `create()` can leave a
+bot row with no object state (6.6); the daily-loss half of section 7.3 does not
+exist (7.1); `orders` has no `cumulative_quote_quantity` (7.2); the balance
+delta is computed from the oldest snapshot across assets (7.3); nothing tests
+two reconciliation runs racing (7.4); the three drift thresholds are guesses
+(7.5); `assertAccountArmed` adds a D1 read to create and resume (7.6).
+
+Resolved: step 3's open question 2 (the client reports weight but does not gate
+on it) — it gates now. Step 6's open question 7 (a halt cancels orders one at a
+time with no budget) — still serial, but now throttled, and the storm test is
+the evidence. Step 6's open question 8 (nothing tests two concurrent events on
+one object) — partly: `rate-limiter.test.ts` forces a real interleaving on one
+object and asserts the ordering, which is the probe step 6 said it had not done.
+
+New:
+
+1. **Nothing has ever made a real exchange call through this.** The limiter is
+   wired to both callers and every test drives it, but there is still no
+   exchange client in either environment (step 4.1's decision 2). Deployed
+   today, the whole path is exercised by nothing. The weights, the 1200 default
+   and the one-sixth reserve are all reasoned, none measured against a real
+   account, and the section 17 testnet period is where that changes.
+2. **A grid halt is still SERIAL, and throttling makes that slower, not
+   faster.** Cancellations go out one at a time (step 6's open question 7,
+   unchanged) and each now waits for budget when the account is busy. That is
+   the correct trade — an unthrottled storm earns a 429 and then a ban, during a
+   halt — but a full ladder halting on a busy account takes longer to complete
+   than it did yesterday, and nothing batches those cancels. Binance has a
+   cancel-all-open-orders-on-a-symbol endpoint that would make this one request;
+   it is not in section 4.1's interface. Worth considering at step 9.
+3. **`maxWaitMs` is one window, and exceeding it is reported but not escalated.**
+   A routine order that cannot get budget in 60 seconds is skipped with a
+   warning; an exit that cannot is skipped with a critical alert. Neither trips
+   anything. If an account is persistently at its ceiling, the honest signal is
+   that alert, and nobody is watching the alerts table automatically until
+   section 10's notifications exist.
+4. **Two Durable Object round trips per exchange call**: one to acquire, one for
+   the client to report the header. They could be one if the acquire response
+   carried the previous call's usage, which is a refinement nobody needs before
+   there is real traffic to measure.
+5. **Budget is consumed on grant and never given back if the call then fails
+   locally.** The gap between the grant and the request leaving is a few
+   statements, so the over-accounting is small and fails in the safe direction.
+   `release` exists only for abandoning a queue place, not for returning spent
+   weight.
+6. **A re-presented ticket keeps its ORIGINAL weight for the purpose of other
+   requests' claims.** A caller that re-presented a ticket with a different
+   weight would be checked against the new one while others queue behind the
+   old. No caller does this — the wrapper's weight is fixed per method — but
+   nothing prevents it.
+7. **The reserve is one sixth for every account, with no per-account
+   configuration.** Step 7's drift thresholds were made per-account
+   configurable specifically so the testnet period could tune them; this was
+   not, and the same argument applies to it.

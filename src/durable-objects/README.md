@@ -39,11 +39,35 @@ one event: Durable Object storage first, D1 second — section 8.1 makes this
 object's storage authoritative, so a crash between the two leaves the mirror
 behind rather than ahead.
 
-## `RateLimiter` — not built
+## `RateLimiter` (section 5.4, step 8)
 
-One per exchange account. Rolling request-weight budget with priority tiers
-(section 5.4). `WeightBudget` in `/src/shared/rate-limiter.ts` is the logic;
-nothing gates a request on it yet.
+One per exchange account, named by the account label. `WeightBudget` in
+`/src/shared/rate-limiter.ts` is the accounting; this object owns it across
+every bot on the account, which is the part a per-request client cannot do.
+
+**Priority is two mechanisms, not one.** A *reserved slice* means routine
+traffic may only draw on `limit - reserveForRiskExit`, so routine ladder
+maintenance cannot spend the budget a stop-loss will need before that stop-loss
+exists — which is the case ordering cannot help with, because nothing is
+waiting yet. A *ticketed queue* then orders whatever is waiting: risk-exit
+first, oldest first within a class, with a waiting request's weight claimed so
+a later one cannot slip past it.
+
+**Refusals hand back a ticket rather than blocking.** The caller sleeps and
+re-presents it, keeping its place. No timers and no unresolved promises live
+inside the object, so every decision is a pure function of (budget, live
+tickets, clock) and the ordering — a risk control — is testable without waiting
+for it. A ticket lost to eviction or TTL becomes a new arrival: it loses its
+place, never its safety.
+
+**The window is persisted.** A DO is evicted after a short idle period and the
+window is 60 seconds; an object that forgot its entries would wake with an
+apparently fresh budget and permit a second full limit inside one window.
+
+Callers do not talk to it directly. `/src/exchange/rate-limited.ts` wraps any
+`RestExchangeClient` so that asking for budget happens before the call, and
+`BotInstance` does that wrapping itself rather than trusting whoever attached
+its dependencies to have remembered.
 
 ## Not built here yet
 

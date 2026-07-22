@@ -17,7 +17,24 @@ export type FailureKind =
   /** No usable reply: DNS, connection reset, timeout, aborted fetch. */
   | "transport"
   /** The exchange replied, but with an error status. */
-  | "exchange_error";
+  | "exchange_error"
+  /**
+   * The request was never sent, because section 5.4's budget refused it.
+   *
+   * This is a THIRD thing, and the distinction is the whole reason it exists.
+   * `transport` means the request left this process and its effect is unknown,
+   * so section 5.1 requires recovery by looking the order up. `exchange_error`
+   * means the exchange understood and refused. Neither is true here: nothing
+   * reached the network, so the order provably does not exist, and there is
+   * nothing to reconcile and nothing to halt over.
+   *
+   * Collapsing it into either of the others is what makes it worth a new kind.
+   * As `transport`, an idempotency record would sit `attempting` forever
+   * waiting to reconcile an order that was never sent. As `exchange_error`, a
+   * busy minute would halt bots, because a definite refusal from the exchange
+   * is a halt trigger (step 6, decision 8) and backpressure is not.
+   */
+  | "rate_limited";
 
 /**
  * The result of one attempt to obtain something from the exchange.
@@ -38,6 +55,14 @@ export type ExchangeOutcome<T> =
       message: string;
       /** Whether retrying could plausibly succeed. */
       retryable: boolean;
+      /**
+       * How long to wait before retrying, when the refusal came with a figure.
+       *
+       * Set on `rate_limited`, where the budget knows exactly when enough
+       * weight ages out of the rolling window. Absent elsewhere; `withRetry`
+       * still computes its own backoff and does not read this.
+       */
+      retryAfterMs?: number;
       at: Timestamp;
     };
 
@@ -78,6 +103,29 @@ export class DowntimeError extends Error {
 /** Build a successful outcome. */
 export function ok<T>(value: T, at: Timestamp): ExchangeOutcome<T> {
   return { ok: true, value, at };
+}
+
+/**
+ * Build a refusal from section 5.4's budget: nothing was sent.
+ *
+ * `retryable` defaults to true, because a budget refusal is almost always
+ * temporary -- the weight ages out of the rolling window. It is false for the
+ * one case that never resolves, a single request costing more than the whole
+ * limit, which no amount of waiting fixes.
+ */
+export function rateLimited<T>(
+  message: string,
+  at: Timestamp,
+  options: { retryAfterMs?: number; retryable?: boolean } = {},
+): ExchangeOutcome<T> {
+  return {
+    ok: false,
+    kind: "rate_limited",
+    message,
+    retryable: options.retryable ?? true,
+    ...(options.retryAfterMs !== undefined ? { retryAfterMs: options.retryAfterMs } : {}),
+    at,
+  };
 }
 
 /**

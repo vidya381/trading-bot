@@ -22,7 +22,9 @@ import type { DcaParams } from "../strategies/dca";
 import type { BotInstance, CreateDcaBotRequest, PipelineResult } from "./bot-instance";
 import { BotInstanceError } from "./bot-instance";
 import { FakeExchange, TEST_PAIR } from "./fake-exchange";
-import { inBot } from "./test-helpers";
+import { inBot, inLimiter, rateLimiterStub } from "./test-helpers";
+import type { AcquireRequest, AcquireResult } from "./rate-limiter";
+import { BINANCE_METHOD_WEIGHTS, type RateLimiterPort } from "../exchange/rate-limited";
 
 const T0 = 1_760_000_000_000;
 const ACTOR = "owner@example.com";
@@ -67,7 +69,20 @@ function priceAt(value: string): Price {
   return { pair: TEST_PAIR, price: m(value), at: clock };
 }
 
-/** Run `body` inside the Durable Object, with this test's dependencies attached. */
+/**
+ * Run `body` inside the Durable Object, with this test's dependencies attached.
+ *
+ * The rate limiter (section 5.4) is a REAL `RateLimiter` Durable Object, but a
+ * fresh one per test, named after this test's bot rather than after its account
+ * label. The routing is genuine -- every exchange call below really does request
+ * budget first -- while a budget spent by one test cannot starve the next. That
+ * is the same isolation `objectName` already gives the bot itself, applied to
+ * the other object it now depends on; without it the whole file would share one
+ * 1200-weight-per-minute budget against a real wall clock.
+ *
+ * The tests that care about the BINDING being wired, rather than about the
+ * budget, attach no `limiterFor` at all. See "wired to the account's limiter".
+ */
 async function run<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
   return await inBot(objectName, async (instance) => {
     instance.attach({
@@ -78,6 +93,8 @@ async function run<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
         idCounter += 1;
         return `generated-${idCounter}`;
       },
+      limiterFor: () => rateLimiterStub(`limiter-${objectName}`),
+      sleep: async () => undefined,
     });
     return await body(instance);
   });
@@ -794,5 +811,263 @@ describe("durability", () => {
     });
 
     await expect(run((bot) => bot.snapshot())).rejects.toThrow(/schemaVersion 99/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section 5.4: this object cannot reach the exchange without budget
+// ---------------------------------------------------------------------------
+
+/**
+ * A limiter that records every request and can be told to refuse.
+ *
+ * `refuse` is a predicate rather than a set of priorities, because WHERE in a
+ * pass the refusal lands changes what should happen. A throttled filter read
+ * costs nothing -- no sequence, no attempt record -- while a throttled
+ * `placeOrder` has already taken both. Refusing "everything routine" would only
+ * ever exercise the first, since the filter read comes first.
+ */
+class SpyLimiter implements RateLimiterPort {
+  readonly requests: AcquireRequest[] = [];
+  refuse: (request: AcquireRequest) => boolean = () => false;
+
+  async acquire(request: AcquireRequest): Promise<AcquireResult> {
+    this.requests.push(request);
+    if (this.refuse(request)) {
+      return {
+        granted: false,
+        reason: "weight_exceeds_limit",
+        ticketId: null,
+        retryAfterMs: 0,
+        queuePosition: 0,
+        usedWeight: 1200,
+        remainingForPriority: 0,
+        at: clock,
+      };
+    }
+    return {
+      granted: true,
+      weight: request.weight,
+      usedWeight: request.weight,
+      remainingForPriority: 1000,
+      at: clock,
+    };
+  }
+
+  async release(): Promise<void> {}
+}
+
+let spy: SpyLimiter;
+
+/** `run`, but against a spy limiter so priorities and refusals are observable. */
+async function runSpied<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
+  return await inBot(objectName, async (instance) => {
+    instance.attach({
+      db,
+      exchange,
+      now: () => clock,
+      newId: () => {
+        idCounter += 1;
+        return `generated-${idCounter}`;
+      },
+      limiterFor: () => spy,
+      sleep: async () => undefined,
+    });
+    return await body(instance);
+  });
+}
+
+describe("wired to the account's limiter (section 5.4)", () => {
+  beforeEach(() => {
+    spy = new SpyLimiter();
+  });
+
+  it("uses the RATE_LIMITER binding for its own account when nothing is injected", async () => {
+    // No `limiterFor` here, deliberately. This is the production path: the
+    // object resolves the account's limiter from the binding itself, so routing
+    // through the budget is not something a caller can forget to wire.
+    const account = "binding-check";
+    await seedPlaceholderTotalBalance(
+      db,
+      { accountLabel: account, asset: "USDT", totalBalance: m("10000"), note: "test fixture" },
+      { actor: ACTOR, now: T0 },
+    );
+
+    await inBot(objectName, async (instance) => {
+      instance.attach({ db, exchange, now: () => clock, newId: () => "generated-x" });
+      await instance.create(creation({ accountLabel: account }));
+      await instance.start(ACTOR);
+      await instance.onPriceUpdate(priceAt("100"));
+    });
+
+    expect(exchange.placed).toHaveLength(1);
+
+    // The real Durable Object named after the ACCOUNT recorded the spend: one
+    // exchangeInfo (20) plus one placeOrder (1).
+    await inLimiter(account, async (limiter) => {
+      const stats = await limiter.stats();
+      expect(stats.usedWeight).toBe(
+        BINANCE_METHOD_WEIGHTS.getSymbolFilters + BINANCE_METHOD_WEIGHTS.placeOrder,
+      );
+    });
+  });
+
+  it("asks for budget BEFORE placing an entry order, at routine priority", async () => {
+    await runSpied((bot) => bot.create(creation()));
+    await runSpied((bot) => bot.start(ACTOR));
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(spy.requests.map((request) => [request.priority, request.weight])).toEqual([
+      // The filter read and the order itself are both entry work, so both are
+      // routine and may only draw on `limit - reserveForRiskExit`.
+      ["routine", BINANCE_METHOD_WEIGHTS.getSymbolFilters],
+      ["routine", BINANCE_METHOD_WEIGHTS.placeOrder],
+    ]);
+  });
+
+  it("asks at risk-exit priority for the cancellations a halt issues", async () => {
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("94")));
+    const placed = exchange.placed.length;
+    expect(placed).toBeGreaterThan(1);
+
+    spy.requests.length = 0;
+    await runSpied((bot) => bot.halt("manual", "risk check", ACTOR));
+
+    // Section 7.2's halt cancels every open order, and every one of those goes
+    // out on the reserved slice -- which is the whole point of the reserve.
+    expect(spy.requests).not.toHaveLength(0);
+    expect(spy.requests.every((request) => request.priority === "risk-exit")).toBe(true);
+    expect(spy.requests.every((request) => request.weight === BINANCE_METHOD_WEIGHTS.cancelOrder)).toBe(
+      true,
+    );
+  });
+
+  it("asks at risk-exit priority for the take-profit exit and its filter read", async () => {
+    await openPosition("100");
+    spy.requests.length = 0;
+
+    // Above average entry by the configured take-profit percentage.
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("103")));
+
+    expect(spy.requests).not.toHaveLength(0);
+    // Section 6.3 step 4 makes this the mandatory exit. Note the FILTER read is
+    // risk-exit too: an exit that cannot be constructed cannot be placed, so
+    // making that read routine would starve the exit through the back door.
+    expect(spy.requests.every((request) => request.priority === "risk-exit")).toBe(true);
+  });
+});
+
+describe("a refused budget (section 5.4) is not a halt", () => {
+  beforeEach(() => {
+    spy = new SpyLimiter();
+  });
+
+  /** Refuse only the order itself, letting the filter read through. */
+  const refusePlacement = (request: AcquireRequest): boolean =>
+    request.weight === BINANCE_METHOD_WEIGHTS.placeOrder;
+
+  it("skips the entry, records why, and leaves the bot running", async () => {
+    await runSpied((bot) => bot.create(creation()));
+    await runSpied((bot) => bot.start(ACTOR));
+
+    spy.refuse = () => true;
+    const result = await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    // NOT halted. The exchange refused nothing -- this system declined to ask --
+    // and turning backpressure into an incident needing human review to undo is
+    // exactly what step 6's decision 8 would have done with any other failure.
+    expect(result.status).toBe("running");
+    expect(result.action).toBe("throttled");
+    expect(exchange.placed).toHaveLength(0);
+
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.status).toBe("running");
+    expect(row!.halt_reason).toBeNull();
+
+    const alerts = await db.alerts.findMany({ where: { alert_type: "order_throttled" } });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("warning");
+  });
+
+  it("costs nothing at all when the refusal lands on the filter read", async () => {
+    // The cheapest place to be throttled, and worth pinning: the filter read
+    // happens before any sequence is taken or attempt recorded, so a refusal
+    // there leaves no trace to clean up and burns no clientOrderId.
+    await runSpied((bot) => bot.create(creation()));
+    await runSpied((bot) => bot.start(ACTOR));
+    spy.refuse = () => true;
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    const snapshot = await runSpied((bot) => bot.snapshot());
+    expect(snapshot.state.nextSequence).toBe(0);
+    const attempts = await inBot(objectName, async (_bot, state) => {
+      const entries = await state.storage.list({ prefix: "attempt:" });
+      return [...entries.values()];
+    });
+    expect(attempts).toHaveLength(0);
+  });
+
+  it("marks the attempt FAILED when the refusal lands on the order itself", async () => {
+    await runSpied((bot) => bot.create(creation()));
+    await runSpied((bot) => bot.start(ACTOR));
+    // Filters are read successfully; only the placement is refused, which is
+    // the case where a sequence and an attempt record already exist.
+    spy.refuse = refusePlacement;
+    const result = await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(result).toMatchObject({ status: "running", action: "throttled" });
+
+    // The distinction from `transport`, which is the reason `rate_limited`
+    // needed to be its own failure kind. A transport failure leaves the attempt
+    // `attempting` because the order may be resting on the book; nothing was
+    // sent here, so leaving it unresolved would have reconciliation chasing an
+    // order that never existed.
+    const attempts = await inBot(objectName, async (_bot, state) => {
+      const entries = await state.storage.list<{ state: string; failureReason?: string }>({
+        prefix: "attempt:",
+      });
+      return [...entries.values()];
+    });
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]!.state).toBe("failed");
+    // The recorded reason says the thing that matters about this failure kind.
+    expect(attempts[0]!.failureReason).toMatch(/not sent/i);
+  });
+
+  it("retries on the next price update once budget is available again", async () => {
+    await runSpied((bot) => bot.create(creation()));
+    await runSpied((bot) => bot.start(ACTOR));
+
+    spy.refuse = refusePlacement;
+    expect((await runSpied((bot) => bot.onPriceUpdate(priceAt("100")))).action).toBe("throttled");
+
+    // `decide()` is a pure function of the position and the price, so the base
+    // order is still the right action and the bot simply does it now.
+    spy.refuse = () => false;
+    const result = await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(result.action).toBe("placed-base");
+    expect(exchange.placed).toHaveLength(1);
+    // A fresh sequence, not a re-send of the throttled id (step 6, decision 8).
+    expect(exchange.placed[0]!.clientOrderId).toBe(`v1-${BOT_ID}-1`);
+  });
+
+  it("raises a cancel_failed alert when a halt's cancellation is throttled", async () => {
+    await openPosition("100");
+    // A second, UNFILLED order, so the halt has something to cancel.
+    // `openPosition` fills the base order completely, which takes it out of
+    // `openOrderIds` -- a halt then cancels nothing and the test would pass
+    // without exercising the path at all.
+    await run((bot) => bot.onPriceUpdate(priceAt("94")));
+    spy.refuse = (request) => request.priority === "risk-exit";
+
+    const result = await runSpied((bot) => bot.halt("manual", "risk check", ACTOR));
+
+    // The halt still happens -- the bot is marked halted first (step 6,
+    // decision 2) -- but the order it could not cancel is reported, and step
+    // 7's reconciliation ingests `cancel_failed` as meaningful drift.
+    expect(result.status).toBe("halted");
+    const alerts = await db.alerts.findMany({ where: { alert_type: "cancel_failed" } });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.message).toContain("rate_limited");
   });
 });

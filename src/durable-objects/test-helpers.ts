@@ -7,6 +7,7 @@
 
 import { env, runInDurableObject } from "cloudflare:test";
 import type { BotInstance } from "./bot-instance";
+import type { RateLimiter } from "./rate-limiter";
 
 /**
  * The `BOT_INSTANCE` namespace, narrowed.
@@ -59,5 +60,44 @@ export async function inBot<T>(
 ): Promise<T> {
   return await runInDurableObject(botStub(botInstanceId), async (instance, state) =>
     body(instance as unknown as BotInstance, state),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The RateLimiter (section 5.4), step 8
+// ---------------------------------------------------------------------------
+
+/** The `RATE_LIMITER` namespace, narrowed. See `botInstanceNamespace`. */
+export function rateLimiterNamespace(): DurableObjectNamespace<RateLimiter> {
+  const binding = env.RATE_LIMITER;
+  if (binding === undefined) {
+    throw new Error(
+      "no RATE_LIMITER binding in the test environment. vitest.config.ts pins " +
+        "tests to the testnet environment, which declares one in wrangler.jsonc; " +
+        "check that pinning is still in place.",
+    );
+  }
+  return binding;
+}
+
+/**
+ * A stub for one exchange account's limiter.
+ *
+ * The name IS the account label, which is the whole of section 5.4's "one per
+ * exchange account": two bots on one account resolve to the same object and
+ * therefore contend for one budget, and two accounts cannot.
+ */
+export function rateLimiterStub(accountLabel: string): DurableObjectStub<RateLimiter> {
+  const namespace = rateLimiterNamespace();
+  return namespace.get(namespace.idFromName(accountLabel));
+}
+
+/** Run `body` inside a `RateLimiter`. The cast is the same one `inBot` explains. */
+export async function inLimiter<T>(
+  accountLabel: string,
+  body: (limiter: RateLimiter, state: DurableObjectState) => Promise<T>,
+): Promise<T> {
+  return await runInDurableObject(rateLimiterStub(accountLabel), async (instance, state) =>
+    body(instance as unknown as RateLimiter, state),
   );
 }

@@ -154,10 +154,14 @@ cannot gain a new bot or restart an old one until a human resets it.
 - **`getOpenOrders` takes a pair**, so an unexpected order can only be seen on a
   pair some bot on the account already trades. Widening this means changing
   section 4.1's interface.
-- **No rate limiting.** Section 5.4's RateLimiter Durable Object does not exist.
-  One pass costs ~20 weight plus ~26 per distinct pair every 5 minutes against
-  a 1200/minute budget, so this job cannot meaningfully starve a bot. A severe
-  trip cancelling many orders at once is the real exposure, and that is step 6's
-  open question 7.
+- **Rate limiting is applied from outside this folder.** Nothing here knows
+  about section 5.4. `/src/workers/reconciliation.ts` wraps the exchange client
+  in the account's `RateLimiter` Durable Object at **routine** priority before
+  passing it in, so every read below is gated while this module still takes all
+  its dependencies as parameters. Routine because one pass costs ~20 weight plus
+  ~26 per distinct pair every 5 minutes against 1200/minute — a periodic audit
+  has no business drawing on the slice reserved for exiting positions. The halts
+  this job performs are not affected: they go through `haltBot` into each bot's
+  own object, which cancels at risk-exit priority.
 - **No exchange client exists**, in either environment. Deployed today the cron
   fires and returns without touching D1.

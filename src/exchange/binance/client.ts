@@ -49,9 +49,11 @@ import {
   parseOrderStatus,
   parseOrderStatusList,
   parsePrice,
+  parseRequestWeightLimit,
   parseServerTime,
   parseUsedWeight,
   readErrorBody,
+  type RequestWeightLimit,
 } from "./parse";
 import {
   ClockOffset,
@@ -108,14 +110,30 @@ export interface FetchLike {
 /**
  * The part of the rate limiter this client touches (section 5.4).
  *
- * Narrowed to the one method so the client can be given the real `WeightBudget`
- * or a recording stub. The client only ever REPORTS usage; it does not ask
- * permission, because the Durable Object that owns the budget across all bots on
- * an account arrives at step 6. Gating belongs there, not in a per-request
- * object that cannot see the other bots' traffic.
+ * Narrowed to these two methods so the client can be given the real
+ * `WeightBudget`, a `RateLimiter` Durable Object stub, or a recording stub. The
+ * client only ever REPORTS; it does not ask permission. Gating belongs in the
+ * object that can see every bot on the account, and it is applied by wrapping
+ * this client (`/src/exchange/rate-limited.ts`) rather than by putting a check
+ * inside a per-request object that cannot see the other bots' traffic.
+ *
+ * Both methods may return a promise, and the client awaits them. That is not
+ * cosmetic: until step 8 the only implementation was the in-memory
+ * `WeightBudget`, whose methods are synchronous, and the signature said so.
+ * Reporting into a Durable Object is an RPC call, and a `void` signature would
+ * have forced this file to either drop the promise on the floor -- a floating
+ * promise in a Worker, which can be cancelled when the request ends -- or lie
+ * about having recorded the weight.
  */
 export interface WeightReporter {
-  syncFromExchange(usedWeight: number, at: Timestamp): void;
+  syncFromExchange(usedWeight: number, at: Timestamp): void | Promise<void>;
+  /**
+   * The account's ceiling, read from an `exchangeInfo` body (section 5.4).
+   *
+   * Optional so `WeightBudget` still satisfies this interface unchanged: it is
+   * constructed with its limit and has no way to be told a new one.
+   */
+  syncLimit?(limit: number, windowMs: number, at: Timestamp): void | Promise<void>;
 }
 
 export interface BinanceClientOptions {
@@ -190,13 +208,28 @@ export class BinanceClient implements RestExchangeClient {
     return this.#syncClock();
   }
 
+  /**
+   * Symbol filters, and -- as a side effect -- the account's weight ceiling.
+   *
+   * `exchangeInfo` carries a top-level `rateLimits` block alongside the symbol
+   * definitions, and section 5.4 names it as one of the two sources for the
+   * budget. Reading it here rather than in a request of its own means the
+   * ceiling is refreshed by traffic the system already had to send: the filter
+   * cache expires hourly (section 4.3 requires periodic refresh), so the limit
+   * is re-read on that same schedule for no additional weight.
+   */
   async getSymbolFilters(pair: Pair): Promise<ExchangeOutcome<SymbolFilters>> {
+    // Captured from inside `parse`, which is the only place the raw body is in
+    // scope. `#request` hands back the parsed value alone, deliberately.
+    let weightLimit: RequestWeightLimit | undefined;
+
     const outcome = await this.#request<SymbolFilters>({
       method: "GET",
       path: "/api/v3/exchangeInfo",
       signed: false,
       params: [["symbol", pair]],
       parse: (body, at) => {
+        weightLimit = parseRequestWeightLimit(body);
         const symbols = (body as Record<string, unknown> | null)?.["symbols"];
         const entry = Array.isArray(symbols) ? symbols[0] : undefined;
         if (entry === undefined) {
@@ -206,7 +239,16 @@ export class BinanceClient implements RestExchangeClient {
       },
     });
 
-    if (outcome.ok) this.#filters.put(outcome.value);
+    if (outcome.ok) {
+      this.#filters.put(outcome.value);
+      if (weightLimit !== undefined) {
+        await this.#rateLimiter?.syncLimit?.(
+          weightLimit.limit,
+          weightLimit.windowMs,
+          outcome.at,
+        );
+      }
+    }
     return outcome;
   }
 
@@ -389,7 +431,7 @@ export class BinanceClient implements RestExchangeClient {
         return classifyThrown<number>(transport.error, transport.receivedAt);
       }
 
-      this.#reportWeight(transport.response, transport.receivedAt);
+      await this.#reportWeight(transport.response, transport.receivedAt);
 
       if (!transport.response.ok) {
         return classifyFailure<number>(
@@ -475,7 +517,7 @@ export class BinanceClient implements RestExchangeClient {
       return classifyThrown<T>(transport.error, transport.receivedAt);
     }
 
-    this.#reportWeight(transport.response, transport.receivedAt);
+    await this.#reportWeight(transport.response, transport.receivedAt);
 
     if (!transport.response.ok) {
       const error = readErrorBody(transport.body);
@@ -516,13 +558,20 @@ export class BinanceClient implements RestExchangeClient {
     };
   }
 
-  /** Feed the response's used-weight header to the rate limiter (section 5.4). */
-  #reportWeight(response: Response, at: Timestamp): void {
+  /**
+   * Feed the response's used-weight header to the rate limiter (section 5.4).
+   *
+   * Awaited rather than fired and forgotten. When the reporter is a Durable
+   * Object stub this is a network call, and a dropped promise in a Worker can
+   * be cancelled the moment the surrounding request finishes -- which would
+   * lose exactly the correction that matters most, the one following a 429.
+   */
+  async #reportWeight(response: Response, at: Timestamp): Promise<void> {
     if (this.#rateLimiter === undefined) return;
     const used = parseUsedWeight(response.headers);
     // Reported for failures too, and especially for them: a 429 is precisely
     // when the exchange's own count matters more than local accounting.
-    if (used !== undefined) this.#rateLimiter.syncFromExchange(used, at);
+    if (used !== undefined) await this.#rateLimiter.syncFromExchange(used, at);
   }
 
   /**

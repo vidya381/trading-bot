@@ -9,6 +9,7 @@ import {
   isUsable,
   LastGoodValue,
   ok,
+  rateLimited,
   withRetry,
   type ExchangeOutcome,
 } from "./downtime";
@@ -345,5 +346,72 @@ describe("LastGoodValue", () => {
     held.clear();
     expect(held.hasValue).toBe(false);
     expect(held.get(AT, MAX_AGE)).toEqual({ fresh: false, reason: "never_recorded" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The third failure kind (section 5.4), added at step 8
+// ---------------------------------------------------------------------------
+
+describe("rateLimited", () => {
+  it("is not usable, so it cannot reach strategy or risk logic", () => {
+    const outcome = rateLimited<number>("budget refused", 1000);
+    expect(isUsable(outcome)).toBe(false);
+    expect(outcome).toMatchObject({ ok: false, kind: "rate_limited", retryable: true });
+  });
+
+  it("is a distinct kind from transport, and that distinction is the point", () => {
+    // `transport` means the request LEFT this process and its effect is
+    // unknown, so section 5.1 requires recovery by looking the order up.
+    // `rate_limited` means it never left, so there is nothing to look up. A
+    // caller branching on `kind` must be able to tell them apart.
+    const thrown = classifyThrown<number>(new Error("socket hang up"), 1000);
+    const refused = rateLimited<number>("budget refused", 1000);
+    expect(thrown.ok).toBe(false);
+    expect(refused.ok).toBe(false);
+    if (thrown.ok || refused.ok) return;
+    expect(thrown.kind).toBe("transport");
+    expect(refused.kind).not.toBe(thrown.kind);
+    expect(refused.kind).not.toBe("exchange_error");
+  });
+
+  it("carries the wait the budget computed", () => {
+    const outcome = rateLimited<number>("budget refused", 1000, { retryAfterMs: 4200 });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.retryAfterMs).toBe(4200);
+  });
+
+  it("can be non-retryable, and withRetry then stops immediately", async () => {
+    const sleep = vi.fn(async () => undefined);
+    let calls = 0;
+    const result = await withRetry<number>(
+      async () => {
+        calls += 1;
+        // A request larger than the whole budget: waiting cannot help.
+        return rateLimited<number>("exceeds the whole budget", 1000, { retryable: false });
+      },
+      { maxAttempts: 5, sleep },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(calls).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("is retried by withRetry when it is temporary", async () => {
+    const sleep = vi.fn(async () => undefined);
+    let calls = 0;
+    const result = await withRetry<number>(
+      async () => {
+        calls += 1;
+        if (calls < 3) return rateLimited<number>("busy", 1000, { retryAfterMs: 500 });
+        return ok(7, 1000);
+      },
+      { maxAttempts: 5, sleep, random: () => 0.5 },
+    );
+
+    expect(result).toMatchObject({ ok: true, value: 7 });
+    expect(calls).toBe(3);
   });
 });

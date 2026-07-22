@@ -4,6 +4,7 @@ import { version } from "../../package.json";
 // wrangler.jsonc, which is this file. Re-exported rather than defined here so
 // the class keeps its own module.
 export { BotInstance } from "../durable-objects/bot-instance";
+export { RateLimiter } from "../durable-objects/rate-limiter";
 
 import { scheduled } from "./reconciliation";
 

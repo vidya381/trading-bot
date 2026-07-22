@@ -15,3 +15,7 @@ export * from "./binance/signing";
 export * from "./binance/filters";
 export * from "./binance/parse";
 export * from "./binance/client";
+// Section 5.4's gate. Exchange-agnostic in shape, but it carries Binance's
+// per-endpoint weight table, which is why it lives here and not in /src/shared
+// -- and it performs I/O, which rules /src/shared out anyway.
+export * from "./rate-limited";

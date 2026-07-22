@@ -66,9 +66,27 @@ export class RateLimiterError extends Error {
   }
 }
 
-interface WeightEntry {
+export interface WeightEntry {
   at: Timestamp;
   weight: number;
+}
+
+/**
+ * A budget's whole mutable state, for persisting and restoring it.
+ *
+ * Added at step 8, when the budget moved inside a Durable Object. A DO is
+ * evicted after a short idle period, and this window is 60 seconds long: an
+ * object that forgot its entries on eviction would wake believing the budget
+ * untouched and permit a second full limit's worth of traffic inside one
+ * window, which is the same failure a fixed window has and the reason this is
+ * a sliding one.
+ *
+ * Plain data on purpose -- `structuredClone`-able, so it round-trips through
+ * Durable Object storage with no encoding step (step 6, decision 4).
+ */
+export interface WeightBudgetSnapshot {
+  readonly entries: readonly WeightEntry[];
+  readonly exchangeReported: { usedWeight: number; at: Timestamp } | null;
 }
 
 /**
@@ -222,6 +240,58 @@ export class WeightBudget {
     this.#exchangeReported = null;
   }
 
+  /**
+   * This budget's mutable state, copied.
+   *
+   * Copied rather than handed out by reference, following step 2's decision 12:
+   * the in-memory store's copy-on-read bug was exactly a caller mutating
+   * something it was given and silently corrupting the source.
+   */
+  snapshot(): WeightBudgetSnapshot {
+    return {
+      entries: this.#entries.map((entry) => ({ ...entry })),
+      exchangeReported:
+        this.#exchangeReported === null ? null : { ...this.#exchangeReported },
+    };
+  }
+
+  /**
+   * Replace this budget's state with a previously taken snapshot.
+   *
+   * Entries outside the window are NOT filtered here; `#expire` does that on
+   * the next read, against the clock the caller passes then rather than one
+   * this method would have to invent.
+   */
+  restore(snapshot: WeightBudgetSnapshot): void {
+    this.#entries = snapshot.entries.map((entry) => ({ ...entry }));
+    this.#exchangeReported =
+      snapshot.exchangeReported === null ? null : { ...snapshot.exchangeReported };
+  }
+
+  /**
+   * How long until `weight` would fit under this priority's ceiling.
+   *
+   * Public because the RateLimiter Durable Object has to answer "come back in
+   * N milliseconds" for a request it is holding in a queue, where the amount
+   * that must free up is this request's weight PLUS everything queued ahead of
+   * it -- a figure `check` cannot be asked for directly without pretending the
+   * request is larger than it is.
+   *
+   * Returns 0 when it already fits.
+   */
+  waitFor(weight: number, priority: RequestPriority, now: Timestamp): number {
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new RateLimiterError(`weight must be positive, got ${weight}`);
+    }
+    const ceiling = this.ceilingFor(priority);
+    // Asking to wait for more than the ceiling can never be satisfied, so the
+    // question is answered as "wait for the whole ceiling to free", which is
+    // the longest honest answer rather than a misleading short one.
+    const wanted = Math.min(weight, ceiling);
+    if (this.usedWeight(now) + wanted <= ceiling) return 0;
+    return this.#waitFor(wanted, ceiling, now);
+  }
+
   /** Remove entries that have aged out of the rolling window. */
   #expire(now: Timestamp): void {
     const cutoff = now - this.#windowMs;
@@ -280,36 +350,13 @@ export function prioritize<T>(
   });
 }
 
-/**
- * Admit as many queued requests as the budget allows, in priority order.
- *
- * A request that does not fit is deferred rather than skipped over, so a large
- * risk-exit request cannot be starved by smaller routine ones queued behind it.
+/*
+ * There was an `admit()` here, which took a whole queue and decided in one pass
+ * how much of it could go, blocking everything behind the first request that
+ * did not fit. It was superseded at step 8 by the RateLimiter Durable Object's
+ * claim-based rule -- a waiting request reserves its weight, so a later one is
+ * granted only if it fits IN ADDITION -- which gives the same protection
+ * against a small request overtaking a large one without deferring a request
+ * there was genuinely room for. Deleted rather than left unused; the step 8
+ * decision-log entry (decision 6) is where that history belongs.
  */
-export function admit<T>(
-  budget: WeightBudget,
-  requests: readonly PendingRequest<T>[],
-  now: Timestamp,
-): { admitted: PendingRequest<T>[]; deferred: PendingRequest<T>[] } {
-  const admitted: PendingRequest<T>[] = [];
-  const deferred: PendingRequest<T>[] = [];
-  let blocked = false;
-
-  for (const request of prioritize(requests)) {
-    if (blocked) {
-      deferred.push(request);
-      continue;
-    }
-    const decision = budget.consume(request.weight, request.priority, now);
-    if (decision.allowed) {
-      admitted.push(request);
-    } else {
-      deferred.push(request);
-      // Only head-of-line block on a temporary shortfall. A request that can
-      // never fit is set aside without stalling everything behind it.
-      blocked = decision.reason === "budget_exhausted";
-    }
-  }
-
-  return { admitted, deferred };
-}

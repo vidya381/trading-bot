@@ -48,12 +48,26 @@
  * discrepancy section 9's reconciliation exists to find. The reverse ordering
  * would leave D1 asserting something that never happened.
  *
- * NO RATE LIMITING YET
- * --------------------
- * Section 5.4's RateLimiter Durable Object is not built (it was not in this
- * step's scope). `WeightBudget` exists and the Binance client reports weight
- * into it, but nothing gates a request. This object can therefore issue
- * unbounded calls during a halt that cancels many orders. See the decision log.
+ * RATE LIMITING (section 5.4, added at step 8)
+ * -------------------------------------------
+ * This object never talks to the exchange client it was handed. Every call goes
+ * through `#exchange()`, which wraps that client in the account's `RateLimiter`
+ * Durable Object, so budget is requested before the request is made rather than
+ * afterwards and hopefully.
+ *
+ * The wrapping happens HERE rather than being the caller's job, deliberately.
+ * If `attach()` simply accepted an already-limited client, then routing through
+ * the budget would be a property of how each caller happened to construct its
+ * dependencies -- true in the wiring someone remembered and false in the one
+ * they did not. Doing it inside means a bot cannot be given an ungated client
+ * even on purpose.
+ *
+ * Which priority a call carries is chosen at the call site, by asking for
+ * `#exchange(config, "risk-exit")` instead of `#exchange(config, "routine")`.
+ * The risk-exit views are the halt path's cancellations, the take-profit exit
+ * sell, and the filter read that exit needs in order to be constructible.
+ * Everything else -- entry buys, their filter reads -- is routine and may only
+ * draw on `limit - reserveForRiskExit`.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -73,6 +87,8 @@ import type {
   Timestamp,
 } from "../shared/exchange-client";
 import { isUsable } from "../shared/downtime";
+import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
+import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
 import { assertAccountArmed } from "../reconciliation/circuit-breaker";
 import { IdempotencyGuard } from "../shared/idempotency";
@@ -127,6 +143,14 @@ export type BotInstanceErrorCode =
   | "invalid_status"
   /** No exchange client or database was attached. */
   | "not_attached"
+  /**
+   * Section 5.4 refused the budget for a request this action needed.
+   *
+   * A code rather than a plain throw for the reason step 2's decision 8 gives:
+   * section 7.5 escalates an unhandled exception to a halt, and backpressure is
+   * not an emergency. The code is what lets `onPriceUpdate` catch and branch.
+   */
+  | "throttled"
   /** The bot row exists in D1 but this object holds no state. */
   | "orphaned_bot_row";
 
@@ -148,10 +172,23 @@ export interface BotInstanceDependencies {
    * `ExchangeClient`: `subscribeToPriceFeed` is not wired in this step (see the
    * decision log), and depending on the narrower type keeps that honest at
    * compile time rather than by comment.
+   *
+   * This is the RAW client. It is never called directly -- `#exchange()` wraps
+   * it in the account's rate limiter first (section 5.4).
    */
   readonly exchange: RestExchangeClient;
   readonly now: () => Timestamp;
   readonly newId: () => string;
+  /**
+   * The `RateLimiter` Durable Object for an account.
+   *
+   * Defaults to the `RATE_LIMITER` binding. Overridable so a test can supply a
+   * recording double, and so a test that wants to observe throttling can drive
+   * one with a controlled clock.
+   */
+  readonly limiterFor?: (accountLabel: string) => RateLimiterPort;
+  /** How the rate-limit wait is performed. Injected so tests need no delay. */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 /** This object's persisted runtime state, beside its configuration. */
@@ -217,6 +254,15 @@ const FILTER_MAX_AGE_MS = 3_600_000;
 
 export class BotInstance extends DurableObject<Env> {
   #dependencies: BotInstanceDependencies | undefined;
+  /**
+   * The gated views of the exchange client, built once per attached client.
+   *
+   * Memoised rather than rebuilt per call so that the two views share one
+   * inner client -- which matters, because `BinanceClient` holds the clock
+   * offset and the symbol filter cache, and two views over two clients would
+   * each re-sync the clock (section 4.2) at their own expense.
+   */
+  #gated: { routine: RestExchangeClient; riskExit: RestExchangeClient } | undefined;
 
   /**
    * Supply or override this object's dependencies.
@@ -237,7 +283,12 @@ export class BotInstance extends DurableObject<Env> {
         (undefined as unknown as RestExchangeClient),
       now: dependencies.now ?? (() => Date.now()),
       newId: dependencies.newId ?? (() => crypto.randomUUID()),
+      limiterFor: dependencies.limiterFor ?? this.#dependencies?.limiterFor,
+      sleep: dependencies.sleep ?? this.#dependencies?.sleep,
     };
+    // The gated views wrap a specific client and a specific limiter. Attaching
+    // new ones must not leave the object still calling through the old pair.
+    this.#gated = undefined;
   }
 
   #deps(): BotInstanceDependencies {
@@ -268,6 +319,51 @@ export class BotInstance extends DurableObject<Env> {
   #newId(): string {
     if (this.#dependencies === undefined) this.attach({});
     return this.#dependencies!.newId();
+  }
+
+  /**
+   * The exchange, seen through section 5.4's budget at the given priority.
+   *
+   * The ONLY way this object reaches the exchange. `#deps().exchange` is the
+   * raw client and is not called anywhere outside this method.
+   */
+  #exchange(config: DcaConfig, priority: RequestPriority): RestExchangeClient {
+    if (this.#gated === undefined) {
+      const deps = this.#deps();
+      const limiter = (deps.limiterFor ?? ((label) => this.#limiterFromEnv(label)))(
+        config.accountLabel,
+      );
+      const routine = withRateLimit(deps.exchange, limiter, {
+        priority: "routine",
+        now: deps.now,
+        label: config.botInstanceId,
+        ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
+      });
+      this.#gated = { routine, riskExit: routine.withPriority("risk-exit") };
+    }
+    return priority === "risk-exit" ? this.#gated.riskExit : this.#gated.routine;
+  }
+
+  /**
+   * The account's limiter from the binding.
+   *
+   * Refuses rather than falling back to an ungated client. That mirrors the
+   * exchange client's own treatment above and for the same reason: the safe
+   * default for a risk control is to stop, not to quietly do without it. An
+   * environment with no `RATE_LIMITER` binding is one deployed with no `--env`,
+   * which already has no database and no bots.
+   */
+  #limiterFromEnv(accountLabel: string): RateLimiterPort {
+    const namespace = this.env.RATE_LIMITER;
+    if (namespace === undefined) {
+      throw new BotInstanceError(
+        "not_attached",
+        "no RATE_LIMITER binding in this environment, so section 5.4's budget " +
+          "cannot be enforced. Refusing to trade ungated. Only testnet and " +
+          "production declare one; a deploy with no --env has neither.",
+      );
+    }
+    return namespace.get(namespace.idFromName(accountLabel));
   }
 
   // -------------------------------------------------------------------------
@@ -479,6 +575,19 @@ export class BotInstance extends DurableObject<Env> {
           return await this.#halt(config, action.reason, action.detail, "system");
       }
     } catch (error) {
+      if (error instanceof BotInstanceError && error.code === "throttled") {
+        // Section 5.4 refused budget somewhere inside this pass. Nothing was
+        // sent, so there is nothing to recover and nothing to halt over. The
+        // pass is abandoned and the next price update re-evaluates from
+        // scratch, because `decide()` is a pure function of position and price.
+        await this.#alert(config, {
+          severity: "warning",
+          category: "system",
+          alertType: "order_throttled",
+          message: error.message,
+        });
+        return { status: "running", action: "throttled", detail: error.message };
+      }
       return await this.#haltOnUnexpected(config, error);
     }
   }
@@ -627,13 +736,27 @@ export class BotInstance extends DurableObject<Env> {
   // Order placement
   // -------------------------------------------------------------------------
 
-  async #ensureFilters(config: DcaConfig, state: BotRuntimeState, now: Timestamp): Promise<SymbolFilters> {
+  /**
+   * Section 4.3's cached filters.
+   *
+   * Takes a priority because the read inherits the priority of what it is FOR:
+   * an exit order that cannot be constructed without fresh filters is still
+   * part of the exit, and making this read routine would put a stop-loss behind
+   * routine traffic through the back door -- the exit's own `placeOrder` would
+   * never be reached to use its reserved budget.
+   */
+  async #ensureFilters(
+    config: DcaConfig,
+    state: BotRuntimeState,
+    now: Timestamp,
+    priority: RequestPriority,
+  ): Promise<SymbolFilters> {
     const cached = state.filters;
     if (cached !== null && now - cached.fetchedAt < FILTER_MAX_AGE_MS) {
       return cached;
     }
 
-    const outcome = await this.#deps().exchange.getSymbolFilters(config.pair);
+    const outcome = await this.#exchange(config, priority).getSymbolFilters(config.pair);
     if (!isUsable(outcome)) {
       if (cached !== null) {
         // Section 5.6: a failed request is not data. Stale filters are still
@@ -642,6 +765,18 @@ export class BotInstance extends DurableObject<Env> {
         // rules that were true an hour ago. Using them is deliberate, which is
         // why `SymbolFilterCache` separates `get` from `peek`.
         return cached;
+      }
+      if (outcome.kind === "rate_limited") {
+        // Distinguished from the two below, which mean the exchange could not
+        // be reached or refused. Nothing was reached here -- the budget said
+        // wait -- and without this branch section 7.5's catch-all would halt a
+        // perfectly healthy bot for the crime of being busy. That halt would
+        // then need a human to undo it, per section 7.2 step 5.
+        throw new BotInstanceError(
+          "throttled",
+          `cannot read symbol filters for ${config.pair} and none are cached: ` +
+            `${outcome.message}`,
+        );
       }
       throw new BotInstanceError(
         "not_attached",
@@ -662,7 +797,9 @@ export class BotInstance extends DurableObject<Env> {
   ): Promise<PipelineResult> {
     let state = await this.#state();
     const now = this.#now();
-    const filters = await this.#ensureFilters(config, state, now);
+    // Routine: this is an entry, and section 5.4's reserve exists precisely so
+    // that entries cannot spend what an exit will need.
+    const filters = await this.#ensureFilters(config, state, now, "routine");
     // Re-read: a filter refresh writes state, and continuing from the copy
     // taken before it would silently discard the filters just cached.
     state = await this.#state();
@@ -723,7 +860,7 @@ export class BotInstance extends DurableObject<Env> {
       return await this.#halt(config, "order_rejected", `pre-send validation failed: ${verified.reason}`, "system");
     }
 
-    const outcome = await this.#deps().exchange.placeOrder({
+    const outcome = await this.#exchange(config, "routine").placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
       side: "buy",
@@ -733,6 +870,31 @@ export class BotInstance extends DurableObject<Env> {
     });
 
     if (!isUsable(outcome)) {
+      if (outcome.kind === "rate_limited") {
+        // Section 5.4 refused the budget, so NOTHING was sent. That is a third
+        // thing from the two cases below and needs its own handling:
+        //
+        //  - not `transport`, whose attempt stays `attempting` because the
+        //    order may be resting on the book. This order provably is not, so
+        //    marking the attempt failed is the truthful record and leaves
+        //    nothing for reconciliation to chase.
+        //  - not a halt, which is what an `exchange_error` gets. The exchange
+        //    has not refused anything; this system declined to ask. Halting a
+        //    bot because the account was briefly busy would turn backpressure
+        //    into an incident requiring human review to undo.
+        //
+        // The action is simply skipped. `decide()` is a pure function of the
+        // position and the price, so the next price update re-evaluates it and
+        // places the order then if it is still the right thing to do.
+        await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        await this.#alert(config, {
+          severity: "warning",
+          category: "system",
+          alertType: "order_throttled",
+          message: `${label} buy skipped: ${outcome.message}`,
+        });
+        return { status: "running", action: "throttled", detail: outcome.message };
+      }
       if (outcome.kind === "transport") {
         // Section 5.6 and 5.1 together: the order's fate is unknown, so the
         // attempt record stays `attempting` and recovery looks it up by
@@ -788,7 +950,10 @@ export class BotInstance extends DurableObject<Env> {
     await this.#cancelOpenOrders(config, state);
     state = await this.#state();
 
-    const filters = await this.#ensureFilters(config, state, now);
+    // Risk-exit throughout: section 6.3 step 4 makes this the cycle's mandatory
+    // exit, and section 5.4 names exactly this class of order as the one that
+    // must not queue behind routine traffic.
+    const filters = await this.#ensureFilters(config, state, now, "risk-exit");
     state = await this.#state();
     const target = takeProfitPrice(config.params, state.position.averageEntryPrice);
     const limit = price.price > target ? price.price : target;
@@ -819,7 +984,7 @@ export class BotInstance extends DurableObject<Env> {
       return { status: "running", action: "recover", detail: decision.reason };
     }
 
-    const outcome = await this.#deps().exchange.placeOrder({
+    const outcome = await this.#exchange(config, "risk-exit").placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
       side: "sell",
@@ -829,6 +994,26 @@ export class BotInstance extends DurableObject<Env> {
     });
 
     if (!isUsable(outcome)) {
+      if (outcome.kind === "rate_limited") {
+        // As in `#placeBuy`: nothing was sent, so the attempt is marked failed
+        // and the bot is not halted. Alerted at `critical` rather than
+        // `warning`, unlike an entry -- an exit that could not be placed even
+        // out of the RESERVED slice means the reserve was not big enough, which
+        // is the one thing section 5.4's priority scheme exists to prevent and
+        // is worth a human seeing. The exit is re-attempted on the next price
+        // update, because `decide()` will still return `take_profit`.
+        await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        await this.#alert(config, {
+          severity: "critical",
+          category: "system",
+          alertType: "exit_order_throttled",
+          message:
+            `the take-profit exit could not obtain risk-exit budget: ${outcome.message}. ` +
+            `It will be retried on the next price update; if this recurs, the ` +
+            `reserved slice is too small for this account's traffic.`,
+        });
+        return { status: "running", action: "throttled", detail: outcome.message };
+      }
       if (outcome.kind === "transport") {
         return { status: "running", action: "unresolved", detail: outcome.message };
       }
@@ -1086,10 +1271,17 @@ export class BotInstance extends DurableObject<Env> {
    * follow-up `getOrderStatus` per order: during a halt that is faster, costs
    * less rate-limit budget, and is not racy, because the cancellation response
    * is the same operation that ended the order.
+   *
+   * RISK-EXIT priority, and this is the call site section 5.4's reserved slice
+   * was built for. Every caller of this method is getting out: a section 7.2
+   * halt, a close, or the cancellation of a resting buy ahead of a take-profit
+   * sell. For DCA that is at most one order, so the throttling is invisible;
+   * for step 9's grid it is a full ladder cancelled in one pass, which is the
+   * exposure step 7 measured and named as the real one.
    */
   async #cancelOpenOrders(config: DcaConfig, state: BotRuntimeState): Promise<void> {
     if (state.openOrderIds.length === 0) return;
-    const exchange = this.#deps().exchange;
+    const exchange = this.#exchange(config, "risk-exit");
     const now = this.#now();
     const stillOpen: string[] = [];
 
