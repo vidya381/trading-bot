@@ -19,6 +19,7 @@ import {
   balanceSnapshots,
   botInstances,
   capitalLedger,
+  circuitBreakers,
   manualAdjustments,
   orders,
   trades,
@@ -35,6 +36,7 @@ export class Database {
   readonly manualAdjustments: Repository<typeof manualAdjustments.columns>;
   readonly auditLog: Repository<typeof auditLog.columns>;
   readonly alerts: Repository<typeof alerts.columns>;
+  readonly circuitBreakers: Repository<typeof circuitBreakers.columns>;
 
   constructor(d1: D1Database) {
     this.#d1 = d1;
@@ -46,6 +48,7 @@ export class Database {
     this.manualAdjustments = new Repository(d1, manualAdjustments);
     this.auditLog = new Repository(d1, auditLog);
     this.alerts = new Repository(d1, alerts);
+    this.circuitBreakers = new Repository(d1, circuitBreakers);
   }
 
   /**

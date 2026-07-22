@@ -15,6 +15,7 @@ import type {
   BalanceSnapshotRow,
   BotInstanceRow,
   CapitalLedgerRow,
+  CircuitBreakerRow,
   ManualAdjustmentRow,
   OrderRow,
   TradeRow,
@@ -30,6 +31,7 @@ const TABLES_CHILDREN_FIRST = [
   "balance_snapshots",
   "manual_adjustments",
   "capital_ledger",
+  "circuit_breakers",
   "bot_instances",
 ] as const;
 
@@ -184,6 +186,23 @@ export function auditLogRow(overrides: Partial<AuditLogRow> = {}): AuditLogRow {
     target_bot_instance_id: null,
     details_json: null,
     created_at: T0,
+    ...overrides,
+  };
+}
+
+export function circuitBreakerRow(
+  overrides: Partial<CircuitBreakerRow> = {},
+): CircuitBreakerRow {
+  return {
+    account_label: "main",
+    state: "armed",
+    reason: null,
+    run_id: null,
+    tripped_at: null,
+    tripped_by: null,
+    reset_at: null,
+    reset_by: null,
+    updated_at: T0,
     ...overrides,
   };
 }

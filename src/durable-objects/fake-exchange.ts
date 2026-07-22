@@ -76,6 +76,20 @@ export class FakeExchange implements RestExchangeClient {
   nextCancelFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force `getSymbolFilters` to fail. Stays set until cleared. */
   filtersFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  /** Set to force `getOpenOrders` to fail. Stays set until cleared. */
+  openOrdersFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  /** Set to force `getAccountBalances` to fail. Stays set until cleared. */
+  balancesFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+
+  /**
+   * What the account holds, for step 7's reconciliation.
+   *
+   * Deliberately NOT derived from the resting orders: the whole point of
+   * section 9's balance check is to catch a change this system cannot explain
+   * from its own records, so a fake that computed the balance from those
+   * records could never express one.
+   */
+  balances: Balance[] = [];
   /**
    * Extra quantity the exchange reports as filled at CANCELLATION time, beyond
    * what the bot knew about -- the race step 3.1's open question 1 describes.
@@ -190,13 +204,56 @@ export class FakeExchange implements RestExchangeClient {
     };
   }
 
+  /**
+   * Every resting order on the pair that is neither cancelled nor fully
+   * filled -- derived from `resting` rather than from a separate list, so a
+   * test cannot set up an exchange whose open orders contradict its own order
+   * book. A test wanting an order this system never placed inserts it into
+   * `resting` directly, which is exactly what step 7's severe tier looks for.
+   */
   async getOpenOrders(pair: Pair): Promise<ExchangeOutcome<OrderStatus[]>> {
-    void pair;
-    return { ok: true, value: [], at: this.now };
+    if (this.openOrdersFailure !== null) {
+      return failure(this.openOrdersFailure.message, this.openOrdersFailure.kind, this.now);
+    }
+    const open: OrderStatus[] = [];
+    for (const [clientOrderId, order] of this.resting) {
+      if (order.cancelled) continue;
+      if (order.request.pair !== pair) continue;
+      if (order.filledQuantity >= order.request.quantity) continue;
+      open.push({
+        clientOrderId,
+        exchangeOrderId: order.exchangeOrderId,
+        pair,
+        side: order.request.side,
+        price: order.request.price,
+        quantity: order.request.quantity,
+        filledQuantity: order.filledQuantity,
+        cumulativeQuoteQuantity: ZERO,
+        state: order.filledQuantity > ZERO ? "partially_filled" : "pending",
+        // No `fills` array: the open-orders endpoint does not return one
+        // (step 3). The fake stays faithful about that.
+        createdAt: this.now,
+        updatedAt: this.now,
+      });
+    }
+    return { ok: true, value: open, at: this.now };
   }
 
   async getAccountBalances(): Promise<ExchangeOutcome<Balance[]>> {
-    return { ok: true, value: [], at: this.now };
+    if (this.balancesFailure !== null) {
+      return failure(this.balancesFailure.message, this.balancesFailure.kind, this.now);
+    }
+    return { ok: true, value: [...this.balances], at: this.now };
+  }
+
+  /** Put an order on the book that this system never placed. */
+  injectForeignOrder(request: OrderRequest): void {
+    this.resting.set(request.clientOrderId, {
+      request,
+      exchangeOrderId: `FOREIGN-${request.clientOrderId}`,
+      filledQuantity: ZERO,
+      cancelled: false,
+    });
   }
 
   /** Build a fill against a resting order, as the exchange would report it. */

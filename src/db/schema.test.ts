@@ -98,7 +98,7 @@ describe.each(Object.values(ALL_TABLES).map((spec) => [spec.name, spec] as const
 );
 
 describe("the schema as a whole", () => {
-  it("declares all eight tables from section 8.2", async () => {
+  it("declares section 8.2's eight tables, plus the circuit breaker", async () => {
     const result = await rawD1()
       .prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table'
@@ -113,6 +113,10 @@ describe("the schema as a whole", () => {
       "balance_snapshots",
       "bot_instances",
       "capital_ledger",
+      // Not in section 8.2. Added by migration 0003 at step 7, because
+      // section 9's severe tier requires the section 7.3 circuit breaker to
+      // exist as a real, latching control rather than a paragraph.
+      "circuit_breakers",
       "manual_adjustments",
       "orders",
       "trades",
@@ -142,6 +146,10 @@ describe("the schema as a whole", () => {
       manual_adjustments: ["amount"],
       audit_log: [],
       alerts: [],
+      // No money at all: it records a latch, not an amount. Section 7.3's
+      // daily-loss THRESHOLD would be a money column, and it is deliberately
+      // not built yet -- see circuit-breaker.ts's header.
+      circuit_breakers: [],
     };
 
     for (const spec of Object.values(ALL_TABLES)) {

@@ -84,7 +84,14 @@
           "tag": "v1",
           "new_sqlite_classes": ["BotInstance"]
         }
-      ]
+      ],
+      // Spec section 9's suggested interval. The handler is `scheduled` in
+      // src/workers/api.ts; a cron trigger is a handler on a Worker, not a
+      // separate Worker, so section 3's "Cron Trigger Worker" box is a
+      // separation of concerns rather than of deployments.
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      }
     },
 
     "production": {
@@ -123,7 +130,16 @@
           "tag": "v1",
           "new_sqlite_classes": ["BotInstance"]
         }
-      ]
+      ],
+      // Declared identically to testnet so the two environments do not differ
+      // in behaviour, which section 16 is emphatic about. Safe to declare
+      // before go-live: `runScheduledReconciliation` checks for an exchange
+      // client BEFORE touching D1, and no credentials exist in either
+      // environment, so this fires and returns without querying the
+      // deliberately empty production database.
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      }
     }
   }
 }

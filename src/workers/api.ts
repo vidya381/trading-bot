@@ -5,6 +5,8 @@ import { version } from "../../package.json";
 // the class keeps its own module.
 export { BotInstance } from "../durable-objects/bot-instance";
 
+import { scheduled } from "./reconciliation";
+
 /**
  * Main API Worker (placeholder).
  *
@@ -28,4 +30,12 @@ export default {
 
     return new Response("Not Found", { status: 404 });
   },
+
+  // Spec section 9's reconciliation job, on the schedule set by
+  // `triggers.crons` in wrangler.jsonc. A cron trigger is a handler on a
+  // Worker rather than a kind of Worker, so section 3's separate "Cron Trigger
+  // Worker" box is preserved as a separation of concerns -- the logic lives in
+  // /src/reconciliation and knows nothing about crons -- rather than as a
+  // second deployment. See the header of ./reconciliation.ts.
+  scheduled,
 } satisfies ExportedHandler<Env>;

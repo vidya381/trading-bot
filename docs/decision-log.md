@@ -1368,7 +1368,10 @@ typecheck clean. All against real D1 in the Workers runtime.
 
 `docs/d1-provisioning.md` gained section 3.1: migration 0002 has **not** been
 applied to the remote testnet database. That is a deliberate omission, not an
-oversight — see deviations.
+oversight — see deviations. *(Since superseded: 0002 was applied manually
+outside a session and nothing recorded it at the time, so section 3.1 went on
+claiming otherwise until 2026-07-22. All three migrations are now applied and
+confirmed. See that section's "Why this section was wrong" note.)*
 
 ### Two decisions taken as settled going in
 
@@ -2088,3 +2091,446 @@ New:
    serialize by default, so the interleavings step 5 had to test for do not
    arise here -- but that is an assumption about the runtime this session did not
    probe, unlike the storage questions it did.
+
+## Step 7: Reconciliation Cron Worker
+Date: 2026-07-22
+
+### What was built
+
+`/src/reconciliation/` (new): `findings.ts` (section 9's three tiers, pure),
+`circuit-breaker.ts` (section 7.3's control, built rather than described),
+`reconcile.ts` (one pass over one account), plus `index.ts` and a folder README.
+
+`src/workers/reconciliation.ts`: the `scheduled` handler, wired into
+`api.ts`'s default export. `wrangler.jsonc` gained `triggers.crons` under both
+environments.
+
+`migrations/0003_circuit_breakers.sql`: one table, one partial index. The
+ninth table, and the third not in section 8.2.
+
+Edits outside the new folder, all small and all listed here so none is
+invisible: `src/db/schema.ts`, `database.ts` and `test-helpers.ts` learned the
+new table; `bot-instance.ts` gained `snapshotIfCreated()` and two
+`assertAccountArmed` calls; `fake-exchange.ts` gained the two surfaces
+reconciliation reads; `schema.test.ts`'s two whole-schema expectations were
+updated.
+
+81 new tests across three files (852 in total across the project), all passing,
+typecheck clean. Real D1 and, in three tests, a real Durable Object; the
+exchange is the only thing mocked, per section 14.
+
+### Four questions asked before writing anything
+
+Section 9 is six lines and every one of them turned out to be underspecified in
+a way that changes what gets built. All four were put to the account owner and
+all four confirmed the recommended reading.
+
+**1. What "what D1 believes" means for a BALANCE.** *(asked, confirmed)*
+
+Nothing in this system maintained an internal balance. `capital_ledger.total_balance`
+was whatever a human typed into `seedPlaceholderTotalBalance`, and step 5's own
+header says total_balance is "reconciliation's to write". Comparing the exchange
+against that placeholder reports a large discrepancy on every run that is not
+drift — it is the placeholder being a guess.
+
+Resolved as a DELTA between runs: `internal_calculated_balance` is the previous
+run's exchange balance plus this system's own recorded activity since, and
+`discrepancy` is what remains after subtracting unreconciled manual
+adjustments. That is the unexplained part of the change, and it is also what
+migration 0001's own comment already assumed when it said `discrepancy` "is NOT
+a plain difference of these two columns".
+
+*Comparing against `capital_ledger.total_balance` — rejected.* The literal
+reading of section 8.2, and it makes run one of every account a large false
+positive that repeats forever until someone re-seeds by hand.
+
+*Rebuilding the balance from `trades` — rejected.* Self-contained and needs no
+baseline, but it can only describe assets this system traded. It is structurally
+blind to a deposit, a withdrawal, or a pre-existing balance — which is exactly
+the "unexplained balance change" the severe tier exists to catch.
+
+The first run for an (account, asset) has no baseline and ADOPTS the exchange's
+balance, classifying `minor` and raising nothing. There is no honest
+alternative: with no prior observation there is no change to explain.
+
+**2. How the three tiers are decided.** *(asked, confirmed)*
+
+Section 9 describes them qualitatively and supplies no thresholds. Resolved as:
+the KIND of finding sets a floor, magnitude may escalate above it, and magnitude
+may never lower it.
+
+*Pure magnitude — rejected.* One numeric ladder makes a small unexpected order
+"minor", and section 9 lists unexpected orders under severe alongside suspected
+key compromise. Something else trading the account is the same event whatever
+the size.
+
+*Pure kind — rejected.* Fully deterministic, but then a rounding difference and
+a 20% unexplained balance drop classify identically.
+
+**3. How much of the circuit breaker to build.** *(asked, confirmed)*
+
+The mechanism plus section 9's trigger. Section 7.3's daily-loss trigger is
+not built — see decision 2.
+
+**4. Whether auto-correct may write Durable Object state.** *(asked, confirmed)*
+
+No. D1 mirror only. See decision 3.
+
+### Decisions made
+
+**1. The account-wide circuit breaker is REAL, and that is the main thing this
+session added beyond section 9 itself.**
+
+Before this, section 7.3 was a paragraph. Section 9's severe tier says "trigger
+the account-wide circuit breaker, halt everything on that account, alert
+immediately", so implementing that tier as anything other than a comment
+required building the control first.
+
+`circuit_breakers` is one mutable row per account, like `capital_ledger`. While
+tripped: no bot on the account can be created, no halted bot can be resumed, and
+every run keeps sweeping for anything still active. Only
+`resetAccountCircuitBreaker` clears it, and it refuses `system`, `ci`, `cron`
+and `reconciliation` — importing step 5's `NON_HUMAN_ACTORS` rather than
+re-declaring the list, so the two cannot drift.
+
+*Halting the bots that exist at the moment of the trip, without a latch —
+rejected.* That is a broadcast, not a breaker. The next bot created on the
+account would start trading straight into whatever caused it.
+
+*KV rather than D1 — rejected.* KV is eventually consistent, and a
+create-blocking check that can read a stale "armed" seconds after a trip has a
+hole in it. Section 8.3 gives KV alert cooldowns, where staleness costs a
+duplicate ping; here it would cost a bot trading on an account under suspected
+key compromise.
+
+*A Durable Object — rejected*, following step 5's decision A. A DO would
+serialise trips properly, but trips come from one cron per account and the write
+is idempotent, so there is no contention to serialise.
+
+The latch is written BEFORE any bot is halted, inverting the obvious order for
+the same reason step 6's decision 2 did: a crash partway through then leaves an
+account latched with some bots still running, which the next sweep fixes. The
+reverse leaves bots halted on an account that still accepts new ones.
+
+**2. Section 7.3's daily-loss trigger is NOT built, and this is a real gap.**
+
+Section 7.3 defines the breaker by one trigger: total realized and unrealized
+loss across all bots on the account for the current day. Section 9 adds a
+second: severe drift. They share one mechanism.
+
+Only the mechanism and section 9's trigger exist. Unrealized loss needs a live
+price for every open position, which means an exchange call per pair on a
+schedule, plus a decision about what "for the current day" means across
+timezones. Bolting a half-considered version of that onto this file would have
+produced a risk control nobody had thought about properly.
+
+`tripAccountCircuitBreaker` takes the reason as a string and has no opinion
+about which trigger produced it, so wiring the second one is a caller change.
+**Stated plainly: an account can currently lose money faster than any per-bot
+stop-loss catches, and nothing account-wide will stop it.** That is section 7.3
+unimplemented, not section 9 unimplemented, but it is the same paragraph.
+
+**3. Auto-correct touches the D1 mirror and nothing else — and that changes
+which findings can be minor.**
+
+Section 8.1 makes each Durable Object the source of truth and section 8.2 calls
+D1 "mirrored from" it. A cron writing a running bot's position would be a second
+writer to that number, from outside the object that serialises access to it,
+using a read already stale by the time the write lands.
+
+The consequence is not just a restriction, and it is the more interesting half:
+a finding is only ever raised as `minor` for something this job can actually
+fix. Where the mirror is wrong in a way it cannot repair — an order in the
+object with no `orders` row at all, which would need a fabricated
+`exchange_order_id` — the finding is raised as `order_state_drift` instead.
+Section 9 defines minor by its ACTION ("auto-correct, log, no alert"), so a
+minor finding nobody can correct would be silent by construction.
+
+*Adding a `BotInstance.applyReconciliation` — rejected.* It would close step 6's
+decision 3 gap, where a fill discovered at cancellation cannot reach the
+position. It also introduces a second writer to the source of truth, from a
+cron, racing live price updates. Step 6 open question 1 stays open.
+
+**4. `TIER_CEILING` — a bug the tests caught, and the most substantive thing I
+got wrong this session.**
+
+The first version of `classifyFinding` let any finding escalate to severe past
+`severePct`. Five tests failed, all reporting `severe` where a lower tier was
+expected, and the reason was the same each time: for an ORDER-level finding the
+only denominator available is that order's own quantity.
+
+A resting order that half-filled without the bot hearing is a 50% divergence of
+that order. A D1 mirror lagging by a whole order is 100%. A fill recorded late —
+section 9's own named example of MINOR drift — is usually the entire order. So
+every ordinary event escalated to severe and tripped the account-wide breaker,
+and `meaningful` had become unreachable in practice. The three-tier scheme had
+silently collapsed into one.
+
+The underlying error was treating one ratio as comparable across kinds when the
+denominators are different things. "50% of one order" and "50% of the account's
+balance" are not two points on one scale.
+
+The fix has two parts. `TIER_CEILING` caps how far each kind may be escalated,
+and `reconcile.ts` now attaches a magnitude only where amount and reference are
+the same asset at account scale — which is `balance_drift` and
+`ledger_allocation_drift`, and nothing else. Every order-level finding is
+classified by kind alone, which is section 9 honoured literally: it calls a
+position mismatch meaningful and puts no size on it.
+
+Worth being clear that the tests caught this, not review. Each of the five
+failures looked like bad test data at first glance, and the first one was
+partly that; it took the third and fourth to show the denominator was wrong
+rather than the numbers.
+
+**5. `balance_drift` has a MINOR floor, which reads wrong until you consider
+rounding.**
+
+Every other exchange-facing kind floors at meaningful or above. This one floors
+at minor and is escalated by the numbers.
+
+The reason is that this job reconstructs the expected balance change from
+recorded trades, rounding notionals half-even at scale 8, while the exchange did
+its own arithmetic. A residual of a few satoshi is that difference, plus any fee
+paid in a third asset that step 6's decision 12 could not convert. With a
+meaningful floor, every run would halt a bot on rounding — a false-positive
+machine, and the fastest way to teach whoever reads the dashboard to ignore it.
+
+So `meaningfulPct` (0.1%) is the line between noise and a real question, and
+`severePct` (2%) between that and latching the account. Both numbers were chosen
+here; the spec contains none. Both are per-account configurable specifically so
+the section 17 testnet period can tune them against real observations rather
+than leaving them at values nobody has tested.
+
+**6. Marking manual adjustments reconciled is BATCHED with the snapshot that
+consumed them.**
+
+Section 8.6 subtracts unreconciled adjustments, and step 4 added
+`reconciled_at` so the second run does not subtract the same one again.
+
+The ordering question is nastier than it looks. Mark first and crash: the
+adjustment is consumed with its explanation lost, so the next run over-alerts.
+Write the snapshot first and crash: the same adjustment is subtracted again next
+run, explaining away a real discrepancy — which UNDER-alerts, and is the
+direction that loses money.
+
+D1's `batch` is a transaction, so both go in one and neither happens. This is
+the one place in the project where step 5's "every partial failure fails in the
+safe direction" reasoning was avoidable rather than merely managed, because the
+two statements involved need no `changes` inspection between them.
+
+**7. Reconciliation writes `capital_ledger.total_balance`, finally giving it a
+real source.**
+
+Step 5's `placeholder-balance.ts` exists only because nothing maintained this
+column, and its header says so. Every run now writes the observed exchange
+balance into it — but only for an asset that ALREADY has a ledger row. Creating
+one would declare capital available for allocation, and that is a human's
+decision, not a cron's.
+
+Note the discrepancy maths deliberately does not read this column. It measures
+from the previous `balance_snapshots` row, so writing the ledger cannot
+influence what the next run detects.
+
+**8. The `scheduled` handler lives on the existing Worker, not a second one.**
+
+Section 3's diagram draws "Cron Trigger Worker: reconciliation job" as its own
+box. Cloudflare's model is that a cron trigger is a HANDLER on a Worker, not a
+kind of Worker, so a genuinely separate deployment would need its own name, its
+own D1 and Durable Object bindings, its own CI step and its own place in section
+16's version tracking — all so two handlers on the same codebase could run in
+different processes.
+
+The separation section 3 is drawing is of concerns, and that is preserved:
+`/src/reconciliation` takes every dependency as a parameter and knows nothing
+about crons.
+
+The cron is declared on production as well as testnet, which is safe for a
+non-obvious reason worth recording: `runScheduledReconciliation` checks for an
+exchange client BEFORE touching D1, and none exists, so it fires and returns
+without querying production's deliberately empty database. Declaring it on only
+one environment would have been the more dangerous choice — section 16 wants the
+two configured identically.
+
+**9. There is still no exchange client, so this is deployed-and-inert.**
+
+Same position as step 6's decision 13, for the same reason: building a Binance
+client needs live credentials and step 4.1's decision 2 left whose exchange
+account will be used undecided. `exchangeFor` returns null, every run is
+skipped, and the handler logs why.
+
+Deliberately NOT an alert. Nothing is wrong — no credentials have been created
+yet, it is a recorded state, and a critical alert every five minutes for it
+would train whoever reads the dashboard to ignore the table.
+
+**10. `snapshotIfCreated()` was added to `BotInstance` rather than matching on
+an error message.**
+
+`snapshot()` throws `BotInstanceError("not_created")` when the object holds no
+state — step 6's open question 6, where capital is reserved and the row written
+before the object's storage is. Reconciliation must distinguish "nothing to
+compare" from "reading it failed", and it reaches the object over RPC, across
+which a thrown error arrives without its `code` property. The caller would have
+had to match on message text.
+
+**11. An orphaned bot row is a system alert, not a drift tier.**
+
+Following from 10: section 9's tiers are about a divergence between belief and
+reality, and a bot whose object was never written has no belief to diverge. It
+is reported as `orphaned_bot_row` (system category) and listed in the run's
+`skipped`, rather than forced into a tier it does not fit.
+
+**12. Routine, for completeness.** The `PendingFinding` / `ClassifiedEntry`
+pairing, the run result shape, the barrel and the README are ordinary
+implementation. One part had a real reason: `classifyAll` is a `map`, so its
+output is index-aligned with its input, and the orchestrator pairs corrections
+back by index. The first draft looked the correction up by matching kind, bot,
+asset and detail — which works until two findings look alike, at which point it
+silently applies the wrong correction. Replaced before it was ever run.
+
+### Closing step 6's loop — explicitly
+
+Step 6's deviations recorded: *"Section 9's reconciliation is relied on by three
+paths here and does not exist yet. Those alerts currently go into a table nobody
+reads automatically."*
+
+**That loop is now closed, and here is exactly how**, since "closed the loop" is
+the sort of claim worth being able to check:
+
+| `alerts.alert_type` written by step 6 | Read as | Tier | Action |
+| --- | --- | --- | --- |
+| `cancel_fill_discrepancy` | `cancel_fill_discrepancy` | meaningful | halt that bot, alert |
+| `unknown_order_fill` | `unknown_order_fill` | **severe** | trip the breaker, halt everything |
+| `order_state_drift` | `reported_order_state_drift` | meaningful | halt that bot, alert |
+| `cancel_failed` | `cancel_failed` | meaningful | halt that bot, alert |
+
+Each run reads UNRESOLVED alerts of these types for bots on the account, turns
+each into a finding, classifies it with everything else, acts on its tier, and
+then sets `alerts.resolved` — which is the only place in the codebase that ever
+writes that column true.
+
+Four rather than step 6's three. `cancel_failed` was not on its list but
+describes the same class of problem — this system's belief about an order
+diverging from the exchange's — and reading its three neighbours while ignoring
+it would have been an arbitrary line.
+
+An alert is resolved only if the tier's action actually landed. If the halt
+throws, the source alert stays unresolved, a `reconciliation_halt_failed` system
+alert is written, and the next run finds it again. There is a test for that
+specifically, because "we acted on it" and "we tried to act on it" being the
+same code path is how an alert gets silently discarded.
+
+Two honest qualifications:
+
+- **Ingested findings carry no magnitude.** The alert's payload is prose in
+  `message`. Re-deriving a number by parsing that prose would be a guess wearing
+  a threshold's authority, so they classify by kind alone. This is fine for
+  three of the four; for `cancel_fill_discrepancy` it means a one-satoshi race
+  and a large one both halt the bot.
+- **Resolving the source alert does not mean the underlying problem is fixed.**
+  It means reconciliation consumed it and escalated. The new alert it writes
+  stays unresolved for a human. Step 6's decision 3 gap — a position
+  understating what the bot holds — is still not repaired by this, only
+  detected and halted on.
+
+### Deviations from the spec
+
+- **Section 9 gives no thresholds; three numbers were chosen here**
+  (`meaningfulPct` 0.1%, `severePct` 2%, `timingWindowMs` 60s). All reasoned,
+  none measured against a real account.
+- **Section 9's "compare against what each relevant Durable Object and D1
+  believe" is not a two-way comparison but a three-way one**, and the three
+  disagree in different ways. Object-vs-D1 is `mirror_drift` (minor,
+  correctable); object-vs-exchange is `order_state_drift` (meaningful). Section
+  9 does not distinguish them.
+- **Section 9's balance comparison had no defined "internal" value** and one was
+  designed here (question 1).
+- **Section 7.3's circuit breaker was built** — it did not exist as code — and
+  only one of its two triggers is wired (decision 2).
+- **Section 3's "Cron Trigger Worker" is a handler on the existing Worker**
+  (decision 8).
+- **`circuit_breakers` is not in section 8.2.** The ninth table; the third
+  addition after step 4's five columns and step 5's one.
+- **Section 9's "auto-correct" is narrower than it sounds** (decision 3).
+- **`getOpenOrders` takes a pair**, so an unexpected order is only visible on a
+  pair some bot on the account already trades. An order on an untraded symbol —
+  a plausible shape for the key-compromise case section 9 names — is invisible.
+  Widening it means changing section 4.1's interface, which is a step 3 edit.
+- **Section 5.4's rate limiter still gates nothing.** Measured rather than
+  asserted this time: one pass is ~20 weight plus ~26 per distinct pair per 5
+  minutes against 1200/minute, so this job is not the problem. A severe trip
+  cancelling many orders at once is, and that is step 6's open question 7.
+- **Section 10's outbound notification still does not exist.** Every alert this
+  session writes, including a tripped circuit breaker, is silent unless someone
+  looks at the table. That is step 8.
+- **No live network call anywhere in the suite**, per section 14.
+
+### Open questions carried forward
+
+Still open from earlier steps: coverage measurement (2.6); `realizedPnl` and
+`roundToStep` module placement (2.7); `Retry-After` parsed but unused (3.3); a
+`tradeId` of `-1` (3.4); `recvWindow` and clock bias untested against real
+latency (3.5); nothing verifies the API key lacks withdrawal permission (3.6);
+whose exchange account and funds (4.1.1); the production allow-list is empty
+(4.1.2); nothing enforces the empty production database (4.1.3); backups
+(4.1.4); an audit entry can be lost on the capital-releasing paths (5.1);
+`MAX_ALLOCATION_ATTEMPTS` untested under real contention (5.3); the position
+understates what the bot holds after a halt that raced a fill (6.1);
+`AttemptStore` needs `listUnresolved()` (6.2); fees in a third asset are never
+converted (6.3); `sellOnStopLoss` is refused rather than implemented (6.4);
+nothing drives `onPriceUpdate` (6.5); `create()` can leave a bot row with no
+object state (6.6, now at least DETECTED — see decision 11); a halt cancels
+orders one at a time (6.7); nothing tests two concurrent events on one object
+(6.8).
+
+Resolved: step 4's open question 3 (`balance_snapshots.classification` on a
+clean run) — confirmed NULL rather than adding a fourth value, since section 9
+names three drift classes and has no word for a clean result. Step 5's open
+question 2 (nothing reconciles `sum(allocated_capital)` against
+`total_allocated`) — `ledger_allocation_drift` is that check, and it is
+meaningful-tier and deliberately not auto-corrected. Step 3's open question 2
+and step 5's open question 4 are partly addressed: the client still does not
+gate on rate limit, but the cron's own contribution is now measured rather than
+unknown, and `total_balance` now has a real source rather than only a
+placeholder.
+
+New:
+
+1. **The daily-loss half of section 7.3 does not exist** (decision 2). The
+   breaker can be tripped by drift and by hand, and by nothing else. An account
+   bleeding steadily within every per-bot stop-loss will not trip it.
+2. **`orders` has no `cumulative_quote_quantity`** (step 4's open question 5,
+   which said "nothing needs it before step 7"). Step 7 did not need it either,
+   because reconciliation compares `filledQuantity` and `state` rather than
+   average fill price. It would be needed to reconcile the VALUE of a partial
+   fill, which nothing does yet. Still cheap to add; the tables are no longer
+   empty in testing but are still empty in production.
+3. **The balance delta is computed from the OLDEST snapshot across assets**, and
+   each asset's arithmetic then measures from its own baseline. That is correct
+   when every asset was snapshotted in the same run, which is true today because
+   every run writes all of them. A future partial run — one asset skipped
+   because its pair's filters could not be read — would leave the baselines at
+   different times, and the trade window would be wider than one asset needed.
+   The maths still works, because a trade before an asset's own baseline is
+   already inside that baseline, but this has not been tested and I would want
+   it tested before trusting it.
+4. **Nothing tests two reconciliation runs racing.** The cron is one invocation
+   per schedule and D1 has no lock, so two overlapping runs on one account would
+   both read the same baseline and both write snapshots. `latch` is
+   compare-and-swap and the adjustment consumption is batched, so the dangerous
+   parts are safe, but the duplicate snapshots would make the NEXT run's
+   baseline ambiguous — it takes the most recent by `checked_at`, and two rows
+   would share it. Step 5 had to test interleaving explicitly; this session did
+   not.
+5. **The three thresholds are guesses** (decision 5). The section 17 testnet
+   period is where they get real values, and nothing currently records what a
+   typical residual actually looks like — the data will be in
+   `balance_snapshots.discrepancy`, but nobody has looked at a real one.
+6. **`assertAccountArmed` adds a D1 read to every `create` and `resume`.**
+   Cheap and correct, but it means those two paths now fail if the
+   `circuit_breakers` table is missing — which is true of any database that has
+   not had migration 0003 applied. See `docs/d1-provisioning.md` section 3.1.
+   *(Corrected same day: this originally read "including remote testnet right
+   now", which was already false when written. All three migrations were
+   applied to remote testnet and confirmed on 2026-07-22. The claim came from
+   reading section 3.1's stale status rather than querying the database — the
+   exact mistake that section now carries a standing convention against.)*

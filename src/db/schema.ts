@@ -124,6 +124,25 @@ export const manualAdjustments = defineTable("manual_adjustments", {
   created_at: integer(),
 });
 
+/**
+ * Section 7.3's account-wide circuit breaker, added by migration 0003 at step
+ * 7. A missing row means the account has never tripped, which is treated as
+ * `armed` -- see `/src/reconciliation/circuit-breaker.ts`.
+ */
+export type CircuitBreakerState = "armed" | "tripped";
+
+export const circuitBreakers = defineTable("circuit_breakers", {
+  account_label: text(),
+  state: text<CircuitBreakerState>(),
+  reason: nullable(text()),
+  run_id: nullable(text()),
+  tripped_at: nullable(integer()),
+  tripped_by: nullable(text()),
+  reset_at: nullable(integer()),
+  reset_by: nullable(text()),
+  updated_at: integer(),
+});
+
 export const auditLog = defineTable("audit_log", {
   id: text(),
   actor: text(),
@@ -155,6 +174,7 @@ export type BalanceSnapshotRow = Row<typeof balanceSnapshots.columns>;
 export type ManualAdjustmentRow = Row<typeof manualAdjustments.columns>;
 export type AuditLogRow = Row<typeof auditLog.columns>;
 export type AlertRow = Row<typeof alerts.columns>;
+export type CircuitBreakerRow = Row<typeof circuitBreakers.columns>;
 
 /** Every table, for the schema-drift test and for Database's construction. */
 export const ALL_TABLES = {
@@ -166,4 +186,5 @@ export const ALL_TABLES = {
   manualAdjustments,
   auditLog,
   alerts,
+  circuitBreakers,
 } as const;

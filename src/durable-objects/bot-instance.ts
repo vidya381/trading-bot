@@ -74,6 +74,7 @@ import type {
 } from "../shared/exchange-client";
 import { isUsable } from "../shared/downtime";
 import { convertFillFee, type RateLookup } from "../shared/fees";
+import { assertAccountArmed } from "../reconciliation/circuit-breaker";
 import { IdempotencyGuard } from "../shared/idempotency";
 import { mul, toDecimalString, ZERO, type Money } from "../shared/money";
 import {
@@ -337,6 +338,13 @@ export class BotInstance extends DurableObject<Env> {
     const db = this.#db();
     const now = this.#now();
 
+    // Section 7.3, added at step 7. An account whose circuit breaker is
+    // tripped must not gain a new bot: halting everything that existed at the
+    // moment of the trip is not a breaker if the next creation starts trading
+    // straight back into whatever caused it. Checked before any capital is
+    // reserved, so a refusal costs nothing to undo.
+    await assertAccountArmed(db, request.accountLabel, `create bot ${request.botInstanceId}`);
+
     // Before any capital is touched. Section 6.1 checks the allocation against
     // the account; this checks the bot's own ladder against its allocation.
     validateDcaParams(request.params, request.allocatedCapital);
@@ -534,6 +542,14 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
 
+    // Section 7.3, added at step 7. The other half of the latch: a bot halted
+    // BY the circuit breaker must not be resumable while the account is still
+    // tripped, or the breaker lasts exactly as long as it takes someone to
+    // click resume. Re-arming the account is a separate, explicit human action
+    // (`resetAccountCircuitBreaker`), and each bot still has to be resumed
+    // individually afterwards per section 7.2 step 5.
+    await assertAccountArmed(this.#db(), config.accountLabel, `resume bot ${config.botInstanceId}`);
+
     const now = this.#now();
     // `halt_reason` is deliberately NOT cleared: migration 0001's
     // halt_requires_reason CHECK is one-directional precisely so a resumed row
@@ -580,6 +596,29 @@ export class BotInstance extends DurableObject<Env> {
   async snapshot(): Promise<BotSnapshot> {
     const config = await this.#config();
     const state = await this.#state();
+    const entries = await this.ctx.storage.list<TrackedOrder>({ prefix: ORDER_KEY_PREFIX });
+    return { config, state, orders: [...entries.values()] };
+  }
+
+  /**
+   * `snapshot()`, but null instead of throwing when this object holds no state.
+   *
+   * Added at step 7. Reconciliation must be able to tell "this bot has nothing
+   * to compare" from "reading it failed", and it reaches this object over RPC,
+   * across which a thrown `BotInstanceError` arrives without its `code`
+   * property -- so the caller would have to match on message text to
+   * distinguish the two. That is exactly the sort of check that keeps working
+   * until someone rewords an error string.
+   *
+   * The null case is real and already documented: step 6's open question 6
+   * describes a `bot_instances` row whose object was never written, because
+   * capital is reserved and the row inserted before this object's storage is.
+   */
+  async snapshotIfCreated(): Promise<BotSnapshot | null> {
+    const config = await this.ctx.storage.get<DcaConfig>(CONFIG_KEY);
+    const state = await this.ctx.storage.get<BotRuntimeState>(STATE_KEY);
+    if (config === undefined || state === undefined) return null;
+    assertReadableSchema(config.schemaVersion);
     const entries = await this.ctx.storage.list<TrackedOrder>({ prefix: ORDER_KEY_PREFIX });
     return { config, state, orders: [...entries.values()] };
   }
