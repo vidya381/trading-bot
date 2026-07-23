@@ -31,10 +31,23 @@
  *
  * That is handled the same way step 6's decision 13 handled it: there is no
  * default client, and the absence is explicit rather than papered over with
- * one constructed against credentials that do not exist. The check happens
- * BEFORE any D1 access, deliberately -- it means a production deploy, whose
- * database has no schema until go-live (section 16.1), gets a clean no-op
- * instead of a failing query every five minutes.
+ * one constructed against credentials that do not exist.
+ *
+ * ---------------------------------------------------------------------------
+ * NO SCHEMA -> NO-OP
+ * ---------------------------------------------------------------------------
+ * Production is deployed but its D1 database is deliberately empty: migrations
+ * are not applied until go-live (section 16.1). Without a guard, the first D1
+ * read here -- `accountLabels`, which queries `bot_instances` -- throws a raw
+ * `no such table` error every time the cron fires. So before any real query,
+ * `db.tableExists("bot_instances")` is checked, and a missing schema returns a
+ * clean no-op with a reason, exactly like the binding checks above. This is a
+ * proactive, specific check rather than a try/catch: it suppresses ONLY the
+ * "schema not applied yet" case, and any other D1 error still surfaces because
+ * nothing here catches it. An earlier version of this header claimed the
+ * exchange-client check already guarded D1; it did not -- `accountLabels` runs
+ * before the per-account exchange check, so this guard is what actually
+ * delivers that promise.
  */
 
 import { databaseFrom, type Database } from "../db";
@@ -71,6 +84,11 @@ export interface ScheduledOptions {
   readonly limiterFor?: (accountLabel: string) => RateLimiterPort;
   /** How the rate-limit wait is performed. Injected so tests need no delay. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /**
+   * The database. Defaults to `databaseFrom(env)`. Overridable for tests (and,
+   * later, a dashboard "reconcile now" button) without reaching for the binding.
+   */
+  readonly db?: Database;
 }
 
 /** No credentials exist yet, in either environment. See the file header. */
@@ -149,7 +167,24 @@ export async function runScheduledReconciliation(
     };
   }
 
-  const db = databaseFrom(env);
+  const db = options.db ?? databaseFrom(env);
+
+  // No schema yet -> clean no-op. Production is deployed with an empty database
+  // (migrations deferred to go-live, section 16.1); without this the first read
+  // below throws `no such table: bot_instances` every five minutes. A specific
+  // check, not a try/catch: only a missing schema is suppressed, and any other
+  // D1 error still surfaces because nothing here catches it. See the header.
+  if (!(await db.tableExists("bot_instances"))) {
+    return {
+      ran: false,
+      reason:
+        "no schema in this environment yet (the `bot_instances` table does not " +
+        "exist). Migrations are deferred to go-live (section 16.1). See " +
+        "docs/d1-provisioning.md.",
+      runs: [],
+    };
+  }
+
   const labels = await accountLabels(db);
   const runs: ReconciliationRunResult[] = [];
 

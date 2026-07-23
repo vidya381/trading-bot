@@ -3512,3 +3512,88 @@ namespace enters `wrangler.jsonc`.
    `controller.cron` handles it as two separate invocations, tested by the routing
    logic but, like every cron and binding in this project, not yet verified
    against the real Cloudflare platform.
+
+---
+
+## Step 10.1: no-schema guard on the cron Workers
+Date: 2026-07-23
+
+A scoped fix between build steps, not a step of its own, like step 3.1.
+
+### What changed
+
+The production Worker is now deployed, but its D1 database is intentionally
+empty — migrations are deferred to go-live (section 16.1). Both cron handlers
+fire on that schedule regardless, and both reached D1 before anything told them
+the schema was absent: reconciliation at `accountLabels` (which reads
+`bot_instances`), notification dispatch at `dispatchPendingAlerts` (which reads
+`alerts`). Each threw a raw `D1_ERROR: no such table` — reconciliation every five
+minutes, dispatch every minute — logged as a real error against a state that is
+expected and correct.
+
+`Database.tableExists(name)` was added (a `sqlite_master` lookup, inside /src/db
+so `no-raw-d1` still passes; `sqlite_master` exists even on an empty database, so
+the check itself never throws). Both Workers now call it before their first real
+query and return the same `ran: false` + reason shape already used for a missing
+binding or secret — logged by the existing handlers as "did not run: …".
+`runScheduledReconciliation` gained a `db?` option, symmetric with dispatch's,
+for the propagation test and eventual dashboard reuse. The reconciliation
+header's claim that the exchange-client check already guarded D1 was corrected:
+it never did — `accountLabels` runs before the per-account exchange check — so
+this guard is what actually delivers the "clean no-op, not a failing query"
+the header had promised.
+
+Three files changed (`src/db/database.ts`, `src/workers/reconciliation.ts`,
+`src/workers/notifications.ts`), one test file added. 1017 tests (up from 1010),
+typecheck clean.
+
+### Decisions made
+
+**1. A proactive `tableExists` check, not a try/catch around the D1 work.**
+
+A specific check reads better against the brief's own warning and matches every
+other guard in these two Workers — the missing-binding and missing-secret checks
+are all proactive and all return `ran: false` with a reason. More importantly, it
+cannot swallow anything: there is no catch block, so a genuine D1 error — a
+constraint or type failure — propagates untouched. Only `tableExists === false`
+produces the no-op.
+
+*A `try { … } catch (e) { if (isMissingTableError(e)) … }` — rejected.* It would
+work, and re-throwing everything but the classified case is not "swallowing", but
+it inverts the safe default: a catch wide enough to see the missing-table error is
+wide enough to mis-handle a future error someone forgets to re-throw. Matching a
+raw D1 error string (`/no such table/`) is also more brittle than asking
+`sqlite_master` a direct question.
+
+**2. Each Worker checks the specific table it is about to read** (`bot_instances`
+for reconciliation, `alerts` for dispatch), not a shared "is the schema there"
+sentinel. Migration 0001 creates every table at once, so any one is
+representative — but naming the table each Worker actually depends on makes the
+no-op reason say exactly what was missing, and keeps the two Workers independent.
+
+### Confirmed unchanged
+
+Where the schema exists — testnet, and production after go-live — `tableExists`
+returns true and both Workers proceed exactly as before; the only added cost is
+one `sqlite_master` lookup per cron fire. Tested directly: the schema-present
+cases assert both Workers run (`ran: true`), and the whole prior suite is
+unchanged at 1017 passing.
+
+### Test coverage
+
+`src/workers/schema-guard.test.ts`, seven tests. The no-schema cases run first,
+against a genuinely empty `env.DB` (a test file starts schema-less; verified with
+a throwaway probe before writing these), and assert each Worker returns the clean
+no-op reason rather than throwing. The schema-present cases assert `tableExists`
+is true/false correctly and both Workers proceed. The propagation cases inject a
+`Database` whose `tableExists` passes but whose first query throws a
+non-missing-table error, and assert it surfaces — proving the guard suppresses
+only the missing-schema case.
+
+### Open questions carried forward
+
+1. **The guard is verified against miniflare's D1, not the real empty production
+   database.** The failure it fixes was observed in production logs; the fix is
+   tested locally. Confirming the production cron logs now show the clean no-op
+   instead of the raw error is a one-look check against the deployed Worker's
+   logs, not something the suite can assert.

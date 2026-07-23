@@ -71,6 +71,24 @@ describe("DiscordNotifier payload", () => {
     expect(embed.footer.text).toBe("alert alert-1");
   });
 
+  it("formats created_at as its real millisecond instant, not a seconds misread", async () => {
+    // `Timestamp` is milliseconds since the epoch (all writers use Date.now()),
+    // and the formatter must render THAT instant -- not a seconds value scaled
+    // as if it were milliseconds, which lands in Jan 1970. This asserts the
+    // rendered timestamp round-trips back to the exact created_at, and that the
+    // year is the real one, so any future seconds-vs-ms slip fails loudly here.
+    const createdAt = Date.UTC(2025, 9, 9, 8, 53, 20); // 2025-10-09T08:53:20Z, a real ms instant
+    const { fetch, calls } = recordingFetch(new Response(null, { status: 204 }));
+    await new DiscordNotifier(MOCK_URL, { fetch }).send(alert({ createdAt }));
+
+    const embed = JSON.parse(calls[0]!.init!.body as string).embeds[0];
+    // Round-trips to the exact instant it was given.
+    expect(new Date(embed.timestamp).getTime()).toBe(createdAt);
+    // And is the real year -- a seconds-as-ms misread would render 1970.
+    expect(new Date(embed.timestamp).getUTCFullYear()).toBe(2025);
+    expect(embed.timestamp).toBe("2025-10-09T08:53:20.000Z");
+  });
+
   it("labels account-wide alerts in the Bot field", async () => {
     const { fetch, calls } = recordingFetch(new Response(null, { status: 204 }));
     await new DiscordNotifier(MOCK_URL, { fetch }).send(

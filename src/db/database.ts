@@ -66,6 +66,27 @@ export class Database {
     if (statements.length === 0) return;
     await this.#d1.batch(statements as D1PreparedStatement[]);
   }
+
+  /**
+   * Whether a table exists in this database.
+   *
+   * Added at step 8's follow-up so the cron Workers can tell "the schema has
+   * not been applied yet" (production before go-live, section 16.1) from a
+   * genuine failure. It queries `sqlite_master`, which always exists -- even on
+   * an empty database -- so this method itself never throws `no such table`.
+   * The result is a boolean, so a caller guards on it without a try/catch and
+   * without intercepting any other error.
+   *
+   * The raw statement is allowed here because this file is inside /src/db; the
+   * `no-raw-d1` build check forbids it only elsewhere.
+   */
+  async tableExists(name: string): Promise<boolean> {
+    const row = await this.#d1
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+      .bind(name)
+      .first();
+    return row !== null;
+  }
 }
 
 /**

@@ -128,6 +128,22 @@ export async function runNotificationDispatch(
   // binding, which `databaseFrom` refuses if absent (a deploy with no --env).
   const db = options.db ?? databaseFrom(env);
 
+  // No schema yet -> clean no-op. Production is deployed with an empty database
+  // (migrations deferred to go-live, section 16.1); without this the dispatch
+  // read below throws `no such table: alerts` every minute. A specific check,
+  // not a try/catch: only a missing schema is suppressed, and any other D1
+  // error still surfaces because nothing here catches it. Mirrors the
+  // reconciliation Worker's guard.
+  if (!(await db.tableExists("alerts"))) {
+    return {
+      ran: false,
+      reason:
+        "no schema in this environment yet (the `alerts` table does not exist). " +
+        "Migrations are deferred to go-live (section 16.1). See " +
+        "docs/d1-provisioning.md.",
+    };
+  }
+
   const result = await dispatchPendingAlerts({
     db,
     notifier,
