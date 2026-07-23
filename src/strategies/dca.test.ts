@@ -34,6 +34,7 @@ const params: DcaParams = {
 };
 
 const config: DcaConfig = {
+  strategy: "dca",
   schemaVersion: DCA_SCHEMA_VERSION,
   botInstanceId: "dca-btc-1",
   accountLabel: "main",

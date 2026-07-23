@@ -2886,3 +2886,390 @@ New:
    configuration.** Step 7's drift thresholds were made per-account
    configurable specifically so the testnet period could tune them; this was
    not, and the same argument applies to it.
+
+---
+
+## Step 9: Grid strategy
+Date: 2026-07-22
+
+> This entry was opened at the START of the step 9 session, after the four
+> questions below were answered but before any code was written, and completed at
+> the end. The four-questions section is the design decided up front; the "what
+> was built" section onward is the record of the work.
+>
+> A note on test counts, since this entry has to pick numbers. Step 8's entry
+> claims 923 tests; the measured baseline at the start of this session was **918
+> across 31 files**. The discrepancy predates this session and nobody has
+> established which figure was wrong, so it is recorded rather than silently
+> reconciled. This session's figures are all measured: it ended at **971 tests
+> across 33 files, passing, typecheck clean** — 918 baseline, plus 39 pure grid
+> tests and 14 grid Durable Object tests.
+
+### What was built
+
+`src/strategies/grid.ts`: the whole of section 6.2 as pure functions, a sibling
+to `dca.ts` with the same no-I/O separation so section 13's backtest can reuse
+it. Ladder construction for both spacing types, the replace-on-fill rule, the
+stop-loss / breakout / accumulated-take-profit thresholds, validation, and the
+D1 `encodeGridParams` / `decodeGridParams` gate. `src/strategies/grid.test.ts`:
+39 pure tests.
+
+`src/durable-objects/bot-instance.ts`: made strategy-polymorphic rather than
+forked into a second Durable Object, per the note the RateLimiter session left.
+The config is now `DcaConfig | GridConfig`, discriminated by a `strategy` field;
+`onPriceUpdate`, `onFill` and creation branch on it; every strategy-agnostic
+method (`#halt`, `#cancelOpenOrders`, `#ensureFilters`, the mirrors, `#alert`,
+`#audit`) was widened to a shared `BotConfigBase` and is reused unchanged. The
+grid branch adds `#gridOnPrice`, `#placeInitialLadder`, `#placeGridOrder`,
+`#applyGridFillToOrder`, `#applyGridExitFill`, `#gridExit` and
+`#placeLiquidationSell`. `src/durable-objects/grid-bot-instance.test.ts`: 14
+tests against real D1 and real Durable Object storage, mocked exchange, per
+section 14.
+
+Small edits outside the new files, listed so none is invisible: `dca.ts` gained
+a required `strategy: "dca"` on `DcaConfig`; `strategies/index.ts` re-exports the
+two strategies as namespaces (they deliberately share names); two test fixtures
+(`dca.test.ts`, `reconcile.test.ts`) and one DCA assertion
+(`bot-instance.test.ts`) gained the `strategy` discriminator; the two folder
+READMEs were updated. No migration, no schema change: grid reuses
+`bot_instances.strategy_type` (already `'grid' | 'dca'`) and the `unknown`
+`strategy_params_json` column, exactly as step 6 anticipated when it kept that
+column `unknown` "because grid will write a different shape at step 9".
+
+### Reusing the object, not forking it — and what that cost
+
+The RateLimiter session's closing note said grid "needs a grid-specific planner
+and grid-specific stored state, plumbed through the same object." That is what
+was done. The judgement worth recording is where the seam fell.
+
+`DcaConfig` had no `strategy` field. Adding a required one is the clean
+discriminator, but it means `#config()` reads a config that legacy stored state
+would lack. Rather than a schema-version bump, an ABSENT `strategy` is read as
+`"dca"` (`normalizeConfig`) — the section-16-additive treatment, and safe
+because no exchange client has ever run, so there is no stored state to be wrong
+about. Recorded so the one untested read path is visible.
+
+The runtime state was the harder call. `BotRuntimeState` gains an OPTIONAL
+`ladder?: GridLadder` rather than becoming a discriminated union. A union is
+cleaner in the abstract, but it would have forced ~20 DCA test accesses to
+`state.position` and the reconciliation fixture to narrow on a discriminator,
+which is churn on working tests for a type-level nicety. Instead a grid bot
+leaves `position` at `EMPTY_POSITION` and `cycleCount` at 0, a DCA bot leaves
+`ladder` absent, and the authoritative discriminator is always
+`config.strategy`. The honest cost: two inert fields on a grid bot, and a
+`state` shape that permits combinations `config.strategy` forbids. The
+alternative's cost was higher and fell on code that already works.
+
+### Decisions made
+
+**1. Buys-only initial ladder, and it is idempotent by slot occupancy.**
+
+Question 2 settled that a started grid places only the buy ladder below spot.
+`#placeInitialLadder` places at each below-spot level whose slot is still empty,
+and marks the ladder `placed` only once no order was throttled. The
+slot-occupancy check is load-bearing: without it, a throttled partial placement
+would re-enter with `placed` still false and mint fresh sequences for levels
+already live, double-placing them. With it, a re-entry fills only the holes. A
+hard rejection (a filter failure the exchange refuses) halts, as everywhere
+else.
+
+**2. The grid exit is built ON TOP of the shared `#halt`, not beside it.**
+
+Section 6.2 step 4 is "cancel all open orders, sell any held position, halt."
+The cancel-and-halt is exactly `#halt`, including step 6's decision-2 ordering
+(mark halted BEFORE cancelling, so a crash mid-cancel leaves a halted bot with
+live orders — visible and safe — rather than a running bot with some cancelled).
+So `#gridExit` calls `#halt` unchanged and layers only the liquidation sell on
+top. The consequence worth stating: a MANUAL halt (section 7.2) does NOT
+liquidate — only the three grid exit reasons (stop-loss, breakout, take-profit)
+do. That matches DCA, whose `sellOnStopLoss` is refused precisely so an auto-sell
+at a loss is never implicit. The grid genuinely differs from DCA here, and it
+differs because section 6.2 step 4 says to sell where section 6.3 step 5 says to
+halt-and-hold; the two strategies were specified differently and are built
+differently.
+
+**3. The liquidation is a marketable LIMIT, and it can fail to fill. Stated,
+not hidden.**
+
+Section 4.5 rules out market orders. So "sell any held position" cannot be a
+market sell; it is a limit at the triggering price, which is marketable (it
+crosses the spread) and fills immediately in a normal book. In a fast drop —
+which is exactly when a stop-loss fires — that limit may not fill, and the bot
+is then left halted holding a resting sell. This is alerted
+(`liquidation_unresolved` / `_throttled` / `_not_constructible`) and the fill,
+whenever it lands, is folded through `#applyGridExitFill`; it is never pretended
+to have happened. This is the real limit of a market-order-free stop-loss on a
+falling market, and it is the one place in this strategy where the safe-by-
+default posture (section 4.5) and the risk control (section 6.2 step 4) are in
+genuine tension. See open question 1.
+
+**4. Each sell carries its buy's cost basis; realized profit is exact per round
+trip.**
+
+Per question 3's ladder model. `planFill` on a sell that completes a round trip
+realizes `(sellPrice - costBasis) x quantity` and nothing else, where
+`costBasis` is the price of the buy that funded that sell, recorded on the slot
+when the replacement was created. The alternative — one blended average cost —
+was rejected because section 6.2 step 6's take-profit triggers on "accumulated
+realized profit", and a blended figure would make that an average-cost artefact
+rather than the sum of what the grid actually earned. Realized profit lives in
+`ladder.realizedGross`, and `state.realizedGross` (the field DCA also uses) is
+kept equal to it, so the shared field is meaningful for both strategies and
+nothing is double-counted.
+
+**5. Geometric spacing uses an integer root, not `Math.pow`.**
+
+`(upper/lower)^(1/(n-1))` needs an nth root, which `money.ts` does not have.
+Using `Math.pow` and snapping to `Money` would put a float in the middle of a
+price calculation, which section 5.2 exists to forbid. Instead the ratio is
+found by binary search over bigint — the largest `r` with `r^(n-1) <= target`,
+rounded to nearest — and the interior levels are built by repeated
+multiplication with BOTH bounds pinned exactly. The pinning means the small
+undershoot a floored ratio produces is absorbed into the top rung rather than
+walking the grid off the bounds a human chose. `buildLevels` is deterministic,
+which is what lets the creation-time capital check and run-time placement agree
+on where the lines are. The root helper is private to `grid.ts`, following the
+precedent that `additionalOrderSizeFor` (compounding, strategy-shaped) lives in
+`dca.ts` rather than `money.ts`.
+
+**6. The capital check is peak buy-side exposure, `orderSize x (gridLines - 1)`.**
+
+The grid analogue of DCA's `plannedTotalSpend`. The most quote a buys-only grid
+can commit at once is every buy level live simultaneously; the top line only
+ever holds a sell, so that is `gridLines - 1` levels. `validateGridParams`
+refuses a ladder that cannot cover that from its allocation, before any capital
+is reserved — the same failure DCA's check prevents, a bot created happily that
+then cannot fund an order mid-run with a position open (section 7.5 → halt).
+
+**7. Point 6 answered here, not decided here.** The session brief asked me to
+recommend rather than decide whether to add Binance's cancel-all-orders-on-
+symbol endpoint. My recommendation is question 1 above: **do not add it now.**
+The reasons in full are in that question; the short form is that throttling is
+not the binding cost (a 20-line ladder is 20 weight against a 200/minute
+reserve), the endpoint's blast radius is the whole account's orders on the
+symbol — which section 3 permits a second bot to share — and nothing has ever
+made a real exchange call, so the latency being optimised is unmeasured and
+section 17 already schedules a real cancellation-storm measurement before
+go-live. Serial-but-throttled cancellation is correct and acceptable for a first
+version. This remains the account owner's call to confirm.
+
+### Deviations from the spec
+
+- **Section 6.2 step 2's "sell orders above" at start is not implemented as
+  written** (decision 1 / question 2). A quote-funded bot has no base to sell;
+  the sell side is built by replace-on-fill.
+- **Section 6.2 step 5's "significantly above" was given a threshold the spec
+  omits** — one grid step by default (question 4) — and the cash-out defaults
+  ON as the spec directs.
+- **Section 6.2 step 4's "sell any held position" is a limit, not a market,
+  order** (decision 3), because section 4.5 forbids market orders. It can rest
+  unfilled.
+- **`take_profit_pct` is written NULL for a grid bot.** Grid take-profit is an
+  accumulated profit AMOUNT in the params, not a percentage, and section 6.1
+  makes it only "recommended" for grid. Migration 0001's DCA-only take-profit
+  CHECK permits this.
+- **Section 5.4's rate limiter still gates every grid order**, including the
+  serial halt cancellations (unchanged from step 8) and now the liquidation
+  sell, all at risk-exit priority.
+- **Section 10's outbound notification still does not exist**, so every grid
+  alert added here — `liquidation_unresolved`, `liquidation_failed`,
+  `liquidation_not_constructible` — is silent unless someone reads the table.
+  That is step 8 proper (alerts), still not built.
+- **No live network call anywhere in the suite**, per section 14.
+
+### Open questions carried forward
+
+Still open from earlier steps, unchanged: coverage measurement (2.6);
+`realizedPnl`/`roundToStep` placement (2.7); `Retry-After` unused (3.3); a
+`tradeId` of `-1` (3.4); `recvWindow`/clock bias untested against real latency
+(3.5); nothing verifies the API key lacks withdrawal permission (3.6); whose
+exchange account and funds (4.1.1); the production allow-list is empty (4.1.2);
+nothing enforces the empty production database (4.1.3); backups (4.1.4); an
+audit entry can be lost on the capital-releasing paths (5.1);
+`MAX_ALLOCATION_ATTEMPTS` untested under real contention (5.3); the position
+understates what the bot holds after a halt that raced a fill (6.1);
+`AttemptStore` needs `listUnresolved()` (6.2); fees in a third asset are never
+converted (6.3); `sellOnStopLoss` is refused rather than implemented for DCA
+(6.4); nothing drives `onPriceUpdate` (6.5); `create()` can leave a bot row with
+no object state (6.6); the daily-loss half of section 7.3 does not exist (7.1);
+`orders` has no `cumulative_quote_quantity` (7.2); the balance delta from the
+oldest snapshot across assets (7.3); nothing tests two reconciliation runs
+racing (7.4); the drift thresholds are guesses (7.5); the rate-limit reserve is
+one sixth for every account with no per-account config (8.7); nothing has ever
+made a real exchange call (8.1); a grid halt is serial and throttling makes it
+slower (8.2, and see decision 7 — now a considered decision rather than an open
+question, pending the account owner's confirmation); `maxWaitMs` exceeded is
+reported but not escalated (8.3); two DO round trips per exchange call (8.4);
+budget consumed on grant is not returned on a local failure (8.5); a
+re-presented ticket keeps its original weight (8.6).
+
+New:
+
+1. **A grid stop-loss liquidation can fail to fill, and the position is then
+   held on a halted bot** (decision 3). The limit is marketable but a fast drop
+   can outrun it, and section 4.5 leaves no market-order fallback. It is alerted
+   and reconciliation-visible, not silently dropped, but "the stop-loss sold the
+   position" is only true when the limit fills. The section 17 testnet period,
+   which must see the stop-loss fire at least once, is where this gets observed
+   against a real book — and it is the specific thing to watch, because a
+   stop-loss that halts but does not sell is the failure a stop-loss exists to
+   prevent.
+2. **The liquidation order lives in `openOrderIds` but not in a ladder slot**,
+   because it is a whole-position sell, not a level order. Nothing recomputes
+   `openOrderIds` from the ladder after an exit (the bot is halted and only the
+   liquidation fill arrives), so this is safe today, but it is a latent coupling:
+   a future code path that rederived `openOrderIds` from the ladder slots would
+   silently drop the liquidation order. Worth a guard if the ladder ever drives
+   `openOrderIds` on a halted bot.
+3. **Grid is not exercised by reconciliation's tests.** `reconcile.ts` reads
+   only base state (`openOrderIds`, `orders`) and a grid `BotSnapshot` satisfies
+   that, so it should work, but no test drives a grid bot through a reconciliation
+   run. The interaction is untested, not known-broken.
+4. **The initial ladder places serially, like the halt cancels serially.** A
+   wide grid starting on a busy account issues N buys one at a time through the
+   budget. Decision 7's reasoning about the halt applies symmetrically to the
+   start, and the same measurement resolves both.
+5. **A geometric ladder's interior levels drift slightly high** because the
+   floored ratio undershoots and the top bound is pinned, widening the top rung.
+   Deterministic and small, but the rungs are not exactly equal-ratio; the test
+   asserts they are equal to within a few satoshi rather than exactly. A real
+   grid's tickSize rounding at placement dwarfs this, but it is a real property
+   of the construction and is recorded rather than smoothed over.
+
+### Four questions asked before writing anything
+
+Section 6.2 is eleven lines and three of them turned out to be underspecified in
+a way that changes what gets built. The fourth question is the rate-limiting
+concern step 8's open question 2 explicitly deferred to this step. All four were
+put to the account owner up front and all four confirmed the recommended
+reading.
+
+**1. A grid halt stays SERIAL; the cancel-all endpoint is not added.** *(asked,
+confirmed)*
+
+Step 8's open question 2 left this for step 9: cancellations go out one at a
+time, each now correctly waiting for risk-exit budget, and Binance has a
+cancel-all-open-orders-on-a-symbol endpoint that would make a ladder halt one
+request instead of many. It is not in section 4.1's interface. The
+recommendation was to leave it there, for three reasons, in ascending order of
+how much they matter.
+
+- **Throttling is not the binding cost, and saying it is would be wrong.** A
+  cancellation is weight 1. A twenty-line ladder is twenty weight against a
+  risk-exit reserve of two hundred per minute, so the reserve absorbs an entire
+  ladder several times over and the budget refuses nothing. What actually makes
+  a serial halt slow is the round trips — two Durable Object hops plus one HTTPS
+  request per order, at the 100–250ms Cloudflare-to-Binance latency section 12
+  quotes. Framing this as a rate-limiting problem would be optimising the wrong
+  thing.
+- **The endpoint's blast radius is wider than a bot.** It cancels every open
+  order on the symbol for the whole ACCOUNT, and section 3's isolation principle
+  permits two bots on one account and one pair — a grid and a DCA on BTCUSDT is
+  exactly the two-strategy arrangement v1 is designed around. One bot halting
+  would silently cancel the other's orders, with nothing in the second bot's
+  state recording that it happened; it would surface as order-state drift in
+  section 9 reconciliation, one halt later. The per-order path structurally
+  cannot do this. Making the batch path safe means a guard proving this bot is
+  the only one on that (account, pair), which is a D1 read and more moving parts
+  than the loop it replaces.
+- **Nothing has ever made a real exchange call** (step 8's open question 1). The
+  latency being optimised is unmeasured, and section 17's checklist already
+  requires a real cancellation storm to be observed against testnet before
+  go-live. Building the optimisation first means choosing it over a measurement
+  that is already scheduled.
+
+*Adding it now — rejected*, per the above. *Revisit at:* the section 17 testnet
+verification, which is where a real ladder halt gets timed. If a full ladder
+takes long enough to matter, this is the fix, and the blast-radius guard is what
+it needs to ship with.
+
+**2. A started grid places BUYS ONLY; every sell is created by replace-on-fill.**
+*(asked, confirmed)*
+
+Section 6.2 step 2 says a started bot "places the full ladder of buy orders
+below and sell orders above". It cannot. Step 6's decision 10 denominated order
+sizes and `allocated_capital` in the QUOTE asset, so a freshly created bot holds
+no base asset and has nothing to sell. The literal reading is unfundable on the
+first pass.
+
+Resolved as: the buy ladder goes out below spot, and a sell exists only once the
+buy one level below it has filled and paid for it. That is self-funding by
+construction — the replace-on-fill rule of section 6.2 step 3 is what builds the
+upper half of the ladder — and it is ordinary long-grid behaviour for a
+quote-funded bot.
+
+*Buying the initial inventory at start — rejected.* It satisfies the sentence
+literally, and it does so by spending a large part of the allocation at spot the
+moment the bot starts, which is a directional bet the strategy is otherwise not
+making. A grid's premise is that it profits from oscillation without taking a
+view; opening it with a single large market-adjacent buy takes one.
+
+*Requiring pre-existing base holdings via an `initialBaseInventory` parameter —
+rejected.* It would make the bot's stored state depend on an operator assertion
+nothing verifies, and section 9's reconciliation would report the mismatch as
+drift the first time the claim was wrong — which is a risk control firing
+because of a configuration field, not because of a trading event.
+
+**3. Ladder state is a stored levels array plus one slot per level, and each
+sell carries the cost basis of the buy that funded it.** *(asked, confirmed)*
+
+The prices are constructed once when the bot starts and persisted, rather than
+recomputed from the parameters on each pass. This follows the reasoning DCA used
+for storing `averageEntryPrice` even though it is derivable: the number the bot
+placed orders against is the number that was recorded, not one re-derived later
+from rounded inputs.
+
+Beside them sits one slot per level holding `{side, clientOrderId, costBasis}`.
+Section 6.2 step 3's rule — a filled buy places a sell one level above, a filled
+sell places a buy one level below — is then a change of two adjacent slots
+rather than a search through a list, and "at most one live order per level" is
+true by construction rather than by check.
+
+`costBasis` is what makes realized profit exact. A grid's profit is inherently
+per round trip: a sell at level i+1 that replaced a buy at level i earns
+`(price[i+1] - price[i]) x quantity` and nothing else. Pairing them at the
+moment the replacement sell is created records that directly.
+
+*Deriving the level prices and storing only the live orders — rejected.* Less
+stored state, but the one-order-per-level invariant becomes a runtime assertion,
+and profit needs a separate cost model bolted on beside it.
+
+*A single weighted-average inventory cost instead of per-level pairing —
+rejected.* One number is simpler and it blends levels, so per-round-trip profit
+stops being exact — which matters because section 6.2 step 6's optional
+take-profit triggers on "accumulated realized profit", and that figure would
+then be an average-cost artefact rather than the sum of what the grid actually
+earned.
+
+**4. "Significantly above the highest grid line" means one grid step above it,
+by default.** *(asked, confirmed)*
+
+Section 6.2 step 5 defines the upside breakout qualitatively and supplies no
+threshold, unlike step 4's stop-loss, which is explicitly "by the configured
+percentage". Resolved by defaulting the threshold to the ladder's own spacing:
+one full level above the top line, configurable to override.
+
+The ladder's spacing is the only scale section 6.2 actually supplies, and it
+carries the right meaning — price has moved past the point where the grid could
+have placed another sell, which is precisely the "idle with no sell orders
+remaining" state step 5 exists to avoid.
+
+*A fixed default percentage — rejected.* Predictable, and a number invented here
+with nothing behind it. Step 7's entry already criticised its own drift
+thresholds on exactly this ground; repeating it deliberately would be worse than
+doing it once by accident.
+
+*Making it a mandatory parameter with no default — rejected.* Nothing is
+guessed, but it adds a required field the spec never asks for, and whoever
+creates the bot still has to invent the number — the same guess, relocated to
+someone with less context.
+
+### The default itself, stated plainly
+
+Section 6.2 step 5 says the cash-out behaviour "should be configurable but
+defaults to on", and the session brief asked for the spec's stated default to be
+followed exactly. So: **`breakoutTakeProfit` defaults to TRUE.** A strong break
+above the highest line cancels the remaining ladder, sells the held position and
+halts, as a take-profit event. Configured off, the bot takes no special action
+and is left idle above its own ladder, which is the state the default exists to
+prevent.

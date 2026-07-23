@@ -92,7 +92,7 @@ import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
 import { assertAccountArmed } from "../reconciliation/circuit-breaker";
 import { IdempotencyGuard } from "../shared/idempotency";
-import { mul, toDecimalString, ZERO, type Money } from "../shared/money";
+import { divideRounded, mul, toDecimalString, ZERO, type Money } from "../shared/money";
 import {
   applyFill,
   closeOrder,
@@ -116,6 +116,24 @@ import {
   type DcaParams,
   type DcaPosition,
 } from "../strategies/dca";
+import {
+  decide as gridDecide,
+  emptyLadder,
+  encodeGridParams,
+  GRID_SCHEMA_VERSION,
+  assertReadableSchema as assertReadableGridSchema,
+  levelOf,
+  openOrderIds as ladderOpenOrderIds,
+  planFill,
+  validateGridParams,
+  withSlot,
+  type GridConfig,
+  type GridHaltReason,
+  type GridLadder,
+  type GridOrderIntent,
+  type GridParams,
+  type GridSlot,
+} from "../strategies/grid";
 import { DurableObjectAttemptStore } from "./attempt-store";
 
 // ---------------------------------------------------------------------------
@@ -128,6 +146,22 @@ const ORDER_KEY_PREFIX = "order:";
 
 function orderKey(clientOrderId: string): string {
   return `${ORDER_KEY_PREFIX}${clientOrderId}`;
+}
+
+/**
+ * Read a stored config, treating an absent `strategy` as `"dca"`.
+ *
+ * The `strategy` discriminator was added at step 9; any config written by step 6
+ * lacks it. Rather than a schema-version bump and a migration, absence is read
+ * as DCA -- the section-16-additive treatment. There is no such stored state
+ * today (no exchange client has ever run), so this is belt-and-braces for the
+ * one field that would otherwise be `undefined` on a legacy row.
+ */
+function normalizeConfig(stored: BotConfig): BotConfig {
+  if ((stored as { strategy?: string }).strategy === undefined) {
+    return { ...(stored as DcaConfig), strategy: "dca" };
+  }
+  return stored;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,13 +225,66 @@ export interface BotInstanceDependencies {
   readonly sleep?: (ms: number) => Promise<void>;
 }
 
-/** This object's persisted runtime state, beside its configuration. */
+/**
+ * The two strategy configurations this one object serves (step 9).
+ *
+ * Reusing the existing `BotInstance` rather than building a second Durable
+ * Object, per the note the RateLimiter session left: the lifecycle, halt, order
+ * placement, mirroring and rate limiting are all strategy-agnostic and already
+ * built. Only the planner and the stored strategy state differ, and both are
+ * plumbed through here, discriminated by `config.strategy`.
+ */
+export type BotConfig = DcaConfig | GridConfig;
+
+/**
+ * The fields both strategy configs share, which every strategy-agnostic method
+ * depends on. Both `DcaConfig` and `GridConfig` structurally satisfy this, so a
+ * shared method can take `BotConfigBase` and be handed either.
+ */
+export interface BotConfigBase {
+  readonly strategy: "dca" | "grid";
+  readonly schemaVersion: number;
+  readonly botInstanceId: string;
+  readonly accountLabel: string;
+  readonly exchange: string;
+  readonly pair: string;
+  readonly capitalAsset: string;
+  readonly allocatedCapital: Money;
+}
+
+/** A halt reason from either strategy. `#halt` is shared, so it accepts both. */
+export type HaltReason = DcaHaltReason | GridHaltReason;
+
+/**
+ * This object's persisted runtime state, beside its configuration.
+ *
+ * The lifecycle fields (status, sequence, open orders, halt, price, filters) are
+ * shared by both strategies. `realizedGross` and `exitOrderId` are shared too --
+ * grid accumulates realized profit in the same field and tracks its liquidation
+ * order the same way. The strategy-specific state is:
+ *
+ *  - DCA: `position` and `cycleCount`;
+ *  - grid: `ladder`.
+ *
+ * A given bot populates only its own strategy's state. `ladder` is optional
+ * rather than a discriminated arm so the DCA state written by step 6 remains
+ * valid unchanged; a DCA bot leaves it absent, a grid bot leaves `position` at
+ * `EMPTY_POSITION` and `cycleCount` at 0. The authoritative discriminator is
+ * always `config.strategy`, not the presence of a field here.
+ */
 export interface BotRuntimeState {
   readonly schemaVersion: number;
   readonly status: BotStatus;
-  /** Completed take-profit cycles (section 6.3 step 6). */
+  /** DCA: completed take-profit cycles (section 6.3 step 6). Inert for grid. */
   readonly cycleCount: number;
+  /** DCA position. `EMPTY_POSITION` and inert for a grid bot. */
   readonly position: DcaPosition;
+  /**
+   * Grid ladder (section 6.2), absent for a DCA bot. The grid-specific stored
+   * state the step 9 brief calls for: level prices, per-level slots, held
+   * position, and accumulated realized profit.
+   */
+  readonly ladder?: GridLadder;
   /**
    * Next idempotency sequence number to use.
    *
@@ -214,11 +301,15 @@ export interface BotRuntimeState {
   readonly haltedAt: Timestamp | null;
   readonly lastPrice: Money | null;
   readonly lastPriceAt: Timestamp | null;
-  /** Gross realized profit across completed cycles, before fees. */
+  /** Gross realized profit: DCA cycles or grid round trips, before fees. */
   readonly realizedGross: Money;
   /** Cached symbol filters (section 4.3), refreshed when stale. */
   readonly filters: SymbolFilters | null;
-  /** Set while a take-profit sell is live, so a fill is attributed correctly. */
+  /**
+   * Set while an exit sell is live, so its fill is attributed to the exit rather
+   * than to strategy state. DCA: the take-profit sell. Grid: the stop-loss,
+   * breakout, or take-profit liquidation sell.
+   */
   readonly exitOrderId: string | null;
 }
 
@@ -235,6 +326,19 @@ export interface CreateDcaBotRequest {
   readonly actor: string;
 }
 
+export interface CreateGridBotRequest {
+  readonly botInstanceId: string;
+  readonly accountLabel: string;
+  readonly exchange: string;
+  readonly pair: Pair;
+  /** The asset the allocation and every order size is denominated in. */
+  readonly capitalAsset: Asset;
+  readonly allocatedCapital: Money;
+  readonly params: GridParams;
+  /** `audit_log.actor`: an authenticated email, or 'system'. */
+  readonly actor: string;
+}
+
 /** What happened on one pass of the event pipeline, for tests and the dashboard. */
 export interface PipelineResult {
   readonly status: BotStatus;
@@ -243,7 +347,7 @@ export interface PipelineResult {
 }
 
 export interface BotSnapshot {
-  readonly config: DcaConfig;
+  readonly config: BotConfig;
   readonly state: BotRuntimeState;
   readonly orders: readonly TrackedOrder[];
 }
@@ -327,7 +431,7 @@ export class BotInstance extends DurableObject<Env> {
    * The ONLY way this object reaches the exchange. `#deps().exchange` is the
    * raw client and is not called anywhere outside this method.
    */
-  #exchange(config: DcaConfig, priority: RequestPriority): RestExchangeClient {
+  #exchange(config: BotConfigBase, priority: RequestPriority): RestExchangeClient {
     if (this.#gated === undefined) {
       const deps = this.#deps();
       const limiter = (deps.limiterFor ?? ((label) => this.#limiterFromEnv(label)))(
@@ -370,17 +474,23 @@ export class BotInstance extends DurableObject<Env> {
   // Stored state
   // -------------------------------------------------------------------------
 
-  async #config(): Promise<DcaConfig> {
-    const config = await this.ctx.storage.get<DcaConfig>(CONFIG_KEY);
-    if (config === undefined) {
+  async #config(): Promise<BotConfig> {
+    const stored = await this.ctx.storage.get<BotConfig>(CONFIG_KEY);
+    if (stored === undefined) {
       throw new BotInstanceError(
         "not_created",
         "this bot instance has no configuration; call create() first",
       );
     }
+    const config = normalizeConfig(stored);
     // Section 16: stored state carries a schemaVersion and the check runs the
-    // first time an object wakes under new code, which is here.
-    assertReadableSchema(config.schemaVersion);
+    // first time an object wakes under new code, which is here. Each strategy
+    // versions its own state, so the assertion is dispatched by strategy.
+    if (config.strategy === "grid") {
+      assertReadableGridSchema(config.schemaVersion);
+    } else {
+      assertReadableSchema(config.schemaVersion);
+    }
     return config;
   }
 
@@ -466,6 +576,7 @@ export class BotInstance extends DurableObject<Env> {
     );
 
     const config: DcaConfig = {
+      strategy: "dca",
       schemaVersion: DCA_SCHEMA_VERSION,
       botInstanceId: request.botInstanceId,
       accountLabel: request.accountLabel,
@@ -494,6 +605,92 @@ export class BotInstance extends DurableObject<Env> {
 
     // One `put` of both keys, so the object cannot end up holding a config with
     // no state or the reverse.
+    await this.ctx.storage.put({ [CONFIG_KEY]: config, [STATE_KEY]: state });
+
+    return { botInstanceId: request.botInstanceId, status: "created" };
+  }
+
+  /**
+   * Bring a GRID bot into existence (section 6.2), the same way `create` does
+   * for DCA.
+   *
+   * Identical ordering and invariants: circuit-breaker check, ladder validation
+   * against the allocation, then `createBotInstanceWithCapital` writes the
+   * `bot_instances` row (this object never does), then the object's own storage.
+   * The ladder is built here from the params so its level prices are fixed once
+   * and persisted (grid decision 3), matching how DCA stores `averageEntryPrice`.
+   *
+   * `take_profit_pct` is written NULL: a grid's take-profit is an accumulated
+   * profit AMOUNT in the params, not a percentage, and section 6.1 makes
+   * take-profit only "recommended" for grid, not mandatory. The schema's
+   * DCA-only take-profit CHECK permits this.
+   */
+  async createGrid(request: CreateGridBotRequest): Promise<{ botInstanceId: string; status: BotStatus }> {
+    if ((await this.ctx.storage.get(CONFIG_KEY)) !== undefined) {
+      throw new BotInstanceError(
+        "already_created",
+        `bot instance ${JSON.stringify(request.botInstanceId)} already has a configuration`,
+      );
+    }
+
+    const db = this.#db();
+    const now = this.#now();
+
+    await assertAccountArmed(db, request.accountLabel, `create bot ${request.botInstanceId}`);
+
+    // Section 6.1 checks the allocation against the account; this checks the
+    // bot's own ladder against its allocation (grid's peak buy-side exposure),
+    // and also rejects a degenerate or out-of-order ladder before any capital
+    // is reserved.
+    validateGridParams(request.params, request.allocatedCapital);
+
+    await createBotInstanceWithCapital(
+      db,
+      {
+        id: request.botInstanceId,
+        accountLabel: request.accountLabel,
+        asset: request.capitalAsset,
+        exchange: request.exchange,
+        pair: request.pair,
+        strategyType: "grid",
+        strategyParams: encodeGridParams(request.params),
+        stopLossPct: request.params.stopLossPct,
+        // Grid take-profit is an amount in the params, not a pct; null here.
+        takeProfitPct: null,
+        requestedCapital: request.allocatedCapital,
+      },
+      { actor: request.actor, now },
+    );
+
+    const config: GridConfig = {
+      strategy: "grid",
+      schemaVersion: GRID_SCHEMA_VERSION,
+      botInstanceId: request.botInstanceId,
+      accountLabel: request.accountLabel,
+      exchange: request.exchange,
+      pair: request.pair,
+      capitalAsset: request.capitalAsset,
+      allocatedCapital: request.allocatedCapital,
+      params: request.params,
+    };
+
+    const state: BotRuntimeState = {
+      schemaVersion: GRID_SCHEMA_VERSION,
+      status: "created",
+      cycleCount: 0,
+      position: EMPTY_POSITION,
+      ladder: emptyLadder(request.params),
+      nextSequence: 0,
+      openOrderIds: [],
+      haltReason: null,
+      haltedAt: null,
+      lastPrice: null,
+      lastPriceAt: null,
+      realizedGross: ZERO,
+      filters: null,
+      exitOrderId: null,
+    };
+
     await this.ctx.storage.put({ [CONFIG_KEY]: config, [STATE_KEY]: state });
 
     return { botInstanceId: request.botInstanceId, status: "created" };
@@ -551,6 +748,10 @@ export class BotInstance extends DurableObject<Env> {
     await this.#putState(state);
 
     try {
+      if (config.strategy === "grid") {
+        return await this.#gridOnPrice(config, price);
+      }
+
       const action = decide({
         config,
         position: state.position,
@@ -619,6 +820,9 @@ export class BotInstance extends DurableObject<Env> {
     }
 
     try {
+      if (config.strategy === "grid") {
+        return await this.#applyGridFillToOrder(config, state, order, fill);
+      }
       return await this.#applyFillToOrder(config, state, order, fill);
     } catch (error) {
       if (error instanceof OrderStateError) {
@@ -632,7 +836,7 @@ export class BotInstance extends DurableObject<Env> {
    * Section 7.2, driven by a human or by a risk control outside this object
    * (the account circuit breaker of 7.3, the global kill switch of 7.4).
    */
-  async halt(reason: DcaHaltReason, detail: string, actor: string): Promise<PipelineResult> {
+  async halt(reason: HaltReason, detail: string, actor: string): Promise<PipelineResult> {
     const config = await this.#config();
     return await this.#halt(config, reason, detail, actor);
   }
@@ -724,10 +928,15 @@ export class BotInstance extends DurableObject<Env> {
    * capital is reserved and the row inserted before this object's storage is.
    */
   async snapshotIfCreated(): Promise<BotSnapshot | null> {
-    const config = await this.ctx.storage.get<DcaConfig>(CONFIG_KEY);
+    const stored = await this.ctx.storage.get<BotConfig>(CONFIG_KEY);
     const state = await this.ctx.storage.get<BotRuntimeState>(STATE_KEY);
-    if (config === undefined || state === undefined) return null;
-    assertReadableSchema(config.schemaVersion);
+    if (stored === undefined || state === undefined) return null;
+    const config = normalizeConfig(stored);
+    if (config.strategy === "grid") {
+      assertReadableGridSchema(config.schemaVersion);
+    } else {
+      assertReadableSchema(config.schemaVersion);
+    }
     const entries = await this.ctx.storage.list<TrackedOrder>({ prefix: ORDER_KEY_PREFIX });
     return { config, state, orders: [...entries.values()] };
   }
@@ -746,7 +955,7 @@ export class BotInstance extends DurableObject<Env> {
    * never be reached to use its reserved budget.
    */
   async #ensureFilters(
-    config: DcaConfig,
+    config: BotConfigBase,
     state: BotRuntimeState,
     now: Timestamp,
     priority: RequestPriority,
@@ -1178,7 +1387,7 @@ export class BotInstance extends DurableObject<Env> {
    * message into an emergency.
    */
   async #onOrderStateError(
-    config: DcaConfig,
+    config: BotConfigBase,
     state: BotRuntimeState,
     error: OrderStateError,
     clientOrderId: string,
@@ -1206,6 +1415,443 @@ export class BotInstance extends DurableObject<Env> {
   }
 
   // -------------------------------------------------------------------------
+  // Grid (section 6.2)
+  // -------------------------------------------------------------------------
+
+  /**
+   * One price update for a grid bot. The grid analogue of the DCA branch in
+   * `onPriceUpdate`: it plans against the pure `grid.ts` decision function and
+   * carries the action out.
+   *
+   * Everything fill-driven -- the replace-on-fill that builds and rebuilds the
+   * ladder -- is handled in `#applyGridFillToOrder`, not here, because it is
+   * triggered by a fill, not a price. This method handles only the price-driven
+   * events: initial placement, the stop-loss, the breakout, and the accumulated
+   * take-profit.
+   */
+  async #gridOnPrice(config: GridConfig, price: Price): Promise<PipelineResult> {
+    const state = await this.#state();
+    const ladder = state.ladder!;
+    const action = gridDecide({ config, ladder, price: price.price });
+
+    switch (action.kind) {
+      case "hold":
+        return { status: "running", action: "hold" };
+      case "place_initial_ladder":
+        return await this.#placeInitialLadder(config, action.orders);
+      case "stop_loss":
+        return await this.#gridExit(config, "stop_loss", action.detail, price);
+      case "breakout_take_profit":
+        return await this.#gridExit(config, "breakout_take_profit", action.detail, price);
+      case "take_profit":
+        return await this.#gridExit(config, "take_profit", action.detail, price);
+    }
+  }
+
+  /**
+   * Section 6.2 step 2: place the initial buy ladder.
+   *
+   * Buys only (grid decision 1). Each order is placed at a level whose slot is
+   * still empty, so a re-entry after a partial placement (some orders throttled)
+   * fills the remaining levels rather than double-placing the ones already live.
+   * `placed` is set true only once no order was throttled; a throttle leaves it
+   * false so the next price update completes the ladder.
+   */
+  async #placeInitialLadder(config: GridConfig, orders: readonly GridOrderIntent[]): Promise<PipelineResult> {
+    let throttled = false;
+    for (const intent of orders) {
+      const current = await this.#state();
+      if (current.ladder!.slots[intent.levelIndex] != null) continue; // already placed
+      const result = await this.#placeGridOrder(config, intent, intent.price, "routine");
+      if (result.status === "halted") return result; // a hard rejection halted the bot
+      if (result.action === "throttled" || result.action === "unresolved") throttled = true;
+    }
+
+    if (!throttled) {
+      const current = await this.#state();
+      await this.#putState({ ...current, ladder: { ...current.ladder!, placed: true } });
+    }
+    return {
+      status: "running",
+      action: throttled ? "initial_ladder_partial" : "placed_initial_ladder",
+      detail: `${orders.length} buy levels below spot`,
+    };
+  }
+
+  /**
+   * Place one grid ladder order and, on success, record its slot.
+   *
+   * The grid counterpart of `#placeBuy`, and it follows exactly the same
+   * idempotency and validation discipline: sequence persisted before the attempt
+   * (step 6, decision 7), `validateOrder` twice as the two independent checks of
+   * section 4.3, and the three-way outcome handling of section 5.4/5.6 -- a
+   * budget refusal marks the attempt failed and skips (nothing was sent), a
+   * transport failure leaves it unresolved for recovery, and an outright refusal
+   * halts. The price and quantity come pre-computed from the ladder, so unlike
+   * `#placeBuy` there is no per-order allocation budgeting (the whole ladder was
+   * validated to fit at creation).
+   *
+   * The order's LEVEL determines its slot. The pure layer never mints an id, so
+   * a placement that fails simply leaves the level empty -- correct, and the next
+   * price update or reconciliation handles it.
+   */
+  async #placeGridOrder(
+    config: GridConfig,
+    intent: GridOrderIntent,
+    limitPrice: Money,
+    priority: RequestPriority,
+  ): Promise<PipelineResult> {
+    let state = await this.#state();
+    const now = this.#now();
+    const filters = await this.#ensureFilters(config, state, now, priority);
+    state = await this.#state();
+
+    const adjusted = validateOrder(
+      { pair: config.pair, side: intent.side, price: limitPrice, quantity: intent.quantity },
+      filters,
+      { rounding: "adjust" },
+    );
+    if (!adjusted.valid) {
+      await this.#alert(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "order_not_constructible",
+        message: `${intent.side} at grid level ${intent.levelIndex} skipped: ${adjusted.reason}`,
+      });
+      return { status: "running", action: "skipped", detail: adjusted.code };
+    }
+
+    const sequence = state.nextSequence;
+    state = { ...state, nextSequence: sequence + 1 };
+    await this.#putState(state);
+
+    const guard = this.#guard(config.botInstanceId);
+    const decision = await guard.beginAttempt(sequence, now);
+    if (decision.action === "recover") {
+      return { status: "running", action: "recover", detail: decision.reason };
+    }
+
+    const verified = validateOrder(
+      { pair: config.pair, side: intent.side, price: adjusted.price, quantity: adjusted.quantity },
+      filters,
+      { rounding: "verify" },
+    );
+    if (!verified.valid) {
+      await guard.markFailed(decision.clientOrderId, `failed the pre-send check: ${verified.reason}`, now);
+      return await this.#halt(config, "order_rejected", `pre-send validation failed: ${verified.reason}`, "system");
+    }
+
+    const outcome = await this.#exchange(config, priority).placeOrder({
+      pair: config.pair,
+      clientOrderId: decision.clientOrderId,
+      side: intent.side,
+      type: "limit",
+      price: adjusted.price,
+      quantity: adjusted.quantity,
+    });
+
+    if (!isUsable(outcome)) {
+      if (outcome.kind === "rate_limited") {
+        await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        await this.#alert(config, {
+          severity: priority === "risk-exit" ? "critical" : "warning",
+          category: "system",
+          alertType: priority === "risk-exit" ? "exit_order_throttled" : "order_throttled",
+          message: `${intent.side} at grid level ${intent.levelIndex} skipped: ${outcome.message}`,
+        });
+        return { status: "running", action: "throttled", detail: outcome.message };
+      }
+      if (outcome.kind === "transport") {
+        return { status: "running", action: "unresolved", detail: outcome.message };
+      }
+      await guard.markFailed(decision.clientOrderId, outcome.message, now);
+      return await this.#halt(config, "order_rejected", `exchange refused the order: ${outcome.message}`, "system");
+    }
+
+    const result = outcome.value;
+    await guard.markPlaced(decision.clientOrderId, result.exchangeOrderId, now);
+
+    const order = createOrder({
+      clientOrderId: decision.clientOrderId,
+      pair: config.pair,
+      side: intent.side,
+      price: adjusted.price,
+      quantity: adjusted.quantity,
+      at: result.acceptedAt,
+    });
+    await this.#putOrder(order);
+
+    const current = await this.#state();
+    const slot: GridSlot = {
+      side: intent.side,
+      clientOrderId: decision.clientOrderId,
+      costBasis: intent.costBasis,
+      quantity: adjusted.quantity,
+    };
+    const ladder = withSlot(current.ladder!, intent.levelIndex, slot);
+    await this.#putState({ ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) });
+    await this.#mirrorOrderInsert(config, order, result.exchangeOrderId);
+
+    for (const fill of result.fills) {
+      await this.onFill(decision.clientOrderId, fill);
+    }
+    return { status: "running", action: `placed-${intent.side}-${intent.levelIndex}`, detail: decision.clientOrderId };
+  }
+
+  /**
+   * Apply a fill against a grid bot's order (section 6.2 step 3).
+   *
+   * Two cases. If the order is the liquidation sell of an exit (`exitOrderId`),
+   * it is folded through `#applyGridExitFill`. Otherwise it is a ladder order:
+   * `planFill` clears the filled slot, moves the held position, computes any
+   * realized profit, and hands back the replacement to place one level over --
+   * a sell above a filled buy, a buy below a filled sell.
+   */
+  async #applyGridFillToOrder(
+    config: GridConfig,
+    state: BotRuntimeState,
+    order: TrackedOrder,
+    fill: Fill,
+  ): Promise<PipelineResult> {
+    const effect = applyFill(order, fill);
+    await this.#putOrder(effect.order);
+
+    if (state.exitOrderId === order.clientOrderId) {
+      return await this.#applyGridExitFill(config, state, effect.order, effect.fullyFilled, fill);
+    }
+
+    const ladder = state.ladder!;
+    const levelIndex = levelOf(ladder, order.clientOrderId);
+    if (levelIndex < 0) {
+      // The order is not on the ladder any more (its slot was cleared, e.g. by a
+      // halt). Record the fill; there is no level to replace.
+      await this.#mirrorOrderUpdate(effect.order);
+      await this.#mirrorTrade(config, effect.order, fill);
+      return { status: state.status, action: "fill_off_ladder", detail: order.clientOrderId };
+    }
+
+    const plan = planFill(ladder, config.params, levelIndex, fill.price, fill.quantity, effect.fullyFilled);
+    const next: BotRuntimeState = {
+      ...state,
+      ladder: plan.ladder,
+      realizedGross: plan.ladder.realizedGross,
+      openOrderIds: ladderOpenOrderIds(plan.ladder),
+    };
+    await this.#putState(next);
+    await this.#mirrorOrderUpdate(effect.order);
+    await this.#mirrorTrade(config, effect.order, fill);
+
+    if (plan.replacement !== null) {
+      // Place the replacement at the level's own price (a resting limit), routine
+      // priority: rebuilding the ladder is ordinary work, not a risk exit.
+      const placed = await this.#placeGridOrder(config, plan.replacement, plan.replacement.price, "routine");
+      return placed.status === "halted"
+        ? placed
+        : { status: "running", action: `replaced-${plan.replacement.side}`, detail: order.clientOrderId };
+    }
+    return {
+      status: next.status,
+      action: effect.fullyFilled ? "filled" : "partially_filled",
+      detail: order.clientOrderId,
+    };
+  }
+
+  /**
+   * Fold a fill against the liquidation sell placed by a grid exit.
+   *
+   * Realized profit for the liquidated slice is `proceeds - costPortion`, where
+   * the cost portion is the held cost prorated by the fraction of the held
+   * position this fill sold. On a full fill the exit is complete and its id is
+   * cleared. The bot stays `halted` throughout -- the liquidation is the halt's
+   * own action, not new trading.
+   */
+  async #applyGridExitFill(
+    config: GridConfig,
+    state: BotRuntimeState,
+    order: TrackedOrder,
+    fullyFilled: boolean,
+    fill: Fill,
+  ): Promise<PipelineResult> {
+    const ladder = state.ladder!;
+    const proceeds = mul(fill.price, fill.quantity, "half-even");
+    const costPortion =
+      ladder.heldQuantity > ZERO
+        ? divideRounded(ladder.heldCost * fill.quantity, ladder.heldQuantity, "half-even")
+        : ZERO;
+    const realized = proceeds - costPortion;
+
+    const nextLadder: GridLadder = {
+      ...ladder,
+      heldQuantity: ladder.heldQuantity - fill.quantity,
+      heldCost: ladder.heldCost - costPortion,
+      realizedGross: ladder.realizedGross + realized,
+    };
+    let next: BotRuntimeState = { ...state, ladder: nextLadder, realizedGross: nextLadder.realizedGross };
+    if (fullyFilled) {
+      next = {
+        ...next,
+        exitOrderId: null,
+        openOrderIds: next.openOrderIds.filter((id) => id !== order.clientOrderId),
+      };
+    }
+    await this.#putState(next);
+    await this.#mirrorOrderUpdate(order);
+    await this.#mirrorTrade(config, order, fill);
+
+    return {
+      status: next.status,
+      action: fullyFilled ? "grid_liquidated" : "partially_filled",
+      detail: order.clientOrderId,
+    };
+  }
+
+  /**
+   * A grid exit (section 6.2 steps 4, 5, 6): cancel all, sell the held position,
+   * halt.
+   *
+   * Built ON TOP of `#halt`, reusing its cancel-all and its step-6-decision-2
+   * ordering (mark halted, THEN cancel) unchanged. The one thing grid adds over
+   * a plain halt is the liquidation sell -- section 6.2 step 4's "sell any held
+   * position" -- which a manual halt deliberately does not do (matching DCA,
+   * whose `sellOnStopLoss` is refused). So the sell is layered here, only for the
+   * three exit reasons, not baked into the shared `#halt`.
+   */
+  async #gridExit(
+    config: GridConfig,
+    reason: GridHaltReason,
+    detail: string,
+    price: Price,
+  ): Promise<PipelineResult> {
+    // Cancels every ladder order and marks the bot halted, in the safe order.
+    await this.#halt(config, reason, detail, "system");
+
+    // The cancelled orders leave the ladder slots stale; clear them. The held
+    // position is untouched by cancellation (only unfilled orders were cancelled)
+    // and is what the liquidation sell now disposes of.
+    const state = await this.#state();
+    const clearedLadder: GridLadder = { ...state.ladder!, slots: state.ladder!.slots.map(() => null) };
+    await this.#putState({ ...state, ladder: clearedLadder });
+
+    if (clearedLadder.heldQuantity > ZERO) {
+      await this.#placeLiquidationSell(config, clearedLadder.heldQuantity, price);
+    }
+
+    return { status: "halted", action: reason, detail };
+  }
+
+  /**
+   * Section 4.5-compliant liquidation: a LIMIT sell of the whole held position,
+   * priced at the triggering price so it is marketable.
+   *
+   * Section 4.5 rules out market orders, so a stop-loss "sell any held position"
+   * cannot be a market order -- it is a marketable limit at the current price. In
+   * a fast drop that limit may not fill, in which case the bot is left halted
+   * holding a resting sell; that is alerted rather than pretended away, and the
+   * fill (whenever it lands) is folded through `#applyGridExitFill`. This is the
+   * honest limit of a market-order-free stop-loss and is recorded as such in the
+   * decision log.
+   *
+   * Risk-exit priority throughout: this is exactly the class of order section
+   * 5.4's reserved slice exists for.
+   */
+  async #placeLiquidationSell(config: GridConfig, quantity: Money, price: Price): Promise<void> {
+    let state = await this.#state();
+    const now = this.#now();
+    const filters = await this.#ensureFilters(config, state, now, "risk-exit");
+    state = await this.#state();
+
+    const adjusted = validateOrder(
+      { pair: config.pair, side: "sell", price: price.price, quantity },
+      filters,
+      { rounding: "adjust" },
+    );
+    if (!adjusted.valid) {
+      await this.#alert(config, {
+        severity: "critical",
+        category: "trading",
+        alertType: "liquidation_not_constructible",
+        message:
+          `the exit liquidation of ${toDecimalString(quantity)} could not be constructed: ` +
+          `${adjusted.reason}. The position is left held on a halted bot; reconciliation owns it.`,
+      });
+      return;
+    }
+
+    const sequence = state.nextSequence;
+    await this.#putState({ ...state, nextSequence: sequence + 1 });
+
+    const guard = this.#guard(config.botInstanceId);
+    const decision = await guard.beginAttempt(sequence, now);
+    if (decision.action === "recover") return;
+
+    const outcome = await this.#exchange(config, "risk-exit").placeOrder({
+      pair: config.pair,
+      clientOrderId: decision.clientOrderId,
+      side: "sell",
+      type: "limit",
+      price: adjusted.price,
+      quantity: adjusted.quantity,
+    });
+
+    if (!isUsable(outcome)) {
+      if (outcome.kind === "rate_limited") {
+        await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        await this.#alert(config, {
+          severity: "critical",
+          category: "system",
+          alertType: "exit_order_throttled",
+          message:
+            `the exit liquidation could not obtain risk-exit budget: ${outcome.message}. It will ` +
+            `not be retried automatically; the position is held on a halted bot and reconciliation ` +
+            `owns it.`,
+        });
+        return;
+      }
+      if (outcome.kind === "transport") {
+        // The sell may be resting on the book. Section 5.1: recover by lookup,
+        // never re-send. Left for reconciliation; the attempt stays `attempting`.
+        await this.#alert(config, {
+          severity: "critical",
+          category: "trading",
+          alertType: "liquidation_unresolved",
+          message: `the exit liquidation's outcome is unknown: ${outcome.message}. It may be resting on the book.`,
+        });
+        return;
+      }
+      await guard.markFailed(decision.clientOrderId, outcome.message, now);
+      await this.#alert(config, {
+        severity: "critical",
+        category: "trading",
+        alertType: "liquidation_failed",
+        message: `the exit liquidation was refused: ${outcome.message}. The position is held on a halted bot.`,
+      });
+      return;
+    }
+
+    await guard.markPlaced(decision.clientOrderId, outcome.value.exchangeOrderId, now);
+    const order = createOrder({
+      clientOrderId: decision.clientOrderId,
+      pair: config.pair,
+      side: "sell",
+      price: adjusted.price,
+      quantity: adjusted.quantity,
+      at: outcome.value.acceptedAt,
+    });
+    await this.#putOrder(order);
+    const current = await this.#state();
+    await this.#putState({
+      ...current,
+      exitOrderId: decision.clientOrderId,
+      openOrderIds: [...current.openOrderIds, decision.clientOrderId],
+    });
+    await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
+
+    for (const fill of outcome.value.fills) {
+      await this.onFill(decision.clientOrderId, fill);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Halt (section 7.2)
   // -------------------------------------------------------------------------
 
@@ -1224,8 +1870,8 @@ export class BotInstance extends DurableObject<Env> {
    * The cancellations themselves are unchanged and still immediate.
    */
   async #halt(
-    config: DcaConfig,
-    reason: DcaHaltReason,
+    config: BotConfigBase,
+    reason: HaltReason,
     detail: string,
     actor: string,
   ): Promise<PipelineResult> {
@@ -1250,8 +1896,12 @@ export class BotInstance extends DurableObject<Env> {
 
     // 4. Fire an alert. Written to D1 unconditionally per section 10; the
     //    outbound Discord/Telegram notification and its KV cooldown are step 8.
+    // The "good news" halts -- a DCA cycle taken to profit, a grid cashed out on
+    // its breakout or profit target -- are `info`, not `critical`. Only an
+    // actual loss, error, or rejection is critical.
+    const positiveExit = reason === "take_profit_reached" || reason === "take_profit" || reason === "breakout_take_profit";
     await this.#alert(config, {
-      severity: reason === "take_profit_reached" ? "info" : "critical",
+      severity: positiveExit ? "info" : "critical",
       category: reason === "unhandled_error" ? "system" : "trading",
       alertType: `halt_${reason}`,
       message: recorded,
@@ -1279,7 +1929,7 @@ export class BotInstance extends DurableObject<Env> {
    * for step 9's grid it is a full ladder cancelled in one pass, which is the
    * exposure step 7 measured and named as the real one.
    */
-  async #cancelOpenOrders(config: DcaConfig, state: BotRuntimeState): Promise<void> {
+  async #cancelOpenOrders(config: BotConfigBase, state: BotRuntimeState): Promise<void> {
     if (state.openOrderIds.length === 0) return;
     const exchange = this.#exchange(config, "risk-exit");
     const now = this.#now();
@@ -1330,7 +1980,7 @@ export class BotInstance extends DurableObject<Env> {
    * -- which is the job it already exists to do.
    */
   async #recordCancellation(
-    config: DcaConfig,
+    config: BotConfigBase,
     order: TrackedOrder,
     remote: OrderStatus,
     now: Timestamp,
@@ -1363,7 +2013,7 @@ export class BotInstance extends DurableObject<Env> {
    * event, and section 10 wants the table to be the dashboard's complete
    * history -- duplicates make it a less useful one, not a more complete one.
    */
-  async #haltOnUnexpected(config: DcaConfig, error: unknown): Promise<PipelineResult> {
+  async #haltOnUnexpected(config: BotConfigBase, error: unknown): Promise<PipelineResult> {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     return await this.#halt(config, "unhandled_error", message, "system");
   }
@@ -1373,7 +2023,7 @@ export class BotInstance extends DurableObject<Env> {
   // -------------------------------------------------------------------------
 
   async #mirrorStatus(
-    config: DcaConfig,
+    config: BotConfigBase,
     status: BotStatus,
     haltReason: string | null,
     haltedAt: Timestamp | null,
@@ -1396,7 +2046,7 @@ export class BotInstance extends DurableObject<Env> {
    * gives, applied to the identity column as well.
    */
   async #mirrorOrderInsert(
-    config: DcaConfig,
+    config: BotConfigBase,
     order: TrackedOrder,
     exchangeOrderId: string,
   ): Promise<void> {
@@ -1439,7 +2089,7 @@ export class BotInstance extends DurableObject<Env> {
    * applies: all three reporting columns are left NULL rather than guessing.
    * Migration 0001's `fee_conversion_all_or_nothing` CHECK enforces that.
    */
-  async #mirrorTrade(config: DcaConfig, order: TrackedOrder, fill: Fill): Promise<void> {
+  async #mirrorTrade(config: BotConfigBase, order: TrackedOrder, fill: Fill): Promise<void> {
     const state = await this.#state();
     const baseAsset = state.filters?.baseAsset;
 
@@ -1467,7 +2117,7 @@ export class BotInstance extends DurableObject<Env> {
   }
 
   async #alert(
-    config: DcaConfig,
+    config: BotConfigBase,
     alert: {
       severity: AlertRow["severity"];
       category: AlertRow["category"];
@@ -1490,7 +2140,7 @@ export class BotInstance extends DurableObject<Env> {
   }
 
   async #audit(
-    config: DcaConfig,
+    config: BotConfigBase,
     action: string,
     actor: string,
     details: Record<string, unknown>,

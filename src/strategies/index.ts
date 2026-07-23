@@ -10,7 +10,14 @@
  * duplication", which is only possible if the strategy is separable from the
  * machinery that talks to an exchange.
  *
- * `dca.ts` is build step 6. Grid (section 6.2) becomes a sibling at step 9.
+ * `dca.ts` is build step 6; `grid.ts` is build step 9.
+ *
+ * The two are re-exported as namespaces rather than flattened, because they
+ * deliberately share names -- both have a `decide`, a `stopLossPrice`, an
+ * `assertReadableSchema` -- which is the point: they are the same shape of pure
+ * strategy module. Consumers import the specific module directly (as the Durable
+ * Object does), so this barrel exists for discoverability, not as the main path.
  */
 
-export * from "./dca";
+export * as dca from "./dca";
+export * as grid from "./grid";

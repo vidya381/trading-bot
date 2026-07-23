@@ -3,24 +3,39 @@
 Stateful compute, one class per unit of state and failure isolation
 (spec section 3).
 
-## `BotInstance` — built (DCA half, build step 6)
+## `BotInstance` — built (DCA step 6, grid step 9)
 
 One object per (exchange account + strategy + trading pair). Source of truth
-for that bot's config, status, position, and idempotency records
-(section 8.1). DCA is step 6; grid reuses the same object at step 9.
+for that bot's config, status, position/ladder, and idempotency records
+(section 8.1). It serves BOTH strategies, discriminated by `config.strategy`:
+DCA was step 6, grid reuses the same object at step 9 rather than a second
+class, because the lifecycle, halt, order placement, mirroring and rate
+limiting are all strategy-agnostic and already built. Only the planner and the
+stored strategy state differ (`position`/`cycleCount` for DCA, `ladder` for
+grid), and both are plumbed through here.
 
 | File | What it is |
 | --- | --- |
-| `bot-instance.ts` | The object: lifecycle, order placement, halt, D1 mirror |
+| `bot-instance.ts` | The object: lifecycle, order placement, halt, D1 mirror, both strategies |
 | `attempt-store.ts` | The real `AttemptStore` (section 5.1), on DO storage |
 | `storage-probe.test.ts` | What DO storage actually does, measured not assumed |
 | `fake-exchange.ts` | Test-only `RestExchangeClient`; never opens a socket |
 | `test-helpers.ts` | Test-only binding narrowing and the `inBot` helper |
+| `grid-bot-instance.test.ts` | The grid branch, end to end (step 9) |
 
-Strategy *decisions* are not here. They live in `/src/strategies/dca.ts` as
-pure functions, so section 13's backtest mode can drive the same logic with
-historical candles and no Durable Object. This object carries the decisions
-out: it places the orders, persists the state, and mirrors to D1.
+Strategy *decisions* are not here. They live in `/src/strategies/dca.ts` and
+`/src/strategies/grid.ts` as pure functions, so section 13's backtest mode can
+drive the same logic with historical candles and no Durable Object. This object
+carries the decisions out: it places the orders, persists the state, and
+mirrors to D1.
+
+The one thing grid adds over DCA's halt is a **liquidation sell** on a
+stop-loss, breakout, or take-profit exit (section 6.2 steps 4-6): the shared
+`#halt` cancels and marks halted, and the grid exit then places a marketable
+limit sell of the held position on top. Section 4.5 forbids market orders, so
+that sell is a limit at the trigger price and may not fill in a fast drop; if it
+rests unfilled the bot is left halted holding it, and that is alerted rather
+than pretended away.
 
 ### Three things worth knowing before changing it
 

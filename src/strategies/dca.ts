@@ -126,6 +126,14 @@ export interface DcaParams {
 
 /** Everything a `BotInstance` needs to know about itself, persisted verbatim. */
 export interface DcaConfig {
+  /**
+   * Discriminates the config union in the Durable Object (grid is the other
+   * arm, added at step 9). Required here so a stored config always records which
+   * strategy it is; the object reads an ABSENT `strategy` as `"dca"`, the
+   * section-16-additive treatment for any state written before this field
+   * existed -- of which there is none, since no exchange client has ever run.
+   */
+  readonly strategy: "dca";
   /** Section 8.1 and 16. See DCA_SCHEMA_VERSION. */
   readonly schemaVersion: number;
   /** Matches BOT_INSTANCE_ID_PATTERN; embedded in every clientOrderId. */

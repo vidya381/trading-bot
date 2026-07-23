@@ -155,7 +155,11 @@ describe("creation (sections 6.1, 8.5)", () => {
 
     expect(snapshot.config.schemaVersion).toBe(1);
     expect(snapshot.config.pair).toBe(TEST_PAIR);
-    expect(snapshot.config.params.takeProfitPct).toBe(m("2"));
+    // Narrow via the discriminator: config is now the strategy union.
+    expect(snapshot.config.strategy).toBe("dca");
+    if (snapshot.config.strategy === "dca") {
+      expect(snapshot.config.params.takeProfitPct).toBe(m("2"));
+    }
     expect(snapshot.state.status).toBe("created");
     expect(snapshot.state.cycleCount).toBe(0);
     expect(snapshot.state.position.quantity).toBe(ZERO);

@@ -14,7 +14,7 @@ the machinery that talks to an exchange.
 | File | Spec | Build step |
 | --- | --- | --- |
 | `dca.ts` | 6.3 | 6 — built |
-| `grid.ts` | 6.2 | 9 — not built |
+| `grid.ts` | 6.2 | 9 — built |
 
 ## `dca.ts`
 
@@ -44,3 +44,40 @@ against `allocated_capital` directly. Every rounding direction is named at its
 call site (step 2's decision 3) and chosen to be conservative: thresholds round
 so that a trigger requires the full configured move, and sizes round down so
 the bot never plans to spend more than it said it would.
+
+## `grid.ts`
+
+`decide()` is the price-driven half of section 6.2 (initial placement,
+stop-loss, breakout, accumulated take-profit); `planFill()` is the fill-driven
+half (the replace-on-fill rule of step 3). The split is the same one DCA has
+between `decide` and the object's `onFill`.
+
+Four readings of section 6.2 are encoded here, all recorded in the step 9
+decision-log entry:
+
+- **A started grid places buys only.** Section 6.2 step 2 says "buy orders
+  below and sell orders above", but capital is quote-denominated (step 6), so a
+  fresh bot holds no base to sell. Every sell is created by replace-on-fill,
+  funded by the buy one level below it.
+
+- **Ladder state is a stored levels array plus one slot per level.** Prices are
+  built once and persisted (as DCA stores `averageEntryPrice`); each sell slot
+  carries the cost basis of the buy it replaced, so realized profit per round
+  trip is exact.
+
+- **"Significantly above the highest line" defaults to one grid step above it**
+  — the ladder's own spacing, the only scale the spec supplies —
+  configurable via `breakoutThresholdPct`.
+
+- **The upside breakout cash-out defaults to ON** (`breakoutTakeProfit`), per
+  the spec's "should be configurable but defaults to on".
+
+Order sizes are quote-denominated as in DCA. Level prices round half-even (a
+grid has no directional interest and each price is snapped to tickSize again at
+placement); the stop-loss and breakout prices round up so a marginal move does
+not trigger early or cash out early; quantities floor.
+
+Geometric spacing computes its ratio with a pure-integer binary-search root —
+no floating point in a price calculation — and fills the interior by repeated
+multiplication with the two bounds pinned, so no accumulated rounding moves the
+grid off the bounds a human chose.

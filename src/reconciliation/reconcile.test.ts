@@ -114,6 +114,7 @@ function snapshotFor(
 ): BotSnapshot {
   return {
     config: {
+      strategy: "dca",
       schemaVersion: DCA_SCHEMA_VERSION,
       botInstanceId,
       accountLabel: ACCOUNT,
