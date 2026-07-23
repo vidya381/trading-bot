@@ -1,184 +1,198 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
-
-  // ---------------------------------------------------------------------------
-  // Base configuration.
-  //
-  // This top-level block is NOT a deployable environment. Per spec section 16,
-  // testnet and production are two fully separate deployments with separate
-  // Worker names and separate config -- never one deployment with a flag.
-  //
-  // All deploys must pass `--env testnet` or `--env production` explicitly.
-  // The npm scripts in package.json always do. If someone runs a bare
-  // `wrangler deploy` by mistake, it deploys a Worker named "trading-bot"
-  // whose /health reports ENVIRONMENT "unconfigured" -- a loud, harmless
-  // signal that the wrong command was run. It cannot overwrite either
-  // real environment, because those use different Worker names.
-  // ---------------------------------------------------------------------------
-  "name": "trading-bot",
-  "main": "src/workers/api.ts",
-  "compatibility_date": "2026-07-14",
-
-  // No "nodejs_compat" flag. Spec section 2 requires native fetch and the Web
-  // Crypto API with no third-party exchange library, specifically to avoid
-  // Node-compatibility risk. Nothing here should need a Node shim.
-
-  "observability": {
-    "enabled": true
-  },
-
-  "vars": {
-    "ENVIRONMENT": "unconfigured"
-  },
-
-  // ---------------------------------------------------------------------------
-  // Environments.
-  //
-  // Remaining resource bindings (KV, R2, Queues, Durable Objects) are
-  // intentionally absent. They are added per environment in the build-order
-  // step that introduces them (section 19): Durable Objects at step 6, Queues
-  // alongside order execution, KV at step 8, R2 at step 12. D1 arrived at step
-  // 4 and is below.
-  //
-  // Each binding is declared separately under both testnet and production --
-  // like "vars", binding keys are non-inheritable, so there is no way to
-  // accidentally point both environments at one database. The two
-  // "database_id" values below are different databases and must stay that way;
-  // that is the whole of section 16's separation, expressed as two UUIDs.
-  //
-  // The base config block above has NO D1 binding, deliberately. A bare
-  // `wrangler deploy` with no --env already reports ENVIRONMENT
-  // "unconfigured"; having no database either means it cannot touch real
-  // trading data at all.
-  // ---------------------------------------------------------------------------
-  "env": {
-    "testnet": {
-      "name": "trading-bot-testnet",
-      "workers_dev": true,
-      "vars": {
-        "ENVIRONMENT": "testnet"
-      },
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "trading-bot-testnet",
-          "database_id": "3f01f245-12b3-4b20-acf7-75b655da2bd7",
-          "migrations_dir": "migrations"
-        }
-      ],
-      "durable_objects": {
-        "bindings": [
-          {
-            "name": "BOT_INSTANCE",
-            "class_name": "BotInstance"
-          },
-          // Spec section 5.4, step 8. One instance per exchange account,
-          // addressed by `idFromName(accountLabel)`. Every exchange call from
-          // every bot on an account passes through its instance, so this
-          // binding is what makes section 5.4's budget account-wide rather
-          // than per-caller.
-          {
-            "name": "RATE_LIMITER",
-            "class_name": "RateLimiter"
-          }
-        ]
-      },
-      // SQLite storage backend, per spec section 2 ("Durable Objects with
-      // SQLite storage backend"). `new_sqlite_classes` rather than
-      // `new_classes` is what selects it, and it cannot be changed after the
-      // class has been deployed -- a class created on the key-value backend
-      // stays on it forever.
-      "migrations": [
-        {
-          "tag": "v1",
-          "new_sqlite_classes": ["BotInstance"]
-        },
-        {
-          "tag": "v2",
-          "new_sqlite_classes": ["RateLimiter"]
-        }
-      ],
-      // Spec section 9's suggested interval. The handler is `scheduled` in
-      // src/workers/api.ts; a cron trigger is a handler on a Worker, not a
-      // separate Worker, so section 3's "Cron Trigger Worker" box is a
-      // separation of concerns rather than of deployments.
-      "triggers": {
-        "crons": [
-          // Section 9 reconciliation. The handler is `scheduled` in
-          // src/workers/api.ts, routed by `controller.cron`.
-          "*/5 * * * *",
-          // Section 10 notification dispatch (step 8), on its own faster tick
-          // so a halt or stop-loss ping does not wait behind reconciliation.
-          // No-ops until the ALERT_COOLDOWNS KV namespace and the
-          // DISCORD_WEBHOOK_URL secret exist (docs/kv-provisioning.md).
-          "* * * * *"
-        ]
-      }
-    },
-
-    "production": {
-      "name": "trading-bot-production",
-      "workers_dev": true,
-      "vars": {
-        "ENVIRONMENT": "production"
-      },
-      // Created, bound, and deliberately EMPTY. Migrations have not been
-      // applied here and must not be until go-live (section 16.1). Applying
-      // them is one command -- `wrangler d1 migrations apply DB --env
-      // production --remote` -- and it belongs with the first production
-      // deploy, not with provisioning.
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "trading-bot-production",
-          "database_id": "4038bdd3-9715-4366-a6b4-d3b007df6258",
-          "migrations_dir": "migrations"
-        }
-      ],
-      // Declared identically to testnet. Durable Object namespaces are scoped
-      // to the Worker, and the two environments are separate Workers, so these
-      // are two distinct namespaces despite the identical text -- the same
-      // separation the two database_id values above express explicitly.
-      "durable_objects": {
-        "bindings": [
-          {
-            "name": "BOT_INSTANCE",
-            "class_name": "BotInstance"
-          },
-          {
-            "name": "RATE_LIMITER",
-            "class_name": "RateLimiter"
-          }
-        ]
-      },
-      "migrations": [
-        {
-          "tag": "v1",
-          "new_sqlite_classes": ["BotInstance"]
-        },
-        {
-          "tag": "v2",
-          "new_sqlite_classes": ["RateLimiter"]
-        }
-      ],
-      // Declared identically to testnet so the two environments do not differ
-      // in behaviour, which section 16 is emphatic about. Safe to declare
-      // before go-live: `runScheduledReconciliation` checks for an exchange
-      // client BEFORE touching D1, and no credentials exist in either
-      // environment, so this fires and returns without querying the
-      // deliberately empty production database.
-      "triggers": {
-        "crons": [
-          // Section 9 reconciliation. The handler is `scheduled` in
-          // src/workers/api.ts, routed by `controller.cron`.
-          "*/5 * * * *",
-          // Section 10 notification dispatch (step 8), on its own faster tick
-          // so a halt or stop-loss ping does not wait behind reconciliation.
-          // No-ops until the ALERT_COOLDOWNS KV namespace and the
-          // DISCORD_WEBHOOK_URL secret exist (docs/kv-provisioning.md).
-          "* * * * *"
-        ]
-      }
-    }
-  }
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	// ---------------------------------------------------------------------------
+	// Base configuration.
+	//
+	// This top-level block is NOT a deployable environment. Per spec section 16,
+	// testnet and production are two fully separate deployments with separate
+	// Worker names and separate config -- never one deployment with a flag.
+	//
+	// All deploys must pass `--env testnet` or `--env production` explicitly.
+	// The npm scripts in package.json always do. If someone runs a bare
+	// `wrangler deploy` by mistake, it deploys a Worker named "trading-bot"
+	// whose /health reports ENVIRONMENT "unconfigured" -- a loud, harmless
+	// signal that the wrong command was run. It cannot overwrite either
+	// real environment, because those use different Worker names.
+	// ---------------------------------------------------------------------------
+	"name": "trading-bot",
+	"main": "src/workers/api.ts",
+	"compatibility_date": "2026-07-14",
+	// No "nodejs_compat" flag. Spec section 2 requires native fetch and the Web
+	// Crypto API with no third-party exchange library, specifically to avoid
+	// Node-compatibility risk. Nothing here should need a Node shim.
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		"ENVIRONMENT": "unconfigured"
+	},
+	// ---------------------------------------------------------------------------
+	// Environments.
+	//
+	// Remaining resource bindings (KV, R2, Queues, Durable Objects) are
+	// intentionally absent. They are added per environment in the build-order
+	// step that introduces them (section 19): Durable Objects at step 6, Queues
+	// alongside order execution, KV at step 8, R2 at step 12. D1 arrived at step
+	// 4 and is below.
+	//
+	// Each binding is declared separately under both testnet and production --
+	// like "vars", binding keys are non-inheritable, so there is no way to
+	// accidentally point both environments at one database. The two
+	// "database_id" values below are different databases and must stay that way;
+	// that is the whole of section 16's separation, expressed as two UUIDs.
+	//
+	// The base config block above has NO D1 binding, deliberately. A bare
+	// `wrangler deploy` with no --env already reports ENVIRONMENT
+	// "unconfigured"; having no database either means it cannot touch real
+	// trading data at all.
+	// ---------------------------------------------------------------------------
+	"env": {
+		"testnet": {
+			"name": "trading-bot-testnet",
+			"workers_dev": true,
+			"vars": {
+				"ENVIRONMENT": "testnet"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "trading-bot-testnet",
+					"database_id": "3f01f245-12b3-4b20-acf7-75b655da2bd7",
+					"migrations_dir": "migrations"
+				}
+			],
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "BOT_INSTANCE",
+						"class_name": "BotInstance"
+					},
+					// Spec section 5.4, step 8. One instance per exchange account,
+					// addressed by `idFromName(accountLabel)`. Every exchange call from
+					// every bot on an account passes through its instance, so this
+					// binding is what makes section 5.4's budget account-wide rather
+					// than per-caller.
+					{
+						"name": "RATE_LIMITER",
+						"class_name": "RateLimiter"
+					}
+				]
+			},
+			// SQLite storage backend, per spec section 2 ("Durable Objects with
+			// SQLite storage backend"). `new_sqlite_classes` rather than
+			// `new_classes` is what selects it, and it cannot be changed after the
+			// class has been deployed -- a class created on the key-value backend
+			// stays on it forever.
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"BotInstance"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"RateLimiter"
+					]
+				}
+			],
+			// Spec section 9's suggested interval. The handler is `scheduled` in
+			// src/workers/api.ts; a cron trigger is a handler on a Worker, not a
+			// separate Worker, so section 3's "Cron Trigger Worker" box is a
+			// separation of concerns rather than of deployments.
+			"triggers": {
+				"crons": [
+					// Section 9 reconciliation. The handler is `scheduled` in
+					// src/workers/api.ts, routed by `controller.cron`.
+					"*/5 * * * *",
+					// Section 10 notification dispatch (step 8), on its own faster tick
+					// so a halt or stop-loss ping does not wait behind reconciliation.
+					// No-ops until the ALERT_COOLDOWNS KV namespace and the
+					// DISCORD_WEBHOOK_URL secret exist (docs/kv-provisioning.md).
+					"* * * * *"
+				]
+			},
+			"kv_namespaces": [
+				{
+					"binding": "ALERT_COOLDOWNS",
+					"id": "bf4f637666bd42a09a25b729744a7c16"
+				}
+			]
+		},
+		"production": {
+			"name": "trading-bot-production",
+			"workers_dev": true,
+			"vars": {
+				"ENVIRONMENT": "production"
+			},
+			// Created, bound, and deliberately EMPTY. Migrations have not been
+			// applied here and must not be until go-live (section 16.1). Applying
+			// them is one command -- `wrangler d1 migrations apply DB --env
+			// production --remote` -- and it belongs with the first production
+			// deploy, not with provisioning.
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "trading-bot-production",
+					"database_id": "4038bdd3-9715-4366-a6b4-d3b007df6258",
+					"migrations_dir": "migrations"
+				}
+			],
+			// Declared identically to testnet. Durable Object namespaces are scoped
+			// to the Worker, and the two environments are separate Workers, so these
+			// are two distinct namespaces despite the identical text -- the same
+			// separation the two database_id values above express explicitly.
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "BOT_INSTANCE",
+						"class_name": "BotInstance"
+					},
+					{
+						"name": "RATE_LIMITER",
+						"class_name": "RateLimiter"
+					}
+				]
+			},
+			"migrations": [
+				{
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"BotInstance"
+					]
+				},
+				{
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"RateLimiter"
+					]
+				}
+			],
+			// Declared identically to testnet so the two environments do not differ
+			// in behaviour, which section 16 is emphatic about. Safe to declare
+			// before go-live: `runScheduledReconciliation` checks for an exchange
+			// client BEFORE touching D1, and no credentials exist in either
+			// environment, so this fires and returns without querying the
+			// deliberately empty production database.
+			"triggers": {
+				"crons": [
+					// Section 9 reconciliation. The handler is `scheduled` in
+					// src/workers/api.ts, routed by `controller.cron`.
+					"*/5 * * * *",
+					// Section 10 notification dispatch (step 8), on its own faster tick
+					// so a halt or stop-loss ping does not wait behind reconciliation.
+					// No-ops until the ALERT_COOLDOWNS KV namespace and the
+					// DISCORD_WEBHOOK_URL secret exist (docs/kv-provisioning.md).
+					"* * * * *"
+				]
+			},
+			"kv_namespaces": [
+				{
+					"binding": "ALERT_COOLDOWNS",
+					"id": "f62b31ae1787470ebc81b93f07d55521"
+				}
+			]
+		}
+	}
 }
