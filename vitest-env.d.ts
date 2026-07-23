@@ -33,5 +33,14 @@ declare namespace Cloudflare {
     // src/workers/notifications.ts. Both go away once the namespace is
     // provisioned and `wrangler types` emits it on both interfaces.
     ALERT_COOLDOWNS: KVNamespace;
+
+    // Build step 10, section 11. The Cloudflare Access verifier's two settings,
+    // supplied to tests by vitest.config.ts's miniflare `bindings`. Declared
+    // here (test-visible, on `Cloudflare.Env`) because ACCESS_AUD is a secret
+    // and ACCESS_TEAM_DOMAIN is empty in wrangler.jsonc until the owner sets it,
+    // so `wrangler types` emits neither. The Worker's own view of both is the
+    // optional `declare global` augmentation in src/api/access.ts.
+    ACCESS_AUD: string;
+    ACCESS_TEAM_DOMAIN: string;
   }
 }

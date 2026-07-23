@@ -51,7 +51,15 @@
 			"name": "trading-bot-testnet",
 			"workers_dev": true,
 			"vars": {
-				"ENVIRONMENT": "testnet"
+				"ENVIRONMENT": "testnet",
+				// Spec section 11, build step 10 (dashboard API). The Zero Trust
+				// team domain, used as the Access JWT issuer and to locate the JWKS
+				// at `<domain>/cdn-cgi/access/certs`. Not a secret (the AUD tag is --
+				// ACCESS_AUD, set with `wrangler secret put`). SET THIS to your team
+				// domain, e.g. "myteam.cloudflareaccess.com"; while it is empty the
+				// API refuses every request with a 503 rather than trusting the
+				// Access email header on its own (fail closed).
+				"ACCESS_TEAM_DOMAIN": "vidya-991.cloudflareaccess.com"
 			},
 			"d1_databases": [
 				{
@@ -124,7 +132,12 @@
 			"name": "trading-bot-production",
 			"workers_dev": true,
 			"vars": {
-				"ENVIRONMENT": "production"
+				"ENVIRONMENT": "production",
+				// See the testnet note above. SET THIS to your team domain before
+				// go-live; empty means the production API fails closed (503) rather
+				// than trusting the Access email header alone. ACCESS_AUD is the
+				// production Access app's own Audience tag, set as a secret.
+				"ACCESS_TEAM_DOMAIN": "vidya-991.cloudflareaccess.com"
 			},
 			// Created, bound, and deliberately EMPTY. Migrations have not been
 			// applied here and must not be until go-live (section 16.1). Applying

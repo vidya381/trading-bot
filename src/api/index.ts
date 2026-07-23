@@ -1,0 +1,125 @@
+/**
+ * The dashboard API layer (spec step 10, backend half), build step 10.
+ *
+ * `handleApiRequest` is the one entry point the Worker calls for every `/api/*`
+ * request. It does three things and nothing else:
+ *
+ *   1. AUTHENTICATE. Build the Access verifier from the environment and verify
+ *      the request's JWT (access.ts). This runs BEFORE routing, so an
+ *      unauthenticated caller learns nothing about which routes exist, and an
+ *      unconfigured verifier refuses everything with a 503 rather than falling
+ *      back to trusting a header.
+ *   2. ROUTE. Match the method and path against the table below.
+ *   3. DISPATCH inside one try/catch, so every handler can simply `throw` and
+ *      the failure becomes the right JSON envelope with the right status
+ *      (envelope.ts).
+ *
+ * No business logic lives here or in any handler -- see handlers.ts. This file
+ * is the wiring: verifier, router, context, error funnel.
+ *
+ * `/health` is deliberately NOT part of this surface. It is handled in the
+ * Worker before delegation (src/workers/api.ts), unauthenticated, because it is
+ * the post-deploy version/environment probe (sections 16, 11.3) and must be
+ * reachable to confirm a deploy without a session.
+ */
+
+import { accessConfigFromEnv, authenticate, type AccessConfig } from "./access";
+import { errorResponse, fail, ApiError } from "./envelope";
+import * as handlers from "./handlers";
+import { resolveRoute, route, type ApiContext, type Route } from "./router";
+import { databaseFrom, type Database } from "../db";
+import type { BotInstance } from "../durable-objects/bot-instance";
+
+const ROUTES: readonly Route[] = [
+  route("GET", "/api/bots", handlers.listBots),
+  route("POST", "/api/bots", handlers.createBot),
+  route("GET", "/api/bots/:id", handlers.getBot),
+  route("POST", "/api/bots/:id/liquidate", handlers.liquidateBot),
+  route("GET", "/api/alerts", handlers.listAlerts),
+  route("POST", "/api/manual-adjustments", handlers.createManualAdjustment),
+  route("GET", "/api/circuit-breakers", handlers.listCircuitBreakers),
+  route("POST", "/api/circuit-breakers/:accountLabel/reset", handlers.resetCircuitBreaker),
+  route("GET", "/api/kill-switch", handlers.getKillSwitch),
+  route("POST", "/api/kill-switch/trigger", handlers.triggerKillSwitch),
+  route("POST", "/api/kill-switch/reset", handlers.resetKillSwitch),
+  route("GET", "/api/reconciliation", handlers.listReconciliationRuns),
+];
+
+/**
+ * What a caller may inject. The Worker leaves everything defaulted; tests supply
+ * the clock, the id source, and -- crucially -- the Access verifier's JWKS
+ * fetcher and clock via `access`, so a test signs its own tokens without a
+ * network fetch. The `aud` and team domain are never injectable (see
+ * `accessConfigFromEnv`): the code path that reads the real secret is always the
+ * one under test.
+ */
+export interface ApiOptions {
+  readonly now?: () => number;
+  readonly newId?: () => string;
+  readonly db?: Database;
+  readonly botNamespace?: DurableObjectNamespace<BotInstance>;
+  readonly access?: Pick<AccessConfig, "now" | "fetchJwks" | "jwksCache">;
+}
+
+function requireBotNamespace(
+  env: Env,
+  override?: DurableObjectNamespace<BotInstance>,
+): DurableObjectNamespace<BotInstance> {
+  const namespace = override ?? env.BOT_INSTANCE;
+  if (namespace === undefined) {
+    throw new ApiError(
+      503,
+      "no_bot_instance_binding",
+      "no BOT_INSTANCE binding in this environment. Only testnet and production declare one; " +
+        "a deploy with no --env has neither a database nor any bots.",
+    );
+  }
+  return namespace;
+}
+
+/** Handle one `/api/*` request end to end. */
+export async function handleApiRequest(
+  request: Request,
+  env: Env,
+  options: ApiOptions = {},
+): Promise<Response> {
+  const url = new URL(request.url);
+
+  try {
+    // 1. Authenticate before anything else.
+    const config = accessConfigFromEnv(env, options.access ?? {});
+    const actor = await authenticate(request, config);
+
+    // 2. Route.
+    const resolution = resolveRoute(ROUTES, request.method, url.pathname);
+    if (resolution.kind === "not_found") {
+      return fail(404, "not_found", `no API route for ${request.method} ${url.pathname}`);
+    }
+    if (resolution.kind === "method_not_allowed") {
+      const body = { data: null, error: { code: "method_not_allowed", message: `${request.method} is not allowed on ${url.pathname}` } };
+      return new Response(JSON.stringify(body), {
+        status: 405,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          Allow: resolution.allowed.join(", "),
+        },
+      });
+    }
+
+    // 3. Build the context and dispatch.
+    const ctx: ApiContext = {
+      request,
+      env,
+      url,
+      params: resolution.params,
+      actor,
+      db: options.db ?? databaseFrom(env),
+      botNamespace: requireBotNamespace(env, options.botNamespace),
+      now: options.now ?? (() => Date.now()),
+      newId: options.newId ?? (() => crypto.randomUUID()),
+    };
+    return await resolution.handler(ctx);
+  } catch (error) {
+    return errorResponse(error);
+  }
+}

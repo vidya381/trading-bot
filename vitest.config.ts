@@ -46,6 +46,15 @@ export default defineConfig({
           // Not application config: the migration set, handed to the test
           // runtime so `applyD1Migrations` can run it. No Worker reads this.
           TEST_MIGRATIONS: migrations,
+          // Build step 10 (dashboard API), section 11. The Access verifier's two
+          // settings, supplied to tests here rather than in wrangler.jsonc:
+          // ACCESS_AUD is a real secret (never committed) and ACCESS_TEAM_DOMAIN
+          // is deliberately empty in wrangler.jsonc until the account owner sets
+          // it. Test values so `accessConfigFromEnv` -- the real path that reads
+          // the secret -- is the one under test; the JWKS fetch is injected per
+          // test so no network is touched and the tests sign their own tokens.
+          ACCESS_AUD: "test-access-aud",
+          ACCESS_TEAM_DOMAIN: "testteam.cloudflareaccess.com",
         },
       },
     }),

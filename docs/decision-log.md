@@ -3862,3 +3862,181 @@ New:
    not stop the rest) and idempotent (a repeat re-sweeps), but on a large
    deployment a single pull is N sequential halts. Acceptable for v1's single
    user and small bot count; worth revisiting if that grows.
+
+## Step 10.4: Dashboard backend API — REST endpoints and Access JWT verification
+Date: 2026-07-23
+
+The backend half of spec step 10 (the dashboard): the HTTP API the React
+frontend will call, and the Cloudflare Access verification (section 11) in front
+of it. Backend only — no React, no styling, no WebSocket/real-time (the frontend
+polls next session). Thirteen endpoints, every one a thin wrapper over
+functionality built in earlier steps; the only genuinely new logic is the JWT
+verification and the JSON envelope. 1093 tests, up from 1041; typecheck clean.
+
+Everything lives in a new `/src/api` folder that takes its dependencies as
+parameters, with `handleApiRequest` as the one binding-aware entry the Worker
+calls for `/api/*`. Same shape as `/src/reconciliation` + `/src/workers`: the
+decisions are testable without a live environment, the wiring is thin.
+
+### Three questions asked before writing anything
+
+The brief said to stop and ask on any ambiguity about endpoint shape, the JWT
+approach, or response format rather than guess. Three were worth asking:
+
+1. **Where the Access team domain comes from.** `ACCESS_AUD` was named in the
+   brief, but verifying a JWT also needs the issuer and the JWKS URL, which
+   derive from the Zero Trust team domain, and only the account owner has it.
+   Answer: a non-secret `ACCESS_TEAM_DOMAIN` var in wrangler.jsonc (the AUD tag
+   stays a secret; the domain is not sensitive).
+2. **How money is serialized.** Answer: decimal strings, not JS numbers — real
+   money must not lose precision past 2^53 or on fractional cents.
+3. **Whether to require the JWT `email` claim to equal the
+   `Cf-Access-Authenticated-User-Email` header.** Answer: yes, require the
+   match. The two Access-provided values cannot be allowed to disagree.
+
+### What was built
+
+- `src/api/access.ts`: Access JWT verification with the Web Crypto API — no
+  library, no `nodejs_compat` (section 2). Verifies the RS256 signature against
+  Cloudflare's JWKS, checks `aud`/`iss`/`exp`/`nbf`, and requires the email
+  header to match the verified `email` claim. Fails closed (503) if `ACCESS_AUD`
+  or `ACCESS_TEAM_DOMAIN` is unset.
+- `src/api/{envelope,serialize,router,handlers,index}.ts`: the envelope
+  (`{ data, error }`) and its error→status map; money→decimal-string and
+  camelCase row views; a dependency-free path router; the thirteen handlers; and
+  `handleApiRequest` (authenticate → route → dispatch in one try/catch).
+- `src/workers/api.ts`: `/api/*` delegated to `handleApiRequest`; `/health` kept
+  byte-for-byte, plus an unauthenticated `/api/health` alias.
+- Config: `ACCESS_TEAM_DOMAIN` var added to both environments (empty, fail
+  closed, with an instruction to set it); `ACCESS_AUD`/`ACCESS_TEAM_DOMAIN` typed
+  via a `declare global` in access.ts (the DISCORD_WEBHOOK_URL pattern) and
+  supplied to tests via vitest.config.ts.
+- Tests: `access.test.ts` (real Web Crypto signatures — a valid one accepted, a
+  tampered/expired/wrong-aud/wrong-issuer/unknown-kid/none-alg one rejected, plus
+  the email-mismatch guard); `api.test.ts` (every endpoint end to end against
+  real D1 and real Durable Objects, only the exchange mocked, auth exercised on
+  live routes); `router.test.ts`.
+
+### Decisions made
+
+**1. Every handler wraps an existing call; the layer adds no business logic.**
+
+A create goes through `BotInstance.create`/`createGrid`, which already run
+section 8.5's capital-ledger check and the mandatory stop-loss/take-profit
+validation — so "validate against the capital ledger, reuse the existing check,
+don't duplicate its logic" is satisfied by *not reimplementing it*: the handler
+decodes the body and calls in, and `insufficient_capital`/`invalid_parameter`
+surface as the modules' own typed errors. Likewise liquidate → `liquidatePosition`
+(step 10.3, including its running-bot rejection verbatim), the breaker/kill-switch
+resets → the same human-only resets, reconciliation → the `audit_log` entries
+runs already write.
+
+**2. The error code is the contract; the envelope maps it to a status.**
+
+The wrapped modules already throw typed codes. `envelope.ts` carries the code
+through verbatim (`insufficient_capital`, `invalid_status`, `globally_tripped`,
+…) and maps it to an HTTP status in one table, so the frontend branches on a
+code, not on prose, and a handler only ever `throw`s. An error with no `.code`
+is a 500 with a generic message — an unreasoned error's text is not echoed.
+
+**3. `GET /api/bots` reads each bot's Durable Object, N times.**
+
+Status, strategy and allocation are authoritative in D1 (mirrored on every
+transition), but the live position and realized profit are the object's own
+(section 8.1) and are not fully mirrored. So the list is one DO snapshot per bot,
+run in parallel. This is the same per-bot fan-out the kill switch and circuit
+breaker already accept, and fine at v1's bot count; a large deployment would want
+the position mirrored to D1 instead. Recorded, not hidden.
+
+**4. Money is the canonical fixed-precision decimal string, verbose and all.**
+
+`toDecimalString`, so allocated capital is `"500.00000000"`, not `"500"`. It is
+exact, always the same shape, and matches how `audit_log` details are already
+written — one money format across the system. The prettier `toTrimmedString`
+exists but a fixed-precision contract is the safer one for the frontend to parse.
+
+**5. `/health` is unchanged and outside the auth surface; `/api/health` is an
+alias.**
+
+The brief listed the health check as `/api/health`; the endpoint that exists is
+`/health`. Rather than move a contract other things may already probe, `/health`
+is kept byte-for-byte and `/api/health` added as an alias returning the same
+payload. Both are unauthenticated on purpose — post-deploy verification (section
+16.1 step 6) reads the version and environment without a dashboard session, so
+putting health behind the JWT gate would break exactly the check it exists for.
+
+**6. The verifier fails closed, and the team domain ships empty.**
+
+`ACCESS_TEAM_DOMAIN` is committed as `""` in both environments with an
+instruction to set it. Until it (and the `ACCESS_AUD` secret) exist, every
+`/api/*` request is refused with a 503 rather than falling back to trusting the
+email header. An empty config value is not a committed placeholder resource id
+(step 4, decision 1) — it is a deliberate blank that makes the safe state the
+default state. The account owner must set the domain and put the secret before
+the API answers anything.
+
+**7. JWKS is cached per isolate, refetched once on an unknown `kid`.**
+
+Access rotates signing keys rarely, so the key set is cached in module state and
+a `kid` miss triggers a single forced refetch before the token is rejected as
+`access_unknown_key`. The cache and the fetcher are injectable, which is what
+lets the tests sign their own tokens and serve their own key with no network.
+
+### Deviations from the spec
+
+- **Section 7.4 "a single dashboard control" and step 10's dashboard form remain
+  unbuilt as UI.** This is the backend they call. `POST /api/kill-switch/trigger`
+  and the create/liquidate/reset endpoints exist and are tested; the buttons do
+  not.
+- **The brief says create "requires stop-loss and take-profit".** For DCA both
+  are mandatory and enforced (decode + `validateDcaParams`). For **grid**,
+  section 6.1 makes take-profit only *recommended*, and a grid's take-profit is
+  an optional accumulated-profit *amount*, not a percentage — so the grid create
+  requires a stop-loss and leaves `takeProfitAmount` optional, deferring to the
+  existing validation rather than adding a stricter rule the spec does not want.
+  The brief's wording is the general DCA case; grid genuinely differs, as it does
+  throughout.
+- **`POST /api/bots/:id/liquidate` cannot actually sell in either deployed
+  environment yet.** `liquidatePosition` fetches a current price, which needs an
+  exchange client, and none exists (step 4.1: whose account is undecided). So in
+  testnet/production the endpoint returns `not_attached` (503) until credentials
+  are wired — the same project-wide gap as everything else that touches the
+  exchange. It is verified here only against the mocked exchange, exactly as
+  section 14 prescribes; the endpoint is correct, the exchange behind it is
+  absent.
+
+### Open questions carried forward
+
+Still open and unchanged: nothing has ever made a real exchange call (8.1); the
+money/rate-limit and alert-delivery caveats of the section 17 amendments; the
+production allow-list is empty and whose funds are at risk is unsettled (4.1);
+the daily-loss circuit-breaker trigger (section 7.3) is unbuilt.
+
+New:
+
+1. **The Access verifier has never seen a real Cloudflare token.** Every test
+   signs with a key this suite minted and serves it through an injected JWKS, so
+   what is proven is that the RS256 verification, the claim checks and the
+   email-match are correct against tokens shaped like Access's — not that they
+   match a token Access actually issues, nor that `ACCESS_TEAM_DOMAIN` and
+   `ACCESS_AUD` are set to the right values. That is a testnet observation once
+   Access is configured (step 11): log in for real and confirm a genuine token
+   verifies and a request without one is refused. Until then, "the JWT check
+   works" is a claim about the code, the same shape of caveat as the rate
+   limiter and the alert path before them.
+
+2. **`GET /api/bots` is N Durable Object reads per call** (decision 3). Fine now;
+   a candidate for mirroring position/PnL to D1 if the bot count grows.
+
+3. **Error paths through a real Durable Object log an "uncaught (in promise)"
+   line to stderr.** When the object throws across RPC (insufficient capital, a
+   running-bot liquidation), the rejection is caught by `handleApiRequest` and
+   returned as the right 4xx, but the runtime still logs the crossing. Cosmetic,
+   present in the reconciliation/kill-switch tests too, and not worth suppressing
+   by swallowing errors closer to the object.
+
+4. **The kill-switch trigger/reset endpoints build their own database and
+   namespace from `env`** (via `tripGlobalKillSwitchFromEnv`), ignoring any `db`
+   injected into `handleApiRequest`. Harmless — both point at the same bindings —
+   but it means those two endpoints are not reroutable to an alternate database
+   the way the others are. Consistent with how step 10.3 built those seams.

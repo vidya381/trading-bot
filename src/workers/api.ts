@@ -8,6 +8,7 @@ export { RateLimiter } from "../durable-objects/rate-limiter";
 
 import { scheduled as reconciliationScheduled } from "./reconciliation";
 import { runNotificationDispatch } from "./notifications";
+import { handleApiRequest } from "../api";
 
 // wrangler.jsonc's `triggers.crons` declares two expressions: "*/5 * * * *"
 // (reconciliation) and "* * * * *" (notification dispatch). Cloudflare fires
@@ -44,24 +45,39 @@ const scheduled: ExportedHandlerScheduledHandler<Env> = async (controller, env, 
 };
 
 /**
- * Main API Worker (placeholder).
+ * Main API Worker.
  *
- * Only /health exists at this stage. Bot management routes, Durable Object
- * bindings, and Cloudflare Access header handling arrive in later build steps.
+ * Two surfaces:
+ *   - `/health` (and its `/api/health` alias): the unauthenticated version and
+ *     environment probe (sections 16, 11.3). Kept OUTSIDE the Access-verified
+ *     API so a deploy can be confirmed without a session, and left byte-for-byte
+ *     unchanged from the placeholder step so its contract does not move.
+ *   - `/api/*`: the dashboard API (build step 10), each request verified against
+ *     Cloudflare Access's JWT before any handler runs. See /src/api.
+ *
+ * Cloudflare Access gates this Worker at the edge; the JWT verification in
+ * /src/api is the defensive second check, so a request that somehow reached the
+ * application without Access is rejected rather than trusted (section 11).
  */
 export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/health") {
+    if (url.pathname === "/health" || url.pathname === "/api/health") {
       // Spec section 16: a deployed version must always be confirmable against
       // what is actually running. Spec section 11.3: the environment must be
       // confirmable programmatically, not just from the dashboard banner.
+      // Unauthenticated on purpose -- post-deploy verification (section 16.1
+      // step 6) reads this without a dashboard session.
       return Response.json({
         status: "ok",
         version,
         environment: env.ENVIRONMENT,
       });
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      return await handleApiRequest(request, env);
     }
 
     return new Response("Not Found", { status: 404 });
