@@ -32,6 +32,7 @@ const TABLES_CHILDREN_FIRST = [
   "manual_adjustments",
   "capital_ledger",
   "circuit_breakers",
+  "global_kill_switch",
   "bot_instances",
 ] as const;
 

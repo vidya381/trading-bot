@@ -9,4 +9,5 @@
 
 export * from "./circuit-breaker";
 export * from "./findings";
+export * from "./kill-switch";
 export * from "./reconcile";

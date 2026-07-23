@@ -91,6 +91,7 @@ import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
 import { assertAccountArmed } from "../reconciliation/circuit-breaker";
+import { assertGlobalArmed } from "../reconciliation/kill-switch";
 import { IdempotencyGuard } from "../shared/idempotency";
 import { divideRounded, mul, toDecimalString, ZERO, type Money } from "../shared/money";
 import {
@@ -307,10 +308,22 @@ export interface BotRuntimeState {
   readonly filters: SymbolFilters | null;
   /**
    * Set while an exit sell is live, so its fill is attributed to the exit rather
-   * than to strategy state. DCA: the take-profit sell. Grid: the stop-loss,
-   * breakout, or take-profit liquidation sell.
+   * than to strategy state. DCA: the take-profit sell, or a human liquidation.
+   * Grid: the stop-loss, breakout, or take-profit liquidation sell, or a human
+   * liquidation.
    */
   readonly exitOrderId: string | null;
+  /**
+   * Which KIND of exit `exitOrderId` is, so the fill can be completed correctly
+   * (step 10.3). A DCA `take_profit` exit completes a cycle and may auto-restart
+   * (section 6.3 step 6); a `liquidation` is a deliberate human close of a
+   * halted bot and must stay halted. Grid ignores this -- its exit-fill folds
+   * into the ladder and stays halted for every reason. Optional and defaulted to
+   * `take_profit` on read, so DCA state written before this field remains valid
+   * (the only exit that existed then was take-profit); nothing has ever run, so
+   * this is belt-and-braces.
+   */
+  readonly exitKind?: "take_profit" | "liquidation";
 }
 
 export interface CreateDcaBotRequest {
@@ -544,11 +557,14 @@ export class BotInstance extends DurableObject<Env> {
     const db = this.#db();
     const now = this.#now();
 
-    // Section 7.3, added at step 7. An account whose circuit breaker is
-    // tripped must not gain a new bot: halting everything that existed at the
-    // moment of the trip is not a breaker if the next creation starts trading
-    // straight back into whatever caused it. Checked before any capital is
-    // reserved, so a refusal costs nothing to undo.
+    // Section 7.4, added at step 10.3, and section 7.3 at step 7. Two
+    // independent latches gate creation, and BOTH must be armed: the global
+    // kill switch (any account) and this account's own circuit breaker.
+    // Halting everything that existed at the moment either was pulled is not a
+    // control if the next creation starts trading straight back into whatever
+    // caused it. Checked before any capital is reserved, so a refusal costs
+    // nothing to undo. Global first: it is the broader condition.
+    await assertGlobalArmed(db, `create bot ${request.botInstanceId}`);
     await assertAccountArmed(db, request.accountLabel, `create bot ${request.botInstanceId}`);
 
     // Before any capital is touched. Section 6.1 checks the allocation against
@@ -636,6 +652,7 @@ export class BotInstance extends DurableObject<Env> {
     const db = this.#db();
     const now = this.#now();
 
+    await assertGlobalArmed(db, `create bot ${request.botInstanceId}`);
     await assertAccountArmed(db, request.accountLabel, `create bot ${request.botInstanceId}`);
 
     // Section 6.1 checks the allocation against the account; this checks the
@@ -855,12 +872,14 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
 
-    // Section 7.3, added at step 7. The other half of the latch: a bot halted
-    // BY the circuit breaker must not be resumable while the account is still
-    // tripped, or the breaker lasts exactly as long as it takes someone to
-    // click resume. Re-arming the account is a separate, explicit human action
-    // (`resetAccountCircuitBreaker`), and each bot still has to be resumed
-    // individually afterwards per section 7.2 step 5.
+    // Sections 7.3 (step 7) and 7.4 (step 10.3). The other half of both latches:
+    // a bot halted BY the global kill switch or this account's breaker must not
+    // be resumable while either is still latched, or the control lasts exactly
+    // as long as it takes someone to click resume. Re-arming each is a separate,
+    // explicit human action (`resetGlobalKillSwitch` / `resetAccountCircuitBreaker`),
+    // and each bot still has to be resumed individually afterwards per section
+    // 7.2 step 5. Global first: it is the broader condition.
+    await assertGlobalArmed(this.#db(), `resume bot ${config.botInstanceId}`);
     await assertAccountArmed(this.#db(), config.accountLabel, `resume bot ${config.botInstanceId}`);
 
     const now = this.#now();
@@ -872,6 +891,118 @@ export class BotInstance extends DurableObject<Env> {
     await this.#audit(config, "bot.resumed", actor, { previous_halt_reason: state.haltReason }, now);
 
     return { status: "running", action: "resumed" };
+  }
+
+  /**
+   * Liquidate the held position on a HALTED bot: the unified human close-out
+   * (step 10.3), usable identically by both strategies.
+   *
+   * This is the deliberate, human-triggered counterpart to two things that are
+   * deliberately NOT automatic. DCA's `sellOnStopLoss` is refused (step 6,
+   * decision 14) precisely so an auto-sell at a loss is never implicit; grid's
+   * stop-loss DOES liquidate, but only for its three exit reasons, never for a
+   * manual halt (step 9, decision 2). So neither strategy will sell a held
+   * position out from under a human on its own. This method is how a human asks
+   * for exactly that, once they have looked at a halted bot and decided to close
+   * it -- through the SAME mechanism grid's stop-loss already uses (cancel open
+   * orders, marketable limit sell at the current price, alert and leave it
+   * resting if it does not fill), so a future dashboard button does not need to
+   * know which strategy it is talking to.
+   *
+   * THREE GUARDS, in order:
+   *
+   *  1. HALTED ONLY. A running bot is refused. Liquidating a bot that is
+   *     actively trading would race its own order placement -- selling base a
+   *     replace-on-fill is about to sell again, or dropping a position the
+   *     strategy still intends to manage. A human must halt it first, which is
+   *     itself an explicit action. This is the one place the "callable
+   *     regardless of WHY it is halted" freedom is bounded: any halt reason is
+   *     fine (stop-loss, manual, breaker, error), but `running` is not a halt.
+   *  2. NO EXIT ALREADY LIVE. If a liquidation or take-profit sell is already
+   *     resting, a second would double-sell. Idempotent no-op instead.
+   *  3. SOMETHING TO SELL. A flat position is a no-op, alerted at info so the
+   *     dashboard shows the click landed and found nothing to do.
+   */
+  async liquidatePosition(actor: string): Promise<PipelineResult> {
+    const config = await this.#config();
+    let state = await this.#state();
+
+    if (state.status !== "halted") {
+      throw new BotInstanceError(
+        "invalid_status",
+        `liquidatePosition requires a halted bot; this one is ${JSON.stringify(state.status)}. ` +
+          `Halt it first: a human must not sell a position out from under a bot that is still ` +
+          `actively trading.`,
+      );
+    }
+
+    if (state.exitOrderId !== null) {
+      return { status: "halted", action: "hold", detail: "a liquidation or exit order is already live" };
+    }
+
+    const heldQuantity =
+      config.strategy === "grid" ? state.ladder!.heldQuantity : state.position.quantity;
+
+    if (heldQuantity <= ZERO) {
+      await this.#alert(config, {
+        severity: "info",
+        category: "trading",
+        alertType: "liquidation_noop",
+        message: "liquidatePosition was called but the position is already flat; nothing to sell",
+      });
+      return { status: "halted", action: "nothing_to_liquidate" };
+    }
+
+    // Cancel anything still believed live before selling. A halt normally
+    // cancels already, but a failed cancel can leave orders open (see
+    // `#cancelOpenOrders`), and a grid halted for a non-exit reason still has
+    // ladder slots referencing now-cancelled orders. Clearing them mirrors
+    // `#gridExit`, so the liquidation sell is the only live order afterwards.
+    await this.#cancelOpenOrders(config, state);
+    state = await this.#state();
+    if (config.strategy === "grid") {
+      const cleared: GridLadder = { ...state.ladder!, slots: state.ladder!.slots.map(() => null) };
+      await this.#putState({ ...state, ladder: cleared });
+    }
+
+    // "At current price" (section 4.5's marketable limit) needs a price, and a
+    // human liquidation is not driven by a price event the way a stop-loss is.
+    // So it is fetched fresh at risk-exit priority. Section 5.6 forbids treating
+    // an unreachable exchange as data: if the read fails, the position is left
+    // held on the halted bot and alerted, rather than sold at a stale or
+    // unknown price. The last-seen price is deliberately NOT used as a fallback
+    // -- a marketable limit priced off a stale tick may not be marketable.
+    const priceOutcome = await this.#exchange(config, "risk-exit").getCurrentPrice(config.pair);
+    if (!isUsable(priceOutcome)) {
+      await this.#alert(config, {
+        severity: "critical",
+        category: "trading",
+        alertType: "liquidation_no_price",
+        message:
+          `could not read a current price to liquidate at (${priceOutcome.kind}: ` +
+          `${priceOutcome.message}); the position is left held on the halted bot`,
+      });
+      return { status: "halted", action: "no_price", detail: priceOutcome.message };
+    }
+
+    await this.#audit(
+      config,
+      "bot.liquidated",
+      actor,
+      {
+        quantity: toDecimalString(heldQuantity),
+        price: toDecimalString(priceOutcome.value.price),
+        halt_reason: state.haltReason,
+      },
+      this.#now(),
+    );
+
+    // The shared mechanism grid's stop-loss uses. It sets `exitOrderId` and
+    // `exitKind: "liquidation"`; the fill is folded by grid's `#applyGridExitFill`
+    // or DCA's `#completeLiquidation`, both of which keep the bot halted.
+    await this.#placeLiquidationSell(config, heldQuantity, priceOutcome.value);
+
+    return { status: "halted", action: "liquidating", detail: toDecimalString(heldQuantity) };
   }
 
   /**
@@ -1245,6 +1376,7 @@ export class BotInstance extends DurableObject<Env> {
       ...(await this.#state()),
       openOrderIds: [decision.clientOrderId],
       exitOrderId: decision.clientOrderId,
+      exitKind: "take_profit",
     });
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
 
@@ -1303,6 +1435,13 @@ export class BotInstance extends DurableObject<Env> {
     await this.#mirrorTrade(config, effect.order, fill);
 
     if (isExit && effect.fullyFilled) {
+      // A take-profit exit completes the cycle (and may auto-restart); a human
+      // liquidation of a halted bot stays halted. `exitKind` distinguishes them
+      // explicitly rather than inferring it from status, so the two paths cannot
+      // be confused by a future change to how status is set.
+      if (state.exitKind === "liquidation") {
+        return await this.#completeLiquidation(config, effect.order, fill);
+      }
       return await this.#completeCycle(config, effect.order, fill.executedAt);
     }
 
@@ -1346,6 +1485,7 @@ export class BotInstance extends DurableObject<Env> {
       position: EMPTY_POSITION,
       openOrderIds: [],
       exitOrderId: null,
+      exitKind: undefined,
       realizedGross: state.realizedGross + gross,
     };
     await this.#putState(completed);
@@ -1379,6 +1519,53 @@ export class BotInstance extends DurableObject<Env> {
         `${config.capitalAsset}; autoRestart is off, so it is awaiting review`,
       "system",
     );
+  }
+
+  /**
+   * A DCA liquidation sell has fully filled (step 10.3).
+   *
+   * Unlike `#completeCycle`, this is NOT a cycle completion: the bot was halted
+   * when a human triggered `liquidatePosition`, and it STAYS halted. There is no
+   * auto-restart to consider. The position is now flat, the realized proceeds --
+   * a loss, quite possibly, since a liquidation is often a deliberate cut, and
+   * that is recorded honestly rather than hidden -- are folded into
+   * `realizedGross`, and the capital reservation is left untouched (releasing it
+   * is a `close`, a separate human decision, exactly as `#completeCycle` leaves
+   * it).
+   */
+  async #completeLiquidation(config: DcaConfig, exit: TrackedOrder, fill: Fill): Promise<PipelineResult> {
+    const state = await this.#state();
+    // Half-even, matching `#completeCycle`: an internal accounting figure.
+    const proceeds = mul(exit.filledQuantity, exit.price, "half-even");
+    const gross = proceeds - state.position.cost;
+
+    const completed: BotRuntimeState = {
+      ...state,
+      position: EMPTY_POSITION,
+      openOrderIds: state.openOrderIds.filter((id) => id !== exit.clientOrderId),
+      exitOrderId: null,
+      exitKind: undefined,
+      realizedGross: state.realizedGross + gross,
+    };
+    await this.#putState(completed);
+    await this.#audit(
+      config,
+      "bot.liquidation_filled",
+      "system",
+      { gross_proceeds: toDecimalString(gross), quantity: toDecimalString(exit.filledQuantity) },
+      fill.executedAt,
+    );
+    await this.#alert(config, {
+      severity: "info",
+      category: "trading",
+      alertType: "liquidation_filled",
+      message:
+        `the human-triggered liquidation sold ${toDecimalString(exit.filledQuantity)} at ` +
+        `${toDecimalString(exit.price)} for a gross ${toDecimalString(gross)} ${config.capitalAsset}. ` +
+        `The bot stays halted.`,
+    });
+
+    return { status: "halted", action: "liquidation_filled", detail: exit.clientOrderId };
   }
 
   /**
@@ -1691,6 +1878,7 @@ export class BotInstance extends DurableObject<Env> {
       next = {
         ...next,
         exitOrderId: null,
+        exitKind: undefined,
         openOrderIds: next.openOrderIds.filter((id) => id !== order.clientOrderId),
       };
     }
@@ -1753,8 +1941,16 @@ export class BotInstance extends DurableObject<Env> {
    *
    * Risk-exit priority throughout: this is exactly the class of order section
    * 5.4's reserved slice exists for.
+   *
+   * Strategy-agnostic (widened to `BotConfigBase` at step 10.3): the body touches
+   * only the pair, the guard, filters, `exitOrderId`/`exitKind` and
+   * `openOrderIds`, never the ladder or the DCA position. Both the grid exit
+   * (`#gridExit`) and the unified human `liquidatePosition` call it, so the two
+   * strategies liquidate through one code path. The eventual fill is folded by
+   * each strategy's own fill handler: grid's `#applyGridExitFill`, DCA's
+   * `#completeLiquidation`.
    */
-  async #placeLiquidationSell(config: GridConfig, quantity: Money, price: Price): Promise<void> {
+  async #placeLiquidationSell(config: BotConfigBase, quantity: Money, price: Price): Promise<void> {
     let state = await this.#state();
     const now = this.#now();
     const filters = await this.#ensureFilters(config, state, now, "risk-exit");
@@ -1842,6 +2038,7 @@ export class BotInstance extends DurableObject<Env> {
     await this.#putState({
       ...current,
       exitOrderId: decision.clientOrderId,
+      exitKind: "liquidation",
       openOrderIds: [...current.openOrderIds, decision.clientOrderId],
     });
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);

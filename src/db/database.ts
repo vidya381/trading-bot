@@ -20,6 +20,7 @@ import {
   botInstances,
   capitalLedger,
   circuitBreakers,
+  globalKillSwitch,
   manualAdjustments,
   orders,
   trades,
@@ -37,6 +38,7 @@ export class Database {
   readonly auditLog: Repository<typeof auditLog.columns>;
   readonly alerts: Repository<typeof alerts.columns>;
   readonly circuitBreakers: Repository<typeof circuitBreakers.columns>;
+  readonly globalKillSwitch: Repository<typeof globalKillSwitch.columns>;
 
   constructor(d1: D1Database) {
     this.#d1 = d1;
@@ -49,6 +51,7 @@ export class Database {
     this.auditLog = new Repository(d1, auditLog);
     this.alerts = new Repository(d1, alerts);
     this.circuitBreakers = new Repository(d1, circuitBreakers);
+    this.globalKillSwitch = new Repository(d1, globalKillSwitch);
   }
 
   /**

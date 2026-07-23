@@ -117,6 +117,10 @@ describe("the schema as a whole", () => {
       // section 9's severe tier requires the section 7.3 circuit breaker to
       // exist as a real, latching control rather than a paragraph.
       "circuit_breakers",
+      // Not in section 8.2. Added by migration 0005 at step 10.3, the global
+      // sibling of circuit_breakers: section 7.4's kill switch needs its own
+      // latch, separate from any account's breaker.
+      "global_kill_switch",
       "manual_adjustments",
       "orders",
       "trades",
@@ -150,6 +154,9 @@ describe("the schema as a whole", () => {
       // daily-loss THRESHOLD would be a money column, and it is deliberately
       // not built yet -- see circuit-breaker.ts's header.
       circuit_breakers: [],
+      // Also a latch, not an amount. Section 7.4 is a one-click emergency stop,
+      // with no threshold of its own.
+      global_kill_switch: [],
     };
 
     for (const spec of Object.values(ALL_TABLES)) {

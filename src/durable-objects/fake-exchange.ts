@@ -24,7 +24,7 @@ import type {
   SymbolFilters,
   Timestamp,
 } from "../shared/exchange-client";
-import { fromDecimalString, ZERO, type Money } from "../shared/money";
+import { fromDecimalString, ONE, ZERO, type Money } from "../shared/money";
 
 export const TEST_PAIR = "BTCUSDT";
 
@@ -80,6 +80,15 @@ export class FakeExchange implements RestExchangeClient {
   openOrdersFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force `getAccountBalances` to fail. Stays set until cleared. */
   balancesFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  /**
+   * What `getCurrentPrice` returns, for the human-triggered liquidation path
+   * (step 10.3), which fetches a fresh price rather than being driven by a price
+   * event. Non-zero by default so a marketable limit is constructible; a test
+   * that wants an unreachable exchange sets `currentPriceFailure`.
+   */
+  currentPrice: Money = 100n * ONE;
+  /** Set to force `getCurrentPrice` to fail. Stays set until cleared. */
+  currentPriceFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
 
   /**
    * What the account holds, for step 7's reconciliation.
@@ -110,7 +119,10 @@ export class FakeExchange implements RestExchangeClient {
   }
 
   async getCurrentPrice(pair: Pair): Promise<ExchangeOutcome<Price>> {
-    return { ok: true, value: { pair, price: ZERO, at: this.now }, at: this.now };
+    if (this.currentPriceFailure !== null) {
+      return failure(this.currentPriceFailure.message, this.currentPriceFailure.kind, this.now);
+    }
+    return { ok: true, value: { pair, price: this.currentPrice, at: this.now }, at: this.now };
   }
 
   async placeOrder(order: OrderRequest): Promise<ExchangeOutcome<OrderResult>> {

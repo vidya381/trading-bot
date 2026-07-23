@@ -143,6 +143,24 @@ export const circuitBreakers = defineTable("circuit_breakers", {
   updated_at: integer(),
 });
 
+/**
+ * Section 7.4's global kill switch, added by migration 0005 at step 10.3. A
+ * missing row means it has never been pulled, which is treated as `armed` --
+ * see `/src/reconciliation/kill-switch.ts`. At most one row, pinned to id 1.
+ */
+export type GlobalKillSwitchState = "armed" | "tripped";
+
+export const globalKillSwitch = defineTable("global_kill_switch", {
+  id: integer(),
+  state: text<GlobalKillSwitchState>(),
+  reason: nullable(text()),
+  tripped_at: nullable(integer()),
+  tripped_by: nullable(text()),
+  reset_at: nullable(integer()),
+  reset_by: nullable(text()),
+  updated_at: integer(),
+});
+
 export const auditLog = defineTable("audit_log", {
   id: text(),
   actor: text(),
@@ -182,6 +200,7 @@ export type ManualAdjustmentRow = Row<typeof manualAdjustments.columns>;
 export type AuditLogRow = Row<typeof auditLog.columns>;
 export type AlertRow = Row<typeof alerts.columns>;
 export type CircuitBreakerRow = Row<typeof circuitBreakers.columns>;
+export type GlobalKillSwitchRow = Row<typeof globalKillSwitch.columns>;
 
 /** Every table, for the schema-drift test and for Database's construction. */
 export const ALL_TABLES = {
@@ -194,4 +213,5 @@ export const ALL_TABLES = {
   auditLog,
   alerts,
   circuitBreakers,
+  globalKillSwitch,
 } as const;

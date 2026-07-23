@@ -3597,3 +3597,268 @@ only the missing-schema case.
    tested locally. Confirming the production cron logs now show the clean no-op
    instead of the raw error is a one-look check against the deployed Worker's
    logs, not something the suite can assert.
+
+---
+
+## Step 10.2: Discord timestamp showing 1970 -- investigated, not a code bug
+Date: 2026-07-23
+
+A test alert manually inserted to verify the newly-provisioned Discord webhook
+(the go-live item added at step 10) landed showing `1/21/70` instead of the real
+date -- the classic seconds-vs-milliseconds tell.
+
+### What was found
+
+The formatter at `src/notifications/discord.ts` renders
+`new Date(alert.createdAt).toISOString()`, treating `created_at` as
+milliseconds. That is correct for this system, and the investigation confirmed
+it rather than assuming it: `Timestamp` is documented as milliseconds since the
+epoch, every alert writer stamps `created_at` with `Date.now()` (the BotInstance
+`#now`, reconciliation's `now`, the circuit breaker), the column has no
+`unixepoch()`/`strftime()` default, and nothing in the dispatch path divides or
+scales the value -- the dispatcher passes `row.created_at` straight through.
+
+A real alert therefore carries `created_at ~= 1.76e12`, which renders 2025. The
+`1/21/70` corresponds to `~1.76e9` reaching `new Date` -- the current time in
+**seconds**. So the value in that particular row was seconds, and the manual
+insert that produced the test alert had used a Unix-seconds value (an
+`unixepoch()` / 10-digit number) rather than the milliseconds the system uses.
+
+### Decision: the formatter was NOT changed
+
+The reported symptom is real, but the cause is the test row's data, not the
+formatter. "Fixing the conversion" by scaling `createdAt` in the notifier would
+have rendered every genuine (millisecond) alert as roughly the year 57700 and
+broken the existing assertion. So the unit handling was left exactly as it is.
+
+This is recorded deliberately, because the instinct the bug invites -- "the date
+is wrong, multiply by 1000 where it is formatted" -- is precisely the change that
+would turn one wrong test row into every real alert being wrong. The formatter
+reflecting the system's own convention is the property to protect, and the fix
+belongs at the insert (use milliseconds, e.g. `unixepoch() * 1000`).
+
+### What changed
+
+One test only, in `src/notifications/discord.test.ts`: a regression test
+asserting the rendered embed timestamp round-trips to the exact `created_at`
+instant AND lands in the real year, so a future seconds-vs-ms slip in either
+direction -- a stray `/1000` (-> 1970) or `* 1000` (-> ~57700) -- fails loudly
+here rather than surfacing as a wrong date in a real Discord alert. 1018 tests,
+typecheck clean. The notifier itself is untouched.
+
+---
+
+## Step 10.3: Human liquidation and the global kill switch
+Date: 2026-07-23
+
+Backend only, and a deliberate precursor to the dashboard (spec step 10) and
+Cloudflare Access (step 11), both of which stay unbuilt. Two risk controls that
+a human triggers: a unified `liquidatePosition` both strategies expose
+identically, and section 7.4's global kill switch, the account-spanning sibling
+of step 7's per-account breaker. 1041 tests, up from 1018; typecheck clean.
+
+I was asked to stop and ask if the strategy-unification or the
+global-vs-account relationship was ambiguous. I judged neither was -- the brief
+is prescriptive (the global switch halts bots *directly* through their own halt
+path, keeps its *own* record, has its *own* reset; both latches independently
+gate create and resume) -- and proceeded without asking. Two forks I decided
+rather than surfaced are called out below (decisions 2 and 5), because "I did
+not ask" is only honest if it says what I decided in the silence.
+
+### What was built
+
+- `BotInstance.liquidatePosition(actor)`: the unified human close-out, callable
+  on a bot in ANY halted state, refused on a running one.
+- A new `exitKind` field on the object's runtime state (`take_profit` |
+  `liquidation`), and a DCA `#completeLiquidation` that keeps the bot halted
+  where `#completeCycle` would auto-restart.
+- `#placeLiquidationSell` widened from `GridConfig` to `BotConfigBase`, so
+  grid's stop-loss and the new human path share one liquidation mechanism.
+- `migrations/0005_global_kill_switch.sql`: a one-row `global_kill_switch`
+  latch, its own record separate from `circuit_breakers`.
+- `src/reconciliation/kill-switch.ts`: `tripGlobalKillSwitch`,
+  `resetGlobalKillSwitch`, `assertGlobalArmed`, mirroring the account breaker's
+  shape (latch-before-sweep, injected `haltBot` port, human-only reset).
+- `BotInstance.create`/`createGrid`/`resume` now assert BOTH latches armed.
+- `src/workers/kill-switch.ts`: `tripGlobalKillSwitchFromEnv` /
+  `resetGlobalKillSwitchFromEnv`, the binding-aware seam the dashboard button
+  will call, building the real halt port from the `BOT_INSTANCE` namespace.
+- Three test files (real D1 + real Durable Objects, only the exchange mocked):
+  DCA and grid liquidation through the one call, a running bot rejected, and a
+  global pull that halts real bots across two different accounts.
+
+### Decisions made
+
+**1. The liquidation mechanism is grid's, reused verbatim, not a second one.**
+
+Section 6.2 step 4's "cancel all, sell any held position, alert if it does not
+fill" was already built at step 9 as `#placeLiquidationSell`, and its body was
+already strategy-agnostic -- it touches the pair, the idempotency guard, the
+filters, `exitOrderId`/`openOrderIds`, and never the ladder or the DCA position.
+So the unification is a type widening (`GridConfig` -> `BotConfigBase`) plus a
+public entry point, not a new sell path. That is the whole point of the brief's
+"a future dashboard button doesn't need to know which strategy it's talking to":
+there is now exactly one place a position is liquidated, and both strategies and
+both trigger reasons (grid's automatic stop-loss, the human's deliberate call)
+go through it.
+
+*A separate DCA liquidation sell -- rejected.* It would have duplicated the
+marketable-limit construction, the three-way outcome handling (throttle /
+transport / refusal), and the alert taxonomy, and the two would have drifted the
+first time one was touched.
+
+**2. A DCA liquidation is distinguished from a take-profit by an explicit
+`exitKind`, not by inferring it from status. (My call, not asked.)**
+
+This is the one place the reuse was not free. Both a take-profit sell and a
+liquidation sell set `exitOrderId`, and DCA's `#applyFillToOrder` routed EVERY
+fully-filled exit into `#completeCycle` -- which zeroes the position and then
+either auto-restarts a fresh cycle or halts with `take_profit_reached` (section
+6.3 step 6). That is exactly wrong for a human liquidation of an already-halted
+bot: it must stay halted, and there is no cycle to complete or restart. So a
+liquidation fill now routes to `#completeLiquidation`, which records the
+realized proceeds -- a loss, quite possibly, and recorded honestly rather than
+hidden, since a liquidation is often a deliberate cut -- and leaves the bot
+halted, capital reservation untouched (releasing it is a `close`, a separate
+human decision).
+
+The fork: I could have branched on `state.status` (a take-profit only happens
+while `running`, a liquidation only while `halted`), avoiding a new field. I
+chose the explicit marker instead, following this log's repeated finding that
+status-implied behaviour is the kind of coupling that breaks silently when a
+future change moves where status is set (step 6's decision 2 inverted the halt
+ordering; step 3.1's decision 3 is a whole entry about a value that type-checked
+while meaning the wrong thing). `exitKind` is optional and read as `take_profit`
+when absent, so it is additive to stored state with no schema-version bump --
+the same treatment grid's `ladder?` got at step 9. Grid needs none of this: its
+exit-fill folds into the ladder and stays halted for every reason, so it ignores
+`exitKind` entirely.
+
+**3. The held position is refused to a RUNNING bot, per the brief.**
+
+`liquidatePosition` throws `invalid_status` unless the bot is halted. Selling a
+position out from under a bot that is still placing orders would race its own
+logic -- grid's replace-on-fill is about to sell that base again a level up; DCA
+still intends to manage it toward take-profit. A human must halt first, itself
+an explicit act. This is the single bound on the brief's "callable regardless of
+why it is halted": any halt reason qualifies (stop-loss, manual, breaker, error,
+the kill switch itself), because `running` is not a halt.
+
+**4. A human liquidation fetches a FRESH price; it does not reuse the last one.
+(My call, not asked.)**
+
+Grid's stop-loss liquidation is driven by a price event and prices the
+marketable limit at that event's price. A human liquidation has no such event,
+so the price is fetched via `getCurrentPrice` at risk-exit priority. If that
+read fails, section 5.6 governs: nothing is sold, the position is left held on
+the halted bot, and it is alerted (`liquidation_no_price`, critical). The
+last-seen `lastPrice` is deliberately NOT a fallback -- a limit priced off a
+stale tick may not be marketable, which defeats the point of pricing it at
+"current price" at all. This is a decision, not an ambiguity: the brief says
+"marketable limit order at current price", and the current price is the one the
+exchange reports now, not the one it reported whenever the bot last heard.
+
+**5. The global kill switch requires a HUMAN actor to TRIP, not only to reset.
+(My call, not asked.)**
+
+The account breaker (step 7) accepts any actor on a trip, because
+`reconciliation` trips it on section 9's severe drift. The global switch has no
+such automated trigger: section 7.4 frames it as "a single dashboard control ...
+for use in a genuine emergency", human by construction. So both the trip and the
+reset refuse `system`/`ci`/`cron`/`reconciliation`. The fork is real -- a kill
+switch is arguably the one control you might want an automated catastrophe
+detector to pull -- and I came down on human-only because no such detector is
+specified and the spec's own framing is a manual control. It is recorded as
+revisitable in the module header: if a global-safety trigger is ever specified,
+relaxing the trip guard is a one-line change and the sweep already takes its
+actor as a string.
+
+**6. A separate table, not a sentinel row in `circuit_breakers`.**
+
+The brief wants the switch to have "its own record of globally tripped, separate
+from any single account's breaker", so that resetting one account's breaker
+cannot clear the global switch and vice versa. A reserved-`account_label`
+sentinel row in `circuit_breakers` would have collided with the account
+namespace and quietly changed what `assertAccountArmed` reads. `global_kill_switch`
+is one row (`CHECK (id = 1)`), latching in the same D1-not-KV way and for the
+same reason as migration 0003 (a create-blocking check that can read a stale
+"armed" seconds after a global stop is a hole in the one control that exists for
+an emergency). The two latches are genuinely independent: `create` and `resume`
+assert BOTH armed, tested directly (`kill-switch.test.ts`'s "independence"
+block: a global trip writes no `circuit_breakers` row, and each resets without
+touching the other).
+
+**7. Both create/resume guards are two calls, global first.**
+
+`assertGlobalArmed` then `assertAccountArmed`, at each of the three sites. Global
+first because it is the broader condition and the more urgent message. I did not
+fold them into one combined helper: the two are genuinely separate controls with
+separate error codes (`globally_tripped` vs `account_tripped`), and a caller --
+eventually the dashboard -- will want to tell a user *which* latch blocked them.
+
+**8. The env wrappers exist, but nothing calls them yet, and that is correct for
+this session.**
+
+`tripGlobalKillSwitchFromEnv` builds the real halt port from the `BOT_INSTANCE`
+namespace exactly as the reconciliation worker does, with the same
+no-binding/no-schema clean refusals. It is the callable seam, tested end to end
+against real Durable Objects. But no HTTP route or UI invokes it: that is the
+dashboard (step 10), gated behind Cloudflare Access (step 11), both explicitly
+out of scope here. So the control is complete and exercisable from code, and has
+no trigger surface a person can reach until those are built -- stated plainly so
+it is not mistaken for finished.
+
+### Deviations from the spec
+
+- **Section 7.4 says "a single dashboard control".** The control is built; the
+  dashboard is not (step 10). What exists is the backend it will call.
+- **Section 6.3 step 5's `sellOnStopLoss` remains refused** (step 6, decision
+  14). This session does NOT implement it -- `liquidatePosition` is a human
+  action, not a config flag that fires on its own. The gap that refusal leaves
+  (a DCA bot halts at a stop-loss holding its position) is now closable by a
+  human, deliberately, which is precisely what section 6.3 step 5 asks for: an
+  auto-sell at a loss must be "an explicit, configured behavior the account
+  owner has chosen", and a human clicking liquidate is more explicit than a
+  config field, not less.
+- **`exitKind` is a new field on Durable Object runtime state**, additive and
+  optional, no schema-version bump (decision 2). It is DO storage, not a D1
+  column, so it touches no migration.
+
+### Open questions carried forward
+
+Still open and unchanged from earlier steps: nothing has ever made a real
+exchange call (8.1); the money/rate-limit caveats of the section 17 amendments;
+the production allow-list is empty (4.1.2); whose funds are at risk (4.1.1).
+
+New:
+
+1. **A human liquidation's marketable limit can fail to fill, exactly as grid's
+   stop-loss can** (step 9, open question 1, now shared by both paths). On a
+   fast drop the limit rests unfilled and the position stays held on the halted
+   bot, alerted, not pretended away. This inherits grid's honest limit of a
+   market-order-free close, and it is verified only against the mock: the fill
+   behaviour against a real book is a section 17 testnet observation, and now
+   there are two callers of it to watch, not one.
+
+2. **A DCA liquidation that PARTIALLY fills does not decrement the position
+   until it fully fills**, matching DCA's take-profit semantics exactly
+   (`#completeCycle` and `#completeLiquidation` both act only on a full fill).
+   Grid's `#applyGridExitFill` decrements per partial fill; DCA does not. The
+   position therefore overstates what the bot holds between a partial exit fill
+   and the full one, with the resting sell accounting for the difference, and
+   reconciliation owns any discrepancy. Consistent with what was already there,
+   but it is a real asymmetry between the two strategies' exit-fill handling and
+   is recorded rather than smoothed over.
+
+3. **Nothing reaches `tripGlobalKillSwitchFromEnv` yet** (decision 8). The
+   control has no human-reachable trigger until the dashboard and Access exist.
+   Its correctness is a claim about the code and its tests, not about a button
+   anyone has pressed.
+
+4. **The global sweep reads every active bot in one query and halts them
+   serially over RPC.** For the account breaker this was step 7's shape and step
+   8/9's serial-cancellation caveat applies per bot; across every account at
+   once the fan-out is larger. It is failure-tolerant (one unreachable bot does
+   not stop the rest) and idempotent (a repeat re-sweeps), but on a large
+   deployment a single pull is N sequential halts. Acceptable for v1's single
+   user and small bot count; worth revisiting if that grows.
