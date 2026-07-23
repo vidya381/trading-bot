@@ -106,14 +106,32 @@ export async function handleApiRequest(
       });
     }
 
-    // 3. Build the context and dispatch.
+    // 3. Schema guard. Production is deployed with an empty D1 until go-live
+    //    (section 16.1); without this, a data endpoint's first query throws a
+    //    raw `no such table` that the catch below flattens into a generic 500,
+    //    indistinguishable from a real bug. This is the SAME proactive
+    //    `tableExists` check the cron Workers use (src/workers/reconciliation.ts,
+    //    schema-guard.test.ts): a boolean gate, NOT a try/catch, so ONLY the
+    //    missing-schema case is special-cased and any other D1 error still
+    //    surfaces below as internal_error. `bot_instances` is the sentinel --
+    //    every migration runs as one set, so if it is absent they all are.
+    const db = options.db ?? databaseFrom(env);
+    if (!(await db.tableExists("bot_instances"))) {
+      return fail(
+        503,
+        "no_schema",
+        "this environment has no database schema yet, migrations are deferred to go-live",
+      );
+    }
+
+    // 4. Build the context and dispatch.
     const ctx: ApiContext = {
       request,
       env,
       url,
       params: resolution.params,
       actor,
-      db: options.db ?? databaseFrom(env),
+      db,
       botNamespace: requireBotNamespace(env, options.botNamespace),
       now: options.now ?? (() => Date.now()),
       newId: options.newId ?? (() => crypto.randomUUID()),

@@ -4040,3 +4040,51 @@ New:
    injected into `handleApiRequest`. Harmless — both point at the same bindings —
    but it means those two endpoints are not reroutable to an alternate database
    the way the others are. Consistent with how step 10.3 built those seams.
+
+## Step 10.5: no-schema guard on the dashboard API
+Date: 2026-07-23
+
+A follow-up to step 10.4, the exact analogue of step 10.1's fix on the cron
+Workers. Production is deployed with an empty D1 until go-live (section 16.1), so
+a data endpoint's first query throws a raw `no such table: bot_instances` --
+which `handleApiRequest`'s catch flattened into a generic
+`{"code":"internal_error"}` 500, indistinguishable from an actual bug. 1098
+tests, up from 1093; typecheck clean.
+
+### What changed
+
+- `src/api/index.ts`: after a route matches and before the handler runs,
+  `handleApiRequest` now does `db.tableExists("bot_instances")` and returns
+  `{"code":"no_schema","message":"this environment has no database schema yet,
+  migrations are deferred to go-live"}` with a **503** when it is absent.
+- `src/api/schema-guard.test.ts`: the no-schema case (a genuinely empty env.DB,
+  the describe defined first so no `freshDatabase` has run), the schema-present
+  case (testnet, unchanged: 200), and a `throwingDb` proving a non-missing-table
+  error still surfaces as `internal_error`.
+
+### Decisions
+
+**1. A proactive boolean gate, not a widened catch.** The same shape as the cron
+Workers' guard (step 10.1), and deliberately so: the check is `tableExists`, run
+before dispatch, so ONLY `false` is special-cased. Any other D1 error -- a
+constraint failure, a genuine fault -- still falls through the unchanged catch to
+`internal_error`. The brief was explicit that the catch must not broaden, and a
+`try/catch` matching on `no such table` error text would have been exactly the
+broadening to avoid (and would break the first time the message reworded).
+
+**2. `bot_instances` is the sentinel.** Every migration runs as one set, so if it
+is absent they all are. One check gates every data endpoint, including those that
+read other tables (a `GET /api/kill-switch` on an empty env is `no_schema` too),
+which the test asserts directly.
+
+**3. 503, matching `access_unconfigured`.** Both mean "this environment is not
+provisioned yet", so they share a status: the deploy exists, the data layer does
+not. The guard runs AFTER auth and routing -- an unauthenticated caller still
+gets 401, an unknown route still gets 404 -- so `no_schema` is only ever returned
+to an authenticated caller hitting a real endpoint on a schema-less environment.
+
+### Cost
+
+One `SELECT 1 FROM sqlite_master` per request on every environment, testnet
+included. A metadata read, negligible, and the same price the cron Workers
+already pay. Not worth caching for v1's request volume.
