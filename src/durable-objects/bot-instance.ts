@@ -2135,6 +2135,10 @@ export class BotInstance extends DurableObject<Env> {
       message: alert.message,
       resolved: false,
       created_at: this.#now(),
+      // Step 8: not yet seen by the notification dispatcher. Recording the
+      // alert here is unconditional (section 10); the outbound ping is the
+      // dispatcher's separate concern.
+      notified_at: null,
     };
     await this.#db().alerts.insert(row);
   }

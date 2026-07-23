@@ -34,6 +34,14 @@ export default defineConfig({
         // miniflare creates from that binding -- declaring the binding does
         // not point tests at the remote database, and nothing in the suite
         // touches Cloudflare.
+        //
+        // The ALERT_COOLDOWNS KV namespace (step 8, section 8.3) IS declared
+        // here rather than in wrangler.jsonc, deliberately: the real namespace
+        // is not provisioned yet (docs/kv-provisioning.md), and this project
+        // does not commit placeholder resource ids (step 4, decision 1).
+        // Miniflare needs only the binding name to spin up a local KV, so tests
+        // exercise the real KvCooldownStore without any Cloudflare resource.
+        kvNamespaces: ["ALERT_COOLDOWNS"],
         bindings: {
           // Not application config: the migration set, handed to the test
           // runtime so `applyD1Migrations` can run it. No Worker reads this.

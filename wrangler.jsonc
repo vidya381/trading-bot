@@ -103,7 +103,16 @@
       // separate Worker, so section 3's "Cron Trigger Worker" box is a
       // separation of concerns rather than of deployments.
       "triggers": {
-        "crons": ["*/5 * * * *"]
+        "crons": [
+          // Section 9 reconciliation. The handler is `scheduled` in
+          // src/workers/api.ts, routed by `controller.cron`.
+          "*/5 * * * *",
+          // Section 10 notification dispatch (step 8), on its own faster tick
+          // so a halt or stop-loss ping does not wait behind reconciliation.
+          // No-ops until the ALERT_COOLDOWNS KV namespace and the
+          // DISCORD_WEBHOOK_URL secret exist (docs/kv-provisioning.md).
+          "* * * * *"
+        ]
       }
     },
 
@@ -159,7 +168,16 @@
       // environment, so this fires and returns without querying the
       // deliberately empty production database.
       "triggers": {
-        "crons": ["*/5 * * * *"]
+        "crons": [
+          // Section 9 reconciliation. The handler is `scheduled` in
+          // src/workers/api.ts, routed by `controller.cron`.
+          "*/5 * * * *",
+          // Section 10 notification dispatch (step 8), on its own faster tick
+          // so a halt or stop-loss ping does not wait behind reconciliation.
+          // No-ops until the ALERT_COOLDOWNS KV namespace and the
+          // DISCORD_WEBHOOK_URL secret exist (docs/kv-provisioning.md).
+          "* * * * *"
+        ]
       }
     }
   }

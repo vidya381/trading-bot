@@ -365,6 +365,7 @@ async function reconcileOrders(
           `cannot trade; recovery is manual.`,
         resolved: false,
         created_at: at,
+        notified_at: null,
       } satisfies AlertRow);
       continue;
     }
@@ -1069,6 +1070,7 @@ async function act(
         message: `SEVERE drift (run ${runId}): ${finding.detail}`,
         resolved: false,
         created_at: at,
+        notified_at: null,
       } satisfies AlertRow);
     }
 
@@ -1103,6 +1105,7 @@ async function act(
         message: `MEANINGFUL drift (run ${runId}): ${finding.detail}`,
         resolved: false,
         created_at: at,
+        notified_at: null,
       } satisfies AlertRow);
 
       if (finding.scope !== "bot" || finding.botInstanceId === null) {
@@ -1139,6 +1142,7 @@ async function act(
             `still be trading.`,
           resolved: false,
           created_at: at,
+          notified_at: null,
         } satisfies AlertRow);
       }
     }

@@ -239,6 +239,7 @@ export async function tripAccountCircuitBreaker(
         `. No bot on this account can be created or resumed until a human resets it.`,
       resolved: false,
       created_at: now,
+      notified_at: null,
     };
     await db.alerts.insert(alert);
   }
@@ -416,6 +417,7 @@ export async function resetAccountCircuitBreaker(
       `Bots halted by the trip remain halted and must each be resumed explicitly.`,
     resolved: false,
     created_at: now,
+    notified_at: null,
   };
   await db.alerts.insert(alert);
 }

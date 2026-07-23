@@ -3273,3 +3273,242 @@ above the highest line cancels the remaining ladder, sells the held position and
 halts, as a take-profit event. Configured off, the bot takes no special action
 and is left idle above its own ladder, which is the state the default exists to
 prevent.
+
+---
+
+## Step 10: Alerts and outbound notification
+Date: 2026-07-22
+
+Section 19's **step 8**. The header is 10, not 8, because the log's sequential
+numbering already spent 8 on the RateLimiter Durable Object (taken out of order,
+see that entry) and 9 on the grid. Every code comment touching this work says
+"step 8", meaning section 19's step 8, and that reference is stable regardless
+of the log's own counter. This is that step, built after the grid it will report
+on.
+
+The recording half of section 10 already existed: every alert in the system is
+written to the D1 `alerts` table by the pipeline that raises it, always and
+unthrottled, and has been since step 6. This session built the **notifying**
+half — the outbound Discord ping and its KV cooldown — and wired it to fire for
+every alert already being written.
+
+### What was built
+
+`migrations/0004_alerts_notified_at.sql`: `alerts.notified_at` (nullable) plus a
+partial index on the un-notified rows.
+
+`/src/notifications/`: `notifier.ts` (the `AlertNotifier` interface,
+`NotifiableAlert`, `NotifyResult`), `discord.ts` (`DiscordNotifier`, the one
+provider), `cooldown.ts` (`CooldownStore`, `KvCooldownStore`,
+`InMemoryCooldownStore`, `cooldownKey`), `dispatch.ts` (`dispatchPendingAlerts`),
+`index.ts`, and a folder README.
+
+`/src/workers/notifications.ts`: the binding-aware shell, `runNotificationDispatch`.
+`api.ts` now routes two crons by `controller.cron`; `wrangler.jsonc` gained a
+second `* * * * *` cron under both environments; `vitest.config.ts` gained an
+`ALERT_COOLDOWNS` miniflare KV; `vitest-env.d.ts` declares it on `Cloudflare.Env`
+for tests.
+
+Seven `alerts.insert` sites gained `notified_at: null` — the whole of the wiring
+change. All sixteen BotInstance alert types funnel through one `#alert` helper
+(one edit); `reconcile.ts` has four direct inserts; `circuit-breaker.ts` has two.
+`src/db/schema.ts` and `src/db/test-helpers.ts`'s `alertRow` gained the column.
+
+`docs/kv-provisioning.md`: the exact commands to create the KV namespace and set
+the Discord secret per environment. **Not run.** No Cloudflare resource was
+created and no secret was set this session.
+
+39 new tests across four new files (1010 in total across the project), all
+passing, typecheck clean. Real D1 and real KV in the Workers runtime per section
+14; only the notifier and its `fetch` are mocked, and the webhook URL in every
+test is a mock, never a real one.
+
+### Decisions made
+
+**1. The dispatcher is a Cron Trigger that reads the alerts table, not an inline
+send at each write site.** *(the session's item 5; my call, reasoned against the
+D1-mirror principle it asked me to weigh)*
+
+Step 5's decision B established that the D1 mirror is written by the same
+pipeline that processes the event — "one place responsible for it" — and the
+brief asked whether that argues for inline sends. It does not, once the right
+"event" is named. That principle governs the **authoritative record**. Section
+10 and the brief both state recording and notifying are two separate concerns;
+the alert row *is* the record and is already written by the event pipeline. The
+ping is a downstream projection of it. For the projection, the event is "an
+un-notified alert row exists", the pipeline is the dispatcher, and the dispatcher
+owns both the send and the cooldown write together — so the principle holds
+*within* the notification concern: one place responsible, for all three alert
+sources at once.
+
+*Inline sending at each write site — rejected*, for three specific reasons.
+It would put an outbound Discord `fetch` on the BotInstance halt path, where step
+3.1 established that speed is a safety property — a slow or hung webhook would
+delay a halt, and the halt is the one path where latency is a risk, not a
+nicety. Alerts are raised from two execution contexts (the Durable Object and the
+reconciliation Worker); a table-reading dispatcher is agnostic to who wrote the
+row, where inline sending would thread a notifier and a KV binding into three
+files. And it would scatter the "one place responsible" across those files rather
+than concentrate it.
+
+*Revisit if:* never, realistically. The separation is the point.
+
+**2. A separate one-minute cron, not folded into reconciliation's five-minute
+pass.** Both are `scheduled` handlers on the same Worker, routed by
+`controller.cron`.
+
+*Folding dispatch into the reconciliation tick — rejected.* Simpler, but a halt
+or stop-loss ping would then wait up to five minutes behind reconciliation. One
+minute is well inside section 10's fifteen-minute cooldown, and the protective
+action already happened synchronously in the object — only the human ping is
+paced here. The cost is that at minutes divisible by five both crons fire; that
+is two separate `scheduled` invocations with different `controller.cron`, routed
+correctly (open question 5).
+
+**3. A `notified_at` column is the dispatcher's queue marker, distinct from
+`resolved`.**
+
+The dispatcher needs a durable, per-row record of "already acted on", to scan
+`WHERE notified_at IS NULL` and never re-process across restarts.
+
+*Reusing `resolved` — rejected.* It already means something else: section 9's
+reconciliation is the one writer of `resolved = true`, closing step 6's alert
+loop, and a step-6 alert can be resolved long before or without ever being
+notified. Two independent lifecycles, two columns.
+
+*A KV high-water-mark cursor instead of a column — rejected, and this is the
+load-bearing part.* Alerts are stamped `created_at` by whichever of two contexts
+wrote them, each with its own clock. A cursor advancing past a `created_at` could
+skip a row written slightly behind it by a skewed clock — silently, forever. A
+per-row flag has no such hole. The cost is that adding a required column forced
+`notified_at: null` onto all seven insert sites; that churn IS the wiring the
+brief asked for (item 4), and it means a future alert writer cannot exist without
+confronting the field.
+
+**4. The notifier depends on `NotifiableAlert`, never on a D1 row or a Discord
+payload.** The dispatcher maps `AlertRow` onto a camel-cased, storage-free shape
+before handing it over, so `DiscordNotifier` sees neither the money/CAST
+conventions of `/src/db` nor is the dispatcher aware Discord exists. A Telegram
+provider (section 2 allows either) is a new class implementing `AlertNotifier`,
+changing nothing in `dispatch.ts` or `cooldown.ts`.
+
+**5. `send` returns a `NotifyResult`, and a failed send is left un-stamped for
+retry.** A 503 or a 429 is a routine, expected outcome, not an exception —
+returning a result rather than throwing keeps the dispatcher's control flow
+linear, and it still guards against a provider that throws anyway by treating a
+throw as `delivered: false`. A failed row is deliberately NOT stamped and its
+cooldown NOT advanced, so the next run finds it and retries; the alert is in D1
+regardless. The cooldown is advanced *before* the row is stamped, so a crash
+between the two re-sends a duplicate ping rather than losing the record that one
+went out — over-notifying is the safe direction for an alert.
+
+**6. Account-wide alerts (null bot) share one per-type cooldown bucket
+(`__account__`).**
+
+*Keying the cooldown on a null bot directly — rejected.* The circuit breaker and
+unattributed reconciliation findings carry `bot_instance_id = null`; a null in
+the key would let a storm of them escape the cooldown. Bucketing per type under a
+shared sentinel throttles them as one stream, which is what section 10 wants.
+
+**7. KV keys self-expire at a TTL at least as long as the window; a garbled value
+is treated as no record.** The alerts table grows forever (section 8.7); the
+cooldown is transient, so its keys are written with `expirationTtl` and clean
+themselves up. A non-numeric stored value is read as "never sent" rather than
+trusted — worst case one extra ping, the safe direction. KV's job here is exactly
+the one section 8.3 assigns it and the one place its eventual consistency is
+harmless, which is why the circuit breaker (migration 0003) used D1 instead.
+
+**8. One timestamp for the whole dispatch run, making within-run throttling
+deterministic.** The first alert of a `(type, bot)` records the run's instant;
+every later one in the same run sees a zero delta and throttles. Combined with
+oldest-first ordering, the *earliest* of a simultaneous burst is the one that
+sends — not an arbitrary one. This is what the cooldown tests pin.
+
+**9. Every alert type flows through; no per-type or per-severity filter.**
+
+The brief (item 4) and section 10 both say every alert type notifies, throttled
+only by the cooldown. So `order_throttled` and the other high-frequency,
+low-value types are not filtered out — they are self-limited by their own
+fifteen-minute cooldown. Adding a severity gate would contradict "every alert
+type" and section 10's "no escalation logic in v1". If the noise proves real in a
+testnet run, the cooldown window per type is the dial to turn, not a filter.
+
+**10. Cooldown duration and category distinction were checked for ambiguity and
+found specified, so neither was asked.** The brief said to stop and ask only if
+one of these two was ambiguous. Neither is: section 10 gives the cooldown as
+"default 15 minutes per alert type per bot instance", and the `category`
+(`trading`/`system`) column has been set at every write site since step 4 — the
+distinction is already data, not a judgement this step had to invent. The
+dispatcher renders it in the Discord embed both visually (colour family by
+category, shade by severity, plus a `[TRADING]`/`[SYSTEM]` label) and
+structurally (Category and Severity as their own fields), so it survives either
+being missed.
+
+**11. KV namespace and Discord secret provisioning deferred, and the shell
+no-ops until they exist.** This mirrors step 4 deferring D1 provisioning to step
+5: no placeholder resource id is committed to `wrangler.jsonc` (step 4, decision
+1), tests get a local KV from miniflare, and `runNotificationDispatch` returns
+`ran: false` — before any D1 access — when either the `ALERT_COOLDOWNS` binding
+or the `DISCORD_WEBHOOK_URL` secret is absent. It is the same shape as
+reconciliation no-opping without an exchange client. The binding is declared in
+two typing places for now (`Cloudflare.Env` in `vitest-env.d.ts` for tests, the
+global `Env` via a `declare global` in `notifications.ts` for the Worker),
+exactly the split step 4 made for `TEST_MIGRATIONS`, and both go away when the
+namespace enters `wrangler.jsonc`.
+
+### Deviations from the spec
+
+- **Section 8.3 describes only the KV last-notified timestamp; there is now also
+  a D1 `notified_at` per row.** The spec did not anticipate that the dispatcher
+  needs a durable, per-*event* record of what it has acted on — the KV cooldown
+  is per `(type, bot)`, not per row, and cannot answer "which rows are still
+  outstanding". The column is that answer. See decision 3.
+- **Section 10's "visually distinguishable on the dashboard" is delivered in the
+  Discord message, not the dashboard,** which is section 19's step 10 and not
+  built. The `category` column that backs the dashboard already exists (step 4),
+  so nothing here blocks it.
+- **Section 10 lists "Queue dead-letter events" as a system alert; no such writer
+  exists.** Queues arrive with order execution, a later step, so there is nothing
+  to wire yet. The dispatcher will cover dead-letter alerts for free the moment
+  that writer inserts a row with `notified_at: null`, because it is type-agnostic.
+  "Unhandled exceptions" and "Worker errors" (the other two section-10 system
+  examples) *are* wired: an unhandled exception halts with reason
+  `unhandled_error`, whose alert `#halt` already classifies as `system`.
+- **Section 2 allows Discord or Telegram; only Discord is built,** per the brief.
+- **The one-minute cron fires and no-ops in every environment until KV and the
+  secret exist,** the same accepted state as reconciliation's cron without
+  credentials.
+
+### Open questions carried forward
+
+1. **Nothing in this project has ever sent a real notification.** The entire path
+   is tested against a mocked notifier and a mocked `fetch`; `DiscordNotifier`'s
+   payload is reasoned from Discord's webhook documentation, not seen to arrive in
+   a real channel. This is the same class of gap as step 7's circuit breaker and
+   step 8's rate limiter, and it fails the same way: a control that has tests is
+   the easiest to assume verified. The failure this raises is specific — a
+   misconfigured webhook is a *silent* failure of the exact channel by which a
+   human is meant to learn a bot halted. **A go-live checklist item has been added
+   for it** (section 17 amendment, 2026-07-22, build step 8): at least one alert of
+   each category seen to actually arrive in the destination channel during
+   testnet. Recorded here and in the checklist deliberately, for the reason the
+   step 7 and 8 amendments give: a gap that lives only in a decision-log entry is
+   one nobody re-reads at the moment it matters.
+2. **A permanently-failing webhook is retried every minute forever.** No attempt
+   cap, no dead-letter. Acceptable for v1 (section 10: no escalation), but it
+   hammers a broken endpoint and grows the per-run `failed` count without bound.
+   The fix, if a real outage shows it is needed, is a small max-attempts stamp
+   that marks a row processed after N failures rather than retrying endlessly.
+3. **Provisioning is not done.** The `ALERT_COOLDOWNS` KV namespace and the
+   `DISCORD_WEBHOOK_URL` secret must be created per environment before any ping
+   fires; `docs/kv-provisioning.md` has the commands, unrun. A go-live dependency.
+4. **`created_at` is stamped by whichever context wrote the alert, and the
+   dispatcher orders by it.** The `notified_at` flag removes the missed-row risk a
+   cursor would have had (decision 3), but the "earliest of a burst sends first"
+   guarantee is only as good as the two contexts' clocks agreeing. The
+   consequence of disagreement is merely *which* of a same-key burst is the one
+   ping that goes out — harmless — but it is noted rather than hidden.
+5. **The two crons both fire at minutes divisible by five.** Routing on
+   `controller.cron` handles it as two separate invocations, tested by the routing
+   logic but, like every cron and binding in this project, not yet verified
+   against the real Cloudflare platform.

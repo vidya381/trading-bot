@@ -23,5 +23,15 @@
 declare namespace Cloudflare {
   interface Env {
     TEST_MIGRATIONS: import("@cloudflare/vitest-pool-workers").D1Migration[];
+
+    // Step 8, section 8.3. The alert-cooldown KV namespace, supplied to tests by
+    // vitest.config.ts's miniflare `kvNamespaces`. Declared here (test-visible,
+    // on `Cloudflare.Env`) rather than in worker-configuration.d.ts because the
+    // real namespace is not provisioned yet, so it is not in wrangler.jsonc and
+    // `wrangler types` cannot emit it (docs/kv-provisioning.md). The Worker's
+    // own view of this binding is the optional `declare global` augmentation in
+    // src/workers/notifications.ts. Both go away once the namespace is
+    // provisioned and `wrangler types` emits it on both interfaces.
+    ALERT_COOLDOWNS: KVNamespace;
   }
 }

@@ -218,6 +218,7 @@ export function alertRow(overrides: Partial<AlertRow> = {}): AlertRow {
     message: "stop loss triggered",
     resolved: false,
     created_at: T0,
+    notified_at: null,
     ...overrides,
   };
 }

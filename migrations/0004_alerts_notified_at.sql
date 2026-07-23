@@ -1,0 +1,58 @@
+-- Migration 0004: `alerts.notified_at` (spec section 10, build step 8).
+--
+-- Step 8 builds the outbound notification half of section 10. Recording an
+-- alert and notifying about it are two separate concerns: section 10 is
+-- explicit that "all alerts are always written to the alerts table ...
+-- regardless of throttling", and only "whether an alert also sends a ...
+-- notification is throttled". Every alert has been written to this table since
+-- step 6; nothing has ever sent a ping.
+--
+-- ---------------------------------------------------------------------------
+-- WHY A COLUMN, AND WHY NOT `resolved`
+-- ---------------------------------------------------------------------------
+-- The dispatcher (a Cron Trigger, like reconciliation) reads this table and
+-- turns un-notified rows into pings. It needs a durable, per-row marker of
+-- "has the dispatcher already decided what to do with this row", so it can
+-- scan `WHERE notified_at IS NULL` and never re-process a row across restarts.
+--
+-- `resolved` cannot serve this: it already means something else entirely.
+-- Section 9's reconciliation is the ONE writer of `resolved = true` (it closes
+-- step 6's alert-driven loop), and a step-6 alert can be resolved by
+-- reconciliation long before -- or without ever -- being notified. The two
+-- lifecycles are independent, so they are two columns.
+--
+-- A high-water-mark cursor (store the last-processed created_at in KV) was
+-- rejected: alerts are written by two different execution contexts -- the
+-- BotInstance Durable Object and the reconciliation cron Worker -- each
+-- stamping `created_at` from its own clock. Clock skew between them could let
+-- a row appear with a created_at behind a cursor that had already advanced,
+-- and it would be silently skipped forever. A per-row flag has no such hole.
+--
+-- ---------------------------------------------------------------------------
+-- SEMANTICS
+-- ---------------------------------------------------------------------------
+--   NULL      -- the dispatcher has not yet processed this row.
+--   <integer> -- the dispatcher processed it at this instant, either by
+--                sending a ping or by deliberately skipping it because the
+--                (alert_type, bot instance) cooldown was still active.
+--
+-- A row is NOT stamped when a send was ATTEMPTED and failed (a webhook 5xx,
+-- a network error): it is left NULL so the next dispatch retries it. That is
+-- why this is a nullable column with no default rather than a boolean -- the
+-- three states (unseen / delivered-or-suppressed / send-failed-retry) collapse
+-- cleanly onto "null vs not-null", and the timestamp is useful to the
+-- dashboard later.
+--
+-- Additive, and a new numbered file rather than an edit to 0001, because 0001
+-- is already applied on the real testnet database and `applyD1Migrations`
+-- records applied migrations by filename (step 4, decision 3). ALTER TABLE ADD
+-- COLUMN appends, so `notified_at` is last in the alerts columns, and
+-- schema.ts and schema.test.ts must match that order.
+
+ALTER TABLE alerts ADD COLUMN notified_at INTEGER;
+
+-- The dispatcher's only query: the small set of rows it still has to act on.
+-- Partial, because the interesting set is almost always empty or tiny while
+-- the table grows without bound (section 8.7 retains everything).
+CREATE INDEX idx_alerts_pending_notification ON alerts (created_at)
+  WHERE notified_at IS NULL;

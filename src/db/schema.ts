@@ -162,6 +162,13 @@ export const alerts = defineTable("alerts", {
   message: text(),
   resolved: boolean(),
   created_at: integer(),
+  // Step 8, migration 0004. When the notification dispatcher processed this
+  // row (sent a ping, or deliberately skipped it on cooldown). NULL means it
+  // has not been processed, or a send was attempted and failed and will be
+  // retried. Recording is independent of `resolved`; see the migration header.
+  // Last in the column list because ALTER TABLE ADD COLUMN appends and
+  // schema.test.ts compares column order against the live database.
+  notified_at: nullable(integer()),
 });
 
 // Decoded row types. Money columns are `bigint`, JSON columns are parsed, and
