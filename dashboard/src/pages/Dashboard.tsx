@@ -66,6 +66,12 @@ export function Dashboard() {
             Alerts
           </Link>
           <Link
+            to="/manual-adjustments"
+            className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"
+          >
+            Log adjustment
+          </Link>
+          <Link
             to="/bots/new"
             className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500"
           >

@@ -21,6 +21,8 @@ import type {
   CreateBotRequest,
   KillSwitchStatus,
   LiquidateResponse,
+  ManualAdjustment,
+  ManualAdjustmentRequest,
   TriggerKillSwitchResponse,
 } from "./types";
 
@@ -161,6 +163,36 @@ export function liquidateBot(id: string, signal?: AbortSignal): Promise<Liquidat
  */
 export function createBot(request: CreateBotRequest, signal?: AbortSignal): Promise<BotDetail> {
   return requestJson<BotDetail>("/api/bots", "POST", { signal, body: request });
+}
+
+// ---------------------------------------------------------------------------
+// Manual adjustments (spec 8.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Log a manual fund movement (`POST /api/manual-adjustments`). `amount` is a
+ * SIGNED decimal string -- negative withdraws, positive deposits -- and the form
+ * builds that sign from an explicit Deposit/Withdrawal choice rather than asking
+ * anyone to type a minus.
+ *
+ * On success the backend answers 201 with the saved row (its authoritative
+ * record, including the id and createdAt), which the form shows as the
+ * confirmation. Every refusal is a distinct `ApiError` code the form branches on:
+ *   - `missing_field`  -- a required field (account, asset, note, or amount) was
+ *                         absent or empty.
+ *   - `invalid_amount` -- the amount was not a valid decimal (or had more than 8
+ *                         decimal places).
+ *   - `no_schema`      -- a schema-less environment (production before go-live).
+ * There is NO idempotency key on this endpoint: unlike a bot create, a resubmit
+ * after a lost response would write a SECOND row, and with no read endpoint that
+ * cannot be checked from here -- the form's "couldn't confirm" copy says so
+ * rather than inviting a blind retry.
+ */
+export function logManualAdjustment(
+  request: ManualAdjustmentRequest,
+  signal?: AbortSignal,
+): Promise<ManualAdjustment> {
+  return requestJson<ManualAdjustment>("/api/manual-adjustments", "POST", { signal, body: request });
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@
  *   /bots/:id     the bot detail view (read-only summary, strategy state, history)
  *   /alerts       the cross-bot alert feed (every alert, filterable)
  *   /kill-switch  the global kill switch control (status, trigger, reset)
+ *   /manual-adjustments  log a manual deposit/withdrawal (spec 8.6)
  *   *             anything else redirects home
  */
 
@@ -26,6 +27,7 @@ import { CreateBot } from "./pages/CreateBot";
 import { BotDetail } from "./pages/BotDetail";
 import { Alerts } from "./pages/Alerts";
 import { KillSwitchPage } from "./pages/KillSwitchPage";
+import { ManualAdjustment } from "./pages/ManualAdjustment";
 
 export function App() {
   return (
@@ -39,6 +41,7 @@ export function App() {
           <Route path="/bots/:id" element={<BotDetail />} />
           <Route path="/alerts" element={<Alerts />} />
           <Route path="/kill-switch" element={<KillSwitchPage />} />
+          <Route path="/manual-adjustments" element={<ManualAdjustment />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

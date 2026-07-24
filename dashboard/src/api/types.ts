@@ -378,6 +378,45 @@ export interface TriggerKillSwitchResponse {
   readonly killSwitch: KillSwitchStatus;
 }
 
+// ---------------------------------------------------------------------------
+// Manual adjustments (spec 8.6; `manualAdjustmentView` in serialize.ts,
+// `POST /api/manual-adjustments`, `createManualAdjustment` handler).
+//
+// The account owner logs a fund movement they made on the exchange OUTSIDE any
+// bot (a deposit or a withdrawal) so reconciliation can subtract it from any
+// detected discrepancy before deciding whether to alert (section 9). The
+// `amount` is SIGNED: negative is a withdrawal, positive a deposit. It is a
+// decimal string in and out, exactly like every other money value.
+//
+// There is NO read endpoint: the route table exposes only the POST. So there is
+// no `fetchManualAdjustments` here and no client-side list -- the honest
+// single-action confirmation from the 201 response is all this surface offers.
+// ---------------------------------------------------------------------------
+
+/** The body of `POST /api/manual-adjustments`. `amount` is a SIGNED decimal
+ *  string (leading "-" for a withdrawal); the backend parses it with the same
+ *  money parser as every other amount. All four fields are required. */
+export interface ManualAdjustmentRequest {
+  readonly accountLabel: string;
+  readonly asset: string;
+  /** Signed: "-250.5" withdraws, "250.5" deposits. */
+  readonly amount: string;
+  readonly note: string;
+}
+
+/** The saved adjustment the 201 echoes back (`manualAdjustmentView`). The
+ *  server's authoritative record of what was written -- used as the confirmation
+ *  receipt. `reconciledAt` is null until a reconciliation run consumes it. */
+export interface ManualAdjustment {
+  readonly id: string;
+  readonly accountLabel: string;
+  readonly asset: string;
+  readonly amount: string;
+  readonly note: string;
+  readonly reconciledAt: number | null;
+  readonly createdAt: number;
+}
+
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertCategory = "trading" | "system";
 

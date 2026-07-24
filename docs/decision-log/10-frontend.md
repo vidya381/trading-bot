@@ -1006,3 +1006,178 @@ New:
    `src/api/handlers.ts` — a signed amount, `accountLabel`/`asset`/`note`, paired
    with an `audit_log` entry). No `fetchManualAdjustments`/create client helper
    exists yet. Not started this session, per the brief.
+
+---
+
+## Step 10.13: Dashboard frontend — manual-adjustment form
+Date: 2026-07-24
+
+The FOURTH write surface, and **the last piece of spec step 10**: the
+manual-adjustment form (spec 8.6). It calls `POST /api/manual-adjustments` —
+`createManualAdjustment`, built at the step-10 backend and wrapped as
+`logManualAdjustment` in the client this session. Frontend only; no backend file
+was touched, so the Worker's tests are unaffected. The dashboard typechecks and
+builds clean (`tsc -b && vite build`, 68 modules). With this, **the entire
+dashboard as originally scoped in section 19's step 10 is built**: bot creation,
+live status view, manual-adjustment form, global kill switch, and alert history.
+
+I was told to stop and ask ONLY if the backend's error codes for this endpoint
+were ambiguous. They are not, and I read them from source rather than guessing:
+`createManualAdjustment` is the simplest write in the system — it inserts the
+`manual_adjustments` row plus a paired `audit_log` entry and does nothing else
+(no capital-ledger check, no exchange call, no account-existence check), so the
+only refusals are `missing_field` (a missing/empty `accountLabel`/`asset`/`note`,
+or a non-string `amount`), `invalid_amount` (an `amount` the money parser
+rejects), and the layer-level `no_schema` (503) / `unauthenticated` /
+`network_error`. All enumerable, none state-dependent. So I proceeded without
+asking.
+
+### What was built
+
+- `dashboard/src/pages/ManualAdjustment.tsx`: the `/manual-adjustments` form —
+  account, asset, an explicit Deposit/Withdrawal choice, an unsigned magnitude, a
+  required note, a live signed-value preview, client validation of only
+  always-invalid things, honest per-code error handling, and an honest
+  single-action confirmation on success.
+- `dashboard/src/api/client.ts`: `logManualAdjustment(request)` → the saved
+  `ManualAdjustment`, with a header documenting the refusal codes and the
+  no-idempotency caveat.
+- `dashboard/src/api/types.ts`: `ManualAdjustmentRequest` (the POST body) and
+  `ManualAdjustment` (the 201 row view), mirrored from `manualAdjustmentView` and
+  the handler's decode.
+- `dashboard/src/{App,pages/Dashboard}.tsx`: the `/manual-adjustments` route and
+  a "Log adjustment" link in the Dashboard header, beside "Alerts".
+
+### Decisions made
+
+**1. Its OWN top-level page at `/manual-adjustments`, reachable from the Dashboard
+header — NOT a bot detail view.** *(the brief's "your call on placement")*
+
+A manual adjustment is an ACCOUNT-level fact (`accountLabel` + `asset`), not a
+bot-level one: it exists because funds moved on the exchange OUTSIDE any bot, and
+reconciliation subtracts it per-account (step 7, decision on the balance delta;
+section 9 step 3). There is no bot it belongs to, and the app has no
+account-detail page, so a bot's detail view is the wrong home. This follows the
+kill switch's own-page precedent (10.10, decision 1) for an account-spanning
+control: one deliberate navigation off the routine bot list, reachable without
+entering any bot. Discoverability is a header link next to "Alerts" and "Create
+bot" — the brief's "easy to find when someone's about to make a deposit/
+withdrawal and wants to log it first." I did NOT add a status-strip tile: the
+strip shows STATUSES (bot counts, unresolved alerts, kill-switch state), and a
+write-action is not a status.
+
+**2. The sign is an explicit Deposit/Withdrawal choice plus an unsigned
+magnitude, never a typed minus — and it is stated three ways (brief item 2, the
+crux).**
+
+The backend's `amount` is signed (negative = withdrawal). Rather than rely on
+anyone remembering that, the form takes a required direction (a two-button
+radiogroup, NO default — it must be chosen) and an unsigned magnitude, then
+`signedAmount` builds the string the backend gets (`-` prefix for a withdrawal, a
+bare positive for a deposit; the money parser accepts both). The sign is shown
+(a) as the chosen direction with a `+`/`−` glyph, (b) in colour (emerald deposit,
+red withdrawal), and (c) as a LIVE PREVIEW of the exact value that will be logged
+("Will log: **−250.5 USDT** — withdrawal (funds leaving the account)"). Making the
+direction a required choice with no default means the form cannot be submitted on
+an unconsidered sign.
+
+**3. Client validation catches ONLY always-invalid things; the server owns the
+rest (brief item 3).** Missing account/asset/note, a non-numeric amount (the same
+≤8-dp decimal grammar mirroring `src/shared/money.ts` the create-bot form uses),
+and a **zero** magnitude. Zero is the one judgement call: the backend would accept
+`"0"`, so a client non-zero rule is technically stricter than the server. I
+included it anyway because, under the Deposit/Withdrawal framing, a zero movement
+records nothing — it is the same "there is no amount to log" category as a
+non-numeric amount, not a ledger-dependent guess. This differs from create-bot
+decision 4's drift concern (a client `<100%` rule there would reject configs the
+server accepts and genuinely wants): here the server does not WANT a zero
+adjustment, it simply does not forbid one, and blocking it costs nothing real.
+Recorded because it is the one spot I went past the literal backend rule.
+
+**4. Note is required, matching the backend and section 8.6.** `requireString`
+rejects an empty note (400 `missing_field`), and section 8.6 lists note as one of
+the three fields. A manual adjustment with no explanation is precisely what
+reconciliation later has to make sense of, so the form enforces it rather than
+sending a blank the backend would bounce.
+
+**5. Honest single-action confirmation from the SERVER's saved record; NO
+client-side list, because there is no read endpoint (brief item 4).** I checked:
+the route table (`src/api/index.ts`) exposes only `POST /api/manual-adjustments`
+— there is no `GET`. So, exactly as the brief instructed, I did not build a
+client-side cache/history of adjustments. On success the form shows a
+confirmation built from the 201 body (the server's authoritative row: the signed
+amount, asset, account, and `createdAt`), then clears the amount and note for the
+next entry while keeping account/asset/direction so a batch on one account is
+quick — with the preview and the confirmation keeping each entry's sign visible.
+The missing read endpoint is an open question below, not worked around.
+
+**6. The "couldn't confirm" copy warns against a blind retry — the OPPOSITE of
+create-bot's, and deliberately so.** Create-bot (10.11, decision 5) could tell the
+user "resubmitting with the same id is safe" because a bot create is idempotent by
+id. A manual adjustment has NO idempotency key and NO read endpoint, so a resubmit
+after a lost response could write a SECOND row that cannot be checked from the
+dashboard. The `network_error`/`bad_response` outcome says exactly that: don't
+simply resubmit; reconcile against the exchange or check the database first. The
+same in-between honesty as the other write surfaces, pointed the other way because
+the underlying guarantee is the other way.
+
+**7. In-flight/double-click protection identical to the three prior write surfaces
+(brief item 5).** A `submitting` guard drops a second submit before the request
+starts; the button disables and shows a spinner while in flight. A double-click
+cannot log two adjustments. Unlike create-bot the form does not navigate away on
+success (there is nowhere bot-specific to go), so `submitting` resets in a
+`finally` and the confirmation renders in place.
+
+### Deviations from the spec
+
+- **Step 10's "manual adjustment form" is now realised as UI**, the last of the
+  five things section 19 step 10 enumerates. Every prior step-10 entry recorded it
+  as unbuilt; this is it. The backend it calls is unchanged.
+- **The form is validated by typecheck and build, not a live Access-gated
+  request** — the standing frontend caveat (10.6/10.8/10.9/10.10/10.11/10.12). No
+  deployed Access-gated request has logged an adjustment end to end, and in a
+  deployed environment today production is schema-less until go-live, so a log
+  there returns `no_schema` before it writes anything.
+- **The dashboard still mirrors the API contract by hand** (the standing open
+  question). `ManualAdjustmentRequest`/`ManualAdjustment` were mirrored from
+  `handlers.ts` and `serialize.ts`; a backend rename would surface as a runtime
+  400 or `undefined`, not a failed typecheck. Same size-appropriate caveat as
+  before.
+
+### Open questions carried forward
+
+Still open and unchanged: nothing has ever made a real exchange call (8.1); the
+money/rate-limit and alert-delivery caveats of the section 17 amendments; the
+production allow-list is empty and whose funds are at risk is unsettled (4.1); the
+daily-loss circuit-breaker trigger (7.3) is unbuilt; the Access verifier has never
+seen a real Cloudflare token (10.4); the frontend is validated by typecheck and
+build, not a live Access-gated request; re-sweeping unreachable bots has no UI
+affordance (10.10).
+
+New:
+
+1. **There is no `GET /api/manual-adjustments`, so logged adjustments cannot be
+   read back from the dashboard.** The form deliberately keeps no client-side list
+   (per the brief) and relies on the single-action confirmation. This has two
+   consequences worth naming: an operator cannot review what has already been
+   logged for an account before adding more, and — combined with the absent
+   idempotency key (decision 6) — a lost-response retry cannot be verified as safe
+   from the UI. If a read/list of recent adjustments is wanted, the fix is a
+   backend `GET /api/manual-adjustments` (and a `fetchManualAdjustments` client
+   helper), NOT a client-side cache. Recorded as the honest gap rather than
+   papered over.
+
+2. **No adjustment has ever been logged against a real deployed origin.** The
+   validation, the signed-amount construction, the confirmation and every error
+   branch render the real contract, but no Access-gated request has written a row
+   end to end. A step-11/go-live observation, the same shape as every write path
+   before it.
+
+3. **The whole dashboard as scoped is now built; what remains for go-live is
+   explicitly NOT dashboard work.** The section 17 checklist still stands: the
+   daily-loss circuit-breaker trigger (7.3), real exchange verification on testnet
+   (rate limiter, alert delivery, a real Access token), the empty production
+   allow-list and settled ownership (4.1), and the deliberately out-of-scope v1
+   exclusions (multi-exchange, multi-user, listing-snipe). None of these is a
+   missing screen; they are the operating/verification work section 17 exists to
+   gate.
