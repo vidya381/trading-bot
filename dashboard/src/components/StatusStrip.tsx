@@ -55,6 +55,31 @@ function Tile({ label, value, tone, muted }: TileProps) {
 }
 
 /**
+ * The unresolved-alert tile: a link to the cross-bot alert feed, pre-filtered to
+ * unresolved (`/alerts?resolved=false`) so the destination matches what the
+ * count means (this session's brief item 6). Keeps the muted-when-zero treatment
+ * of the plain count tiles.
+ */
+function UnresolvedAlertsTile({ count }: { count: number }) {
+  return (
+    <Link
+      to="/alerts?resolved=false"
+      className="flex flex-col rounded-lg border border-zinc-800 bg-zinc-900/60 px-4 py-3 transition-colors hover:border-zinc-700 hover:bg-zinc-900"
+    >
+      <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">Unresolved alerts</span>
+      <span
+        className={[
+          "tabular mt-1 text-2xl font-semibold",
+          count === 0 ? "text-zinc-600" : "text-amber-300",
+        ].join(" ")}
+      >
+        {count}
+      </span>
+    </Link>
+  );
+}
+
+/**
  * The kill-switch tile: a link to the control page that shows the current state
  * at a glance. Tripped is a filled-red tile so it cannot read as one more count;
  * `null` (not yet loaded, or a failed poll before any success) shows a muted
@@ -113,7 +138,7 @@ export function StatusStrip({
       <Tile label="Halted" value={halted} tone="bad" muted />
       <Tile label="Stopped" value={stopped} tone="neutral" muted />
       <Tile label="Created" value={created} tone="neutral" muted />
-      <Tile label="Unresolved alerts" value={unresolved} tone="warn" muted />
+      <UnresolvedAlertsTile count={unresolved} />
     </section>
   );
 }

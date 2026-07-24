@@ -14,6 +14,8 @@
 import type {
   ApiEnvelope,
   Alert,
+  AlertCategory,
+  AlertSeverity,
   Bot,
   BotDetail,
   CreateBotRequest,
@@ -84,8 +86,32 @@ export function fetchBots(signal?: AbortSignal): Promise<Bot[]> {
   return requestJson<Bot[]>("/api/bots", "GET", { signal });
 }
 
-export function fetchAlerts(signal?: AbortSignal): Promise<Alert[]> {
-  return requestJson<Alert[]>("/api/alerts", "GET", { signal });
+/**
+ * The three filters `GET /api/alerts` supports SERVER-SIDE (`listAlerts` in
+ * src/api/handlers.ts). All optional; an omitted field is not sent, so the
+ * backend returns that dimension unfiltered. There is deliberately no
+ * `botInstanceId` filter -- the backend does not offer one, and the cross-bot
+ * feed does not need it (it shows every bot).
+ */
+export interface AlertFilters {
+  readonly category?: AlertCategory;
+  readonly severity?: AlertSeverity;
+  readonly resolved?: boolean;
+}
+
+/**
+ * Alerts across every bot and account (`GET /api/alerts`). Filtering is
+ * SERVER-SIDE via query params -- the backend validates each value and 400s an
+ * unrecognised one (`invalid_filter`), so we only ever send values from the
+ * typed unions above and never fetch-everything-then-filter.
+ */
+export function fetchAlerts(filters: AlertFilters = {}, signal?: AbortSignal): Promise<Alert[]> {
+  const params = new URLSearchParams();
+  if (filters.category !== undefined) params.set("category", filters.category);
+  if (filters.severity !== undefined) params.set("severity", filters.severity);
+  if (filters.resolved !== undefined) params.set("resolved", String(filters.resolved));
+  const query = params.toString();
+  return requestJson<Alert[]>(`/api/alerts${query ? `?${query}` : ""}`, "GET", { signal });
 }
 
 /**

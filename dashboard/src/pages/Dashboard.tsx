@@ -38,7 +38,9 @@ function FreshnessIndicator({
 
 export function Dashboard() {
   const botsPoll = usePolling<Bot[]>(fetchBots);
-  const alertsPoll = usePolling<Alert[]>(fetchAlerts);
+  // Unfiltered: the status strip derives its unresolved-alert count from this
+  // list. The cross-bot feed (/alerts) does its own filtered poll.
+  const alertsPoll = usePolling<Alert[]>((signal) => fetchAlerts({}, signal));
   // The kill-switch state is polled independently (like bots and alerts), so it
   // keeps last-good through a blip and one endpoint failing never blanks another.
   const killSwitchPoll = usePolling<KillSwitchStatus>(fetchKillSwitch);
@@ -57,6 +59,12 @@ export function Dashboard() {
             lastUpdated={botsPoll.lastUpdated ?? alertsPoll.lastUpdated}
             error={botsPoll.error ?? alertsPoll.error}
           />
+          <Link
+            to="/alerts"
+            className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"
+          >
+            Alerts
+          </Link>
           <Link
             to="/bots/new"
             className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500"

@@ -13,6 +13,7 @@
  *                 static segment so it wins the match, and generated ids never
  *                 collide with it)
  *   /bots/:id     the bot detail view (read-only summary, strategy state, history)
+ *   /alerts       the cross-bot alert feed (every alert, filterable)
  *   /kill-switch  the global kill switch control (status, trigger, reset)
  *   *             anything else redirects home
  */
@@ -23,6 +24,7 @@ import { KillSwitchBanner } from "./components/KillSwitchBanner";
 import { Dashboard } from "./pages/Dashboard";
 import { CreateBot } from "./pages/CreateBot";
 import { BotDetail } from "./pages/BotDetail";
+import { Alerts } from "./pages/Alerts";
 import { KillSwitchPage } from "./pages/KillSwitchPage";
 
 export function App() {
@@ -35,6 +37,7 @@ export function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/bots/new" element={<CreateBot />} />
           <Route path="/bots/:id" element={<BotDetail />} />
+          <Route path="/alerts" element={<Alerts />} />
           <Route path="/kill-switch" element={<KillSwitchPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

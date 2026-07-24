@@ -880,3 +880,129 @@ New:
    `fetchAlerts` already exists and the detail view lists per-bot alerts); the
    manual-adjustment form has `POST /api/manual-adjustments` (spec 8.6). Neither
    was started this session, per the brief.
+
+---
+
+## Step 10.12: Dashboard frontend — cross-bot alert feed
+Date: 2026-07-24
+
+The second of step 10's two remaining UI pieces (the first was the 10.8 bot
+detail view; the manual-adjustment form is the last, and was NOT started this
+session per the brief). A page at `/alerts` showing every alert across every bot
+and account — not scoped to one bot the way the detail view's list is —
+filterable by category, severity and resolved status, polling every 5s. The
+dashboard typechecks and builds clean; the backend was not touched, so its tests
+are unaffected.
+
+I was told to stop and ask only if the backend's actual filter-parameter support
+was unclear from source. It was not — I read it from `listAlerts` in
+`src/api/handlers.ts`: `GET /api/alerts` supports exactly three query filters,
+`category` (`trading`|`system`), `severity` (`info`|`warning`|`critical`) and
+`resolved` (`true`|`false`), each validated with a 400 (`invalid_filter`) on an
+unrecognised value, ordered `created_at` desc, limit 200. There is no
+`bot_instance_id` filter. So I proceeded without asking, filtering server-side
+via those three params and no others.
+
+### What was built
+
+- `dashboard/src/pages/Alerts.tsx`: the page. Owns the URL-backed filter state
+  (`useSearchParams`), renders the three filter selects, and delegates the poll
+  to a child `AlertFeed` keyed by the active filters. Honest loading / empty /
+  `no_schema` / `unauthenticated` / generic error states, same pattern as
+  `BotDetail`.
+- `dashboard/src/api/client.ts`: `fetchAlerts` now takes an optional
+  `AlertFilters` ({ category?, severity?, resolved? }) and builds the query
+  string, sending only set fields. `AlertFilters` is exported.
+- `dashboard/src/components/AlertList.tsx`: **generalised in place** (see
+  decision 1) with three optional props — `linkToBot`, `emptyMessage`,
+  `heading` — all defaulting to the previous per-bot behaviour.
+- `dashboard/src/App.tsx`: new `/alerts` route.
+- `dashboard/src/components/StatusStrip.tsx`: the "Unresolved alerts" tile is now
+  a link to `/alerts?resolved=false` (brief item 6).
+- `dashboard/src/pages/Dashboard.tsx`: an "Alerts" link in the header (brief item
+  1, discoverability), and its alerts poll updated to the new `fetchAlerts({},
+  signal)` signature.
+
+### Decisions made
+
+**1. `AlertList` was generalised, not duplicated — one renderer serves both the
+per-bot list and the cross-bot feed.** *(the brief's central instruction)*
+
+The existing `AlertList` already rendered the exact section-10 visual pattern the
+feed needs (severity accent, trading/system chip, resolved dimming), so building a
+second alert component would have been the divergence the brief warns against. It
+was hardcoded for one bot in three ways, each now an OPTIONAL prop defaulting to
+the old behaviour so `BotDetail` is unchanged:
+
+- `linkToBot` (default `false`) — when true, a row carrying a `botInstanceId`
+  becomes a `Link` to that bot's detail page; a row without one (a system alert
+  with no bot) stays a plain row. The per-bot list, already scoped to one bot,
+  passes it off; the feed passes it on. This is the detail view's per-bot list
+  linking *the other direction* (item 5): the detail page links a bot → its
+  alerts; the feed links an alert → its bot.
+- `emptyMessage` (default the per-bot text) — the feed distinguishes "no alerts
+  at all" from "none match these filters".
+- `heading` (default `"Alerts"`, `null` suppresses) — the feed provides its own
+  page title, so it passes a count-only heading rather than a second "Alerts".
+
+`AlertRow` builds one shared body and chooses only its wrapper (`div` vs `Link`),
+so the markup exists once.
+
+**2. Filtering is server-side, and the chosen filters live in the URL.** *(brief
+items 3, 6)*
+
+`GET /api/alerts` filters server-side, so the page sends `category`/`severity`/
+`resolved` as query params and never fetches-everything-then-filters. Filter
+state is held in the URL (`useSearchParams`), not component state, for three
+payoffs: the status strip's unresolved tile deep-links as `/alerts?resolved=false`
+and the page reads it back; a filtered view is bookmarkable; and the browser back
+button steps through filter changes. `filtersFromParams` keeps only values the
+backend accepts, so a hand-edited URL with a bogus value falls back to unfiltered
+rather than provoking a 400.
+
+**3. The feed is a child keyed by the active filters, so a filter change
+refetches immediately.** `usePolling` restarts its interval only when the
+interval changes — a new fetcher identity alone would not refetch until the next
+5s tick. Rather than teach `usePolling` a new trigger, `AlertFeed` is keyed by the
+filter string (`category|severity|resolved`), so changing a filter remounts it and
+fetches at once. This is the identical `key`-to-refetch trick the bot detail view
+uses to re-poll on navigation (10.8), kept consistent rather than inventing a
+second mechanism.
+
+**4. The feed does NOT cross-reference the bots list to label each alert's link
+with its pair.** The brief asks only that an alert link back to its bot; the link
+target itself shows full bot identity. Fetching `GET /api/bots` purely to turn a
+`botInstanceId` into a pair label would add a second poll and a join for a
+cosmetic gain the brief did not ask for, so the row links out with a `→`
+affordance and no label. If a pair label is later wanted, that is the place to add
+the second source.
+
+### Deviations from the spec
+
+None. Section 10's two alert categories, severity, and the resolved/unresolved
+distinction are all rendered as specified; the page is the "alert history" of the
+section-19 step-10 dashboard list, at cross-bot scope.
+
+### Open questions carried forward
+
+Still open and unchanged: nothing has ever made a real exchange call (8.1); the
+money/rate-limit and alert-delivery caveats of the section 17 amendments; the
+production allow-list is empty and whose funds are at risk is unsettled (4.1); the
+daily-loss circuit-breaker trigger (7.3) is unbuilt; the Access verifier has never
+seen a real Cloudflare token (10.4); the frontend is validated by typecheck and
+build, not a live Access-gated request (10.6/10.8/10.9/10.10/10.11); re-sweeping
+unreachable bots has no UI affordance (10.10).
+
+New:
+
+1. **The feed is validated by typecheck and build, not a live Access-gated
+   request** — the standing frontend caveat. No deployed request has ever loaded a
+   filtered alert list end to end, and in a deployed environment today production
+   is schema-less until go-live, so the feed there would render the `no_schema`
+   state rather than any alert.
+
+2. **The one remaining step-10 UI piece is the manual-adjustment form.** It has a
+   backend (`POST /api/manual-adjustments`, spec 8.6; `createManualAdjustment` in
+   `src/api/handlers.ts` — a signed amount, `accountLabel`/`asset`/`note`, paired
+   with an `audit_log` entry). No `fetchManualAdjustments`/create client helper
+   exists yet. Not started this session, per the brief.
