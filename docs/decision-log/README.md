@@ -30,4 +30,4 @@ the index below. Do not write to the old `docs/decision-log.md` stub.
 | [07.md](07.md) | 7 | Reconciliation Cron Worker |
 | [08.md](08.md) | 8 | RateLimiter Durable Object |
 | [09.md](09.md) | 9 | Grid strategy |
-| [10.md](10.md) | 10, 10.1–10.8 | Alerts and outbound notification; no-schema guards; Discord timestamp investigation; human liquidation and the global kill switch; dashboard backend API; dashboard deploy guard; dashboard frontend; bot detail view |
+| [10.md](10.md) | 10, 10.1–10.9 | Alerts and outbound notification; no-schema guards; Discord timestamp investigation; human liquidation and the global kill switch; dashboard backend API; dashboard deploy guard; dashboard frontend; bot detail view; liquidate action |

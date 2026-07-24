@@ -11,7 +11,7 @@
  * so callers can branch on `error.code` rather than on prose.
  */
 
-import type { ApiEnvelope, Alert, Bot, BotDetail } from "./types";
+import type { ApiEnvelope, Alert, Bot, BotDetail, LiquidateResponse } from "./types";
 
 /** An API failure, carrying the backend's typed error code. */
 export class ApiError extends Error {
@@ -25,10 +25,11 @@ export class ApiError extends Error {
   }
 }
 
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function requestJson<T>(path: string, method: string, signal?: AbortSignal): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
+      method,
       signal,
       headers: { accept: "application/json" },
       // Same-origin; the Access cookie rides along by default. Explicit for
@@ -59,11 +60,11 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 export function fetchBots(signal?: AbortSignal): Promise<Bot[]> {
-  return getJson<Bot[]>("/api/bots", signal);
+  return requestJson<Bot[]>("/api/bots", "GET", signal);
 }
 
 export function fetchAlerts(signal?: AbortSignal): Promise<Alert[]> {
-  return getJson<Alert[]>("/api/alerts", signal);
+  return requestJson<Alert[]>("/api/alerts", "GET", signal);
 }
 
 /**
@@ -73,5 +74,19 @@ export function fetchAlerts(signal?: AbortSignal): Promise<Alert[]> {
  * honest message rather than a blank page.
  */
 export function fetchBot(id: string, signal?: AbortSignal): Promise<BotDetail> {
-  return getJson<BotDetail>(`/api/bots/${encodeURIComponent(id)}`, signal);
+  return requestJson<BotDetail>(`/api/bots/${encodeURIComponent(id)}`, "GET", signal);
+}
+
+/**
+ * Liquidate a halted bot's position (`POST /api/bots/:id/liquidate`). No request
+ * body -- the backend takes the actor from the verified Access identity.
+ *
+ * The caller MUST inspect `result.action`, not just await success: the
+ * price-unusable outcome is a 200 with `action: "no_price"` (position left held,
+ * alerted), not a thrown error. A no-longer-halted bot throws `ApiError` with
+ * code `invalid_status`; an environment with no exchange wired throws
+ * `not_attached`.
+ */
+export function liquidateBot(id: string, signal?: AbortSignal): Promise<LiquidateResponse> {
+  return requestJson<LiquidateResponse>(`/api/bots/${encodeURIComponent(id)}/liquidate`, "POST", signal);
 }

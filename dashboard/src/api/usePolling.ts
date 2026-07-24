@@ -11,11 +11,11 @@
  *     response cannot overwrite a newer one or leak past unmount.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export const POLL_INTERVAL_MS = 5000;
 
-export interface PollState<T> {
+interface PollData<T> {
   readonly data: T | null;
   readonly error: Error | null;
   readonly loading: boolean;
@@ -23,11 +23,21 @@ export interface PollState<T> {
   readonly lastUpdated: number | null;
 }
 
+export interface PollState<T> extends PollData<T> {
+  /**
+   * Force an immediate fetch, outside the interval, and resolve when it
+   * settles. Used after a mutation (e.g. a liquidation) so the view reflects
+   * the new state at once rather than after up to one poll interval. A no-op
+   * after unmount.
+   */
+  readonly refetch: () => Promise<void>;
+}
+
 export function usePolling<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number = POLL_INTERVAL_MS,
 ): PollState<T> {
-  const [state, setState] = useState<PollState<T>>({
+  const [state, setState] = useState<PollData<T>>({
     data: null,
     error: null,
     loading: true,
@@ -38,6 +48,10 @@ export function usePolling<T>(
   // interval; the polling loop reads the latest one each tick.
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
+
+  // The live `tick` for this mount, exposed through `refetch`. Reset to a no-op
+  // on unmount so a forced refetch after unmount does nothing.
+  const tickRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   useEffect(() => {
     let stopped = false;
@@ -63,6 +77,7 @@ export function usePolling<T>(
       }
     };
 
+    tickRef.current = tick;
     void tick();
     const id = setInterval(() => void tick(), intervalMs);
 
@@ -70,8 +85,11 @@ export function usePolling<T>(
       stopped = true;
       controller?.abort();
       clearInterval(id);
+      tickRef.current = () => Promise.resolve();
     };
   }, [intervalMs]);
 
-  return state;
+  const refetch = useCallback(() => tickRef.current(), []);
+
+  return { ...state, refetch };
 }

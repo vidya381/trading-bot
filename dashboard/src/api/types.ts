@@ -223,6 +223,43 @@ export interface BotDetail extends Bot {
   readonly alerts: readonly Alert[];
 }
 
+// ---------------------------------------------------------------------------
+// Liquidation (`POST /api/bots/:id/liquidate`, `liquidateBot` handler)
+//
+// The response is `{ result, bot }`. `result` is the bot object's own
+// `PipelineResult` (mirrored from `src/durable-objects/bot-instance.ts`) -- and
+// crucially, the PRICE-UNUSABLE outcome is NOT an HTTP error: when no current
+// price can be read, `liquidatePosition` alerts, leaves the position held, and
+// returns normally with `action: "no_price"` (a 200). So the frontend must
+// branch on `result.action` within a success, not only on error codes. The
+// error paths (`invalid_status` for a no-longer-halted bot, `not_attached` for
+// an environment with no exchange wired) arrive as thrown `ApiError`s instead.
+// ---------------------------------------------------------------------------
+
+/** The `PipelineResult` a liquidation returns. */
+export interface LiquidationResult {
+  readonly status: BotStatus;
+  /**
+   * What the call did. The outcomes the dashboard distinguishes:
+   *   - "liquidating"          -- a marketable limit sell was placed; the bot
+   *                               stays halted (the fill may still rest).
+   *   - "no_price"             -- no current price was readable; nothing sold,
+   *                               the position is held, a critical alert fired.
+   *   - "nothing_to_liquidate" -- the position was already flat.
+   *   - "hold"                 -- an exit/liquidation order was already live;
+   *                               nothing was placed (idempotent).
+   */
+  readonly action: string;
+  readonly detail?: string;
+}
+
+/** The body of a successful `POST /api/bots/:id/liquidate`. */
+export interface LiquidateResponse {
+  readonly result: LiquidationResult;
+  /** The refreshed summary, or null if the bot's row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertCategory = "trading" | "system";
 

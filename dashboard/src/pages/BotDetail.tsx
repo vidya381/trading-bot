@@ -26,6 +26,7 @@ import { ApiError, fetchBot } from "../api/client";
 import { usePolling } from "../api/usePolling";
 import type { BotDetail as BotDetailData } from "../api/types";
 import { BotSummary } from "../components/BotSummary";
+import { LiquidateAction } from "../components/LiquidateAction";
 import { StrategyState } from "../components/StrategyState";
 import { OrderHistory } from "../components/OrderHistory";
 import { TradeHistory } from "../components/TradeHistory";
@@ -130,6 +131,13 @@ function BotDetailView({ id }: { id: string }) {
       ) : bot !== null ? (
         <>
           <BotSummary bot={bot} />
+          {/*
+           * The liquidate control renders only for a halted bot (brief item 1);
+           * the component itself further hides the button when the position is
+           * flat, so a halted-but-empty bot shows no action. A successful
+           * response refetches immediately (item 4) via `poll.refetch`.
+           */}
+          {bot.status === "halted" && <LiquidateAction bot={bot} onLiquidated={poll.refetch} />}
           <StrategyState bot={bot} />
           <OrderHistory orders={bot.orders} />
           <TradeHistory trades={bot.trades} />
