@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/*
+ * Dark theme only, no toggle (per this session's brief and the spec's dark
+ * dashboard decision). Tailwind v4 is configured CSS-first: this single import
+ * pulls in the framework, and the base rules below fix the palette to dark so
+ * there is no light mode to fall back to. Components use dark palette utilities
+ * (slate/zinc backgrounds, light text) directly rather than `dark:` variants,
+ * because there is only ever one theme.
+ */
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #09090b; /* zinc-950 */
+  color: #e4e4e7; /* zinc-200 */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures for money and counts, so columns line up and numbers do not
+   jitter as they poll. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

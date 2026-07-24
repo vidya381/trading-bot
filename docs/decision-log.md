@@ -4088,3 +4088,238 @@ to an authenticated caller hitting a real endpoint on a schema-less environment.
 One `SELECT 1 FROM sqlite_master` per request on every environment, testnet
 included. A metadata read, negligible, and the same price the cron Workers
 already pay. Not worth caching for v1's request volume.
+
+## Step 10.6: Dashboard frontend — scaffolding, status strip, and bot list
+Date: 2026-07-23
+
+The first UI of the project, the front half of spec step 10, built on the
+backend API of steps 10.3–10.5. Deliberately narrow scope: project scaffolding,
+the environment banner, the status strip, and the bot list, reading real data
+from `GET /api/bots` and `GET /api/alerts` by polling. Explicitly NOT built this
+session (each a follow-up): the bot detail view, the create-bot form, the alert
+feed UI, the manual-adjustment form, and the kill-switch / liquidate controls.
+
+Everything lives in `/dashboard`, previously a placeholder folder, now a React +
+Vite + TypeScript app with its own toolchain (Tailwind v4, react-router),
+separate from the Worker's, as step 1's decision 2 always intended. The dashboard
+build typechecks and builds clean; the backend's 1098 tests still pass unchanged
+after the `wrangler.jsonc` change below.
+
+I was asked to stop and ask if the Tailwind setup or the static-assets binding
+approach was ambiguous. Neither was, once checked against the installed tooling
+rather than memory (decision 1), so I proceeded. The one thing the brief told me
+to verify before committing to it — that serving the frontend from the same
+Worker is straightforward on this Wrangler — is decision 1, and it is.
+
+### What was built
+
+- `dashboard/` toolchain: `package.json` (own deps, TS 5.7 not the Worker's TS
+  7 — decision 3), `vite.config.ts`, three `tsconfig` files, `index.html`.
+- `src/env.ts`: the build-time `ENVIRONMENT` constant (decision 2).
+- `src/api/`: `types.ts` (the `Bot`/`Alert`/envelope shapes mirrored from
+  `src/api/serialize.ts`), `client.ts` (same-origin fetch + envelope unwrap into
+  a typed `ApiError`), `usePolling.ts` (a 5s poll that keeps last-good data).
+- `src/components/`: `EnvironmentBanner`, `StatusStrip`, `StatusBadge`,
+  `BotList` (a real `<table>` at `md`+, stacked cards below, one dataset).
+- `src/pages/`: `Dashboard` (owns the polling, feeds strip + list) and
+  `BotDetailPlaceholder` (the `/bots/:id` landing site for next session).
+- `src/App.tsx` + `main.tsx`: the banner-outside-router shell and the routes.
+- `wrangler.jsonc`: an `assets` block under BOTH environments (decision 1).
+- `package.json` (root): `build:dashboard:{testnet,production}` and reworked
+  `deploy:*` scripts that build the dashboard, with the environment baked in,
+  before `wrangler deploy` (decision 10).
+
+### Decisions made
+
+**1. The frontend is served as static assets from the SAME Worker as `/api/*`,
+via `run_worker_first`, not a separate Pages project.** *(the brief's deploy
+question; confirmed straightforward before committing)*
+
+The brief asked me to confirm this is clean on the current Wrangler (4.112.0)
+before committing, and to propose the alternative if it is genuinely awkward. It
+is clean. The installed `node_modules/wrangler/config-schema.json` shows
+`assets.run_worker_first` accepts an ARRAY of route globs (not only a boolean),
+so:
+
+```jsonc
+"assets": {
+  "directory": "./dashboard/dist",
+  "not_found_handling": "single-page-application",
+  "run_worker_first": ["/api/*", "/health"]
+}
+```
+
+routes `/api/*` and `/health` to the Worker's own fetch handler and serves every
+other path from `dist/`, with SPA fallback to `index.html` so client-side routes
+deep-link. One deployment per environment, one Worker, consistent with the rest
+of the project. Declared under BOTH envs because binding keys are
+non-inheritable (step 1, decision 1) — the same reasoning the two `database_id`s
+already follow. Verified with `wrangler deploy --dry-run --env testnet` and
+`--env production`: both read the 4-file assets directory and resolve every
+binding. `src/workers/api.ts` was left BYTE-FOR-BYTE unchanged — the Worker
+already 404s non-`/api/`, non-`/health` paths, and now simply never sees them.
+
+*A separate Cloudflare Pages project — rejected.* It would be a second
+deployment target, a second Access application to configure per environment, and
+a second place the environment-to-URL mapping could drift. The brief preferred
+one deployment per environment "consistent with everything else built so far",
+and the config supports it with no contortion.
+
+*Revisit if:* a future need to serve the dashboard and the API from genuinely
+different origins appears (none is foreseen). The routing is validated by config
+and dry-run this session, not yet by a live request against a deployed Access-
+gated origin — that is a step-11 observation, the same shape of caveat the JWT
+verifier carries (step 10.4, open question 1).
+
+**2. The environment is baked in at BUILD time (`VITE_ENVIRONMENT`), never
+detected at runtime.**
+
+Section 11.3 requires the banner be driven by "a value baked in at deploy time,
+not a runtime toggle, so it can never be wrong due to a runtime bug." So
+`src/env.ts` reads `import.meta.env.VITE_ENVIRONMENT`, which Vite statically
+inlines at build — confirmed by grepping the built bundle: the string
+`VITE_ENVIRONMENT` does not appear in `dist` at all, and `"TESTNET — NOT REAL
+MONEY"` does. There is no fetch, no host-sniffing, no `/health` read feeding the
+banner. A testnet build cannot render a production banner because the value is a
+compile-time constant, not a decision made in the browser.
+
+The two real builds set it explicitly (`build:dashboard:testnet` /
+`:production`). An unset value — a plain `vite dev` — resolves to `development`
+and renders a distinct violet "LOCAL DEVELOPMENT" bar, so a local look is never
+mistaken for a deployed environment either. Production's bar is deliberately
+slim and neutral (present, so the environment is always labelled, but
+undramatic); testnet's is the loud amber one, because testnet is the environment
+one deploy away from real money.
+
+*Reading the environment from `/health` at runtime — rejected outright.* It is
+exactly what section 11.3 forbids: a runtime fetch that a bug, a cache, or a
+proxy could make wrong, on the one indicator whose entire job is to be
+trustworthy.
+
+**3. The dashboard pins TypeScript 5.7, not the Worker's TypeScript 7.**
+
+The Worker toolchain runs TS 7.0.2 (step 1). The React/Vite plugin ecosystem
+targets the TS 5.x line, so the dashboard keeps its own `typescript` at ^5.7 in
+its own `package.json`. This is the concrete payoff of step 1's decision 2 (the
+dashboard has its own toolchain): the two can move independently, and a frontend
+dependency that is not ready for TS 7 does not hold back the backend or vice
+versa.
+
+**4. Money stays a decimal string end to end; display trims cosmetically, never
+parses to a float.**
+
+The backend renders every money field as an exact decimal string precisely to
+avoid float precision loss (step 10.4, decision 4). The frontend honours that:
+`types.ts` types every money field as `string`, and `format.ts`'s `trimDecimal`
+/ `signOf` operate on the string (drop trailing zeros, test for a sign) without
+ever constructing a `Number`. No `parseFloat` exists in the codebase. A balance
+past 2^53 or a fractional cent survives to the screen intact.
+
+**5. Polling keeps LAST-GOOD data through a transient failure and reports the
+error beside it, rather than blanking.**
+
+`usePolling` fetches once immediately, then every 5s (brief item 7; no
+WebSockets, the deliberate simplification decided earlier). On a failed poll it
+retains the previous data and surfaces the error as a small "Update failed"
+indicator; `loading` is true only until the first load resolves. A 5-second blip
+on a money dashboard must not flash the screen empty and imply every bot
+vanished. In-flight requests are aborted on unmount and on each new tick, so a
+slow response cannot overwrite a newer one. The two endpoints poll
+independently, so alerts failing does not blank the bot list.
+
+**6. No auth code; the same-origin Access cookie is the whole mechanism.**
+
+There is no login UI and no token handling (brief item 8). `client.ts` makes
+plain same-origin `fetch("/api/...")` calls with `credentials: "same-origin"`;
+Cloudflare Access gates the origin and the browser's existing session cookie
+rides along. The one Access-aware touch is defensive: if a fetch comes back as
+non-JSON with a 401/403 (Access serving a login redirect once a session
+expires), `client.ts` surfaces a clear "session expired — reload" error instead
+of crashing on a failed JSON parse. Building a login form would duplicate — and
+weaken — what Access already does before the app is ever reached.
+
+**7. Row/card navigation to `/bots/:id` is wired now, to a placeholder.**
+
+Every table row and mobile card is a react-router `<Link>` to
+`/bots/{id}`, landing on `BotDetailPlaceholder`, which reads and shows the id so
+the routing is demonstrably correct and says plainly the view is next session's
+work (brief item 6). The next session builds only the destination; the
+navigation, the id plumbing, and the SPA deep-link fallback are already done.
+
+**8. Dark theme only, applied directly — no `dark:` variants, no toggle.**
+
+Tailwind v4, configured CSS-first (`@import "tailwindcss"`, no `tailwind.config`
+file, no PostCSS). Because there is exactly one theme (the decided dark-only), a
+component uses dark palette utilities (`bg-zinc-900`, `text-zinc-100`) directly
+rather than `dark:` variants that would imply a light mode that does not exist.
+`color-scheme: dark` is set so native form controls and scrollbars match.
+
+**9. The P&L column is labelled "Realized (gross)", following the backend's own
+honesty.**
+
+The backend deliberately names the field `realizedGross` and refuses to call it
+"pnl" because it is gross of fees (step 10.4 / serialize.ts). The UI shows it
+under an equally honest label rather than the brief's shorthand "PnL", so the
+number on screen does not claim to be net profit. Sign colouring (green/red/
+zinc) is by the string's sign.
+
+**10. The deploy scripts build the dashboard first, per environment.**
+
+`assets.directory` must exist at deploy time, and each environment's `dist` must
+have that environment's banner baked in. So `deploy:testnet` is
+`build:dashboard:testnet && wrangler deploy --env testnet` (and likewise
+production), where the build script sets `VITE_ENVIRONMENT` inline. The two are
+inseparable — deploying without rebuilding could ship the wrong environment's
+banner, which is the one bug section 11.3 exists to prevent — so they live in
+one script rather than as two things a person must remember to run in order.
+
+### Deviations from the spec
+
+- **Section 11.3 says the banner is driven by "the `ENVIRONMENT` variable".**
+  On the backend that is the Worker `var` (`env.ENVIRONMENT`); the frontend
+  cannot read a Worker var at runtime, and section 11.3 is emphatic the value be
+  baked in at build, not read at runtime. So the frontend uses its own
+  build-time `VITE_ENVIRONMENT`, set from the same environment name. Same value,
+  same guarantee, honouring the "not a runtime toggle" clause literally rather
+  than the variable's name.
+- **Section 11.3's "one deployment per environment, each with its own URL and
+  Access policy" is now half-real.** The build and serving are per-environment
+  and the config is in place; the actual second Access application and the
+  allow-lists are step 11, unbuilt. What exists is one Worker per environment
+  that will serve its own dashboard behind its own Access app once configured.
+- **The spec's step 10 bundles the dashboard as one step.** It is being built in
+  halves — backend (10.3–10.5), then this UI slice, with the remaining forms and
+  controls as named follow-ups — matching the project's one-slice-per-session
+  cadence rather than landing all of step 10 at once.
+
+### Open questions carried forward
+
+Still open and unchanged: nothing has ever made a real exchange call (8.1); the
+money/rate-limit and alert-delivery caveats of the section 17 amendments; the
+production allow-list is empty and whose funds are at risk is unsettled (4.1);
+the daily-loss circuit-breaker trigger (section 7.3) is unbuilt; the Access
+verifier has never seen a real Cloudflare token (10.4, open question 1).
+
+New:
+
+1. **The static-asset routing is validated by config and `--dry-run`, not by a
+   live request.** `run_worker_first: ["/api/*", "/health"]` resolves and both
+   environments' dry-runs read the assets directory, but no deployed request has
+   yet confirmed that `/api/*` reaches the Worker while `/bots/:id` serves
+   `index.html` through the Access gate. That is a step-11 observation once an
+   Access app fronts a real deploy — the same "claim about the code, not the
+   wire" shape as the JWT verifier and the alert path before it.
+
+2. **The dashboard consumes the API contract but shares no types with it.**
+   `dashboard/src/api/types.ts` is hand-mirrored from `src/api/serialize.ts`.
+   The two are separate toolchains (decision 3), so a backend field rename would
+   not fail the dashboard's typecheck — it would surface as a runtime `undefined`
+   in the UI. Acceptable at this size; a shared generated contract is the fix if
+   the surface grows.
+
+3. **A local look shows chrome, not populated data.** `/api/*` is Access-gated,
+   so `vite dev` against a local `wrangler dev` renders the banner, strip and
+   empty/error states but no real bots unless the caller has a session and the
+   local D1 has schema. Populated data needs the deployed, Access-gated origin.
+   Expected, and stated in the dashboard README rather than papered over with a
+   mock-data mode (which the brief's scope excludes).

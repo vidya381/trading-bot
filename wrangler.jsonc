@@ -50,6 +50,25 @@
 		"testnet": {
 			"name": "trading-bot-testnet",
 			"workers_dev": true,
+			// Spec section 11.3 / build step 10 (dashboard). The React dashboard
+			// (in /dashboard) is served as static assets from THIS Worker, so there
+			// is one deployment per environment rather than a separate Pages project
+			// -- consistent with everything else here. `run_worker_first` routes
+			// /api/* and /health to the Worker's own fetch handler; every other path
+			// is served from the built assets, with `single-page-application`
+			// falling back to index.html so client-side routes (e.g. /bots/:id)
+			// deep-link correctly. `directory` must exist at deploy time -- the
+			// deploy scripts build the dashboard first (see package.json). The dist
+			// is built per environment with VITE_ENVIRONMENT baked in, which is what
+			// drives the environment banner (section 11.3).
+			"assets": {
+				"directory": "./dashboard/dist",
+				"not_found_handling": "single-page-application",
+				"run_worker_first": [
+					"/api/*",
+					"/health"
+				]
+			},
 			"vars": {
 				"ENVIRONMENT": "testnet",
 				// Spec section 11, build step 10 (dashboard API). The Zero Trust
@@ -131,6 +150,19 @@
 		"production": {
 			"name": "trading-bot-production",
 			"workers_dev": true,
+			// See the testnet note above. Declared identically; the difference
+			// between the two dashboards is the VITE_ENVIRONMENT baked into each
+			// build (the banner), not this config. The assets directory is the same
+			// path -- the production deploy script builds it with
+			// VITE_ENVIRONMENT=production before deploying.
+			"assets": {
+				"directory": "./dashboard/dist",
+				"not_found_handling": "single-page-application",
+				"run_worker_first": [
+					"/api/*",
+					"/health"
+				]
+			},
 			"vars": {
 				"ENVIRONMENT": "production",
 				// See the testnet note above. SET THIS to your team domain before

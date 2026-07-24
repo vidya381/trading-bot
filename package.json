@@ -7,8 +7,11 @@
   "license": "MIT",
   "scripts": {
     "dev": "wrangler dev --env testnet",
-    "deploy:testnet": "wrangler deploy --env testnet",
-    "deploy:production": "wrangler deploy --env production",
+    "dev:dashboard": "npm --prefix dashboard run dev",
+    "build:dashboard:testnet": "VITE_ENVIRONMENT=testnet npm --prefix dashboard run build",
+    "build:dashboard:production": "VITE_ENVIRONMENT=production npm --prefix dashboard run build",
+    "deploy:testnet": "npm run build:dashboard:testnet && wrangler deploy --env testnet",
+    "deploy:production": "npm run build:dashboard:production && wrangler deploy --env production",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
