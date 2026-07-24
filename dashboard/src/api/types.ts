@@ -260,6 +260,55 @@ export interface LiquidateResponse {
   readonly bot: Bot | null;
 }
 
+// ---------------------------------------------------------------------------
+// Global kill switch (spec section 7.4; `killSwitchView` in serialize.ts,
+// `GET /api/kill-switch`, `POST /api/kill-switch/{trigger,reset}`).
+//
+// The status view is the `global_kill_switch` row, camelCased; the `armed` shape
+// (all-null trip/reset fields) is what the backend returns when the row has
+// never been written, so `state` is the only field guaranteed to be present.
+//
+// A TRIGGER returns `{ result, killSwitch }`. `result` is the backend's
+// `GlobalTripResult` (mirrored from `src/reconciliation/kill-switch.ts`): the
+// sweep NEVER rethrows on an unreachable bot -- it halts what it can and reports
+// the rest in `failures`, so a partial outcome is a normal 200, not an error.
+// `haltedBotIds` and `failures` together are the honest record of what the pull
+// actually did (this session's brief items 5 and 7).
+// ---------------------------------------------------------------------------
+
+export type KillSwitchState = "armed" | "tripped";
+
+export interface KillSwitchStatus {
+  readonly state: KillSwitchState;
+  readonly reason: string | null;
+  readonly trippedAt: number | null;
+  readonly trippedBy: string | null;
+  readonly resetAt: number | null;
+  readonly resetBy: string | null;
+}
+
+/** One bot the sweep reached but could not halt (`failures[]` in the result). */
+export interface KillSwitchHaltFailure {
+  readonly botInstanceId: string;
+  readonly message: string;
+}
+
+/** The backend's `GlobalTripResult`: what a single pull actually did. */
+export interface GlobalTripResult {
+  /** False when the switch was already tripped by an earlier call (a re-sweep). */
+  readonly newlyTripped: boolean;
+  /** Bots this call successfully halted, across every account. */
+  readonly haltedBotIds: readonly string[];
+  /** Bots this call reached but could NOT halt -- non-empty is a partial outcome. */
+  readonly failures: readonly KillSwitchHaltFailure[];
+}
+
+/** The body of a successful `POST /api/kill-switch/trigger`. */
+export interface TriggerKillSwitchResponse {
+  readonly result: GlobalTripResult;
+  readonly killSwitch: KillSwitchStatus;
+}
+
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertCategory = "trading" | "system";
 

@@ -5,9 +5,9 @@
  * across a transient failure and surfaces the error without blanking the screen.
  */
 
-import { fetchAlerts, fetchBots } from "../api/client";
+import { fetchAlerts, fetchBots, fetchKillSwitch } from "../api/client";
 import { usePolling } from "../api/usePolling";
-import type { Alert, Bot } from "../api/types";
+import type { Alert, Bot, KillSwitchStatus } from "../api/types";
 import { StatusStrip } from "../components/StatusStrip";
 import { BotList } from "../components/BotList";
 import { formatTime } from "../format";
@@ -38,6 +38,9 @@ function FreshnessIndicator({
 export function Dashboard() {
   const botsPoll = usePolling<Bot[]>(fetchBots);
   const alertsPoll = usePolling<Alert[]>(fetchAlerts);
+  // The kill-switch state is polled independently (like bots and alerts), so it
+  // keeps last-good through a blip and one endpoint failing never blanks another.
+  const killSwitchPoll = usePolling<KillSwitchStatus>(fetchKillSwitch);
 
   const bots = botsPoll.data ?? [];
   const alerts = alertsPoll.data ?? [];
@@ -54,7 +57,7 @@ export function Dashboard() {
         />
       </div>
 
-      <StatusStrip bots={bots} alerts={alerts} />
+      <StatusStrip bots={bots} alerts={alerts} killSwitch={killSwitchPoll.data} />
 
       {firstLoad ? (
         <div className="rounded-lg border border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">

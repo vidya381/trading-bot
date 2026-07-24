@@ -527,3 +527,200 @@ New:
    fires only if the bot resumes between page load and the click; the copy tells
    the user and the poll resolves the view. It is coded from the backend's
    guarantee, not from having seen the two events interleave.
+
+## Step 10.10: Dashboard frontend — global kill switch control
+Date: 2026-07-24
+
+The second WRITE surface the dashboard exposes, and the most severe: spec
+section 7.4's global kill switch, on its OWN top-level page rather than any bot's
+detail view. It calls the backend built at step 10.3 and wrapped as three
+endpoints at step 10.4: `GET /api/kill-switch` (status), `POST
+/api/kill-switch/trigger` (pull), `POST /api/kill-switch/reset` (re-arm).
+Deliberately divergent from the liquidate action (step 10.9) on confirmation
+style. Frontend only; no backend file was touched, so its 1098 tests are
+unaffected (re-run green this session). The dashboard typechecks and builds
+clean.
+
+I was told to stop and ask ONLY if the shape of a partial-failure response was
+ambiguous. It is not, and I read it from source rather than guessing
+(`tripGlobalKillSwitch` in `src/reconciliation/kill-switch.ts`, the
+`triggerKillSwitch` handler, `killSwitchView` in `serialize.ts`): the sweep
+never rethrows on an unreachable bot — it returns a 200 whose `result.failures[]`
+lists what it could not halt alongside `result.haltedBotIds[]`. So the partial
+outcome is a fully-specified success shape, not an ambiguity. The one genuinely
+in-between case (below, decision 4) is the absence of a backend response, not a
+backend response of uncertain shape — nothing to ask about. So I proceeded.
+
+### What was built
+
+- `dashboard/src/pages/KillSwitchPage.tsx`: the `/kill-switch` control page — a
+  prominent status card (item 1) plus the trigger and reset controls, owning the
+  status poll and re-reading it after any attempt.
+- `dashboard/src/components/KillSwitchTrigger.tsx`: the type-to-confirm trigger
+  (items 2, 3, 5, 7, 8) — a required reason input, a required `HALT ALL BOTS`
+  confirmation phrase, and the honest halted/failed result rendering.
+- `dashboard/src/components/KillSwitchReset.tsx`: the reset control (item 4) — a
+  required note, a plain confirm (no type-to-confirm), and honest re-arm copy.
+- `dashboard/src/components/KillSwitchBanner.tsx`: the App-level tripped banner
+  (item 6), mounted OUTSIDE the routes so a tripped switch is unmissable on every
+  page; renders nothing while armed.
+- `dashboard/src/components/StatusStrip.tsx`: a kill-switch tile (item 6) — a
+  link to the control page showing armed/tripped at a glance, filled-red when
+  tripped; grid widened 6→7 columns.
+- `dashboard/src/api/{client,types}.ts`: `fetchKillSwitch`/`triggerKillSwitch`/
+  `resetKillSwitch`; `requestJson` generalised to carry a JSON body (the first
+  POST with a body — liquidate had none); `KillSwitchStatus`, `GlobalTripResult`,
+  `TriggerKillSwitchResponse` mirrored from the backend.
+- `dashboard/src/format.ts`: `formatDateTime` (full date+time) for when the
+  switch was tripped — the WHEN as a record, not just a freshness tick.
+- `dashboard/src/{App,pages/Dashboard}.tsx`: the `/kill-switch` route, the banner
+  in the shell, and the Dashboard polling the switch to feed the strip tile.
+
+### Decisions made
+
+**1. A dedicated `/kill-switch` page, NOT the bot list and NOT any bot's detail
+view.** *(the brief's "your call on exact placement")*
+
+The brief allowed either the main status-strip page or a dedicated
+settings-style area. I chose a dedicated page: a control whose blast radius is
+total should sit one deliberate navigation off the routine bot list, not inline
+beside the tables an operator scrolls all day. Reachability without entering a
+bot (the brief's hard requirement) is satisfied two ways that do not need a
+global nav bar — which the app deliberately lacks and which I did not add: the
+status strip's kill-switch tile (a link, present on the home page) and the
+tripped banner's "Manage" link (present on every page). Bot detail already has a
+"← Back to bots" link, so the control is reachable from there too without a nav.
+
+**2. Type-to-confirm, diverging from liquidate's plain yes/no (item 2) — and the
+reason is a SECOND, separate input, not the confirmation text.**
+
+Liquidate (step 10.9, decision 6) explicitly reserved type-to-confirm for this
+control. The trip button stays visibly disabled (`disabled:bg-red-950`, not just
+a hover change) until BOTH: a non-empty reason AND the confirmation field equals
+`HALT ALL BOTS` character-for-character. These are two distinct inputs on
+purpose: the reason (item 3) is free text that becomes the permanent record (it
+lands in the alert and audit log the backend writes), so it can be anything and
+must not be the fixed phrase; the phrase is a fixed, meaningless-on-its-own
+friction gate that forces a deliberate act. Conflating them — "type the reason to
+confirm" — would either weaken the gate (any text unlocks it) or corrupt the
+record (the record is forced to be a ritual phrase). The confirm field tints
+red on a mismatch and emerald on an exact match, so the gate's state is visible,
+not just enforced.
+
+*The phrase is a UI friction gate, not a security control* — it runs entirely
+client-side. The real guards are the backend's own: it refuses an empty reason
+and refuses a non-human actor. The phrase exists to stop a mis-click and make
+the weight of the action land, which is exactly what a UI confirmation is for.
+
+**3. Reset is a distinct control requiring a note, with a PLAIN confirm — not
+type-to-confirm (item 4).** Triggering and resetting are two separate sections
+with two separate buttons; they are never one toggle. Reset requires a note (the
+same record-keeping reasoning as the reason), but it does NOT use the phrase
+gate: re-arming is comparatively safe — it halts nothing and resumes nothing, it
+only lets bots be created/resumed again — so the phrase would be disproportionate
+friction. The button enables once the note is non-empty. The success copy is
+explicit about what reset does NOT do (every halted bot stays halted until
+resumed individually; a tripped account breaker stays blocked), mirroring the
+backend module's own header.
+
+**4. A partial trip is a SUCCESS to inspect; a mid-flight request failure is an
+explicit "outcome unknown" — this is the crux of item 7.**
+
+Two different truths, handled as two different things:
+
+- *Backend-provided partial* (`result.failures[]` in a 200): rendered honestly —
+  a "✓ Halted (N)" list AND a "✗ Could not reach (M)" list with each failure's
+  message, and copy that says the unreached bots may still be trading and that
+  pulling again re-sweeps them (idempotent). A warning tone, not success, when
+  any failed. The frontend never collapses this to "done".
+- *No backend response at all* (the `fetch` threw — a network drop after the
+  POST, when the latch may or may not have been written and some bots may or may
+  not have halted): shown as "Outcome unknown — could not confirm", stating the
+  switch may already be tripped, that pulling again is safe because the action is
+  idempotent, and that the status will refresh to the truth. Critically, the
+  trigger calls `onChanged` (a status refetch) in a `finally`, so whichever way
+  the attempt went — success, thrown error, or unknown — the status card, the
+  strip tile and the banner re-read the real state at once and resolve the
+  uncertainty. Claiming neither total success nor total failure when the truth is
+  in between is the specific thing item 7 asks for.
+
+**5. The trigger form shows only while armed; the reset form only while tripped;
+outcome banners persist across the flip.** After a successful trip, `onChanged`
+flips the polled state to tripped, which collapses the trigger form and reveals
+the reset form — but the trigger's result banner (its halted/failed lists) is
+local state that stays rendered, so the operator still sees exactly what the pull
+did while now being offered the reset. Same pattern liquidate used to keep an
+outcome visible after its button hid (step 10.9, decision 3). A consequence: to
+re-sweep failed bots without resetting, the UI has no affordance — you would
+reset then trigger. I judged that acceptable over putting a second loud red
+button on the tripped screen; failures are rare (an unreachable DO), the list
+names exactly which bots, and reconciliation owns any resulting drift. Recorded
+as revisitable if real cancellation-storm failures prove common.
+
+**6. `GET /api/kill-switch` is polled independently in three places (banner,
+page, strip), consistent with the codebase's poll-per-surface idiom.** The
+Dashboard already runs bots and alerts as two independent `usePolling` calls
+(step 10.6, decision 5); the kill switch is a third, and the App-level banner and
+the control page each poll it too. Each keeps last-good through a blip, so a
+failed poll never makes a real tripped state vanish, and one endpoint failing
+never blanks another. The cost is up to three 5s polls of a tiny endpoint on the
+home page — negligible, and cheaper than a shared context/store this codebase
+does not otherwise use. A shared store is the fix only if this surface grows.
+
+**7. In-flight/double-click protection identical to liquidate (item 8).** A
+`submitting` guard drops a second submit before the request starts, and the
+button disables + shows a spinner while in flight, on both the trigger and the
+reset. A double-click cannot fire two pulls or two resets.
+
+### Deviations from the spec
+
+- **Section 7.4's "single dashboard control" is now realised as UI.** Every prior
+  step 10 entry recorded it as unbuilt; this is it. The backend it calls
+  (steps 10.3/10.4) is unchanged.
+- **The trip cannot demonstrably halt real bots in a deployed environment yet**,
+  for the standing project reasons: production is schema-less until go-live, so
+  both endpoints return `no_schema`/`kill_switch_unavailable` (503) there — the UI
+  renders that as an honest "nothing to halt in this environment" state, not a
+  false success. In testnet the sweep runs against real Durable Objects, but no
+  exchange client is attached (step 4.1), and no deployed Access-gated request has
+  exercised the flow. It is verified here against the backend contract and the
+  backend's own tests (which trip against real DOs with a mocked exchange), plus
+  the dashboard typecheck/build — the same "claim about the code, not the wire"
+  shape every write path in this project carries until step 11.
+- **The dashboard still mirrors the API contract by hand** (step 10.6/10.8/10.9,
+  open question). `KillSwitchStatus`/`GlobalTripResult`/`TriggerKillSwitchResponse`
+  were mirrored from `serialize.ts` and `kill-switch.ts`; a backend rename would
+  surface as a runtime `undefined`, not a failed typecheck. Acceptable at this
+  size, same caveat as before.
+
+### Open questions carried forward
+
+Still open and unchanged: nothing has ever made a real exchange call (8.1); the
+money/rate-limit and alert-delivery caveats of the section 17 amendments; the
+production allow-list is empty and whose funds are at risk is unsettled (4.1);
+the daily-loss circuit-breaker trigger (7.3) is unbuilt; the Access verifier has
+never seen a real Cloudflare token (10.4, open question 1); the frontend is
+validated by typecheck and build, not a live Access-gated request
+(10.6/10.8/10.9).
+
+New:
+
+1. **The whole kill-switch flow has never run against a real deployed origin.**
+   The status card, the trigger's type-to-confirm gate, the halted/failed result
+   rendering, the reset, and the banner all render the real contract, but no
+   Access-gated request has exercised one end to end — and in a deployed
+   environment today the only reachable outcome is the `no_schema`/`kill_switch_
+   unavailable` state (production) since production is schema-less until go-live.
+   A step-11/go-live observation.
+
+2. **The "outcome unknown" (mid-flight failure) path is coded from the contract,
+   never seen to interleave**, exactly like liquidate's `invalid_status` race
+   (10.9, open question 2). It fires only if the `fetch` drops after the POST is
+   sent; the copy and the follow-up refetch handle it, but it is reasoned from the
+   idempotent-sweep guarantee, not from having watched a real network drop land
+   between the latch write and the response.
+
+3. **Re-sweeping unreachable bots has no UI affordance** (decision 5): the trigger
+   form hides once tripped, so catching a `failures[]` bot means reset-then-
+   trigger. Fine while failures are rare; revisit if a real cancellation storm
+   makes partial trips common.

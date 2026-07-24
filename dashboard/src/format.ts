@@ -57,3 +57,20 @@ export function formatTime(epochMs: number | null): string {
     second: "2-digit",
   });
 }
+
+/**
+ * Epoch ms -> a full local date + time string, or "—" for null. Used where the
+ * WHEN matters as a record, not just a freshness tick -- e.g. when the global
+ * kill switch was tripped.
+ */
+export function formatDateTime(epochMs: number | null): string {
+  if (epochMs === null) return "—";
+  return new Date(epochMs).toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
