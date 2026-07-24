@@ -11,7 +11,7 @@
  * so callers can branch on `error.code` rather than on prose.
  */
 
-import type { ApiEnvelope, Alert, Bot } from "./types";
+import type { ApiEnvelope, Alert, Bot, BotDetail } from "./types";
 
 /** An API failure, carrying the backend's typed error code. */
 export class ApiError extends Error {
@@ -64,4 +64,14 @@ export function fetchBots(signal?: AbortSignal): Promise<Bot[]> {
 
 export function fetchAlerts(signal?: AbortSignal): Promise<Alert[]> {
   return getJson<Alert[]>("/api/alerts", signal);
+}
+
+/**
+ * One bot's full detail (`GET /api/bots/:id`). A missing bot surfaces as an
+ * `ApiError` with code `unknown_bot` (404); a schema-less environment as
+ * `no_schema` (503) -- the detail page branches on those codes to show an
+ * honest message rather than a blank page.
+ */
+export function fetchBot(id: string, signal?: AbortSignal): Promise<BotDetail> {
+  return getJson<BotDetail>(`/api/bots/${encodeURIComponent(id)}`, signal);
 }

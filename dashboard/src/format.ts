@@ -22,6 +22,32 @@ export function signOf(value: string): "positive" | "negative" | "zero" {
   return /[1-9]/.test(value) ? "positive" : "zero";
 }
 
+/**
+ * Compare two decimal strings numerically, returning -1 / 0 / 1, WITHOUT ever
+ * constructing a float (the same discipline the rest of this module keeps).
+ *
+ * Used only for display positioning -- e.g. deciding where the current price
+ * breaks a grid ladder into sells-above and buys-below. Integer and fractional
+ * parts are compared as `BigInt`, so precision past 2^53 or on fractional cents
+ * is exact.
+ */
+export function compareDecimal(a: string, b: string): number {
+  const negA = a.startsWith("-");
+  const negB = b.startsWith("-");
+  if (negA !== negB) return negA ? -1 : 1;
+  const sign = negA ? -1 : 1;
+  const [ai, af = ""] = (negA ? a.slice(1) : a).split(".");
+  const [bi, bf = ""] = (negB ? b.slice(1) : b).split(".");
+  const intA = BigInt(ai || "0");
+  const intB = BigInt(bi || "0");
+  if (intA !== intB) return intA < intB ? -sign : sign;
+  const len = Math.max(af.length, bf.length);
+  const fa = BigInt(af.padEnd(len, "0") || "0");
+  const fb = BigInt(bf.padEnd(len, "0") || "0");
+  if (fa === fb) return 0;
+  return fa < fb ? -sign : sign;
+}
+
 /** Epoch ms -> a short local time string, or "—" for null. */
 export function formatTime(epochMs: number | null): string {
   if (epochMs === null) return "—";
