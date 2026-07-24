@@ -224,6 +224,75 @@ export interface BotDetail extends Bot {
 }
 
 // ---------------------------------------------------------------------------
+// Bot creation REQUEST (`POST /api/bots`, `createBot` handler)
+//
+// The shape the create form SENDS -- mirrored from the backend handler's decode
+// (`createBot` in src/api/handlers.ts) and the two strategy param decoders
+// (`decodeDcaParams`/`decodeGridParams`). Money is a decimal string on the way
+// IN too, exactly as it comes back out; a percentage is a plain decimal string
+// ("20" = 20%). The strategy-specific `params` object is what each decoder
+// expects, minus `strategy`/`schemaVersion`, which the backend stamps itself.
+//
+// A successful create answers 201 with the full `BotDetail` (above), so the
+// caller navigates straight to the new bot without a second fetch.
+// ---------------------------------------------------------------------------
+
+/** The DCA `params` object `decodeDcaParams` expects (all money/percent strings). */
+export interface DcaParamsInput {
+  readonly baseOrderSize: string;
+  readonly additionalOrderSize: string;
+  readonly stepMultiplier: string;
+  readonly dropPct: string;
+  readonly maxAdditionalBuys: number;
+  /** Mandatory for DCA -- defines the cycle's exit (spec 6.3 step 4). */
+  readonly takeProfitPct: string;
+  readonly stopLossPct: string;
+  readonly autoRestart: boolean;
+  /**
+   * Always false. The backend rejects `true` as unimplemented (a stop-loss halt
+   * cancels open orders and leaves the position held; a configured control that
+   * silently did nothing is worse than none -- see the DcaParams.sellOnStopLoss
+   * note and validateDcaParams). Sent explicitly so the decoder's required-
+   * boolean check passes; the form offers no toggle for it.
+   */
+  readonly sellOnStopLoss: false;
+}
+
+/** The grid `params` object `decodeGridParams` expects. */
+export interface GridParamsInput {
+  readonly upperBound: string;
+  readonly lowerBound: string;
+  readonly gridLines: number;
+  readonly spacing: "arithmetic" | "geometric";
+  readonly orderSize: string;
+  readonly stopLossPct: string;
+  /** Cash out on an upside breakout (spec 6.2 step 5; defaults on). */
+  readonly breakoutTakeProfit: boolean;
+  /** Optional; the backend defaults an omitted value to null. */
+  readonly breakoutThresholdPct?: string | null;
+  /**
+   * The grid take-profit -- an accumulated realized-profit AMOUNT, not a
+   * percentage, and OPTIONAL for grid (spec 6.1/6.2). Null/omitted leaves the
+   * bot relying on its stop-loss and breakout exit.
+   */
+  readonly takeProfitAmount?: string | null;
+}
+
+interface CreateBotBase {
+  readonly botInstanceId: string;
+  readonly accountLabel: string;
+  readonly exchange: string;
+  readonly pair: string;
+  readonly capitalAsset: string;
+  readonly allocatedCapital: string;
+}
+
+/** The discriminated body of `POST /api/bots`. */
+export type CreateBotRequest =
+  | (CreateBotBase & { readonly strategy: "dca"; readonly params: DcaParamsInput })
+  | (CreateBotBase & { readonly strategy: "grid"; readonly params: GridParamsInput });
+
+// ---------------------------------------------------------------------------
 // Liquidation (`POST /api/bots/:id/liquidate`, `liquidateBot` handler)
 //
 // The response is `{ result, bot }`. `result` is the bot object's own

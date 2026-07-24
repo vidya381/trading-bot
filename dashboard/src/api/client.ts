@@ -16,6 +16,7 @@ import type {
   Alert,
   Bot,
   BotDetail,
+  CreateBotRequest,
   KillSwitchStatus,
   LiquidateResponse,
   TriggerKillSwitchResponse,
@@ -109,6 +110,31 @@ export function fetchBot(id: string, signal?: AbortSignal): Promise<BotDetail> {
  */
 export function liquidateBot(id: string, signal?: AbortSignal): Promise<LiquidateResponse> {
   return requestJson<LiquidateResponse>(`/api/bots/${encodeURIComponent(id)}/liquidate`, "POST", { signal });
+}
+
+/**
+ * Create a bot instance (`POST /api/bots`). Returns the created bot's FULL
+ * detail: the 201 body is the same `botDetail` shape as `GET /api/bots/:id`, so
+ * the caller navigates straight to it without a second fetch (brief item 6).
+ *
+ * The backend is the source of truth for everything capital- and account-state
+ * dependent, and each refusal is a distinct `ApiError` code the form branches on:
+ *   - `insufficient_capital`      -- the ledger's available < requested; the
+ *                                    message carries the available-vs-requested
+ *                                    detail, shown verbatim (brief item 4).
+ *   - `exceeds_allocated_capital` -- the config would out-spend its own
+ *                                    allocation (planned spend > allocated).
+ *   - `no_ledger_row`             -- the account+asset has no capital ledger yet.
+ *   - `duplicate_bot_instance` / `already_created` -- the id is taken.
+ *   - `globally_tripped` / `account_tripped` -- a pulled kill switch or a
+ *                                    tripped account breaker blocks creation.
+ *   - `invalid_parameter`         -- a strategy param failed the backend's own
+ *                                    validation.
+ * Creation does NOT touch the exchange (config is saved, no orders placed), so
+ * unlike liquidate it never returns `not_attached`.
+ */
+export function createBot(request: CreateBotRequest, signal?: AbortSignal): Promise<BotDetail> {
+  return requestJson<BotDetail>("/api/bots", "POST", { signal, body: request });
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@
  * across a transient failure and surfaces the error without blanking the screen.
  */
 
+import { Link } from "react-router-dom";
 import { fetchAlerts, fetchBots, fetchKillSwitch } from "../api/client";
 import { usePolling } from "../api/usePolling";
 import type { Alert, Bot, KillSwitchStatus } from "../api/types";
@@ -51,10 +52,18 @@ export function Dashboard() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-xl font-semibold text-zinc-100">Bots</h1>
-        <FreshnessIndicator
-          lastUpdated={botsPoll.lastUpdated ?? alertsPoll.lastUpdated}
-          error={botsPoll.error ?? alertsPoll.error}
-        />
+        <div className="flex items-center gap-3">
+          <FreshnessIndicator
+            lastUpdated={botsPoll.lastUpdated ?? alertsPoll.lastUpdated}
+            error={botsPoll.error ?? alertsPoll.error}
+          />
+          <Link
+            to="/bots/new"
+            className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500"
+          >
+            <span aria-hidden>＋</span> Create bot
+          </Link>
+        </div>
       </div>
 
       <StatusStrip bots={bots} alerts={alerts} killSwitch={killSwitchPoll.data} />

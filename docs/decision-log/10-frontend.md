@@ -724,3 +724,159 @@ New:
    form hides once tripped, so catching a `failures[]` bot means reset-then-
    trigger. Fine while failures are rare; revisit if a real cancellation storm
    makes partial trips common.
+
+---
+
+## Step 10.11: Dashboard frontend — create-bot form
+Date: 2026-07-24
+
+The THIRD write surface, and the last piece of spec step 10: the create-bot form
+(spec 6.1, and step 10's "bot creation form with mandatory risk fields and
+capital-ledger check"). It calls `POST /api/bots` — the endpoint built at step 10
+backend, wrapped as `createBot` in the client this session. Frontend only; no
+backend file was touched, so the Worker's tests are unaffected. The dashboard
+typechecks and builds clean (`tsc -b && vite build`, 66 modules).
+
+I was told to stop and ask ONLY if the backend's validation error shape was
+ambiguous. It is not, and I read it from source rather than guessing: every
+refusal is the `{ data: null, error: { code, message } }` envelope
+(`src/api/envelope.ts`), the codes are enumerable (`STATUS_BY_CODE`), and the one
+detail the brief singled out — `insufficient_capital`'s available-vs-requested
+numbers — lives in the `message` string (`src/capital/ledger.ts`), not in
+structured fields. So the form surfaces that message verbatim; there was nothing
+to ask about, and I proceeded.
+
+### What was built
+
+- `dashboard/src/pages/CreateBot.tsx`: the `/bots/new` form — shared fields, a
+  grid/DCA strategy toggle that switches which fieldset mounts, a strategy-aware
+  risk-controls section, client validation of only-always-invalid things, honest
+  per-code error handling, and navigate-to-detail on success.
+- `dashboard/src/api/client.ts`: `createBot(request)` → `BotDetail`, with a
+  header documenting each refusal code it can surface.
+- `dashboard/src/api/types.ts`: `CreateBotRequest` (discriminated by strategy),
+  `DcaParamsInput`, `GridParamsInput` — mirrored from the backend handler's
+  decode and the two strategy param decoders.
+- `dashboard/src/{App,pages/Dashboard}.tsx`: the `/bots/new` route (declared
+  before `/bots/:id`) and a "＋ Create bot" button beside the bot-list heading.
+
+### Decisions made
+
+**1. Success navigates to the new bot's detail page, not back to the list (brief
+item 6).** The 201 body is the full `botDetail` (the write-response convention
+established at step 10 backend, decision "return the created bot"), so `createBot`
+is typed to return `BotDetail` and the form does `navigate(/bots/:id)` with no
+second fetch. The person lands on exactly what they made.
+
+**2. The visible fields switch by MOUNTING, not hiding (brief item 2).** The
+grid/DCA toggle renders only the selected strategy's fieldset, so a stale field
+from the other strategy can never reach the payload. `buildRequest` is a
+discriminated switch that produces exactly one strategy's `params` shape.
+
+**3. The mandatory-vs-optional take-profit distinction is made real, not cosmetic
+(brief item 3).** Stop-loss is required (`*`) for both. DCA's take-profit
+(`takeProfitPct`) is required (`*`) with copy naming it the cycle's exit; grid's
+take-profit (`takeProfitAmount`) is labelled `(optional)`, described as a profit
+AMOUNT (not a percentage), and sits beside the `breakoutTakeProfit` checkbox
+(default on, spec 6.2 step 5) — so the form shows the two strategies genuinely
+differ, matching the backend's own deviation note (step 10 backend).
+
+**4. Client validation catches only what is always invalid; the server owns
+everything ledger- or state-dependent (brief items 4, 5).** Missing fields,
+non-numeric input (a decimal grammar mirroring `src/shared/money.ts` — ≤8 dp, no
+sign), percentages in a sensible range (`0 < x < 100` for stop-loss/drop, the
+same `<100%` the backend enforces, checked with the existing `compareDecimal` so
+no float is built and the two rules cannot disagree), integers (`gridLines ≥ 2`,
+`maxAdditionalBuys ≥ 0`), and grid `lower < upper`. It deliberately does NOT
+replicate the capital-ledger check or the planned-spend-vs-allocation check;
+those come back as the backend's real `insufficient_capital` (message shown
+verbatim) and `exceeds_allocated_capital`, each with its own distinct banner. The
+DCA take-profit is validated `> 0` with NO upper cap, because the backend imposes
+none — a client `<100%` rule there would reject configs the server accepts (drift).
+
+**5. Honest, distinct error handling keyed on the code, reusing the liquidate /
+kill-switch pattern (brief item 7).** Separate messages for
+`insufficient_capital`, `exceeds_allocated_capital`, `no_ledger_row`,
+`duplicate_bot_instance`/`already_created` (also pinned to the id field),
+`globally_tripped` (with a link to the kill-switch page), `account_tripped`,
+`invalid_parameter`, and `unauthenticated`. A `network_error`/`bad_response`
+becomes an explicit "couldn’t confirm" state — the same in-between honesty the
+kill switch uses — and it notes that resubmitting **with the same id is safe**: a
+create that actually landed comes back as `duplicate_bot_instance` rather than
+making a second bot, so reusing the prefilled id gives retry a natural idempotency.
+
+**6. In-flight/double-click protection identical to the two prior write surfaces
+(brief item 7).** A `submitting` guard drops a second submit before the request
+starts; the button disables and shows a spinner while in flight. On success the
+component unmounts via navigation (no state reset needed); on error `submitting`
+resets so the person can correct and retry.
+
+**7. Fields the brief didn't enumerate but the backend requires got reasoned
+defaults, not silent omissions.** `exchange` defaults to `binance` (the only v1
+exchange) and stays editable; `capitalAsset` defaults to `USDT`; `botInstanceId`
+is a required, editable text field prefilled with a generated `bot-xxxxxx` slug
+(it is the bot's display name and URL id). `sellOnStopLoss` is NOT offered as a
+control and is always sent `false` — the backend rejects `true` as unimplemented
+(`validateDcaParams`), so exposing it would be a toggle that only ever errors.
+`autoRestart` (DCA) and `breakoutTakeProfit` (grid) ARE exposed, since both are
+real, meaningful options the decoders require.
+
+**8. A best-effort `fetchBots` on mount feeds `<datalist>` suggestions for the
+account/pair/asset fields.** No accounts endpoint exists and none was invented;
+the fields stay free text (a brand-new account still works), and a failed fetch is
+swallowed — the suggestions only help an operator pick an account that already has
+a capital ledger. `/bots/new` is declared before `/bots/:id`; the static segment
+wins the route match and generated ids never collide with the literal `new`.
+
+### Deviations from the spec
+
+- **Step 10's "bot creation form" is now realised as UI.** Every prior step 10
+  entry recorded it as unbuilt (the backend deviation note: "the buttons do not
+  [exist]"). This is it; the backend it calls is unchanged.
+- **Creation needs NO exchange client wired — unlike liquidate.** This was the
+  brief's explicit question. Confirmed from source: `BotInstance.create`/
+  `createGrid` check the two latches, validate params, reserve capital via the
+  step-5 pipeline, and write the row + config — none of which touches the
+  exchange (spec 6.2/6.3 "Created: config saved, no orders placed yet"). The
+  `not_attached` paths are all in start/price/liquidate. So a real successful
+  creation works today without the step-4.1 exchange client; liquidate's
+  `not_attached` gap does not apply here. The bot cannot be *started* (place
+  orders) without the exchange, but that is a later action, not this form.
+- **The form is validated by typecheck and build, not a live Access-gated
+  request** — the standing frontend caveat (10.6/10.8/10.9/10.10). No deployed
+  Access-gated request has created a bot end to end.
+- **The dashboard still mirrors the request contract by hand.**
+  `CreateBotRequest`/`DcaParamsInput`/`GridParamsInput` were mirrored from
+  `handlers.ts` and the strategy decoders; a backend rename would surface as a
+  runtime 400, not a failed typecheck. Same size-appropriate caveat as before.
+
+### Open questions carried forward
+
+Still open and unchanged: nothing has ever made a real exchange call (8.1); the
+money/rate-limit and alert-delivery caveats of the section 17 amendments; the
+production allow-list is empty and whose funds are at risk is unsettled (4.1); the
+daily-loss circuit-breaker trigger (7.3) is unbuilt; the Access verifier has never
+seen a real Cloudflare token (10.4); the frontend is validated by typecheck and
+build, not a live Access-gated request (10.6/10.8/10.9/10.10); re-sweeping
+unreachable bots has no UI affordance (10.10).
+
+New:
+
+1. **No create has ever run against a real deployed origin.** Every refusal path
+   and the success-navigate render the real contract, but no Access-gated request
+   has created a bot end to end. In a deployed environment today production is
+   schema-less until go-live, so a create there would return `no_schema` before it
+   ever reserved capital. A step-11/go-live observation, the same shape as every
+   write path before it.
+
+2. **A create is idempotent by id, but only if the SAME id is resubmitted.** The
+   "couldn’t confirm" copy leans on this: reusing the prefilled id turns a lost-
+   response retry into a `duplicate_bot_instance` rather than a second bot. If a
+   future change regenerates the id on each attempt, that safety evaporates —
+   recorded so the coupling is explicit.
+
+3. **The two remaining step-10 UI pieces are the alert feed page and the manual-
+   adjustment form.** The alert history has a backend (`GET /api/alerts`,
+   `fetchAlerts` already exists and the detail view lists per-bot alerts); the
+   manual-adjustment form has `POST /api/manual-adjustments` (spec 8.6). Neither
+   was started this session, per the brief.
