@@ -4089,6 +4089,88 @@ One `SELECT 1 FROM sqlite_master` per request on every environment, testnet
 included. A metadata read, negligible, and the same price the cron Workers
 already pay. Not worth caching for v1's request volume.
 
+## Step 10.7: deploy guard — refuse a dashboard build that mismatches the target `--env`
+Date: 2026-07-23
+
+The bug decision 10 (build-order note above) warned about, made real. Production
+was deployed with a bare `wrangler deploy --env production` -- the standard
+pattern for backend-only changes -- which redeployed the Worker but uploaded the
+`dashboard/dist` still sitting there from an earlier testnet build. The wrong
+environment banner (the one thing section 11.3 exists to prevent) rendered on
+production until `npm run deploy:production` was run to rebuild first. `wrangler
+deploy` never rebuilds and never checks what the dist was built for; the
+`deploy:*` scripts avoid the trap by rebuilding, but nothing stopped the bare
+command. This makes the mismatch impossible to deploy rather than a thing to
+remember. 9 new guard tests (`node --test`), 1098 worker tests and both
+typechecks unchanged.
+
+### What changed
+
+- `dashboard/vite.config.ts`: a small `buildEnvStamp` plugin writes
+  `dashboard/dist/.build-env.json` (`{environment, builtAt}`) on every build,
+  recording the `VITE_ENVIRONMENT` the bundle was built with -- normalized
+  exactly as `src/env.ts` does (unset/unknown -> `development`, never a real
+  env). A minimal module-scoped `declare const process` keeps the dashboard's
+  deliberately node-types-free toolchain (decision 3) intact.
+- `scripts/verify-dashboard-build.mjs`: reads that stamp and exits non-zero with
+  a clear message on mismatch, missing build, or missing stamp; exits 0 on a
+  match. Pure `checkBuild()` plus a thin CLI.
+- `wrangler.jsonc`: each environment's `build.command` is
+  `node scripts/verify-dashboard-build.mjs <env>` (hardcoded per env). Wrangler
+  runs `build.command` before every `wrangler deploy --env <env>`, bare command
+  included, and *before* it collects/uploads assets; a non-zero exit aborts the
+  deploy before anything reaches Cloudflare.
+- `scripts/verify-dashboard-build.test.mjs` + `test:deploy-guard` script: the
+  pure logic and the CLI's exit codes and gate.
+
+### Decisions
+
+**1. Wired into Wrangler's own build hook, not a separate script.** The brief
+preferred making the bare command impossible to misuse over adding one more
+script people must remember. `build.command` is exactly Wrangler's pre-deploy
+hook: it fires on `wrangler deploy --env X` no matter who invokes it, so the
+guard cannot be bypassed short of editing `wrangler.jsonc`. The existing
+`deploy:*` scripts still build first; the hook then verifies -- belt and braces,
+with the hook as the load-bearing half. Verified empirically that the hook runs
+before asset upload and that a non-zero exit aborts with no upload.
+
+**2. A stamp file, not grepping the bundle.** The check needs the built
+environment. A `.build-env.json` the build writes is deterministic; grepping a
+minified bundle for `"testnet"`/`"production"` is not (both strings appear -- the
+banner compares against them). The stamp lives inside `dist` so its lifecycle is
+the build's: `rm -rf dist` removes it, a rebuild recreates it, so a stale stamp
+cannot outlive its build. Its only contents -- the environment name -- are
+already public in the banner, so serving it as an asset leaks nothing.
+
+**3. Verify-and-fail, not auto-rebuild.** The hook refuses a mismatch rather than
+silently rebuilding the right dashboard. The brief asked for a check that *fails
+loudly* "rather than deploying whatever static files happen to be sitting in the
+output folder"; a silent auto-build inside a production deploy would also be a
+surprising thing to do without the operator asking. The error names both
+environments and the one-line fix (`npm run deploy:<env>`).
+
+**4. Gated on `WRANGLER_COMMAND=deploy`.** Wrangler also runs `build.command` for
+other commands. The script no-ops unless the command is `deploy` (or it was run
+directly, WRANGLER_COMMAND unset), so `wrangler dev --env testnet` -- the `dev`
+script -- is never blocked for lacking a matching build. Confirmed the
+vitest-pool-workers runner does not execute `build.command` at all, so the test
+suite is unaffected by the hook.
+
+### Cost / notes
+
+The guard is a Node process spawn per deploy (and a no-op spawn on other Wrangler
+commands that trigger the hook) -- irrelevant at deploy cadence. The stamp adds
+one tiny asset to each build. `test:deploy-guard` runs on Node's built-in runner,
+outside the Workers pool, because the guard is filesystem/CLI code that does not
+belong in `vitest.config.ts`'s runtime.
+
+### Verified
+
+All four cases via `wrangler deploy --dry-run` (never contacts Cloudflare):
+testnet build + `--env testnet` deploys; the same dist + `--env production`
+aborts with a MISMATCH and no upload; no dist + `--env testnet` aborts with "no
+dashboard build"; production build + `--env production` deploys.
+
 ## Step 10.6: Dashboard frontend — scaffolding, status strip, and bot list
 Date: 2026-07-23
 

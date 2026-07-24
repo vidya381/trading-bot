@@ -49,6 +49,19 @@
 	"env": {
 		"testnet": {
 			"name": "trading-bot-testnet",
+			// Pre-deploy guard (scripts/verify-dashboard-build.mjs). Wrangler runs
+			// this `build.command` before every `wrangler deploy --env testnet`,
+			// bare command included, and BEFORE it uploads assets; a non-zero exit
+			// aborts the deploy before anything reaches Cloudflare. It refuses to
+			// deploy a dashboard/dist built for anything other than testnet -- so a
+			// stale production (or unbuilt) dist can never be shipped here with the
+			// wrong environment banner. The env name is hardcoded because this hook
+			// only ever runs for the testnet deployment. The script no-ops on
+			// non-deploy Wrangler commands (e.g. `wrangler dev`), so local dev is
+			// never gated on having a matching build.
+			"build": {
+				"command": "node scripts/verify-dashboard-build.mjs testnet"
+			},
 			"workers_dev": true,
 			// Spec section 11.3 / build step 10 (dashboard). The React dashboard
 			// (in /dashboard) is served as static assets from THIS Worker, so there
@@ -149,6 +162,14 @@
 		},
 		"production": {
 			"name": "trading-bot-production",
+			// Pre-deploy guard -- see the testnet note above. Hardcoded to production
+			// because this hook only ever runs for the production deployment. This is
+			// exactly what stops a bare `wrangler deploy --env production` from
+			// shipping a dist that was last built for testnet: the deploy aborts
+			// before any upload unless dashboard/dist was built for production.
+			"build": {
+				"command": "node scripts/verify-dashboard-build.mjs production"
+			},
 			"workers_dev": true,
 			// See the testnet note above. Declared identically; the difference
 			// between the two dashboards is the VITE_ENVIRONMENT baked into each
