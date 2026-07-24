@@ -68,7 +68,7 @@ evaluateStopLoss(outcome.value);
 
 This is a deliberate deviation from section 4.1's literal `Promise<Price>`
 signatures. See decision 1 in the step 3 entry of the
-[decision log](../../docs/decision-log.md).
+[decision log](../../docs/decision-log/03.md).
 
 ## Retrying happens at the call site
 
