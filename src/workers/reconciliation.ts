@@ -22,16 +22,31 @@
  * `/src/reconciliation` with no knowledge of a cron at all.
  *
  * ---------------------------------------------------------------------------
- * THERE IS NO EXCHANGE CLIENT
+ * THE EXCHANGE CLIENT (step 3.2 -- resolved)
  * ---------------------------------------------------------------------------
- * Deployed today, this handler does nothing except say so. Building a Binance
- * client needs live API credentials; step 4.1's decision 2 recorded that whose
- * exchange account will be used is still undecided, and no secret exists in
- * either environment.
+ * When nothing is injected, the client is now built from real, secret-backed
+ * credentials by `resolveDefaultExchange` in `./exchange.ts`: it reads
+ * BINANCE_API_KEY / BINANCE_API_SECRET and points a `BinanceClient` at the base
+ * URL for THIS environment, chosen purely from `env.ENVIRONMENT` (testnet ->
+ * testnet.binance.vision, production -> api.binance.com) so the two can never
+ * be pointed at each other's exchange. See that file's header for the full
+ * enforcement argument.
  *
- * That is handled the same way step 6's decision 13 handled it: there is no
- * default client, and the absence is explicit rather than papered over with
- * one constructed against credentials that do not exist.
+ * If either secret is missing this FAILS CLOSED with a specific reason and the
+ * pass does not run -- the same shape as the RATE_LIMITER, BOT_INSTANCE and
+ * schema guards below, and as `./notifications.ts`'s DISCORD_WEBHOOK_URL check.
+ * The credential resolution deliberately happens AFTER the schema guard AND
+ * only when there is at least one account to reconcile. Two reasons: an
+ * environment deployed empty before go-live (production today) still no-ops on
+ * "no schema"; and an environment with a schema but no bots yet has nothing
+ * that needs the exchange, so it is not made to fail for a secret it does not
+ * yet need. Once accounts exist, a missing secret is a hard refusal. Step 6's
+ * decision 13 reasoning still holds where it applies: there is no client built
+ * against credentials that do not exist -- the absence is now a clear refusal
+ * instead of a silent skip.
+ *
+ * Tests inject `exchangeFor` (a `FakeExchange`) and so never reach this path
+ * and never make a real network call.
  *
  * ---------------------------------------------------------------------------
  * NO SCHEMA -> NO-OP
@@ -59,14 +74,19 @@ import {
   type ReconciliationRunResult,
 } from "../reconciliation";
 import type { RestExchangeClient, Timestamp } from "../shared/exchange-client";
+import { resolveDefaultExchange } from "./exchange";
 
 /**
  * How the handler obtains a client for one exchange account.
  *
- * Returns null when no credentials are available for that account, which is
- * currently always. A factory rather than a single client because section 3's
- * isolation principle is per exchange account, and two accounts will one day
- * mean two key pairs.
+ * A factory rather than a single client because section 3's isolation principle
+ * is per exchange account, and two accounts will one day mean two key pairs.
+ *
+ * The `| null` return is for INJECTED factories (a test that wants an account
+ * skipped) -- the production factory from `resolveDefaultExchange` always
+ * returns a client, because the "no credentials" case is caught once, up front,
+ * as a fail-closed refusal rather than a per-account null. A null is still
+ * honoured here (skip, no alert) so that seam stays usable.
  */
 export type ExchangeFactory = (accountLabel: string) => RestExchangeClient | null;
 
@@ -90,9 +110,6 @@ export interface ScheduledOptions {
    */
   readonly db?: Database;
 }
-
-/** No credentials exist yet, in either environment. See the file header. */
-const NO_EXCHANGE_CONFIGURED: ExchangeFactory = () => null;
 
 export interface ScheduledResult {
   readonly ran: boolean;
@@ -130,7 +147,6 @@ export async function runScheduledReconciliation(
   env: Env,
   options: ScheduledOptions = {},
 ): Promise<ScheduledResult> {
-  const exchangeFor = options.exchangeFor ?? NO_EXCHANGE_CONFIGURED;
   const now = options.now ?? (() => Date.now());
   const newId = options.newId ?? (() => crypto.randomUUID());
 
@@ -188,12 +204,33 @@ export async function runScheduledReconciliation(
   const labels = await accountLabels(db);
   const runs: ReconciliationRunResult[] = [];
 
+  // The exchange client. Injected in tests; otherwise built from this
+  // environment's secrets, but ONLY once we know there is something to
+  // reconcile. Resolving after `accountLabels` and gating on it is deliberate:
+  //   - an environment with a schema but no bots (e.g. right after go-live)
+  //     has nothing that needs the exchange, so it must not be made to fail
+  //     for a secret it does not yet need;
+  //   - it comes after the schema guard, so production deployed empty still
+  //     no-ops on "no schema" rather than on a missing secret.
+  // When accounts DO exist, a missing secret fails closed with a specific
+  // reason -- see ./exchange.ts and this file's header.
+  let exchangeFor = options.exchangeFor;
+  if (exchangeFor === undefined && labels.length > 0) {
+    const resolved = resolveDefaultExchange(env, now);
+    if (!resolved.ok) {
+      return { ran: false, reason: resolved.reason, runs: [] };
+    }
+    exchangeFor = resolved.exchangeFor;
+  }
+
   for (const accountLabel of labels) {
-    const exchange = exchangeFor(accountLabel);
+    // Non-null: the loop only runs when labels.length > 0, and in that case the
+    // block above set `exchangeFor` (injected, or resolved-or-returned).
+    const exchange = exchangeFor!(accountLabel);
     if (exchange === null) {
-      // Not an alert. Nothing is wrong: no credentials have been created yet,
-      // and raising a critical alert every five minutes for a known, recorded
-      // state would train whoever reads the dashboard to ignore it.
+      // An injected factory chose to skip this account. Not an alert and not a
+      // failure: the production factory never returns null (a missing secret is
+      // caught up front, above), so this is only reachable via a test seam.
       continue;
     }
 
@@ -249,11 +286,14 @@ export async function runScheduledReconciliation(
   }
 
   if (labels.length > 0 && runs.length === 0) {
+    // Only reachable now via an injected factory that returned null for every
+    // account: the production factory never returns null (a missing secret is a
+    // fail-closed refusal up front). Kept because that test seam is still valid.
     return {
       ran: false,
       reason:
-        `${labels.length} account(s) exist but none has exchange credentials, so ` +
-        `nothing could be reconciled. See step 4.1's decision 2.`,
+        `${labels.length} account(s) exist but the exchange factory returned no ` +
+        `client for any of them, so nothing could be reconciled.`,
       runs: [],
     };
   }

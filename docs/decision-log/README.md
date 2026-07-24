@@ -23,7 +23,7 @@ the index below. Do not write to the old `docs/decision-log.md` stub.
 | --- | --- | --- |
 | [01.md](01.md) | 1 | Repository setup |
 | [02.md](02.md) | 2 | Shared infrastructure modules |
-| [03.md](03.md) | 3, 3.1 | Exchange integration layer; `cancelOrder` returns the cancelled order |
+| [03.md](03.md) | 3, 3.1, 3.2 | Exchange integration layer; `cancelOrder` returns the cancelled order; real credentials provider and testnet exchange wiring |
 | [04.md](04.md) | 4, 4.1 | D1 schema and migrations; D1 databases provisioned |
 | [05.md](05.md) | 5 | Capital ledger and bot-creation validation |
 | [06.md](06.md) | 6 | DCA BotInstance Durable Object |
