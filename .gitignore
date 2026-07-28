@@ -12,6 +12,11 @@ node_modules/
 .dev.vars
 .dev.vars.*
 
+# Throwaway, local-only exchange verification tools (hit the real testnet/sandbox
+# with live credentials). Manual tools, never committed.
+scripts/verify-exchange.ts
+scripts/verify-gemini.ts
+
 # Wrangler / Cloudflare local state
 .wrangler/
 dist/

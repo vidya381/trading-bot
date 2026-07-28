@@ -1,17 +1,57 @@
 # Exchange integration layer
 
-The Binance implementation of the interface in
+Two implementations of the interface in
 [`../shared/exchange-client.ts`](../shared/exchange-client.ts)
-(spec section 4, build step 3).
+(spec section 4): Binance (build step 3) and Gemini (build step 3.4). They
+coexist behind the identical `RestExchangeClient`; strategy code and `BotInstance`
+depend only on the interface and cannot tell which exchange is underneath.
 
 | Module | Spec | What it does |
 | --- | --- | --- |
-| [`credentials.ts`](./credentials.ts) | 4.4 | Injectable API key/secret port, plus a fake for tests |
+| [`credentials.ts`](./credentials.ts) | 4.4 | Injectable API key/secret port, plus a fake for tests. Shared by both exchanges |
 | [`binance/signing.ts`](./binance/signing.ts) | 4.2 | HMAC-SHA256 via Web Crypto, and the clock-drift offset |
-| [`binance/filters.ts`](./binance/filters.ts) | 4.3 | `exchangeInfo` parsing, order validation and rounding, filter cache |
+| [`binance/filters.ts`](./binance/filters.ts) | 4.3 | `exchangeInfo` parsing, and the exchange-agnostic order validation and filter cache |
 | [`binance/parse.ts`](./binance/parse.ts) | 4.1, 5.4 | Payload parsing, weight headers and limits, error classification |
 | [`binance/client.ts`](./binance/client.ts) | 4.1 | The eight REST methods, each wrapped in downtime detection |
-| [`rate-limited.ts`](./rate-limited.ts) | 5.4 | Gate: asks the account's `RateLimiter` for budget before every call |
+| [`gemini/signing.ts`](./gemini/signing.ts) | 4.2 | HMAC-**SHA384** over a base64 JSON payload, and the monotonic **nonce** (no clock sync) |
+| [`gemini/filters.ts`](./gemini/filters.ts) | 4.3 | `symbols/details` parsing (with the field-name inversion); re-exports the shared validator |
+| [`gemini/parse.ts`](./gemini/parse.ts) | 4.1 | Payload parsing (boolean order-state flags, `fee_currency`, derived balances), error classification |
+| [`gemini/client.ts`](./gemini/client.ts) | 4.1 | The same REST surface, POST-with-header-auth, and lookup-then-cancel |
+| [`rate-limited.ts`](./rate-limited.ts) | 5.4 | Gate: asks the account's `RateLimiter` for budget before every call (Binance weight table) |
+
+## The second exchange (`gemini/`, step 3.4)
+
+Structurally parallel to `binance/`, but not a copy — Gemini's transport and
+payloads differ where they actually differ, each verified against Gemini's own
+published reference:
+
+- **Signing is a different mechanism.** `hex(HMAC-SHA384(base64(JSON payload)))`,
+  with the key, payload and signature in the `X-GEMINI-*` headers of a POST with
+  an empty body — not a signed query string. And there is **no clock sync**:
+  Gemini authenticates with a monotonic **nonce**, so the whole
+  `getServerTime`/`ClockOffset` apparatus Binance needs has no analogue.
+  `getServerTime` returns a clear failure rather than a fabricated value.
+- **Order state is boolean flags** (`is_live`/`is_cancelled`), mapped to
+  `OrderState` in `gemini/parse.ts`, not a status string.
+- **The symbol-detail field names are inverted**: Gemini's `tick_size` is the
+  *quantity* increment (our `stepSize`) and `quote_increment` is the *price*
+  increment (our `tickSize`), and both arrive as JSON numbers (one in scientific
+  notation). `gemini/filters.ts` is where that trap is handled.
+- **Cancel is by numeric `order_id` only**, so `cancelOrder` resolves the
+  `client_order_id` to an `order_id` first, then cancels — the cancel response
+  still carries the final filled quantity.
+
+`validateOrder` and `SymbolFilterCache` are exchange-agnostic and have one
+implementation, physically under `binance/filters.ts` (a step-3 accident, when
+there was one exchange); `gemini/filters.ts` re-exports them so the Gemini client
+never reaches across into `binance/`. Hoisting them to a neutral module is a
+deferred refactor.
+
+The Gemini implementation is built and tested but **not yet dispatched to**:
+nothing chooses Gemini over Binance for a bot yet, exactly as production Binance
+was left unwired at step 3.2. `src/workers/exchange-gemini.ts` holds the ready
+`ENVIRONMENT`-derived base URL and fail-closed `GEMINI_API_KEY`/`GEMINI_API_SECRET`
+resolver for when that dispatch step arrives.
 
 ## The gate (`rate-limited.ts`, step 8)
 
