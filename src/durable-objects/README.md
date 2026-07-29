@@ -84,6 +84,18 @@ Callers do not talk to it directly. `/src/exchange/rate-limited.ts` wraps any
 `BotInstance` does that wrapping itself rather than trusting whoever attached
 its dependencies to have remembered.
 
+## Attaching the exchange client (step 13)
+
+`BotInstance` no longer needs a test to `attach` an exchange before it can trade.
+When none is injected — the production path — `#rawExchange` resolves the account's
+real client on demand from the bot's own stored `exchange`/`accountLabel`, through
+`resolveExchangeForAccount` (the single dispatch home from step 11). An injected
+client always wins, so the automated suite still injects a `FakeExchange` and makes
+no live call. Missing credentials or a non-trading `ENVIRONMENT` fail closed as
+`not_attached`, carrying the resolver's own message — the object refuses to trade
+rather than building a client against secrets that do not exist. The *price feed*
+that would drive `onPriceUpdate` on its own is still the missing half (below).
+
 ## Not built here yet
 
 `subscribeToPriceFeed` (section 4.6): the WebSocket Hibernation connection,

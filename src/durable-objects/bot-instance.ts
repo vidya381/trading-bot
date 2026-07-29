@@ -75,6 +75,8 @@ import { DurableObject } from "cloudflare:workers";
 import { createBotInstanceWithCapital, releaseBotCapital } from "../capital";
 import { databaseFrom, type Database } from "../db";
 import type { AlertRow, AuditLogRow, BotStatus, OrderRow, TradeRow } from "../db/schema";
+import { isExchangeId } from "../db/schema";
+import { resolveExchangeForAccount } from "../workers/exchange-dispatch";
 import { validateOrder } from "../exchange/binance/filters";
 import type {
   Asset,
@@ -204,9 +206,14 @@ export interface BotInstanceDependencies {
   readonly db: Database;
   /**
    * The REST half of section 4.1. Deliberately `RestExchangeClient` and not
-   * `ExchangeClient`: `subscribeToPriceFeed` is not wired in this step (see the
-   * decision log), and depending on the narrower type keeps that honest at
+   * `ExchangeClient`: `subscribeToPriceFeed` is still not wired (the price feed
+   * is its own step), and depending on the narrower type keeps that honest at
    * compile time rather than by comment.
+   *
+   * OPTIONAL in practice: `attach` takes a `Partial`, and when this is omitted
+   * (the production path) `#rawExchange` resolves a real client from the
+   * environment for the account's registered exchange (step 13). A test supplies
+   * this to inject a `FakeExchange` and keep the suite free of any live call.
    *
    * This is the RAW client. It is never called directly -- `#exchange()` wraps
    * it in the account's rate limiter first (section 5.4).
@@ -384,12 +391,15 @@ export class BotInstance extends DurableObject<Env> {
   /**
    * Supply or override this object's dependencies.
    *
-   * The database comes from the environment by default. The exchange client
-   * does NOT, and cannot yet: it needs live API credentials, and step 4.1
-   * recorded that whose exchange account will be used is still undecided. So
-   * there is no default, and the object refuses to trade rather than silently
-   * constructing a client against credentials that do not exist. Wiring it from
-   * secrets is the job of whichever step creates them.
+   * The database comes from the environment by default. The exchange client is
+   * NOT built here: it is resolved lazily by `#rawExchange` the first time a call
+   * needs it, from the bot's own stored `exchange`/`accountLabel` through
+   * `resolveExchangeForAccount` (step 13). Attaching an exchange overrides that
+   * resolution -- which is how tests inject a `FakeExchange` and keep the suite
+   * free of any live call. Left unattached in production, the object resolves a
+   * real client on demand and refuses (fails closed) if credentials or a trading
+   * `ENVIRONMENT` are absent, rather than constructing a client against secrets
+   * that do not exist.
    */
   attach(dependencies: Partial<BotInstanceDependencies>): void {
     this.#dependencies = {
@@ -408,19 +418,54 @@ export class BotInstance extends DurableObject<Env> {
     this.#gated = undefined;
   }
 
-  #deps(): BotInstanceDependencies {
-    if (this.#dependencies === undefined) {
-      this.attach({});
-    }
-    const deps = this.#dependencies!;
-    if (deps.exchange === undefined) {
+  /**
+   * The RAW exchange client for this bot: injected if a test attached one,
+   * otherwise built from the environment for the account's registered exchange.
+   *
+   * An injected client always wins, so every test that `attach`es a `FakeExchange`
+   * is unaffected and the automated suite still makes no live call. When nothing
+   * is injected -- the production path -- the client is resolved from the bot's own
+   * stored `exchange` and `accountLabel` through `resolveExchangeForAccount`, the
+   * single dispatch home step 11 decision 7 built for exactly this: it derives the
+   * base URL from `ENVIRONMENT` alone (impossible to point testnet at production),
+   * reads the account's secrets, and hands back a `RestExchangeClient` already
+   * wired to report used weight into section 5.4's budget. `now` is threaded so the
+   * client's clock-drift correction (section 4.2) uses the same clock the object
+   * does.
+   *
+   * Every fail-closed reason -- a non-trading `ENVIRONMENT`, a missing secret, an
+   * unregistered/unknown exchange value, a null factory result -- becomes a
+   * `not_attached` `BotInstanceError` carrying the resolver's own message, so the
+   * object refuses to trade rather than constructing a client against credentials
+   * that do not exist. This is the raw client; `#exchange` wraps it in the account
+   * rate limiter (the gate) before any call.
+   */
+  #rawExchange(config: BotConfigBase, now: () => Timestamp): RestExchangeClient {
+    const injected = this.#dependencies?.exchange as RestExchangeClient | undefined;
+    if (injected !== undefined) return injected;
+
+    if (!isExchangeId(config.exchange)) {
       throw new BotInstanceError(
         "not_attached",
-        "no exchange client attached. There is no default: it needs live API " +
-          "credentials, and none exist in this project yet (step 4.1).",
+        `bot ${config.botInstanceId}'s stored exchange ${JSON.stringify(config.exchange)} ` +
+          `is not a known exchange ("binance" or "gemini"); refusing to build a client.`,
       );
     }
-    return deps;
+
+    const resolution = resolveExchangeForAccount(config.exchange, this.env, now);
+    if (!resolution.ok) {
+      throw new BotInstanceError("not_attached", resolution.reason);
+    }
+
+    const client = resolution.exchangeFor(config.accountLabel);
+    if (client === null) {
+      throw new BotInstanceError(
+        "not_attached",
+        `no exchange client could be built for account ${JSON.stringify(config.accountLabel)} ` +
+          `on ${config.exchange}.`,
+      );
+    }
+    return client;
   }
 
   #db(): Database {
@@ -441,16 +486,19 @@ export class BotInstance extends DurableObject<Env> {
   /**
    * The exchange, seen through section 5.4's budget at the given priority.
    *
-   * The ONLY way this object reaches the exchange. `#deps().exchange` is the
-   * raw client and is not called anywhere outside this method.
+   * The ONLY way this object reaches the exchange. `#rawExchange` supplies the
+   * raw client (injected in tests, resolved from the environment in production)
+   * and is not called anywhere outside this method.
    */
   #exchange(config: BotConfigBase, priority: RequestPriority): RestExchangeClient {
     if (this.#gated === undefined) {
-      const deps = this.#deps();
+      if (this.#dependencies === undefined) this.attach({});
+      const deps = this.#dependencies!;
+      const raw = this.#rawExchange(config, deps.now);
       const limiter = (deps.limiterFor ?? ((label) => this.#limiterFromEnv(label)))(
         config.accountLabel,
       );
-      const routine = withRateLimit(deps.exchange, limiter, {
+      const routine = withRateLimit(raw, limiter, {
         priority: "routine",
         now: deps.now,
         label: config.botInstanceId,
