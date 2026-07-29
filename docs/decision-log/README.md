@@ -32,4 +32,4 @@ the index below. Do not write to the old `docs/decision-log.md` stub.
 | [09.md](09.md) | 9 | Grid strategy |
 | [10-backend.md](10-backend.md) | 10, 10.1–10.5, 10.7 | Alerts and outbound notification; no-schema guards; Discord timestamp investigation; human liquidation and the global kill switch; dashboard backend API; dashboard deploy guard |
 | [10-frontend.md](10-frontend.md) | 10.6, 10.8, 10.9, 10.10, 10.11, 10.12 | Dashboard frontend scaffolding and bot list; bot detail view; liquidate action; global kill switch control; create-bot form; cross-bot alert feed |
-| [11.md](11.md) | 11 | Account registry (`accounts` table), live tradable-pair listing (`listTradablePairs` + KV cache), and the Binance-vs-Gemini exchange dispatch deferred from step 3.4 |
+| [11.md](11.md) | 11, 11.1 | Account registry (`accounts` table), live tradable-pair listing (`listTradablePairs` + KV cache), and the Binance-vs-Gemini exchange dispatch deferred from step 3.4; wiring the create-bot form's Account/Exchange/Pair fields to that registry (dropdown, read-only exchange, searchable pair typeahead) |

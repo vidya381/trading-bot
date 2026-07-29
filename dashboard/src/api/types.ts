@@ -14,6 +14,40 @@ export type ApiEnvelope<T> =
   | { readonly data: T; readonly error: null }
   | { readonly data: null; readonly error: { readonly code: string; readonly message: string } };
 
+/**
+ * One registered account and the venue it trades on (`listAccounts` in
+ * src/api/handlers.ts, `GET /api/accounts`). This is the authoritative list the
+ * create-bot form's account dropdown reads: every selectable account is real and
+ * carries its own exchange, so exchange is never a separately-typed value.
+ */
+export interface Account {
+  readonly accountLabel: string;
+  readonly exchange: string;
+  readonly createdAt: number;
+}
+
+/**
+ * An account's live tradable pairs (`getAccountSymbols` in src/api/handlers.ts,
+ * `GET /api/accounts/:label/symbols`). `pairs` is the venue's real tradable set
+ * (thousands on Binance, a few hundred on Gemini), so the create-bot pair field
+ * offers real symbols instead of a free-typed guess. `cached` is true when served
+ * from the KV cache rather than a fresh exchange call.
+ *
+ * FAILURES the caller must branch on (thrown as `ApiError`):
+ *   - `exchange_unavailable` (502) -- the venue could not be reached; this is the
+ *     Binance geo-block seen live in production. The message carries the reason;
+ *     the form frames it as "our end", not the user's mistake.
+ *   - `unknown_account` (404)      -- no such registered account. Rare from this
+ *     form, since the dropdown only ever offers registered accounts.
+ */
+export interface AccountSymbols {
+  readonly accountLabel: string;
+  readonly exchange: string;
+  readonly pairs: readonly string[];
+  readonly cached: boolean;
+  readonly fetchedAt: number;
+}
+
 /** A bot's lifecycle status (spec section 8.1). */
 export type BotStatus = "created" | "running" | "halted" | "stopped";
 
@@ -281,7 +315,13 @@ export interface GridParamsInput {
 interface CreateBotBase {
   readonly botInstanceId: string;
   readonly accountLabel: string;
-  readonly exchange: string;
+  // NOTE: `exchange` is deliberately NOT part of the request. The account
+  // registry (step 11) is authoritative for which venue an account trades on --
+  // `POST /api/bots` derives it from the selected account and REJECTS a body
+  // `exchange` that disagrees (`exchange_mismatch`). Omitting it entirely makes
+  // that disagreement structurally impossible: the form shows the account's real
+  // exchange read-only, and never sends a separately-typed value that could drift
+  // from it. See `resolveBotExchange` in src/api/handlers.ts.
   readonly pair: string;
   readonly capitalAsset: string;
   readonly allocatedCapital: string;

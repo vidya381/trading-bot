@@ -13,6 +13,8 @@
 
 import type {
   ApiEnvelope,
+  Account,
+  AccountSymbols,
   Alert,
   AlertCategory,
   AlertSeverity,
@@ -86,6 +88,30 @@ async function requestJson<T>(path: string, method: string, options: RequestOpti
 
 export function fetchBots(signal?: AbortSignal): Promise<Bot[]> {
   return requestJson<Bot[]>("/api/bots", "GET", { signal });
+}
+
+/**
+ * Every registered account and its exchange (`GET /api/accounts`). The real,
+ * authoritative list the create-bot form's account dropdown reads -- so an
+ * account is chosen, never typed, and its exchange comes back alongside it rather
+ * than being asked for a second time.
+ */
+export function fetchAccounts(signal?: AbortSignal): Promise<Account[]> {
+  return requestJson<Account[]>("/api/accounts", "GET", { signal });
+}
+
+/**
+ * One account's live tradable pairs (`GET /api/accounts/:label/symbols`), for the
+ * create-bot pair typeahead. This is a REAL exchange call behind an hour-long KV
+ * cache, so it can genuinely fail -- the caller must branch on the code:
+ *   - `exchange_unavailable` (502) -- the venue could not be reached (the Binance
+ *     geo-block seen live). Not the user's mistake; the form says so and suggests
+ *     a different account rather than a generic error.
+ *   - `unknown_account` (404)      -- no such registered account (rare here, since
+ *     the dropdown only offers registered accounts).
+ */
+export function fetchAccountSymbols(label: string, signal?: AbortSignal): Promise<AccountSymbols> {
+  return requestJson<AccountSymbols>(`/api/accounts/${encodeURIComponent(label)}/symbols`, "GET", { signal });
 }
 
 /**
