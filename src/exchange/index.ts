@@ -51,6 +51,11 @@ export {
   type GeminiErrorBody,
 } from "./gemini/parse";
 export { GeminiClient, GEMINI_BASE_URLS, type GeminiClientOptions } from "./gemini/client";
+// The price-feed codec (step 14, Session B): the transport-free half of the live
+// feed, one implementation per exchange. Pure and stateless; the `PriceFeed`
+// Durable Object (a later session) owns the socket and calls a codec.
+export type { PriceFeedCodec, FeedEvent } from "./price-feed-codec";
+export { GeminiPriceFeedCodec, GEMINI_WS_URLS } from "./gemini/price-feed";
 // Section 5.4's gate. Exchange-agnostic in shape, but it carries Binance's
 // per-endpoint weight table, which is why it lives here and not in /src/shared
 // -- and it performs I/O, which rules /src/shared out anyway.
