@@ -98,7 +98,15 @@ that would drive `onPriceUpdate` on its own is still the missing half (below).
 
 ## Not built here yet
 
-`subscribeToPriceFeed` (section 4.6): the WebSocket Hibernation connection,
-backoff reconnect, and REST gap backfill. Deferred to its own session — the
-section 4.1 callback signature does not fit hibernation, since a callback
-closure cannot survive the object being evicted.
+The price feed (section 4.6) — a separate `PriceFeed` Durable Object per
+(exchange, pair) that owns one outbound socket, fans closed 1-minute candles out
+to subscribed bots via their existing `onPriceUpdate`, and drives
+reconnect-with-backoff + REST gap-backfill from a single alarm. Designed in
+decision-log step 14; being built in that arc's own sessions.
+
+The old `subscribeToPriceFeed` callback is **gone from the interface** (step 14,
+part of Session A): a callback closure could never survive eviction, and the
+hibernation handlers the spec assumed do not apply because an **outbound** socket
+does not hibernate. So the feed is a Durable Object that rebuilds its own socket
+on every (re)connect, and no closure crosses a boundary. `getCandles` on the REST
+client is what the feed's gap-backfill will call.

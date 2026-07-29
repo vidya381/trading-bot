@@ -17,6 +17,7 @@ import {
   parseRetryAfterMs,
   parseServerTime,
   parseUsedWeight,
+  parseKlines,
   readErrorBody,
   toOrderState,
 } from "./parse";
@@ -708,5 +709,35 @@ describe("parseRequestWeightLimit", () => {
         body([{ rateLimitType: "REQUEST_WEIGHT", interval: "MINUTE", intervalNum: 1, limit: 0 }]),
       ),
     ).toBeUndefined();
+  });
+});
+
+describe("parseKlines", () => {
+  const MIN = 60_000;
+  const row = (openTime: number, close: string, closeTime: number) => [
+    openTime, "1.00", "2.00", "0.50", close, "3.00000000", closeTime, "x", 5, "0", "0", "0",
+  ];
+
+  it("parses string OHLCV, uses the reported close time, and sorts oldest-first", () => {
+    const body = [row(AT, "43005.25", AT + MIN - 1), row(AT - MIN, "43000.50", AT - 1)];
+    const candles = parseKlines("BTCUSDT", body, AT);
+
+    expect(candles.map((c) => c.openTime)).toEqual([AT - MIN, AT]);
+    expect(candles[1]!.close).toBe(m("43005.25"));
+    expect(candles[0]!.closeTime).toBe(AT - 1);
+    // Close time in the past at `at` is closed; the current candle is not.
+    expect(candles[0]!.closed).toBe(true);
+    expect(candles[1]!.closed).toBe(false);
+  });
+
+  it("throws on a non-array body or a short row (a real API change)", () => {
+    expect(() => parseKlines("BTCUSDT", { klines: [] }, AT)).toThrow(ParseError);
+    expect(() => parseKlines("BTCUSDT", [[AT, "1", "2", "3"]], AT)).toThrow(ParseError);
+  });
+
+  it("throws when a monetary field is a number, not the string Binance sends", () => {
+    expect(() => parseKlines("BTCUSDT", [[AT, 1, "2", "3", "4", "5", AT + MIN - 1]], AT)).toThrow(
+      ParseError,
+    );
   });
 });

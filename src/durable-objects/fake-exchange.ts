@@ -14,6 +14,8 @@
 import type { ExchangeOutcome } from "../shared/downtime";
 import type {
   Balance,
+  Candle,
+  CandleInterval,
   Fill,
   OrderRequest,
   OrderResult,
@@ -135,6 +137,24 @@ export class FakeExchange implements RestExchangeClient {
       return failure(this.currentPriceFailure.message, this.currentPriceFailure.kind, this.now);
     }
     return { ok: true, value: { pair, price: this.currentPrice, at: this.now }, at: this.now };
+  }
+
+  /** Candles this fake returns, oldest-first. A test sets these directly. */
+  candles: Candle[] = [];
+  /** Set to force `getCandles` to fail. Stays set until cleared. */
+  candlesFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+
+  async getCandles(
+    _pair: Pair,
+    _interval: CandleInterval,
+    since?: Timestamp,
+  ): Promise<ExchangeOutcome<Candle[]>> {
+    if (this.candlesFailure !== null) {
+      return failure(this.candlesFailure.message, this.candlesFailure.kind, this.now);
+    }
+    const value =
+      since === undefined ? this.candles : this.candles.filter((c) => c.closeTime > since);
+    return { ok: true, value: [...value], at: this.now };
   }
 
   async placeOrder(order: OrderRequest): Promise<ExchangeOutcome<OrderResult>> {

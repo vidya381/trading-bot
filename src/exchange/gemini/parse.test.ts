@@ -5,6 +5,7 @@ import {
   INVALID_NONCE_REASON,
   parseBalances,
   parseCancelledOrder,
+  parseCandles,
   parseFills,
   parseOrderResult,
   parseOrderStatus,
@@ -305,5 +306,42 @@ describe("parseSymbolList", () => {
 
   it("returns an empty list for an empty response", () => {
     expect(parseSymbolList([])).toEqual([]);
+  });
+});
+
+describe("parseCandles", () => {
+  const MIN = 60_000;
+
+  it("parses number OHLCV rows into Money, oldest-first, with derived close/closed", () => {
+    // Gemini sends newest-first; values are JSON numbers.
+    const body = [
+      [AT, 43000.5, 43010, 42990, 43005.25, 1.5],
+      [AT - MIN, 42980, 43001, 42950, 43000.5, 0.000784],
+    ];
+    const candles = parseCandles("BTCUSD", body, AT, MIN);
+
+    expect(candles.map((c) => c.openTime)).toEqual([AT - MIN, AT]);
+    expect(candles[1]!.close).toBe(m("43005.25"));
+    expect(candles[0]!.volume).toBe(m("0.000784"));
+    expect(candles[1]!.closeTime).toBe(AT + MIN - 1);
+    // The candle whose close time has passed at `at` is closed; the current one is not.
+    expect(candles[0]!.closed).toBe(true);
+    expect(candles[1]!.closed).toBe(false);
+  });
+
+  it("rounds a value with more than SCALE decimals explicitly (toFixed at the money boundary)", () => {
+    const candles = parseCandles("BTCUSD", [[AT, 1.123456789, 1, 1, 1, 0]], AT, MIN);
+    // 1.123456789 -> toFixed(8) -> "1.12345679".
+    expect(candles[0]!.open).toBe(m("1.12345679"));
+  });
+
+  it("throws on a non-array body (a real API change)", () => {
+    expect(() => parseCandles("BTCUSD", { changes: [] }, AT, MIN)).toThrow(ParseError);
+  });
+
+  it("throws on a malformed row rather than guessing", () => {
+    expect(() => parseCandles("BTCUSD", [[AT, 1, 2, 3]], AT, MIN)).toThrow(ParseError);
+    // A monetary field that is a string, not the number Gemini's candle feed sends.
+    expect(() => parseCandles("BTCUSD", [[AT, "1", 2, 3, 4, 5]], AT, MIN)).toThrow(ParseError);
   });
 });

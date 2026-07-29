@@ -7,10 +7,13 @@
  * nothing about BotInstance, the strategies or reconciliation changes, and no
  * caller can tell which exchange is underneath.
  *
- * Covers the REST surface only. `subscribeToPriceFeed` is deliberately absent for
- * the same reason as on the Binance side -- section 4.6 puts that connection in a
- * Durable Object -- so this class implements `RestExchangeClient`, the narrower
- * half, and is complete rather than a full client with one throwing method.
+ * Covers the whole `RestExchangeClient` interface. The live price feed is NOT a
+ * client method -- section 4.6 puts that connection in a Durable Object, and step
+ * 14 established it cannot hibernate (an outbound socket does not), so the feed
+ * owns its own socket and this client stays purely request/response. `getCandles`
+ * is the one method with a Gemini-specific wrinkle worth flagging up front: its
+ * OHLCV arrive as JSON NUMBERS, not the decimal strings the rest of this API
+ * uses, so `parse.ts` rounds them explicitly to the money scale.
  *
  * The shape of the differences from Binance:
  *
@@ -36,6 +39,8 @@
 
 import type {
   Balance,
+  Candle,
+  CandleInterval,
   OrderRequest,
   OrderResult,
   OrderStatus,
@@ -60,6 +65,7 @@ import {
   classifyFailure,
   parseBalances,
   parseCancelledOrder,
+  parseCandles,
   parseOrderResult,
   parseOrderStatus,
   parseOrderStatusList,
@@ -78,6 +84,26 @@ export const GEMINI_BASE_URLS = {
   production: "https://api.gemini.com",
   sandbox: "https://api.sandbox.gemini.com",
 } as const;
+
+/**
+ * Map the interface's canonical intervals to Gemini's own timeframe spelling and
+ * the interval's length in milliseconds.
+ *
+ * Gemini writes the three longer intervals as "1hr"/"6hr"/"1day", not "1h"/"6h"/
+ * "1d". The millisecond length is used to derive each candle's close time, since
+ * Gemini reports only the open time. Only "1m" is exercised in v1 (the price
+ * feed's gap-backfill); the rest are declared for the section 13 backtest and are
+ * unverified against the live endpoint until then.
+ */
+const GEMINI_TIMEFRAMES: Record<CandleInterval, { timeframe: string; ms: number }> = {
+  "1m": { timeframe: "1m", ms: 60_000 },
+  "5m": { timeframe: "5m", ms: 300_000 },
+  "15m": { timeframe: "15m", ms: 900_000 },
+  "30m": { timeframe: "30m", ms: 1_800_000 },
+  "1h": { timeframe: "1hr", ms: 3_600_000 },
+  "6h": { timeframe: "6hr", ms: 21_600_000 },
+  "1d": { timeframe: "1day", ms: 86_400_000 },
+};
 
 /**
  * How long to wait for a reply.
@@ -319,6 +345,39 @@ export class GeminiClient implements RestExchangeClient {
       signed: true,
       parse: (body) => parseBalances(body),
     });
+  }
+
+  /**
+   * Historical candles from `/v2/candles/:symbol/:timeframe`.
+   *
+   * Unsigned public data. Gemini's endpoint takes NO time-range parameter -- it
+   * returns a fixed recent window -- so `since` is honoured by filtering the
+   * parsed window locally, and this client cannot reach candles older than the
+   * window covers (the asymmetry documented on the interface). For the feed's
+   * short reconnect gaps the window always covers the missed candles; deep
+   * history is a section 13 concern this does not claim to serve.
+   *
+   * The in-progress candle (`closed: false`) is returned when its close time is
+   * after `since`; a gap-backfill consumer drops it and waits for the live feed
+   * to close it. OHLCV arrive as JSON numbers here, not strings -- see
+   * `candleMoney` in `parse.ts`.
+   */
+  async getCandles(
+    pair: Pair,
+    interval: CandleInterval,
+    since?: Timestamp,
+  ): Promise<ExchangeOutcome<Candle[]>> {
+    const { timeframe, ms } = GEMINI_TIMEFRAMES[interval];
+    const outcome = await this.#request<Candle[]>({
+      path: `/v2/candles/${toGeminiSymbol(pair)}/${timeframe}`,
+      signed: false,
+      parse: (body, at) => parseCandles(pair, body, at, ms),
+    });
+    if (!outcome.ok || since === undefined) return outcome;
+    return ok(
+      outcome.value.filter((candle) => candle.closeTime > since),
+      outcome.at,
+    );
   }
 
   // -------------------------------------------------------------------------

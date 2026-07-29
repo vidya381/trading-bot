@@ -205,10 +205,10 @@ export class BotInstanceError extends Error {
 export interface BotInstanceDependencies {
   readonly db: Database;
   /**
-   * The REST half of section 4.1. Deliberately `RestExchangeClient` and not
-   * `ExchangeClient`: `subscribeToPriceFeed` is still not wired (the price feed
-   * is its own step), and depending on the narrower type keeps that honest at
-   * compile time rather than by comment.
+   * The exchange client, section 4.1. The live price feed is NOT part of this
+   * interface -- step 14 made it a separate Durable Object (an outbound feed
+   * socket cannot hibernate, so it cannot be a client method), and this object
+   * receives prices through its own `onPriceUpdate`, not a client callback.
    *
    * OPTIONAL in practice: `attach` takes a `Partial`, and when this is omitted
    * (the production path) `#rawExchange` resolves a real client from the

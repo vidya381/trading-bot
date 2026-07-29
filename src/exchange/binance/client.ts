@@ -1,12 +1,12 @@
 /**
  * The Binance implementation of the exchange interface (spec section 4).
  *
- * Covers the REST surface only. The live price feed is deliberately absent:
- * section 4.6 puts that connection inside a Durable Object using the WebSocket
- * Hibernation API, so it cannot belong to a client object a Worker constructs
- * per request. This class implements `RestExchangeClient`, and the split is what
- * lets it be complete rather than a full `ExchangeClient` with one method that
- * throws.
+ * Covers the whole `RestExchangeClient` interface. The live price feed is NOT a
+ * client method: section 4.6 puts that connection inside a Durable Object, and
+ * step 14 established it cannot be a hibernating socket at all (an outbound
+ * WebSocket does not hibernate), so the feed owns its own socket lifecycle and
+ * this client stays purely request/response. `getCandles` here is the REST
+ * klines read the feed's gap-backfill and section 13's backtest both use.
  *
  * Every network call returns an `ExchangeOutcome`. Nothing in this file returns
  * a bare value, and nothing throws on a failed request -- section 5.6 requires
@@ -21,6 +21,8 @@
 
 import type {
   Balance,
+  Candle,
+  CandleInterval,
   OrderRequest,
   OrderResult,
   OrderStatus,
@@ -46,6 +48,7 @@ import {
   INVALID_TIMESTAMP_CODE,
   parseBalances,
   parseCancelledOrder,
+  parseKlines,
   parseOrderResult,
   parseOrderStatus,
   parseOrderStatusList,
@@ -81,6 +84,11 @@ export const ENDPOINT_WEIGHTS = {
   time: 1,
   exchangeInfo: 20,
   tickerPrice: 2,
+  // `/api/v3/klines` at the default limit (<=100). From the published docs, not
+  // measured -- like every weight here (section 17 amendment), and doubly so
+  // since Binance is geo-blocked from this infrastructure (step 3.3) and this
+  // number cannot be verified against the real venue until a relay exists.
+  klines: 2,
   placeOrder: 1,
   cancelOrder: 1,
   orderStatus: 4,
@@ -399,6 +407,43 @@ export class BinanceClient implements RestExchangeClient {
       params: [],
       parse: (body) => parseBalances(body),
     });
+  }
+
+  /**
+   * Historical candles from `/api/v3/klines`.
+   *
+   * Unsigned public data. Binance's own interval spelling matches the canonical
+   * short form for every value in `CandleInterval`, so the interval passes
+   * straight through. Unlike Gemini, klines takes a `startTime`, so `since` is
+   * pushed to the exchange as well as filtered locally for an exact `closeTime`
+   * boundary -- Binance can serve deep history, Gemini cannot (the asymmetry on
+   * the interface). Reachability is the usual Binance caveat: geo-blocked from
+   * this infrastructure (step 3.3), so this path is unverifiable against the real
+   * venue until a relay exists, exactly like every other Binance call.
+   */
+  async getCandles(
+    pair: Pair,
+    interval: CandleInterval,
+    since?: Timestamp,
+  ): Promise<ExchangeOutcome<Candle[]>> {
+    const params: (readonly [string, QueryValue])[] = [
+      ["symbol", pair],
+      ["interval", interval],
+    ];
+    if (since !== undefined) params.push(["startTime", since]);
+
+    const outcome = await this.#request<Candle[]>({
+      method: "GET",
+      path: "/api/v3/klines",
+      signed: false,
+      params,
+      parse: (body, at) => parseKlines(pair, body, at),
+    });
+    if (!outcome.ok || since === undefined) return outcome;
+    return ok(
+      outcome.value.filter((candle) => candle.closeTime > since),
+      outcome.at,
+    );
   }
 
   // -------------------------------------------------------------------------

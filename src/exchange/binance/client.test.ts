@@ -347,6 +347,47 @@ describe("getCurrentPrice", () => {
   });
 });
 
+describe("getCandles", () => {
+  // Binance klines: [openTime, open, high, low, close, volume, closeTime, ...],
+  // OHLCV as STRINGS, oldest-first, close time reported directly.
+  const KLINES = [
+    [AT - 120_000, "42900.00", "42985.00", "42890.00", "42980.00", "2.00000000", AT - 60_001, "x", 5, "0", "0", "0"],
+    [AT - 60_000, "42980.00", "43001.00", "42950.00", "43000.50", "0.00078400", AT - 1, "x", 5, "0", "0", "0"],
+    [AT, "43000.50", "43010.00", "42990.00", "43005.25", "1.50000000", AT + 59_999, "x", 5, "0", "0", "0"],
+  ];
+
+  it("GETs /api/v3/klines unsigned and parses oldest-first with the reported close time", async () => {
+    const { client, calls } = harness({ "/api/v3/klines": () => json(KLINES) });
+
+    const outcome = await client.getCandles("BTCUSDT", "1m");
+
+    expect(isUsable(outcome)).toBe(true);
+    if (isUsable(outcome)) {
+      const candles = outcome.value;
+      expect(candles.map((c) => c.openTime)).toEqual([AT - 120_000, AT - 60_000, AT]);
+      expect(candles[2]!.close).toBe(m("43005.25"));
+      expect(candles[1]!.volume).toBe(m("0.000784"));
+      // Reported, not derived.
+      expect(candles[0]!.closeTime).toBe(AT - 60_001);
+      expect(candles[2]!.closed).toBe(false);
+      expect(candles[0]!.closed).toBe(true);
+    }
+    expect(calls[0]!.url.pathname).toBe("/api/v3/klines");
+    expect(calls[0]!.url.searchParams.get("interval")).toBe("1m");
+    // Unsigned: no signature query parameter.
+    expect(calls[0]!.url.searchParams.get("signature")).toBeNull();
+  });
+
+  it("pushes `since` to the exchange as startTime and filters the result", async () => {
+    const { client, calls } = harness({ "/api/v3/klines": () => json(KLINES) });
+    const outcome = await client.getCandles("BTCUSDT", "1m", AT - 30_000);
+    expect(calls[0]!.url.searchParams.get("startTime")).toBe(String(AT - 30_000));
+    expect(isUsable(outcome)).toBe(true);
+    // closeTimes AT-60001, AT-1, AT+59999; since=AT-30000 drops the oldest.
+    if (isUsable(outcome)) expect(outcome.value.map((c) => c.openTime)).toEqual([AT - 60_000, AT]);
+  });
+});
+
 describe("getSymbolFilters", () => {
   it("parses and caches the symbol's filters", async () => {
     const { client } = harness();

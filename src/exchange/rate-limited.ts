@@ -60,6 +60,8 @@
 import { rateLimited, type ExchangeOutcome } from "../shared/downtime";
 import type {
   Balance,
+  Candle,
+  CandleInterval,
   OrderRequest,
   OrderResult,
   OrderStatus,
@@ -106,6 +108,7 @@ export const BINANCE_METHOD_WEIGHTS: MethodWeights = {
   // documented weight as the single-symbol form.
   listTradablePairs: ENDPOINT_WEIGHTS.exchangeInfo,
   getCurrentPrice: ENDPOINT_WEIGHTS.tickerPrice,
+  getCandles: ENDPOINT_WEIGHTS.klines,
   placeOrder: ENDPOINT_WEIGHTS.placeOrder,
   cancelOrder: ENDPOINT_WEIGHTS.cancelOrder,
   getOrderStatus: ENDPOINT_WEIGHTS.orderStatus,
@@ -207,6 +210,16 @@ export class RateLimitedExchange implements RestExchangeClient {
 
   async getCurrentPrice(pair: Pair): Promise<ExchangeOutcome<Price>> {
     return this.#gate("getCurrentPrice", pair, () => this.#inner.getCurrentPrice(pair));
+  }
+
+  async getCandles(
+    pair: Pair,
+    interval: CandleInterval,
+    since?: Timestamp,
+  ): Promise<ExchangeOutcome<Candle[]>> {
+    return this.#gate("getCandles", `${pair} ${interval}`, () =>
+      this.#inner.getCandles(pair, interval, since),
+    );
   }
 
   async placeOrder(order: OrderRequest): Promise<ExchangeOutcome<OrderResult>> {

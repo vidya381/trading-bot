@@ -16,6 +16,7 @@ node_modules/
 # with live credentials). Manual tools, never committed.
 scripts/verify-exchange.ts
 scripts/verify-gemini.ts
+scripts/verify-gemini-ws.ts
 
 # Wrangler / Cloudflare local state
 .wrangler/

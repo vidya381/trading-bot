@@ -82,18 +82,21 @@ guarantee literally true rather than qualified.
 The *interface* still lives in `/src/shared`, because strategy code depends on
 it and must never depend on anything in this folder.
 
-## REST only
+## Request/response only — the feed is not a client method
 
-`subscribeToPriceFeed` is deliberately absent. Section 4.6 puts the WebSocket
-connection inside a Durable Object using the Hibernation API, so it cannot
-belong to a client object a Worker constructs per request — the connection has
-to outlive the request that opened it.
+There is no `subscribeToPriceFeed` and no live socket here. Section 4.6 puts the
+price feed inside a Durable Object, and step 14 established the harder fact: an
+**outbound** WebSocket (our object dialling out to the exchange) does **not**
+hibernate, so the feed cannot be a hibernating client method the way the spec
+first imagined. The feed is its own Durable Object that owns its socket
+lifecycle; `BinanceClient` and `GeminiClient` stay purely request/response.
 
-The interface is therefore split in two. `BinanceClient` implements
-`RestExchangeClient`, the REST surface (the original eight methods plus
-`listTradablePairs`, added at step 11 for the account pair-listing endpoint).
-`ExchangeClient` extends it with the price feed, and step 6's Durable Object is
-what will implement that.
+`getCandles` (added at step 14) is the one REST method the feed leans on: its
+gap-backfill on reconnect reads historical candles through it, and section 13's
+backtest reads the same method. It is public/unsigned on both venues. Note the
+Gemini wrinkle — its candle OHLCV arrive as JSON numbers, not decimal strings —
+handled in `gemini/parse.ts`, and the `since` asymmetry between the two venues,
+documented on the interface itself.
 
 ## Every call returns an outcome
 

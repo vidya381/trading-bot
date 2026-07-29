@@ -25,6 +25,7 @@
 
 import type {
   Balance,
+  Candle,
   Fill,
   OrderResult,
   OrderSide,
@@ -36,7 +37,7 @@ import type {
 import type { ExchangeOutcome } from "../../shared/downtime";
 import { classifyStatus } from "../../shared/downtime";
 import type { OrderState } from "../../shared/order-state";
-import { fromDecimalString, mul, ZERO, type Money } from "../../shared/money";
+import { fromDecimalString, mul, SCALE, ZERO, type Money } from "../../shared/money";
 
 export class ParseError extends Error {
   constructor(message: string) {
@@ -524,4 +525,92 @@ export function parseBalances(body: unknown): Balance[] {
       locked,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Candles
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a candle OHLCV value to Money.
+ *
+ * THE ONE PLACE IN THIS FILE A NUMBER BECOMES MONEY, and it is deliberate.
+ * Everywhere else Gemini sends monetary values as decimal strings that go
+ * straight into `fromDecimalString` with no `Number(...)` anywhere. Candles are
+ * the documented exception: `/v2/candles` (and the live feed the step 14 probe
+ * observed) render open/high/low/close/volume as JSON NUMBERS. There is no
+ * string form to reach for, so the number is rounded EXPLICITLY to the money
+ * scale via `toFixed(SCALE)` -- which is exactly the "rounding must be explicit"
+ * that `fromDecimalString` demands, applied at the one boundary that forces it.
+ *
+ * This is acceptable precisely because a candle drives strategy DECISIONS
+ * (compare a close to a grid level), not settlement arithmetic: a value is never
+ * summed into a balance from here. `toFixed(SCALE)` also removes the scientific
+ * notation `String(1e-7)` would produce, which `fromDecimalString` rejects.
+ */
+function candleMoney(value: unknown, field: string, context: string): Money {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ParseError(
+      `${context}: expected ${field} to be a finite number, got ${typeof value}`,
+    );
+  }
+  return fromDecimalString(value.toFixed(SCALE));
+}
+
+/** A candle row's leading timestamp, in milliseconds, as a JSON number. */
+function candleTime(value: unknown, context: string): Timestamp {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ParseError(`${context}: expected a numeric ms timestamp, got ${typeof value}`);
+  }
+  return value;
+}
+
+/**
+ * Parse `/v2/candles/:symbol/:timeframe` into `Candle`s, oldest-first.
+ *
+ * Gemini returns a bare array of `[timeMs, open, high, low, close, volume]`
+ * rows, MOST-RECENT-FIRST. This sorts ascending by open time rather than
+ * assuming the order, so a change in Gemini's ordering cannot silently reverse
+ * the series.
+ *
+ * Gemini reports only the open time; the close time is derived as
+ * `openTime + intervalMs - 1` (the candle's last millisecond, matching the
+ * inclusive convention Binance reports directly). `closed` is set from whether
+ * that close time has already passed at request time (`at`), so the current
+ * in-progress candle comes back `closed: false`.
+ */
+export function parseCandles(
+  pair: string,
+  body: unknown,
+  at: Timestamp,
+  intervalMs: number,
+): Candle[] {
+  if (!Array.isArray(body)) {
+    throw new ParseError("/v2/candles: expected an array of candle rows");
+  }
+
+  const candles: Candle[] = body.map((row, index) => {
+    const context = `/v2/candles row ${index}`;
+    if (!Array.isArray(row) || row.length < 6) {
+      throw new ParseError(
+        `${context}: expected [timeMs, open, high, low, close, volume]`,
+      );
+    }
+    const openTime = candleTime(row[0], context);
+    const closeTime = openTime + intervalMs - 1;
+    return {
+      pair,
+      openTime,
+      closeTime,
+      open: candleMoney(row[1], "open", context),
+      high: candleMoney(row[2], "high", context),
+      low: candleMoney(row[3], "low", context),
+      close: candleMoney(row[4], "close", context),
+      volume: candleMoney(row[5], "volume", context),
+      closed: at > closeTime,
+    };
+  });
+
+  candles.sort((a, b) => a.openTime - b.openTime);
+  return candles;
 }

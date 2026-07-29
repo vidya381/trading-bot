@@ -349,3 +349,64 @@ describe("listTradablePairs", () => {
     expect(isUsable(outcome)).toBe(false);
   });
 });
+
+describe("getCandles", () => {
+  // Gemini renders candle OHLCV as JSON NUMBERS, most-recent-first, and reports
+  // only the open time. These rows are 1-minute candles around AT.
+  const CANDLE_ROWS = [
+    [AT, 43000.5, 43010, 42990, 43005.25, 1.5], // in-progress: closeTime AT+59999 > AT
+    [AT - 60_000, 42980, 43001, 42950, 43000.5, 0.000784],
+    [AT - 120_000, 42900, 42985, 42890, 42980, 2.0],
+  ];
+
+  it("GETs the public /v2/candles endpoint, unsigned, oldest-first", async () => {
+    const { client, requests } = clientWith((url) => {
+      expect(url.pathname).toBe("/v2/candles/btcusd/1m");
+      return json(CANDLE_ROWS);
+    });
+
+    const outcome = await client.getCandles("BTCUSD", "1m");
+
+    expect(isUsable(outcome)).toBe(true);
+    if (isUsable(outcome)) {
+      const candles = outcome.value;
+      // Sorted ascending by open time despite Gemini sending newest-first.
+      expect(candles.map((c) => c.openTime)).toEqual([AT - 120_000, AT - 60_000, AT]);
+      // OHLCV came in as numbers and became Money via explicit rounding.
+      expect(candles[2]!.close).toBe(m("43005.25"));
+      expect(candles[1]!.volume).toBe(m("0.000784"));
+      // Close time derived from open time + 1m - 1ms.
+      expect(candles[0]!.closeTime).toBe(AT - 120_000 + 60_000 - 1);
+      // The current candle has not closed; the two older ones have.
+      expect(candles[2]!.closed).toBe(false);
+      expect(candles[0]!.closed).toBe(true);
+      expect(candles[1]!.closed).toBe(true);
+    }
+    expect(requests[0]!.method).toBe("GET");
+    expect(requests[0]!.headers["X-GEMINI-SIGNATURE"]).toBeUndefined();
+  });
+
+  it("maps the longer intervals to Gemini's own spelling", async () => {
+    const { client } = clientWith((url) => {
+      expect(url.pathname).toBe("/v2/candles/btcusd/1hr");
+      return json([]);
+    });
+    await client.getCandles("BTCUSD", "1h");
+  });
+
+  it("honours `since` by filtering locally to candles that close after it", async () => {
+    const { client } = clientWith(() => json(CANDLE_ROWS));
+    // closeTimes are AT-60001, AT-1, AT+59999. since = AT-30000 drops the oldest.
+    const outcome = await client.getCandles("BTCUSD", "1m", AT - 30_000);
+    expect(isUsable(outcome)).toBe(true);
+    if (isUsable(outcome)) {
+      expect(outcome.value.map((c) => c.openTime)).toEqual([AT - 60_000, AT]);
+    }
+  });
+
+  it("surfaces a transport failure as a non-usable outcome", async () => {
+    const { client } = clientWith(() => json([], { status: 503 }));
+    const outcome = await client.getCandles("BTCUSD", "1m");
+    expect(isUsable(outcome)).toBe(false);
+  });
+});

@@ -6,8 +6,8 @@ Built before any strategy logic and fully unit tested first
 | Module | Spec | What it does |
 | --- | --- | --- |
 | [`money.ts`](./money.ts) | 5.2 | Fixed-point arithmetic on `bigint` at scale 8 |
-| [`exchange-client.ts`](./exchange-client.ts) | 4.1 | The `ExchangeClient` interface and its types. Type-only |
-| | | Split at step 3 into `RestExchangeClient` + the price feed; every method now returns an `ExchangeOutcome` |
+| [`exchange-client.ts`](./exchange-client.ts) | 4.1 | The `RestExchangeClient` interface and its types. Type-only |
+| | | Every method returns an `ExchangeOutcome`. The old `subscribeToPriceFeed`/`ExchangeClient` split was removed at step 14 (an outbound feed socket cannot hibernate, so the feed is a Durable Object, not a client method); `getCandles` was added for the feed's backfill and section 13's backtest |
 | [`order-state.ts`](./order-state.ts) | 5.3 | Order lifecycle and partial-fill accounting |
 | [`idempotency.ts`](./idempotency.ts) | 5.1 | Deterministic `clientOrderId`s and attempt records |
 | [`rate-limiter.ts`](./rate-limiter.ts) | 5.4 | Rolling request-weight budget with priority, snapshot/restore |

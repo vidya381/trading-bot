@@ -16,6 +16,7 @@
 
 import type {
   Balance,
+  Candle,
   Fill,
   OrderResult,
   OrderStatus,
@@ -560,4 +561,72 @@ export function parseOrderStatusList(body: unknown): OrderStatus[] {
     throw new ParseError("open orders: expected an array");
   }
   return body.map((entry) => parseOrderStatus(entry));
+}
+
+// ---------------------------------------------------------------------------
+// Candles (klines)
+// ---------------------------------------------------------------------------
+
+/** One string monetary field of a kline row, by position. */
+function klineMoney(row: unknown[], index: number, field: string, context: string): Money {
+  const value = row[index];
+  if (typeof value !== "string") {
+    throw new ParseError(
+      `${context}: expected ${field} (field ${index}) to be a decimal string, got ${typeof value}`,
+    );
+  }
+  try {
+    return fromDecimalString(value);
+  } catch (cause) {
+    throw new ParseError(`${context}: ${field}: ${(cause as Error).message}`);
+  }
+}
+
+/** One millisecond-timestamp field of a kline row, by position. */
+function klineTime(row: unknown[], index: number, context: string): Timestamp {
+  const value = row[index];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ParseError(`${context}: expected a numeric ms timestamp at field ${index}`);
+  }
+  return value;
+}
+
+/**
+ * Parse `/api/v3/klines` into `Candle`s, oldest-first.
+ *
+ * Unlike Gemini, Binance renders each kline's OHLCV as decimal STRINGS, so they
+ * stay on the ordinary `fromDecimalString` path with no number->Money boundary.
+ * A kline row is `[openTime, open, high, low, close, volume, closeTime, ...]`;
+ * the close time is REPORTED (field 6), not derived, and `closed` is set from
+ * whether it has passed at request time. Binance returns klines oldest-first
+ * already, but this sorts ascending rather than relying on that.
+ */
+export function parseKlines(pair: string, body: unknown, at: Timestamp): Candle[] {
+  if (!Array.isArray(body)) {
+    throw new ParseError("klines: expected an array of kline rows");
+  }
+
+  const candles: Candle[] = body.map((row, index) => {
+    const context = `klines row ${index}`;
+    if (!Array.isArray(row) || row.length < 7) {
+      throw new ParseError(
+        `${context}: expected [openTime, open, high, low, close, volume, closeTime, ...]`,
+      );
+    }
+    const closeTime = klineTime(row, 6, context);
+    return {
+      pair,
+      openTime: klineTime(row, 0, context),
+      closeTime,
+      open: klineMoney(row, 1, "open", context),
+      high: klineMoney(row, 2, "high", context),
+      low: klineMoney(row, 3, "low", context),
+      close: klineMoney(row, 4, "close", context),
+      volume: klineMoney(row, 5, "volume", context),
+      closed: at > closeTime,
+    };
+  });
+
+  candles.sort((a, b) => a.openTime - b.openTime);
+  return candles;
 }

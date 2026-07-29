@@ -128,6 +128,19 @@ export interface Candle {
 }
 
 /**
+ * A candle interval, in the canonical short form this system uses.
+ *
+ * The subset both Binance and Gemini support. Each implementation maps these to
+ * the exchange's own spelling (Gemini writes "1hr"/"6hr"/"1day" for the last
+ * three). Declared in full -- like `SymbolStatus` -- so the set is a closed
+ * union the code handles rather than a free string, but only "1m" is exercised
+ * and verified in v1: it is what the price feed's gap-backfill (section 4.6,
+ * step 14) needs. The wider intervals are the declared extension surface for
+ * section 13's backtest, and each must be verified per exchange before first use.
+ */
+export type CandleInterval = "1m" | "5m" | "15m" | "30m" | "1h" | "6h" | "1d";
+
+/**
  * An order the bot wants to place.
  *
  * `clientOrderId` is generated deterministically by the bot (section 5.1) and
@@ -256,19 +269,8 @@ export interface Balance {
 }
 
 /**
- * Handle to a live price subscription. Section 4.6 keeps the underlying
- * connection inside a Durable Object using the WebSocket Hibernation API;
- * reconnection and gap backfill are that object's responsibility, at step 6.
- */
-export interface WebSocketHandle {
-  readonly pair: Pair;
-  /** Close the subscription and stop delivering updates. */
-  close(): void;
-}
-
-/**
- * The request/response half of the exchange interface: everything reachable
- * over REST, and the whole surface a strategy needs in order to act.
+ * The exchange interface: everything reachable over REST, and the whole surface
+ * a strategy needs in order to act.
  *
  * Every method resolves to an `ExchangeOutcome` rather than to a bare value.
  * Section 4.1 writes these as `Promise<Price>`, `Promise<OrderResult>` and so
@@ -347,25 +349,37 @@ export interface RestExchangeClient {
   getOpenOrders(pair: Pair): Promise<ExchangeOutcome<OrderStatus[]>>;
 
   getAccountBalances(): Promise<ExchangeOutcome<Balance[]>>;
-}
 
-/**
- * The complete exchange interface: the REST surface plus the live price feed.
- *
- * Split from `RestExchangeClient` because the two halves are built at different
- * steps and, more importantly, live in different places. Section 4.6 puts the
- * WebSocket connection inside a Durable Object using the Hibernation API, so it
- * cannot be a method on a plain client object that a Worker constructs per
- * request -- the connection has to outlive the request that opened it.
- *
- * The split is what lets the Binance REST implementation at step 3 be complete
- * and honest rather than a full implementation with one method that throws.
- * Code needing only to read prices and place orders should depend on
- * `RestExchangeClient`; only step 6's Durable Object needs this.
- */
-export interface ExchangeClient extends RestExchangeClient {
-  subscribeToPriceFeed(
+  /**
+   * Historical OHLCV candles for a pair, returned OLDEST-FIRST.
+   *
+   * Public, unsigned data on both exchanges. The price feed's gap-backfill on
+   * reconnect (section 4.6, step 14) and section 13's backtest both read it, and
+   * neither needs credentials. Each returned candle's `closed` flag is set from
+   * whether its close time has passed at request time, so the current
+   * in-progress candle (close time still in the future) comes back
+   * `closed: false` and a backfill consumer should drop it.
+   *
+   * `since`, WHEN SUPPLIED, asks for candles whose close time is AFTER it, and
+   * is BEST-EFFORT, bounded by the window the exchange's endpoint returns. This
+   * asymmetry is real and stated rather than hidden: Binance's klines endpoint
+   * takes a start time and can reach deep history, but Gemini's `/v2/candles`
+   * returns only a fixed recent window with no range parameter, so the Gemini
+   * implementation fetches that window and filters locally and CANNOT serve
+   * candles older than it covers. For the feed's short reconnect gaps this is
+   * always sufficient; deep-history backtest on Gemini is a section 13 open
+   * question, not something this method promises.
+   *
+   * Note the money exception this method introduces: Gemini renders candle
+   * OHLCV as JSON NUMBERS, not the decimal strings the rest of its API uses (the
+   * step 14 probe confirmed this on the live feed, and the REST endpoint matches
+   * it). The Gemini implementation therefore rounds each value explicitly to the
+   * money scale rather than assuming a string is available. Binance renders
+   * klines as strings, so it stays on the ordinary `fromDecimalString` path.
+   */
+  getCandles(
     pair: Pair,
-    onUpdate: (candle: Candle) => void,
-  ): WebSocketHandle;
+    interval: CandleInterval,
+    since?: Timestamp,
+  ): Promise<ExchangeOutcome<Candle[]>>;
 }
