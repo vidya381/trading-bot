@@ -280,6 +280,34 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
 }
 
 /**
+ * POST /api/bots/:id/start -- the explicit start (spec 6.2/6.3 step 2).
+ *
+ * Calls `BotInstance.start(actor)` from step 6 verbatim. Deliberately a thin
+ * wrapper, the same shape as `liquidateBot`: `start` is the ONLY authority on
+ * whether the transition is allowed, and its one refusal -- a bot whose status
+ * is not `created` -- is its own `invalid_status`, surfaced here as 409 by the
+ * envelope's code map, NOT flattened into a generic failure.
+ *
+ * WHAT `start` DOES AND DOES NOT DO (confirmed from source, not assumed):
+ * `start` moves the status `created -> running`, mirrors it to D1, and audits
+ * `bot.started`. It places NO order and makes NO exchange call -- the base order
+ * (DCA) or the ladder (grid) fires on the next `onPriceUpdate`, because placing
+ * needs a price and reading one is an exchange call that can fail (§5.6). So
+ * this endpoint cannot return a price-unusable, unreachable-exchange, or
+ * order-filter error: `start`'s only failure is `invalid_status`. Returns the
+ * pipeline result and the refreshed bot so the new status shows immediately.
+ */
+export async function startBot(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const result = await botStub(ctx, id).start(ctx.actor);
+  const [row, snapshot] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+}
+
+/**
  * POST /api/bots/:id/liquidate -- the unified human close-out (endpoint 4).
  *
  * Calls `liquidatePosition(actor)` from step 10.3 verbatim. It is valid only on

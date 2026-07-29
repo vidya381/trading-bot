@@ -26,6 +26,7 @@ import { ApiError, fetchBot } from "../api/client";
 import { usePolling } from "../api/usePolling";
 import type { BotDetail as BotDetailData } from "../api/types";
 import { BotSummary } from "../components/BotSummary";
+import { StartAction } from "../components/StartAction";
 import { LiquidateAction } from "../components/LiquidateAction";
 import { StrategyState } from "../components/StrategyState";
 import { OrderHistory } from "../components/OrderHistory";
@@ -131,6 +132,14 @@ function BotDetailView({ id }: { id: string }) {
       ) : bot !== null ? (
         <>
           <BotSummary bot={bot} />
+          {/*
+           * The start control renders only for a created bot (this session's
+           * brief item 2); any other status shows nothing. Its confirm dialog
+           * spells out what the bot's real config will place once running, and
+           * is honest that no order fires until the execution path is wired. A
+           * successful start refetches immediately (item 7) via `poll.refetch`.
+           */}
+          {bot.status === "created" && <StartAction bot={bot} onStarted={poll.refetch} />}
           {/*
            * The liquidate control renders only for a halted bot (brief item 1);
            * the component itself further hides the button when the position is

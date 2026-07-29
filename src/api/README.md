@@ -62,6 +62,7 @@ rather than trusting the header alone.
 | `GET /api/bots` | D1 rows + each bot's DO snapshot (position, PnL) |
 | `GET /api/bots/:id` | DO snapshot + D1 order/trade/alert history |
 | `POST /api/bots` | `BotInstance.create`/`createGrid` (ledger check + SL/TP reused); exchange derived from the `accounts` registry (step 11) |
+| `POST /api/bots/:id/start` | `BotInstance.start` (step 6); `created -> running` only, its `invalid_status` refusal surfaced as 409 |
 | `POST /api/bots/:id/liquidate` | `BotInstance.liquidatePosition` (step 10.3) |
 | `GET /api/accounts` | registered accounts and their exchange, from the `accounts` table (step 11) |
 | `GET /api/accounts/:label/symbols` | the account's live tradable pairs via its real client's `listTradablePairs`, KV-cached (step 11) |

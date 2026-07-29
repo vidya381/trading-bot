@@ -363,6 +363,38 @@ describe("bots", () => {
     expect(res.body.error.code).toBe("insufficient_capital");
   });
 
+  it("starts a created bot, moving it to running and auditing the human actor", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `s${suffix}`;
+    await createDcaBot(id, account);
+
+    const res = await api("POST", `/api/bots/${id}/start`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "running", action: "started" });
+    // The refreshed bot in the response already shows the new status.
+    expect(res.body.data.bot).toMatchObject({ id, status: "running" });
+    // start places NO order -- it only moves status; nothing hit the exchange.
+    expect(exchange.placed).toEqual([]);
+    // The D1 row was mirrored and the start audited to the verified human actor.
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("running");
+    const audit = await db.auditLog.findMany({ where: { action: "bot.started" } });
+    expect(audit[0]!.actor).toBe(HUMAN);
+  });
+
+  it("refuses to start a bot that is not created, surfacing invalid_status (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `sr${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN)); // already running
+
+    const res = await api("POST", `/api/bots/${id}/start`);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+  });
+
   it("refuses to liquidate a RUNNING bot, reusing the existing rejection (409)", async () => {
     const account = `acct-${suffix}`;
     await seedBalance(account);

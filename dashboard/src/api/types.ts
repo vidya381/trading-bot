@@ -370,6 +370,35 @@ export interface LiquidateResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Start (`POST /api/bots/:id/start`, `startBot` handler)
+//
+// The response is `{ result, bot }`, the same shape as liquidate. `result` is
+// the bot object's own `PipelineResult` from `BotInstance.start` -- and the
+// crucial fact, confirmed from source (src/durable-objects/bot-instance.ts): a
+// successful start is ALWAYS `{ status: "running", action: "started" }`. It
+// places NO order and makes NO exchange call. The base order (DCA) / ladder
+// (grid) fires on the next `onPriceUpdate`, so start cannot return a price,
+// reachability, or order-filter outcome. Its ONE failure is a bot whose status
+// is not `created`, which arrives as a thrown `ApiError` with code
+// `invalid_status` (409) -- there is no success-with-a-different-action path to
+// branch on the way liquidate has, because start does not touch the exchange.
+// ---------------------------------------------------------------------------
+
+/** The `PipelineResult` a start returns -- always `action: "started"` on success. */
+export interface StartResult {
+  readonly status: BotStatus;
+  readonly action: string;
+  readonly detail?: string;
+}
+
+/** The body of a successful `POST /api/bots/:id/start`. */
+export interface StartResponse {
+  readonly result: StartResult;
+  /** The refreshed summary (now `running`), or null if the row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
 // Global kill switch (spec section 7.4; `killSwitchView` in serialize.ts,
 // `GET /api/kill-switch`, `POST /api/kill-switch/{trigger,reset}`).
 //

@@ -25,6 +25,7 @@ import type {
   LiquidateResponse,
   ManualAdjustment,
   ManualAdjustmentRequest,
+  StartResponse,
   TriggerKillSwitchResponse,
 } from "./types";
 
@@ -164,6 +165,22 @@ export function fetchBot(id: string, signal?: AbortSignal): Promise<BotDetail> {
  */
 export function liquidateBot(id: string, signal?: AbortSignal): Promise<LiquidateResponse> {
   return requestJson<LiquidateResponse>(`/api/bots/${encodeURIComponent(id)}/liquidate`, "POST", { signal });
+}
+
+/**
+ * Start a created bot (`POST /api/bots/:id/start`). No request body -- the
+ * backend takes the actor from the verified Access identity.
+ *
+ * Unlike liquidate, there is NO success-with-a-different-action to inspect:
+ * `BotInstance.start` only moves the status `created -> running` (it places no
+ * order and makes no exchange call -- the base order/ladder fires later, on the
+ * next price update), so a success is always `result.action: "started"`. Its
+ * one refusal -- a bot that is no longer `created` -- arrives as a thrown
+ * `ApiError` with code `invalid_status` (409). It therefore never returns the
+ * `not_attached`/price/reachability outcomes liquidate can.
+ */
+export function startBot(id: string, signal?: AbortSignal): Promise<StartResponse> {
+  return requestJson<StartResponse>(`/api/bots/${encodeURIComponent(id)}/start`, "POST", { signal });
 }
 
 /**
