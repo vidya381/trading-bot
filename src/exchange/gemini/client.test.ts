@@ -327,3 +327,25 @@ describe("downtime classification", () => {
     expect(stub).toHaveBeenCalledOnce();
   });
 });
+
+describe("listTradablePairs", () => {
+  it("GETs /v1/symbols (unsigned) and upper-cases the returned names", async () => {
+    const { client, requests } = clientWith((url) => {
+      expect(url.pathname).toBe("/v1/symbols");
+      return json(["btcusd", "ethusd", "ethbtc"]);
+    });
+
+    const outcome = await client.listTradablePairs();
+
+    expect(isUsable(outcome)).toBe(true);
+    if (isUsable(outcome)) expect(outcome.value).toEqual(["BTCUSD", "ETHUSD", "ETHBTC"]);
+    expect(requests[0]!.method).toBe("GET");
+    expect(requests[0]!.headers["X-GEMINI-SIGNATURE"]).toBeUndefined();
+  });
+
+  it("surfaces a transport failure as a non-usable outcome", async () => {
+    const { client } = clientWith(() => json({ result: "error" }, { status: 503 }));
+    const outcome = await client.listTradablePairs();
+    expect(isUsable(outcome)).toBe(false);
+  });
+});

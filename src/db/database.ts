@@ -14,6 +14,7 @@
 import { DatabaseError } from "./columns";
 import { Repository } from "./table";
 import {
+  accounts,
   alerts,
   auditLog,
   balanceSnapshots,
@@ -30,6 +31,7 @@ export class Database {
   readonly #d1: D1Database;
 
   readonly botInstances: Repository<typeof botInstances.columns>;
+  readonly accounts: Repository<typeof accounts.columns>;
   readonly capitalLedger: Repository<typeof capitalLedger.columns>;
   readonly orders: Repository<typeof orders.columns>;
   readonly trades: Repository<typeof trades.columns>;
@@ -43,6 +45,7 @@ export class Database {
   constructor(d1: D1Database) {
     this.#d1 = d1;
     this.botInstances = new Repository(d1, botInstances);
+    this.accounts = new Repository(d1, accounts);
     this.capitalLedger = new Repository(d1, capitalLedger);
     this.orders = new Repository(d1, orders);
     this.trades = new Repository(d1, trades);

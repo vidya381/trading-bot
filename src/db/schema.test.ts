@@ -108,6 +108,11 @@ describe("the schema as a whole", () => {
       .all<{ name: string }>();
 
     expect(result.results.map((row) => row.name)).toEqual([
+      // Not in section 8.2. Added by migration 0006 at step 11: the account
+      // registry, making account -> exchange a validated fact so bot creation
+      // can dispatch to the right exchange client instead of trusting a
+      // free-typed string.
+      "accounts",
       "alerts",
       "audit_log",
       "balance_snapshots",
@@ -132,6 +137,9 @@ describe("the schema as a whole", () => {
     // migration without adding it here is a visible diff rather than a silent
     // pass. Every one of these must be INTEGER, never TEXT and never REAL.
     const expected: Record<string, readonly string[]> = {
+      // The account registry holds a label, an exchange, and timestamps -- no
+      // amount of any kind (step 11).
+      accounts: [],
       bot_instances: ["stop_loss_pct", "take_profit_pct", "allocated_capital"],
       capital_ledger: ["total_balance", "total_allocated"],
       orders: ["price", "quantity", "filled_quantity"],

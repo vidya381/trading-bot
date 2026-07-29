@@ -29,12 +29,15 @@ import * as handlers from "./handlers";
 import { resolveRoute, route, type ApiContext, type Route } from "./router";
 import { databaseFrom, type Database } from "../db";
 import type { BotInstance } from "../durable-objects/bot-instance";
+import { envSymbolLister, type SymbolLister } from "../workers/symbols";
 
 const ROUTES: readonly Route[] = [
   route("GET", "/api/bots", handlers.listBots),
   route("POST", "/api/bots", handlers.createBot),
   route("GET", "/api/bots/:id", handlers.getBot),
   route("POST", "/api/bots/:id/liquidate", handlers.liquidateBot),
+  route("GET", "/api/accounts", handlers.listAccounts),
+  route("GET", "/api/accounts/:label/symbols", handlers.getAccountSymbols),
   route("GET", "/api/alerts", handlers.listAlerts),
   route("POST", "/api/manual-adjustments", handlers.createManualAdjustment),
   route("GET", "/api/circuit-breakers", handlers.listCircuitBreakers),
@@ -59,6 +62,8 @@ export interface ApiOptions {
   readonly db?: Database;
   readonly botNamespace?: DurableObjectNamespace<BotInstance>;
   readonly access?: Pick<AccessConfig, "now" | "fetchJwks" | "jwksCache">;
+  /** Injected by tests so the symbols endpoint makes no live exchange call. */
+  readonly symbolLister?: SymbolLister;
 }
 
 function requireBotNamespace(
@@ -133,6 +138,7 @@ export async function handleApiRequest(
       actor,
       db,
       botNamespace: requireBotNamespace(env, options.botNamespace),
+      symbolLister: options.symbolLister ?? envSymbolLister,
       now: options.now ?? (() => Date.now()),
       newId: options.newId ?? (() => crypto.randomUUID()),
     };

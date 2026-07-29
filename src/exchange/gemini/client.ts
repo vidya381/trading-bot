@@ -64,6 +64,7 @@ import {
   parseOrderStatus,
   parseOrderStatusList,
   parsePrice,
+  parseSymbolList,
   readErrorBody,
 } from "./parse";
 import {
@@ -187,6 +188,22 @@ export class GeminiClient implements RestExchangeClient {
       path: `/v1/pubticker/${toGeminiSymbol(pair)}`,
       signed: false,
       parse: (body, at) => parsePrice(pair, body, at),
+    });
+  }
+
+  /**
+   * Every trading pair Gemini lists, from `/v1/symbols`.
+   *
+   * Unsigned public data. Gemini returns its symbols lowercase and
+   * separator-less; `parseSymbolList` upper-cases them back to this system's
+   * `Pair` convention. See that function for why -- unlike Binance -- the list
+   * is not status-filtered here (Gemini exposes status only per symbol).
+   */
+  async listTradablePairs(): Promise<ExchangeOutcome<Pair[]>> {
+    return this.#request<Pair[]>({
+      path: "/v1/symbols",
+      signed: false,
+      parse: (body) => parseSymbolList(body),
     });
   }
 

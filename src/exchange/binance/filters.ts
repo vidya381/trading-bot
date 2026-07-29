@@ -186,6 +186,37 @@ export function parseExchangeInfo(
 }
 
 /**
+ * The names of every currently-tradable pair in an `exchangeInfo` response.
+ *
+ * Deliberately leaner than `parseExchangeInfo`: it reads only each entry's
+ * `symbol` and `status`, not its filters or assets. A full catalogue runs to
+ * thousands of symbols in every state the venue has, and `listTradablePairs`
+ * wants the pair NAMES, not their order-validation rules -- forcing the whole
+ * catalogue through `parseSymbolFilters` (which throws on any entry missing a
+ * baseAsset, quoteAsset or recognised status) would let one odd delisted symbol
+ * refuse the entire list. So a non-`TRADING` or nameless entry is simply
+ * excluded -- it is not a tradable pair -- rather than throwing. Only the
+ * top-level shape being wrong (`symbols` not an array) is loud, since that is a
+ * genuine API change, not one bad row.
+ */
+export function parseTradablePairs(body: unknown): Pair[] {
+  const symbols = (body as Record<string, unknown> | null)?.["symbols"];
+  if (!Array.isArray(symbols)) {
+    throw new FilterError("exchangeInfo response has no symbols array");
+  }
+  const pairs: Pair[] = [];
+  for (const entry of symbols) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const name = record["symbol"];
+    if (record["status"] === "TRADING" && typeof name === "string" && name !== "") {
+      pairs.push(name);
+    }
+  }
+  return pairs;
+}
+
+/**
  * Reason an order cannot be sent as specified.
  *
  * Each is a distinct, loggable cause rather than a generic rejection, because

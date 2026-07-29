@@ -95,6 +95,7 @@ describe("asking before calling", () => {
 
     await client.getServerTime();
     await client.getSymbolFilters(TEST_PAIR);
+    await client.listTradablePairs();
     await client.getCurrentPrice(TEST_PAIR);
     await client.getOrderStatus(TEST_PAIR, "v1-bot-0");
     await client.getOpenOrders(TEST_PAIR);
@@ -104,6 +105,7 @@ describe("asking before calling", () => {
     expect(limiter.requests.map((request) => request.weight)).toEqual([
       BINANCE_METHOD_WEIGHTS.getServerTime,
       BINANCE_METHOD_WEIGHTS.getSymbolFilters,
+      BINANCE_METHOD_WEIGHTS.listTradablePairs,
       BINANCE_METHOD_WEIGHTS.getCurrentPrice,
       BINANCE_METHOD_WEIGHTS.getOrderStatus,
       BINANCE_METHOD_WEIGHTS.getOpenOrders,

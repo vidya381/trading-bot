@@ -28,8 +28,15 @@ import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
 import type {
   AlertCategory,
   AlertSeverity,
+  ExchangeId,
   ManualAdjustmentRow,
 } from "../db/schema";
+import { EXCHANGE_IDS, isExchangeId } from "../db/schema";
+import {
+  KvSymbolCacheStore,
+  listAccountSymbols,
+  type SymbolCacheStore,
+} from "../workers/symbols";
 import type { Asset, Pair } from "../shared/exchange-client";
 import { fromDecimalString, toDecimalString, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
@@ -77,6 +84,16 @@ function requireString(body: Record<string, unknown>, field: string): string {
   const value = body[field];
   if (typeof value !== "string" || value.trim() === "") {
     throw badRequest("missing_field", `field ${JSON.stringify(field)} must be a non-empty string`);
+  }
+  return value;
+}
+
+/** A non-empty string field, or undefined when absent. Rejects a present-but-empty value. */
+function optionalString(body: Record<string, unknown>, field: string): string | undefined {
+  const value = body[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.trim() === "") {
+    throw badRequest("invalid_field", `field ${JSON.stringify(field)}, if given, must be a non-empty string`);
   }
   return value;
 }
@@ -160,12 +177,67 @@ export async function getBot(ctx: ApiContext): Promise<Response> {
  * an insufficient balance, a missing stop-loss, a tripped breaker or a pulled
  * kill switch all surface as their existing typed errors.
  */
+/**
+ * The exchange a new bot will be wired to -- the actual dispatch fix (step 11),
+ * deferred from both exchange-integration sessions.
+ *
+ * Before this, `POST /api/bots` trusted whatever `exchange` string the request
+ * body typed and stored it. Now the account registry is authoritative:
+ *
+ *   - Account IS registered -> its `exchange` is used, full stop. A body value
+ *     that disagrees is a client bug, so it is REJECTED rather than silently
+ *     overridden -- a bot quietly wired to the wrong venue is exactly the
+ *     "looks right, isn't" failure this step exists to remove.
+ *   - Account is NOT registered -> soft fallback to the body's `exchange`
+ *     (pre-registry behaviour), validated to be a known `ExchangeId`. This is
+ *     the "soft-enforce" half: creation still works for an un-backfilled or
+ *     not-yet-registered account, so existing bots and tests are undisturbed,
+ *     while a registered account becomes authoritative the moment it exists.
+ *
+ * The returned `ExchangeId` is what selects the client implementation the bot is
+ * wired to when order execution runs (via `resolveExchangeForAccount`); until
+ * then it is stored on the `bot_instances` row as the authoritative record of
+ * which venue this bot belongs to.
+ */
+async function resolveBotExchange(
+  ctx: ApiContext,
+  accountLabel: string,
+  bodyExchange: string | undefined,
+): Promise<ExchangeId> {
+  const account = await ctx.db.accounts.findOne({ account_label: accountLabel });
+  if (account !== null) {
+    if (bodyExchange !== undefined && bodyExchange !== account.exchange) {
+      throw badRequest(
+        "exchange_mismatch",
+        `account ${JSON.stringify(accountLabel)} is registered on ${account.exchange}, ` +
+          `not ${JSON.stringify(bodyExchange)}; omit "exchange" or match the registry`,
+      );
+    }
+    return account.exchange;
+  }
+
+  if (bodyExchange === undefined) {
+    throw badRequest(
+      "unregistered_account",
+      `account ${JSON.stringify(accountLabel)} is not registered and no "exchange" was given; ` +
+        `register the account (see docs/d1-provisioning.md) or supply "exchange"`,
+    );
+  }
+  if (!isExchangeId(bodyExchange)) {
+    throw badRequest(
+      "invalid_exchange",
+      `exchange must be one of ${EXCHANGE_IDS.join(", ")}, got ${JSON.stringify(bodyExchange)}`,
+    );
+  }
+  return bodyExchange;
+}
+
 export async function createBot(ctx: ApiContext): Promise<Response> {
   const body = await readJsonObject(ctx.request);
 
   const botInstanceId = requireString(body, "botInstanceId");
   const accountLabel = requireString(body, "accountLabel");
-  const exchange = requireString(body, "exchange");
+  const exchange = await resolveBotExchange(ctx, accountLabel, optionalString(body, "exchange"));
   const pair = requireString(body, "pair") as Pair;
   const capitalAsset = requireString(body, "capitalAsset") as Asset;
   const allocatedCapital = requireMoney(body, "allocatedCapital");
@@ -223,6 +295,73 @@ export async function liquidateBot(ctx: ApiContext): Promise<Response> {
     snapshotOf(ctx, id),
   ]);
   return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+}
+
+// ---------------------------------------------------------------------------
+// Accounts (section 4.4, step 11)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/accounts -- every registered account and its exchange.
+ *
+ * The registry the dashboard's future create-bot dropdown reads: a real list of
+ * accounts to choose from, each with the venue it trades on. Ordered by label so
+ * the dropdown is stable.
+ */
+export async function listAccounts(ctx: ApiContext): Promise<Response> {
+  const rows = await ctx.db.accounts.findMany({
+    orderBy: [{ column: "account_label", direction: "asc" }],
+  });
+  return ok(
+    rows.map((row) => ({
+      accountLabel: row.account_label,
+      exchange: row.exchange,
+      createdAt: row.created_at,
+    })),
+  );
+}
+
+/**
+ * GET /api/accounts/:label/symbols -- the account's live tradable pairs, cached.
+ *
+ * Resolves the account's real exchange from the registry, gets a real client for
+ * it (`resolveExchangeForAccount`, reusing the Binance and Gemini resolvers), and
+ * returns the venue's live tradable pairs -- cached in KV (`SYMBOL_CACHE`) for an
+ * hour so a dropdown does not hit the exchange on every open. See
+ * `workers/symbols.ts` for the caching and degradation behaviour.
+ *
+ * A live-call failure (unreachable exchange, missing credentials) surfaces as a
+ * 502 carrying the reason, rather than being cached or reported as success.
+ */
+export async function getAccountSymbols(ctx: ApiContext): Promise<Response> {
+  const label = ctx.params.label!;
+  const account = await ctx.db.accounts.findOne({ account_label: label });
+  if (account === null) {
+    throw notFound("unknown_account", `no registered account ${JSON.stringify(label)}`);
+  }
+
+  const cache: SymbolCacheStore | null =
+    ctx.env.SYMBOL_CACHE === undefined ? null : new KvSymbolCacheStore(ctx.env.SYMBOL_CACHE);
+
+  const listing = await listAccountSymbols({
+    account: { label, exchange: account.exchange },
+    env: ctx.env,
+    now: ctx.now,
+    lister: ctx.symbolLister,
+    cache,
+  });
+
+  if (!listing.ok) {
+    throw new ApiError(502, "exchange_unavailable", listing.failure.message);
+  }
+
+  return ok({
+    accountLabel: label,
+    exchange: account.exchange,
+    pairs: listing.pairs,
+    cached: listing.cached,
+    fetchedAt: listing.fetchedAt,
+  });
 }
 
 // ---------------------------------------------------------------------------

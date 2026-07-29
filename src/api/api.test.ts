@@ -30,6 +30,7 @@ import { fromDecimalString as m } from "../shared/money";
 import type { Jwks } from "./access";
 import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
+import type { SymbolLister } from "../workers/symbols";
 
 const T0 = 1_760_000_000_000;
 const HUMAN = "owner@example.com";
@@ -116,6 +117,8 @@ interface ApiCall {
   readonly token?: string | null;
   /** Override the email HEADER only (to force a mismatch); `null` sends none. */
   readonly headerEmail?: string | null;
+  /** Inject the symbols endpoint's lister so no live exchange call is made. */
+  readonly symbolLister?: SymbolLister;
 }
 
 async function api(method: string, path: string, call: ApiCall = {}): Promise<{ status: number; body: any }> {
@@ -141,6 +144,7 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
     now: () => clock,
     newId: () => `api-${(idCounter += 1)}`,
     access: { now: () => clock, fetchJwks: async () => key.jwks, jwksCache },
+    ...(call.symbolLister !== undefined ? { symbolLister: call.symbolLister } : {}),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -594,5 +598,141 @@ describe("reconciliation", () => {
       actor: "reconciliation",
       details: { tier: "meaningful", run_id: `run-${suffix}` },
     });
+  });
+});
+
+describe("accounts (step 11)", () => {
+  it("GET /api/accounts lists registered accounts and their exchange, ordered by label", async () => {
+    await db.accounts.insert({ account_label: `z-${suffix}`, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await db.accounts.insert({ account_label: `a-${suffix}`, exchange: "binance", created_at: T0, updated_at: T0 });
+
+    const res = await api("GET", "/api/accounts");
+
+    expect(res.status).toBe(200);
+    const mine = (res.body.data as { accountLabel: string; exchange: string }[]).filter((a) =>
+      a.accountLabel.endsWith(`-${suffix}`),
+    );
+    expect(mine).toEqual([
+      { accountLabel: `a-${suffix}`, exchange: "binance", createdAt: T0 },
+      { accountLabel: `z-${suffix}`, exchange: "gemini", createdAt: T0 },
+    ]);
+  });
+
+  it("GET /api/accounts/:label/symbols returns pairs, cached on the second call", async () => {
+    const account = `sym-${suffix}`;
+    await db.accounts.insert({ account_label: account, exchange: "binance", created_at: T0, updated_at: T0 });
+
+    let calls = 0;
+    const symbolLister: SymbolLister = async () => {
+      calls += 1;
+      return { ok: true, value: ["BTCUSDT", "ETHUSDT"], at: T0 };
+    };
+
+    const first = await api("GET", `/api/accounts/${account}/symbols`, { symbolLister });
+    expect(first.status).toBe(200);
+    expect(first.body.data).toEqual({
+      accountLabel: account,
+      exchange: "binance",
+      pairs: ["BTCUSDT", "ETHUSDT"],
+      cached: false,
+      fetchedAt: T0,
+    });
+
+    const second = await api("GET", `/api/accounts/${account}/symbols`, { symbolLister });
+    expect(second.status).toBe(200);
+    expect(second.body.data.cached).toBe(true);
+    // The second call was served from the KV cache; the exchange was hit once.
+    expect(calls).toBe(1);
+  });
+
+  it("GET /api/accounts/:label/symbols is 404 for an unregistered account", async () => {
+    const res = await api("GET", `/api/accounts/nope-${suffix}/symbols`, {
+      symbolLister: async () => ({ ok: true, value: [], at: T0 }),
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_account");
+  });
+
+  it("GET /api/accounts/:label/symbols surfaces an exchange failure as 502", async () => {
+    const account = `down-${suffix}`;
+    await db.accounts.insert({ account_label: account, exchange: "gemini", created_at: T0, updated_at: T0 });
+
+    const res = await api("GET", `/api/accounts/${account}/symbols`, {
+      symbolLister: async () => ({
+        ok: false,
+        kind: "transport",
+        message: "exchange unreachable",
+        retryable: true,
+        at: T0,
+      }),
+    });
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("exchange_unavailable");
+  });
+});
+
+describe("bot creation dispatches exchange from the account registry (step 11)", () => {
+  async function createBotBody(account: string, id: string, exchange?: string) {
+    const body: Record<string, unknown> = {
+      botInstanceId: id,
+      accountLabel: account,
+      pair: TEST_PAIR,
+      capitalAsset: "USDT",
+      allocatedCapital: "500",
+      strategy: "dca",
+      params: dcaParamsJson,
+    };
+    if (exchange !== undefined) body.exchange = exchange;
+    return api("POST", "/api/bots", { body });
+  }
+
+  it("derives the exchange from the registry when the account is registered, body exchange omitted", async () => {
+    const account = `reg-${suffix}`;
+    await seedBalance(account);
+    await db.accounts.insert({ account_label: account, exchange: "gemini", created_at: T0, updated_at: T0 });
+
+    const res = await createBotBody(account, `rb-${suffix}`);
+    expect(res.status).toBe(201);
+
+    const row = await db.botInstances.findOne({ id: `rb-${suffix}` });
+    expect(row!.exchange).toBe("gemini");
+  });
+
+  it("rejects a body exchange that disagrees with the registry (400)", async () => {
+    const account = `mis-${suffix}`;
+    await seedBalance(account);
+    await db.accounts.insert({ account_label: account, exchange: "gemini", created_at: T0, updated_at: T0 });
+
+    const res = await createBotBody(account, `mb-${suffix}`, "binance");
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("exchange_mismatch");
+  });
+
+  it("soft-falls back to the body exchange for an unregistered account", async () => {
+    const account = `unreg-${suffix}`;
+    await seedBalance(account);
+
+    const res = await createBotBody(account, `ub-${suffix}`, "binance");
+    expect(res.status).toBe(201);
+    const row = await db.botInstances.findOne({ id: `ub-${suffix}` });
+    expect(row!.exchange).toBe("binance");
+  });
+
+  it("rejects an unregistered account with no exchange given (400)", async () => {
+    const account = `bare-${suffix}`;
+    await seedBalance(account);
+
+    const res = await createBotBody(account, `bb-${suffix}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("unregistered_account");
+  });
+
+  it("rejects an unknown exchange value on the fallback path (400)", async () => {
+    const account = `bad-${suffix}`;
+    await seedBalance(account);
+
+    const res = await createBotBody(account, `xb-${suffix}`, "kraken");
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_exchange");
   });
 });

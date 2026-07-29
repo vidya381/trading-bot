@@ -34,6 +34,14 @@ declare namespace Cloudflare {
     // provisioned and `wrangler types` emits it on both interfaces.
     ALERT_COOLDOWNS: KVNamespace;
 
+    // Step 11, section 8.3. The tradable-pair cache KV namespace, supplied to
+    // tests by vitest.config.ts's miniflare `kvNamespaces`. Declared here for the
+    // same reason as ALERT_COOLDOWNS: the real namespace is not provisioned yet,
+    // so it is absent from wrangler.jsonc and `wrangler types` cannot emit it
+    // (docs/kv-provisioning.md). The Worker's own view is the optional `declare
+    // global` augmentation in src/workers/symbols.ts.
+    SYMBOL_CACHE: KVNamespace;
+
     // Build step 10, section 11. The Cloudflare Access verifier's two settings,
     // supplied to tests by vitest.config.ts's miniflare `bindings`. Declared
     // here (test-visible, on `Cloudflare.Env`) because ACCESS_AUD is a secret

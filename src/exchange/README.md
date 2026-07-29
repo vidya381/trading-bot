@@ -12,7 +12,7 @@ depend only on the interface and cannot tell which exchange is underneath.
 | [`binance/signing.ts`](./binance/signing.ts) | 4.2 | HMAC-SHA256 via Web Crypto, and the clock-drift offset |
 | [`binance/filters.ts`](./binance/filters.ts) | 4.3 | `exchangeInfo` parsing, and the exchange-agnostic order validation and filter cache |
 | [`binance/parse.ts`](./binance/parse.ts) | 4.1, 5.4 | Payload parsing, weight headers and limits, error classification |
-| [`binance/client.ts`](./binance/client.ts) | 4.1 | The eight REST methods, each wrapped in downtime detection |
+| [`binance/client.ts`](./binance/client.ts) | 4.1 | The REST methods (eight + `listTradablePairs`), each wrapped in downtime detection |
 | [`gemini/signing.ts`](./gemini/signing.ts) | 4.2 | HMAC-**SHA384** over a base64 JSON payload, and the monotonic **nonce** (no clock sync) |
 | [`gemini/filters.ts`](./gemini/filters.ts) | 4.3 | `symbols/details` parsing (with the field-name inversion); re-exports the shared validator |
 | [`gemini/parse.ts`](./gemini/parse.ts) | 4.1 | Payload parsing (boolean order-state flags, `fee_currency`, derived balances), error classification |
@@ -90,8 +90,10 @@ belong to a client object a Worker constructs per request — the connection has
 to outlive the request that opened it.
 
 The interface is therefore split in two. `BinanceClient` implements
-`RestExchangeClient`, the eight-method REST surface. `ExchangeClient` extends it
-with the price feed, and step 6's Durable Object is what will implement that.
+`RestExchangeClient`, the REST surface (the original eight methods plus
+`listTradablePairs`, added at step 11 for the account pair-listing endpoint).
+`ExchangeClient` extends it with the price feed, and step 6's Durable Object is
+what will implement that.
 
 ## Every call returns an outcome
 

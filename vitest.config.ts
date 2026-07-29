@@ -41,7 +41,12 @@ export default defineConfig({
         // does not commit placeholder resource ids (step 4, decision 1).
         // Miniflare needs only the binding name to spin up a local KV, so tests
         // exercise the real KvCooldownStore without any Cloudflare resource.
-        kvNamespaces: ["ALERT_COOLDOWNS"],
+        // ALERT_COOLDOWNS (step 8) and SYMBOL_CACHE (step 11): both real
+        // namespaces are unprovisioned, so they live here rather than in
+        // wrangler.jsonc (see the note above). Miniflare needs only the binding
+        // name to spin up a local KV, so tests exercise the real
+        // KvCooldownStore and KvSymbolCacheStore without any Cloudflare resource.
+        kvNamespaces: ["ALERT_COOLDOWNS", "SYMBOL_CACHE"],
         bindings: {
           // Not application config: the migration set, handed to the test
           // runtime so `applyD1Migrations` can run it. No Worker reads this.

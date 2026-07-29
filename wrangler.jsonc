@@ -157,6 +157,10 @@
 				{
 					"binding": "ALERT_COOLDOWNS",
 					"id": "bf4f637666bd42a09a25b729744a7c16"
+				},
+				{
+					"binding": "SYMBOL_CACHE",
+					"id": "987f8b7b34c747be94652ba6d23dcfd6"
 				}
 			]
 		},

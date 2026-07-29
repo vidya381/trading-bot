@@ -1027,3 +1027,37 @@ describe("default fetch wiring", () => {
     await client.getServerTime();
   });
 });
+
+describe("listTradablePairs", () => {
+  it("hits the full exchangeInfo catalogue (no symbol param) and returns TRADING pairs", async () => {
+    const { client, callsTo } = harness({
+      "/api/v3/exchangeInfo": () =>
+        json({
+          symbols: [
+            { symbol: "BTCUSDT", status: "TRADING" },
+            { symbol: "ETHUSDT", status: "TRADING" },
+            { symbol: "LUNAUSDT", status: "HALT" },
+          ],
+        }),
+    });
+
+    const outcome = await client.listTradablePairs();
+
+    expect(isUsable(outcome)).toBe(true);
+    if (isUsable(outcome)) expect(outcome.value).toEqual(["BTCUSDT", "ETHUSDT"]);
+
+    // The catalogue request carries no `symbol` filter -- that is what makes it
+    // the whole list rather than one entry.
+    const call = callsTo("/api/v3/exchangeInfo").at(-1)!;
+    expect(call.url.searchParams.has("symbol")).toBe(false);
+  });
+
+  it("surfaces a transport failure as a non-usable outcome", async () => {
+    const { client } = harness({
+      "/api/v3/exchangeInfo": () => json({ msg: "down" }, { status: 503 }),
+    });
+
+    const outcome = await client.listTradablePairs();
+    expect(isUsable(outcome)).toBe(false);
+  });
+});

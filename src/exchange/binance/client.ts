@@ -36,6 +36,7 @@ import { toTrimmedString } from "../../shared/money";
 import type { CredentialProvider } from "../credentials";
 import {
   parseSymbolFilters,
+  parseTradablePairs,
   SymbolFilterCache,
   validateOrder,
   type OrderValidation,
@@ -259,6 +260,24 @@ export class BinanceClient implements RestExchangeClient {
       signed: false,
       params: [["symbol", pair]],
       parse: (body, at) => parsePrice(body, at),
+    });
+  }
+
+  /**
+   * Every currently-tradable pair, from the full `exchangeInfo` catalogue.
+   *
+   * The SAME endpoint as `getSymbolFilters` but with no `symbol` parameter, so
+   * the response carries every symbol on the venue rather than one. Unsigned,
+   * like the other Tier 0 reads. `parseTradablePairs` keeps only `TRADING`
+   * symbols, which is exactly the set a create-bot form may offer.
+   */
+  async listTradablePairs(): Promise<ExchangeOutcome<Pair[]>> {
+    return this.#request<Pair[]>({
+      method: "GET",
+      path: "/api/v3/exchangeInfo",
+      signed: false,
+      params: [],
+      parse: (body) => parseTradablePairs(body),
     });
   }
 

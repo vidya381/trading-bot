@@ -20,6 +20,25 @@ export type BotStatus = "created" | "running" | "halted" | "stopped";
 /** Section 6: the two strategies in v1. */
 export type StrategyType = "grid" | "dca";
 
+/**
+ * The exchanges an account can trade on (sections 4.4, 16).
+ *
+ * The single source of the set. The `accounts.exchange` CHECK constraint
+ * (migration 0006) is this union's shadow in SQL, exactly as
+ * `strategy_type IN ('grid','dca')` shadows `StrategyType`. Adding a third
+ * exchange is a deliberate value change here plus a one-string-wider CHECK in a
+ * follow-up migration -- not a restructuring. `isExchangeId` is the runtime
+ * guard for values arriving as free-typed strings (a stored `bot_instances.exchange`,
+ * a request field).
+ */
+export type ExchangeId = "binance" | "gemini";
+
+export const EXCHANGE_IDS: readonly ExchangeId[] = ["binance", "gemini"];
+
+export function isExchangeId(value: unknown): value is ExchangeId {
+  return typeof value === "string" && (EXCHANGE_IDS as readonly string[]).includes(value);
+}
+
 export type OrderSide = "buy" | "sell";
 
 /** Section 9's drift classes. NULL where a run found no drift to classify. */
@@ -60,6 +79,19 @@ export const botInstances = defineTable("bot_instances", {
   // capital_ledger row (account_label, asset) its allocation lives in. Not the
   // pair's quote asset by definition, though in practice it will be.
   capital_asset: text(),
+});
+
+/**
+ * The account registry (migration 0006, step 11). One row per exchange account,
+ * making "which exchange does this account belong to" a registered, validated
+ * fact rather than a free-typed guess. `exchange` is an `ExchangeId`, so a
+ * decoded row is already narrowed to the known set.
+ */
+export const accounts = defineTable("accounts", {
+  account_label: text(),
+  exchange: text<ExchangeId>(),
+  created_at: integer(),
+  updated_at: integer(),
 });
 
 export const capitalLedger = defineTable("capital_ledger", {
@@ -192,6 +224,7 @@ export const alerts = defineTable("alerts", {
 // Decoded row types. Money columns are `bigint`, JSON columns are parsed, and
 // every column is present -- these are also the insert types.
 export type BotInstanceRow = Row<typeof botInstances.columns>;
+export type AccountRow = Row<typeof accounts.columns>;
 export type CapitalLedgerRow = Row<typeof capitalLedger.columns>;
 export type OrderRow = Row<typeof orders.columns>;
 export type TradeRow = Row<typeof trades.columns>;
@@ -205,6 +238,7 @@ export type GlobalKillSwitchRow = Row<typeof globalKillSwitch.columns>;
 /** Every table, for the schema-drift test and for Database's construction. */
 export const ALL_TABLES = {
   botInstances,
+  accounts,
   capitalLedger,
   orders,
   trades,

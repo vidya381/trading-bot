@@ -118,6 +118,18 @@ export class FakeExchange implements RestExchangeClient {
     return { ok: true, value: { ...this.filters, pair, fetchedAt: this.now }, at: this.now };
   }
 
+  /** The pairs this fake reports as tradable. Defaults to its one test pair. */
+  tradablePairs: Pair[] = [TEST_PAIR];
+  /** Set to force `listTradablePairs` to fail. Stays set until cleared. */
+  tradablePairsFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+
+  async listTradablePairs(): Promise<ExchangeOutcome<Pair[]>> {
+    if (this.tradablePairsFailure !== null) {
+      return failure(this.tradablePairsFailure.message, this.tradablePairsFailure.kind, this.now);
+    }
+    return { ok: true, value: [...this.tradablePairs], at: this.now };
+  }
+
   async getCurrentPrice(pair: Pair): Promise<ExchangeOutcome<Price>> {
     if (this.currentPriceFailure !== null) {
       return failure(this.currentPriceFailure.message, this.currentPriceFailure.kind, this.now);

@@ -15,6 +15,7 @@
 
 import type { Database } from "../db/database";
 import type { BotInstance } from "../durable-objects/bot-instance";
+import type { SymbolLister } from "../workers/symbols";
 
 /** Everything a handler is given: the request, the verified actor, and ports. */
 export interface ApiContext {
@@ -27,6 +28,13 @@ export interface ApiContext {
   readonly actor: string;
   readonly db: Database;
   readonly botNamespace: DurableObjectNamespace<BotInstance>;
+  /**
+   * Reaches an account's exchange for its tradable pairs. Injected (default
+   * `envSymbolLister`) so a test exercises the symbols endpoint's caching
+   * without a live exchange call -- the same seam `access.fetchJwks` gives the
+   * JWT path.
+   */
+  readonly symbolLister: SymbolLister;
   readonly now: () => number;
   readonly newId: () => string;
 }

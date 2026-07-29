@@ -10,6 +10,7 @@
 import { applyD1Migrations, env } from "cloudflare:test";
 import { Database } from "./database";
 import type {
+  AccountRow,
   AlertRow,
   AuditLogRow,
   BalanceSnapshotRow,
@@ -34,6 +35,9 @@ const TABLES_CHILDREN_FIRST = [
   "circuit_breakers",
   "global_kill_switch",
   "bot_instances",
+  // No table foreign-keys to `accounts`, so its position is free; last, beside
+  // the other parent-ish tables.
+  "accounts",
 ] as const;
 
 /**
@@ -129,6 +133,16 @@ export function tradeRow(overrides: Partial<TradeRow> = {}): TradeRow {
     fee_reporting_asset: "USDT",
     fee_conversion_rate: 65_000_000_000n, // 650.0 USDT per BNB
     executed_at: T0,
+    ...overrides,
+  };
+}
+
+export function accountRow(overrides: Partial<AccountRow> = {}): AccountRow {
+  return {
+    account_label: "main",
+    exchange: "binance",
+    created_at: T0,
+    updated_at: T0,
     ...overrides,
   };
 }

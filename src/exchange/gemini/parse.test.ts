@@ -10,6 +10,7 @@ import {
   parseOrderStatus,
   parseOrderStatusList,
   parsePrice,
+  parseSymbolList,
   ParseError,
   readErrorBody,
   toOrderState,
@@ -280,5 +281,29 @@ describe("parseBalances", () => {
 
   it("rejects a non-array", () => {
     expect(() => parseBalances({})).toThrow(ParseError);
+  });
+});
+
+describe("parseSymbolList", () => {
+  it("upper-cases Gemini's lowercase symbols into this system's Pair convention", () => {
+    // The inverse of toGeminiSymbol, which lowercases "BTCUSD" -> "btcusd".
+    expect(parseSymbolList(["btcusd", "ethusd", "ethbtc"])).toEqual([
+      "BTCUSD",
+      "ETHUSD",
+      "ETHBTC",
+    ]);
+  });
+
+  it("skips a non-string or empty entry rather than throwing", () => {
+    expect(parseSymbolList(["btcusd", "", 123, null, "ethusd"])).toEqual(["BTCUSD", "ETHUSD"]);
+  });
+
+  it("throws when the body is not an array (a real API change)", () => {
+    expect(() => parseSymbolList({ symbols: [] })).toThrow(ParseError);
+    expect(() => parseSymbolList(null)).toThrow(ParseError);
+  });
+
+  it("returns an empty list for an empty response", () => {
+    expect(parseSymbolList([])).toEqual([]);
   });
 });

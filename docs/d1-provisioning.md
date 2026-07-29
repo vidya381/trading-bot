@@ -366,3 +366,58 @@ confirmed at zero rows.
 
 Re-run this check if the pool version or `remoteBindings` ever changes. A test
 suite that silently truncates a real database is a bad thing to discover late.
+
+---
+
+## Registering an account (step 11)
+
+The `accounts` table (migration 0006) records which exchange each account trades
+on. There is deliberately **no** `POST /api/accounts` endpoint — registering a
+real account is a rare, high-privilege human act, seeded by hand exactly like
+`capital_ledger.total_balance` is (step 5). This is that manual step.
+
+`account_label` is the primary key and is the label your `capital_ledger` rows
+and bots already use. `exchange` must be `'binance'` or `'gemini'` (the CHECK
+constraint rejects anything else). Timestamps are milliseconds since the epoch.
+
+**Register one account on each exchange** (testnet), so there is one of each to
+test with:
+
+```sh
+# A Binance account labelled "main". Its client is built from the
+# BINANCE_API_KEY / BINANCE_API_SECRET secrets by convention (see the migration
+# header) -- those must already be set for this environment (step 3.2).
+npx wrangler d1 execute DB --env testnet --remote \
+  --command "INSERT INTO accounts (account_label, exchange, created_at, updated_at)
+             VALUES ('main', 'binance', unixepoch()*1000, unixepoch()*1000)"
+
+# A Gemini account labelled "gemini-main". Its client is built from
+# GEMINI_API_KEY / GEMINI_API_SECRET (step 3.4); set those for this environment
+# with `wrangler secret put GEMINI_API_KEY --env testnet` (and the secret).
+npx wrangler d1 execute DB --env testnet --remote \
+  --command "INSERT INTO accounts (account_label, exchange, created_at, updated_at)
+             VALUES ('gemini-main', 'gemini', unixepoch()*1000, unixepoch()*1000)"
+```
+
+Confirm, and see them the way the dashboard will (`GET /api/accounts` reads this
+table):
+
+```sh
+npx wrangler d1 execute DB --env testnet --remote \
+  --command "SELECT account_label, exchange FROM accounts ORDER BY account_label"
+```
+
+Notes:
+
+- **Pre-existing bots were backfilled automatically.** Migration 0006 registers
+  one account per distinct `account_label` already on a `bot_instances` row
+  (carrying that bot's exchange), so accounts that already had bots need no manual
+  INSERT. A bot whose `exchange` was some unrecognised free-typed string is
+  skipped by the backfill and simply left unregistered — register it by hand
+  above if you want it authoritative. Check what the backfill produced with the
+  same `SELECT` as above.
+- **Seeding order.** To create a bot whose exchange comes from the registry,
+  register the account first, then seed its `capital_ledger` balance (above),
+  then create the bot. An unregistered account still works (bot creation falls
+  back to the request's `exchange`), but a registered one is authoritative and a
+  mismatching request `exchange` is rejected.

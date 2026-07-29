@@ -300,6 +300,19 @@ export interface RestExchangeClient {
   /** Trading rules for a pair, for order validation and rounding (section 4.3). */
   getSymbolFilters(pair: Pair): Promise<ExchangeOutcome<SymbolFilters>>;
 
+  /**
+   * Every currently tradable pair on the exchange, as it names them.
+   *
+   * The registry-facing counterpart of `getSymbolFilters`: that one reads the
+   * rules of a pair already known; this one answers "which pairs exist here at
+   * all", so a pair can be offered/validated rather than free-typed. Only pairs
+   * currently in `TRADING` status are returned -- a halted or delisted symbol is
+   * not a tradable pair -- so the result is directly the set a create-bot form
+   * may present. Unsigned public data on both exchanges; the caller is expected
+   * to cache it (the set changes rarely) rather than call it per request.
+   */
+  listTradablePairs(): Promise<ExchangeOutcome<Pair[]>>;
+
   getCurrentPrice(pair: Pair): Promise<ExchangeOutcome<Price>>;
 
   placeOrder(order: OrderRequest): Promise<ExchangeOutcome<OrderResult>>;

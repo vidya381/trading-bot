@@ -85,3 +85,42 @@ After both resources exist in an environment, the every-minute cron stops
 no-opping. Confirm by checking the Worker's logs (observability is on) for a
 line like `notification dispatch: scanned=… sent=… throttled=… failed=…`
 instead of `notification dispatch did not run: …`.
+
+---
+
+## 4. (Step 11) The tradable-pair cache KV namespace `SYMBOL_CACHE`
+
+> **Status: NOT executed.** The `SYMBOL_CACHE` namespace does not exist in either
+> environment yet. Until it does, `GET /api/accounts/:label/symbols` still works
+> but **degrades to a live exchange call on every request** (the response says
+> `cached: false`) rather than serving a one-hour-cached list. A missing cache is
+> a performance concern, not a correctness one — unlike a missing credential,
+> which fails closed.
+
+Same kind of resource, same reason it is not in the repo yet, and the same
+handling as `ALERT_COOLDOWNS`: it is a second KV namespace (step 11, section
+8.3), declared for tests via `vitest.config.ts`'s miniflare `kvNamespaces` and
+kept out of `wrangler.jsonc` until a real id exists (no placeholder ids — step 4,
+decision 1). The Worker's optional view of it is the `declare global`
+augmentation in `src/workers/symbols.ts`.
+
+```sh
+# Testnet
+npx wrangler kv namespace create SYMBOL_CACHE --env testnet
+# Production
+npx wrangler kv namespace create SYMBOL_CACHE --env production
+```
+
+Add the binding under **both** environments' `kv_namespaces` in `wrangler.jsonc`
+(alongside `ALERT_COOLDOWNS`), each pointing at its own printed id:
+
+```jsonc
+"kv_namespaces": [
+  { "binding": "ALERT_COOLDOWNS", "id": "<that environment's cooldown id>" },
+  { "binding": "SYMBOL_CACHE",    "id": "<that environment's symbol-cache id>" }
+]
+```
+
+Then `npm run cf-typegen`, after which the `declare global` in
+`src/workers/symbols.ts` can be removed. Confirm by calling the endpoint twice
+for one account: the second response should report `cached: true`.

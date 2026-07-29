@@ -29,6 +29,7 @@ import type {
   OrderResult,
   OrderSide,
   OrderStatus,
+  Pair,
   Price,
   Timestamp,
 } from "../../shared/exchange-client";
@@ -307,6 +308,38 @@ export function parsePrice(pair: string, body: unknown, at: Timestamp): Price {
     price: requireMoney(record, "last", "pubticker"),
     at,
   };
+}
+
+/**
+ * Parse Gemini's `/v1/symbols` response into this system's pair names.
+ *
+ * Gemini returns a bare array of symbol strings in ITS convention -- lowercase,
+ * no separator (`"btcusd"`, `"ethusd"`). This system's `Pair` is the exchange's
+ * name in the convention the rest of the code uses (uppercase, matching what
+ * `toGeminiSymbol` lowercases FROM), so each is upper-cased back on the way in --
+ * the inverse of `toGeminiSymbol`.
+ *
+ * DIVERGENCE FROM BINANCE, stated rather than hidden: `/v1/symbols` carries no
+ * per-symbol status. Binance's `exchangeInfo` tags every symbol `TRADING` /
+ * `HALT` / etc., so `parseTradablePairs` can filter to the tradable set; Gemini
+ * exposes status only through the per-symbol `/v1/symbols/details/{symbol}`, so
+ * filtering here would cost one request per symbol. `/v1/symbols` is Gemini's
+ * own list of its supported trading symbols, and it is taken as the tradable set
+ * directly. A symbol that is momentarily closed would still appear; confirming
+ * it is `TRADING` remains `getSymbolFilters`' job at order time, exactly as it is
+ * on the Binance side.
+ */
+export function parseSymbolList(body: unknown): Pair[] {
+  if (!Array.isArray(body)) {
+    throw new ParseError("/v1/symbols: expected an array of symbol strings");
+  }
+  const pairs: Pair[] = [];
+  for (const entry of body) {
+    if (typeof entry === "string" && entry !== "") {
+      pairs.push(entry.toUpperCase());
+    }
+  }
+  return pairs;
 }
 
 /**

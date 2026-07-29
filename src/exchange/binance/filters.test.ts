@@ -6,6 +6,7 @@ import {
   FilterError,
   parseExchangeInfo,
   parseSymbolFilters,
+  parseTradablePairs,
   SymbolFilterCache,
   validateOrder,
 } from "./filters";
@@ -606,5 +607,42 @@ describe("SymbolFilterCache", () => {
 
   it("rejects a non-positive max age", () => {
     expect(() => new SymbolFilterCache({ maxAgeMs: 0 })).toThrow(FilterError);
+  });
+});
+
+describe("parseTradablePairs", () => {
+  it("returns only the names of TRADING symbols", () => {
+    const body = {
+      symbols: [
+        { symbol: "BTCUSDT", status: "TRADING" },
+        { symbol: "ETHUSDT", status: "TRADING" },
+        { symbol: "LUNAUSDT", status: "HALT" },
+        { symbol: "OLDUSDT", status: "BREAK" },
+      ],
+    };
+    expect(parseTradablePairs(body)).toEqual(["BTCUSDT", "ETHUSDT"]);
+  });
+
+  it("skips a nameless or malformed entry rather than throwing", () => {
+    const body = {
+      symbols: [
+        { symbol: "BTCUSDT", status: "TRADING" },
+        { status: "TRADING" }, // no symbol
+        null,
+        "nonsense",
+        { symbol: "", status: "TRADING" },
+        { symbol: "ETHUSDT", status: "TRADING" },
+      ],
+    };
+    expect(parseTradablePairs(body)).toEqual(["BTCUSDT", "ETHUSDT"]);
+  });
+
+  it("throws only when the top-level symbols array is absent (a real API change)", () => {
+    expect(() => parseTradablePairs({})).toThrow(FilterError);
+    expect(() => parseTradablePairs(null)).toThrow(FilterError);
+  });
+
+  it("returns an empty list when nothing is TRADING", () => {
+    expect(parseTradablePairs({ symbols: [{ symbol: "X", status: "HALT" }] })).toEqual([]);
   });
 });

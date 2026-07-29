@@ -102,6 +102,9 @@ export type MethodWeights = Record<keyof RestExchangeClient, number>;
 export const BINANCE_METHOD_WEIGHTS: MethodWeights = {
   getServerTime: ENDPOINT_WEIGHTS.time,
   getSymbolFilters: ENDPOINT_WEIGHTS.exchangeInfo,
+  // The full-catalogue `exchangeInfo` (no symbol filter) carries the same
+  // documented weight as the single-symbol form.
+  listTradablePairs: ENDPOINT_WEIGHTS.exchangeInfo,
   getCurrentPrice: ENDPOINT_WEIGHTS.tickerPrice,
   placeOrder: ENDPOINT_WEIGHTS.placeOrder,
   cancelOrder: ENDPOINT_WEIGHTS.cancelOrder,
@@ -196,6 +199,10 @@ export class RateLimitedExchange implements RestExchangeClient {
 
   async getSymbolFilters(pair: Pair): Promise<ExchangeOutcome<SymbolFilters>> {
     return this.#gate("getSymbolFilters", pair, () => this.#inner.getSymbolFilters(pair));
+  }
+
+  async listTradablePairs(): Promise<ExchangeOutcome<Pair[]>> {
+    return this.#gate("listTradablePairs", "", () => this.#inner.listTradablePairs());
   }
 
   async getCurrentPrice(pair: Pair): Promise<ExchangeOutcome<Price>> {
