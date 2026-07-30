@@ -24,6 +24,7 @@
  */
 
 import { accessConfigFromEnv, authenticate, type AccessConfig } from "./access";
+import { handleWsCheck } from "./debug-ws-check"; // TEMPORARY DIAGNOSTIC — see block below.
 import { errorResponse, fail, ApiError } from "./envelope";
 import * as handlers from "./handlers";
 import { resolveRoute, route, type ApiContext, type Route } from "./router";
@@ -95,6 +96,19 @@ export async function handleApiRequest(
     // 1. Authenticate before anything else.
     const config = accessConfigFromEnv(env, options.access ?? {});
     const actor = await authenticate(request, config);
+
+    // ─── TEMPORARY DIAGNOSTIC — /api/debug/ws-check (decision-log 14.6, Tier 0) ──
+    // DELETE AFTER ONE CONFIRMING RUN. Removal = delete this block and the
+    // `handleWsCheck` import above, delete src/api/debug-ws-check.ts and its test.
+    // Wired here — AFTER authenticate() (so it is behind Access + the JWT re-check,
+    // exactly like every real route, with no new Access surface) but BEFORE the
+    // schema guard and ApiContext, because it needs neither D1 nor the BOT_INSTANCE
+    // binding. This is the same placement the removed /api/debug/exchange-check used
+    // (decision-log 03). Read-only market data; no order path, no credentials.
+    if (request.method === "GET" && url.pathname === "/api/debug/ws-check") {
+      return await handleWsCheck(env);
+    }
+    // ─── END TEMPORARY DIAGNOSTIC ───────────────────────────────────────────────
 
     // 2. Route.
     const resolution = resolveRoute(ROUTES, request.method, url.pathname);
