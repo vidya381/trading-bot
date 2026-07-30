@@ -20,6 +20,7 @@ import { freshDatabase } from "../db/test-helpers";
 import { fromDecimalString as m } from "../shared/money";
 import type { Price } from "../shared/exchange-client";
 import type { FeedSocket, PriceFeed, SocketHandlers } from "./price-feed";
+import { httpUrlForWebSocket, openOutboundSocket } from "./price-feed";
 import { inFeed } from "./test-helpers";
 
 const NOW = 1_785_354_250_000; // receipt clock; Price.at is this, not the candle time
@@ -497,5 +498,81 @@ describe("subscriber registry and fan-out (C2)", () => {
     // restart batch would have "backfilled" 19:40..19:44 that nobody was listening for.
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.price).toBe(m("63718.00"));
+  });
+});
+
+/**
+ * The outbound-socket TRANSPORT (`openOutboundSocket`), which the stream-engine and
+ * lifecycle tests above all bypass with an injected `connect`. That injection is why
+ * a real bug survived here until the live Tier 0 run: `fetch` REJECTS a `ws(s)://`
+ * URL ("Fetch API cannot load"), so the handshake must use an `http(s)://` URL with
+ * an `Upgrade` header and read the socket off `response.webSocket`. These lock in the
+ * fix so the feed's own transport is proven, not just its engine.
+ */
+describe("openOutboundSocket transport (Cloudflare handshake)", () => {
+  it("translates ws(s):// to http(s):// for the fetch upgrade", () => {
+    expect(httpUrlForWebSocket("wss://api.sandbox.gemini.com/v2/marketdata")).toBe(
+      "https://api.sandbox.gemini.com/v2/marketdata",
+    );
+    expect(httpUrlForWebSocket("ws://localhost:8787/feed")).toBe("http://localhost:8787/feed");
+    // An already-http URL is left untouched.
+    expect(httpUrlForWebSocket("https://example.com/x")).toBe("https://example.com/x");
+  });
+
+  it("fetches the https URL with an Upgrade header, reads webSocket, and accepts it", async () => {
+    const listeners: Record<string, ((ev: unknown) => void)[]> = {};
+    const ws = {
+      accepted: false,
+      sent: [] as string[],
+      closed: false,
+      accept() {
+        this.accepted = true;
+      },
+      addEventListener(type: string, fn: (ev: unknown) => void) {
+        (listeners[type] ??= []).push(fn);
+      },
+      send(data: string) {
+        this.sent.push(data);
+      },
+      close() {
+        this.closed = true;
+      },
+    };
+    const calls: { url: string; init: RequestInit | undefined }[] = [];
+    const fakeFetch = (async (url: unknown, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return { status: 101, webSocket: ws } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const received: string[] = [];
+    const handlers: SocketHandlers = {
+      onMessage: (raw) => {
+        received.push(raw);
+      },
+      onClose: () => {},
+    };
+    const socket = await openOutboundSocket(
+      "wss://api.sandbox.gemini.com/v2/marketdata",
+      handlers,
+      fakeFetch,
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe("https://api.sandbox.gemini.com/v2/marketdata");
+    expect((calls[0]!.init!.headers as Record<string, string>).Upgrade).toBe("websocket");
+    expect(ws.accepted).toBe(true);
+
+    for (const fn of listeners.message ?? []) fn({ data: '{"type":"heartbeat"}' });
+    expect(received).toStrictEqual(['{"type":"heartbeat"}']);
+    socket.send("SUBSCRIBE");
+    expect(ws.sent).toStrictEqual(["SUBSCRIBE"]);
+  });
+
+  it("throws when the upgrade response has no webSocket", async () => {
+    const fakeFetch = (async () =>
+      ({ status: 200, webSocket: null }) as unknown as Response) as unknown as typeof fetch;
+    await expect(
+      openOutboundSocket("wss://x/y", { onMessage: () => {}, onClose: () => {} }, fakeFetch),
+    ).rejects.toThrow(/no WebSocket in the upgrade response/);
   });
 });

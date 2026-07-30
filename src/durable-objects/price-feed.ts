@@ -133,9 +133,35 @@ export interface PriceFeedDependencies {
   connect: (url: string, handlers: SocketHandlers) => Promise<FeedSocket>;
 }
 
-/** Production transport: an outbound WebSocket via the fetch-Upgrade handshake. */
-async function openOutboundSocket(url: string, handlers: SocketHandlers): Promise<FeedSocket> {
-  const response = await fetch(url, { headers: { Upgrade: "websocket" } });
+/**
+ * Translate a WebSocket URL to the http(s) scheme Cloudflare's outbound-WebSocket
+ * client requires. On Workers the client is `fetch()` with an `Upgrade: websocket`
+ * header, and `fetch` REJECTS a `ws://`/`wss://` URL ("Fetch API cannot load") — the
+ * scheme must be `http://`/`https://`, and the handshake response then carries the
+ * socket on its `webSocket` property. Gemini's marketdata URL is `wss://`, so this
+ * runs on every connect. Exported because passing the `wss://` URL straight to
+ * `fetch` was a real bug this transport shipped with — caught by the temporary Tier 0
+ * `/api/debug/ws-check` diagnostic (decision-log 14.6, since removed) before the feed
+ * ever ran live. The scheme translation and its handshake tests are the permanent
+ * residue of that catch; keep them.
+ */
+export function httpUrlForWebSocket(url: string): string {
+  if (url.startsWith("wss://")) return `https://${url.slice("wss://".length)}`;
+  if (url.startsWith("ws://")) return `http://${url.slice("ws://".length)}`;
+  return url;
+}
+
+/**
+ * Production transport: an outbound WebSocket via the fetch-Upgrade handshake.
+ * `fetchImpl` is injectable so the handshake shape (http(s) scheme, `Upgrade`
+ * header, reading `.webSocket`, `.accept()`) is testable without a live socket.
+ */
+export async function openOutboundSocket(
+  url: string,
+  handlers: SocketHandlers,
+  fetchImpl: typeof fetch = fetch,
+): Promise<FeedSocket> {
+  const response = await fetchImpl(httpUrlForWebSocket(url), { headers: { Upgrade: "websocket" } });
   const ws = response.webSocket;
   if (ws === null) {
     throw new Error(
