@@ -106,11 +106,17 @@ export interface SocketHandlers {
 export interface PriceFeedDependencies {
   now: () => Timestamp;
   /**
-   * The `#forward` seam. In C1 this is a no-op in production (nothing subscribes
-   * yet) and a collector in tests; C2 replaces it with fan-out to every
-   * subscribed bot's `onPriceUpdate`.
+   * The `#forward` seam: what happens to one closed candle. The production
+   * default (C2) is `#fanOut` — deliver it to every subscribed bot. Tests
+   * override this with a collector to assert the raw stream the engine produces.
    */
   forward: (price: Price) => Promise<void>;
+  /**
+   * Deliver one price to one subscriber. The production default is the cross-DO
+   * RPC `BOT_INSTANCE.get(idFromName(id)).onPriceUpdate(price)`; tests inject a
+   * spy so fan-out and failure isolation are testable without real BotInstances.
+   */
+  deliver: (botInstanceId: string, price: Price) => Promise<unknown>;
   codec: PriceFeedCodec;
   /** Open the outbound socket. Rejects/throws if the connection cannot be made. */
   connect: (url: string, handlers: SocketHandlers) => Promise<FeedSocket>;
@@ -150,7 +156,8 @@ export class PriceFeed extends DurableObject<Env> {
 
   #deps: PriceFeedDependencies = {
     now: () => Date.now(),
-    forward: async () => {},
+    forward: (price) => this.#fanOut(price),
+    deliver: (botInstanceId, price) => this.#deliverToBot(botInstanceId, price),
     codec: new GeminiPriceFeedCodec(),
     connect: openOutboundSocket,
   };
@@ -163,6 +170,11 @@ export class PriceFeed extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    // The durable subscriber registry: a real SQLite table, so it survives
+    // eviction and gives set semantics (and idempotency) for free.
+    ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS subscribers (bot_instance_id TEXT PRIMARY KEY)",
+    );
     // Nothing may forward against an unread watermark, so this blocks rather than
     // racing the first message.
     ctx.blockConcurrencyWhile(async () => {
@@ -171,11 +183,12 @@ export class PriceFeed extends DurableObject<Env> {
     });
   }
 
-  /** Override the clock, forward sink, codec, and transport. Tests only. */
+  /** Override the clock, forward sink, deliver, codec, and transport. Tests only. */
   attach(deps: Partial<PriceFeedDependencies>): void {
     this.#deps = {
       now: deps.now ?? this.#deps.now,
       forward: deps.forward ?? this.#deps.forward,
+      deliver: deps.deliver ?? this.#deps.deliver,
       codec: deps.codec ?? this.#deps.codec,
       connect: deps.connect ?? this.#deps.connect,
     };
@@ -207,15 +220,62 @@ export class PriceFeed extends DurableObject<Env> {
 
   /**
    * Take the feed down: close the socket and cancel the alarm. C2's `unsubscribe`
-   * calls this when the last subscriber leaves. The watermark is left intact, so a
-   * later restart does not re-forward what this run already delivered.
+   * calls this when the last subscriber leaves.
+   *
+   * The watermark is RESET, not preserved. This is the "going idle" teardown, not
+   * a transient reconnect: candles that close while no bot is subscribed are
+   * irrelevant, so a later restart must re-prime fresh rather than treat the stale
+   * watermark as a reconnect gap and backfill up to a day of candles that nobody
+   * was listening for. (A transient reconnect does NOT call `stopFeed`, so it keeps
+   * its watermark and backfills correctly — see `#onSocketClosed`.)
    */
   async stopFeed(): Promise<void> {
     this.#socket?.close();
     this.#socket = null;
     this.#current = null;
     this.#primed = false;
+    this.#state = { ...this.#state, watermark: null };
+    await this.#persist();
     await this.ctx.storage.deleteAlarm();
+  }
+
+  /**
+   * Subscribe a bot to this pair's feed (RPC). Carries the `{exchange, pair}`
+   * config because a Durable Object cannot read its own name, so the feed cannot
+   * derive its market from the `gemini:BTCUSD` key — the subscriber, which knows
+   * its own config, supplies it.
+   *
+   * Idempotent: `INSERT OR IGNORE`, so a redelivered status transition (section
+   * 5.1) cannot double-add. The FIRST subscriber (empty → non-empty) brings the
+   * feed up via C1's `startFeed`; later joins only ensure the config is recorded.
+   */
+  async subscribe(botInstanceId: string, config: PriceFeedConfig): Promise<void> {
+    const before = this.#subscriberCount();
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO subscribers (bot_instance_id) VALUES (?)",
+      botInstanceId,
+    );
+    if (before === 0 && this.#subscriberCount() > 0) {
+      await this.startFeed(config);
+    } else {
+      await this.configure(config);
+    }
+  }
+
+  /**
+   * Unsubscribe a bot (RPC). Idempotent: a `DELETE` of a non-member is a no-op, so
+   * a redelivered transition is safe. The LAST subscriber leaving (non-empty →
+   * empty) takes the feed down via C1's `stopFeed`.
+   */
+  async unsubscribe(botInstanceId: string): Promise<void> {
+    const before = this.#subscriberCount();
+    this.ctx.storage.sql.exec(
+      "DELETE FROM subscribers WHERE bot_instance_id = ?",
+      botInstanceId,
+    );
+    if (before > 0 && this.#subscriberCount() === 0) {
+      await this.stopFeed();
+    }
   }
 
   /**
@@ -447,6 +507,68 @@ export class PriceFeed extends DurableObject<Env> {
   }
 
   // -------------------------------------------------------------------------
+  // Fan-out (the #forward seam's production implementation)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Deliver one closed candle to every current subscriber, concurrently.
+   *
+   * `Promise.allSettled` isolates failures: one slow or throwing bot cannot stall
+   * or break delivery to the others. A non-running bot's `onPriceUpdate` returns
+   * `"ignored"` — a SUCCESSFUL RPC — so a stale subscriber needs no special-casing.
+   *
+   * A delivery that actually REJECTS is recorded as a `system` alert naming the
+   * bot (in the message — the `bot_instance_id` column is a foreign key that an
+   * orphaned bot would violate), and the subscriber is DELIBERATELY NOT pruned. A
+   * fan-out exception is not a reliable
+   * "permanently dead" signal — it is more often transient — and auto-pruning a live
+   * bot on a transient error would silently blind its stop-loss, with nothing to
+   * re-subscribe it until it halts and resumes. A genuinely orphaned subscriber is
+   * section 9 reconciliation's concern, not the per-candle hot path's. See
+   * decision-log 14.4.
+   */
+  async #fanOut(price: Price): Promise<void> {
+    const ids = this.#subscriberIds();
+    if (ids.length === 0) return;
+
+    const results = await Promise.allSettled(ids.map((id) => this.#deps.deliver(id, price)));
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i]!;
+      if (result.status === "rejected") {
+        const reason = result.reason as Error | undefined;
+        await this.#alert(
+          "warning",
+          "system",
+          "price_feed_fanout_failed",
+          `delivering a price to bot ${ids[i]} failed: ${reason?.message ?? String(result.reason)}`,
+        );
+      }
+    }
+  }
+
+  /** The production delivery: a cross-DO RPC to the bot's `onPriceUpdate`. */
+  async #deliverToBot(botInstanceId: string, price: Price): Promise<unknown> {
+    const namespace = this.env.BOT_INSTANCE;
+    if (namespace === undefined) {
+      throw new Error("no BOT_INSTANCE binding; cannot deliver a price to a subscriber");
+    }
+    return namespace.get(namespace.idFromName(botInstanceId)).onPriceUpdate(price);
+  }
+
+  #subscriberIds(): string[] {
+    return this.ctx.storage.sql
+      .exec<{ bot_instance_id: string }>("SELECT bot_instance_id FROM subscribers")
+      .toArray()
+      .map((row) => row.bot_instance_id);
+  }
+
+  #subscriberCount(): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscribers")
+      .one().n;
+  }
+
+  // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
 
@@ -464,9 +586,12 @@ export class PriceFeed extends DurableObject<Env> {
   }
 
   /**
-   * Record a feed-level alert in D1 (section 10). `bot_instance_id` is null — this
-   * is a feed concern, not one bot's — and the outbound notification is the
-   * dispatcher's separate job, exactly as `BotInstance.#alert` leaves it.
+   * Record a feed-level alert in D1 (section 10). `bot_instance_id` is always null:
+   * these are feed concerns, not one bot's, AND the column is a foreign key into
+   * `bot_instances`, so a fan-out failure attributed to an orphaned/deleted bot
+   * (which has no row — the very case worth alerting on) would violate it. The
+   * failing bot's id therefore travels in the MESSAGE. The outbound notification is
+   * the dispatcher's separate job, exactly as `BotInstance.#alert` leaves it.
    */
   async #alert(
     severity: AlertRow["severity"],

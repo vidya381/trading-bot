@@ -381,3 +381,121 @@ describe("socket lifecycle, alarm, and backoff", () => {
     });
   });
 });
+
+describe("subscriber registry and fan-out (C2)", () => {
+  it("fans a closed candle out to every subscriber", async () => {
+    const delivered: Array<{ id: string; price: Price }> = [];
+    const fake = fakeConnect();
+    await inFeed(freshKey(), async (feed) => {
+      feed.attach({
+        now: () => NOW,
+        connect: fake.connect,
+        deliver: async (id, price) => void delivered.push({ id, price }),
+      });
+      await feed.subscribe("bot-a", CONFIG); // first subscriber opens the feed
+      await feed.subscribe("bot-b", CONFIG);
+      await fake.sockets[0]!.deliver(BATCH); // primes to 19:39
+      await fake.sockets[0]!.deliver(ROLLOVER["1940"]); // finalises 19:39 -> fan-out
+    });
+    // One closed candle, delivered once to each bot.
+    expect(delivered).toHaveLength(2);
+    expect(delivered.map((d) => d.id).sort()).toEqual(["bot-a", "bot-b"]);
+    expect(delivered.every((d) => d.price.price === m("63718.00"))).toBe(true);
+  });
+
+  it("isolates a failing subscriber, alerts (attributed), and does NOT prune it", async () => {
+    const delivered: string[] = [];
+    const fake = fakeConnect();
+    await inFeed(freshKey(), async (feed) => {
+      feed.attach({
+        now: () => NOW,
+        connect: fake.connect,
+        deliver: async (id) => {
+          if (id === "bot-bad") throw new Error("bot gone");
+          delivered.push(id);
+        },
+      });
+      await feed.subscribe("bot-good", CONFIG);
+      await feed.subscribe("bot-bad", CONFIG);
+      await fake.sockets[0]!.deliver(BATCH);
+      await fake.sockets[0]!.deliver(ROLLOVER["1940"]); // candle 1
+      await fake.sockets[0]!.deliver(ROLLOVER["1941"]); // candle 2 — bot-bad still tried
+    });
+    // The good bot received both candles; the bad one never blocked it.
+    expect(delivered).toEqual(["bot-good", "bot-good"]);
+    // A fanout-failure alert per candle, naming the failing bot in the message
+    // (the bot_instance_id column is a FK, so it stays null) — and not pruned.
+    const alerts = await db.alerts.findMany({ where: { alert_type: "price_feed_fanout_failed" } });
+    expect(alerts).toHaveLength(2);
+    expect(alerts.every((a) => a.category === "system")).toBe(true);
+    expect(alerts.every((a) => a.bot_instance_id === null)).toBe(true);
+    expect(alerts.every((a) => a.message.includes("bot-bad"))).toBe(true);
+  });
+
+  it("opens the connection on the first subscribe and closes it on the last unsubscribe", async () => {
+    const fake = fakeConnect();
+    await inFeed(freshKey(), async (feed) => {
+      feed.attach({ now: () => NOW, connect: fake.connect, deliver: async () => {} });
+      expect(fake.sockets).toHaveLength(0);
+      await feed.subscribe("bot-a", CONFIG);
+      expect(fake.sockets).toHaveLength(1); // first subscribe connected
+      await feed.subscribe("bot-b", CONFIG);
+      expect(fake.sockets).toHaveLength(1); // second did not reconnect
+      await feed.unsubscribe("bot-a");
+      expect(fake.sockets[0]!.closed).toBe(false); // bot-b still subscribed
+      await feed.unsubscribe("bot-b");
+      expect(fake.sockets[0]!.closed).toBe(true); // last unsubscribe closed it
+    });
+  });
+
+  it("is idempotent: redelivered subscribe/unsubscribe do not double-open, double-close, or throw", async () => {
+    const fake = fakeConnect();
+    await inFeed(freshKey(), async (feed) => {
+      feed.attach({ now: () => NOW, connect: fake.connect, deliver: async () => {} });
+      await feed.subscribe("bot-a", CONFIG);
+      await feed.subscribe("bot-a", CONFIG); // redelivered first-subscribe
+      expect(fake.sockets).toHaveLength(1); // NOT a second connection
+      await feed.unsubscribe("bot-never"); // unsubscribe of a non-member
+      expect(fake.sockets[0]!.closed).toBe(false); // still has bot-a; no stop
+      await feed.unsubscribe("bot-a");
+      expect(fake.sockets[0]!.closed).toBe(true);
+      await feed.unsubscribe("bot-a"); // redelivered unsubscribe of the last member
+      expect(fake.sockets).toHaveLength(1); // no crash, no re-stop, no new socket
+    });
+  });
+
+  it("resets the watermark on stop so a restart re-primes fresh (no stale-history flood)", async () => {
+    const delivered: Price[] = [];
+    const restartBatch = JSON.stringify({
+      changes: [
+        [1785354000000, 63719.06, 63719.06, 63719.06, 63719.06, 0.1], // 19:40
+        [1785354060000, 63719.06, 63719.06, 63719.06, 63719.06, 0.2], // 19:41
+        [1785354120000, 63719.06, 63719.06, 63719.06, 63719.06, 0.3], // 19:42
+        [1785354180000, 63719.06, 63719.06, 63719.06, 63719.06, 0.4], // 19:43
+        [1785354240000, 63719.06, 63719.06, 63719.06, 63719.06, 0.5], // 19:44
+        [1785354300000, 63719.06, 63720.0, 63719.0, 63719.5, 0.6], // 19:45 (current)
+      ],
+      symbol: "BTCUSD",
+      type: "candles_1m_updates",
+    });
+    const fake = fakeConnect();
+    await inFeed(freshKey(), async (feed) => {
+      feed.attach({
+        now: () => NOW,
+        connect: fake.connect,
+        deliver: async (_id, price) => void delivered.push(price),
+      });
+      await feed.subscribe("bot-a", CONFIG);
+      await fake.sockets[0]!.deliver(BATCH);
+      await fake.sockets[0]!.deliver(ROLLOVER["1940"]); // forwards 19:39
+      await feed.unsubscribe("bot-a"); // stopFeed: watermark reset
+
+      await feed.subscribe("bot-a", CONFIG); // restart: new socket
+      await fake.sockets[1]!.deliver(restartBatch); // primes; must forward NO history
+    });
+    // Only the single pre-stop candle. Had the stale watermark survived, the
+    // restart batch would have "backfilled" 19:40..19:44 that nobody was listening for.
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.price).toBe(m("63718.00"));
+  });
+});
