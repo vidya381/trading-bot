@@ -8,6 +8,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import type { BotInstance } from "./bot-instance";
 import type { RateLimiter } from "./rate-limiter";
+import type { PriceFeed } from "./price-feed";
 
 /**
  * The `BOT_INSTANCE` namespace, narrowed.
@@ -99,5 +100,42 @@ export async function inLimiter<T>(
 ): Promise<T> {
   return await runInDurableObject(rateLimiterStub(accountLabel), async (instance, state) =>
     body(instance as unknown as RateLimiter, state),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The PriceFeed (section 4.6), step 14
+// ---------------------------------------------------------------------------
+
+/** The `PRICE_FEED` namespace, narrowed. See `botInstanceNamespace`. */
+export function priceFeedNamespace(): DurableObjectNamespace<PriceFeed> {
+  const binding = env.PRICE_FEED;
+  if (binding === undefined) {
+    throw new Error(
+      "no PRICE_FEED binding in the test environment. vitest.config.ts pins " +
+        "tests to the testnet environment, which declares one in wrangler.jsonc; " +
+        "check that pinning is still in place.",
+    );
+  }
+  return binding;
+}
+
+/**
+ * A stub for one (exchange, pair) feed. The name IS `"<exchange>:<pair>"`, which
+ * is the whole of "one shared feed per market": two bots on the same pair resolve
+ * to the same object and share its one socket.
+ */
+export function priceFeedStub(key: string): DurableObjectStub<PriceFeed> {
+  const namespace = priceFeedNamespace();
+  return namespace.get(namespace.idFromName(key));
+}
+
+/** Run `body` inside a `PriceFeed`. The cast is the same one `inBot` explains. */
+export async function inFeed<T>(
+  key: string,
+  body: (feed: PriceFeed, state: DurableObjectState) => Promise<T>,
+): Promise<T> {
+  return await runInDurableObject(priceFeedStub(key), async (instance, state) =>
+    body(instance as unknown as PriceFeed, state),
   );
 }

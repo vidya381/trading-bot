@@ -7,6 +7,7 @@ interface __BaseEnv_Env {
 	ENVIRONMENT: "testnet" | "production" | "unconfigured";
 	BOT_INSTANCE?: DurableObjectNamespace<import("./src/workers/api").BotInstance>;
 	RATE_LIMITER?: DurableObjectNamespace<import("./src/workers/api").RateLimiter>;
+	PRICE_FEED?: DurableObjectNamespace<import("./src/workers/api").PriceFeed>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
@@ -18,6 +19,7 @@ declare namespace Cloudflare {
 		ENVIRONMENT: "testnet";
 		BOT_INSTANCE: DurableObjectNamespace<import("./src/workers/api").BotInstance>;
 		RATE_LIMITER: DurableObjectNamespace<import("./src/workers/api").RateLimiter>;
+		PRICE_FEED: DurableObjectNamespace<import("./src/workers/api").PriceFeed>;
 	}
 	interface ProductionEnv {
 		ALERT_COOLDOWNS: KVNamespace;
@@ -25,6 +27,7 @@ declare namespace Cloudflare {
 		ENVIRONMENT: "production";
 		BOT_INSTANCE: DurableObjectNamespace<import("./src/workers/api").BotInstance>;
 		RATE_LIMITER: DurableObjectNamespace<import("./src/workers/api").RateLimiter>;
+		PRICE_FEED: DurableObjectNamespace<import("./src/workers/api").PriceFeed>;
 	}
 	interface Env extends __BaseEnv_Env {}
 }

@@ -115,6 +115,16 @@
 					{
 						"name": "RATE_LIMITER",
 						"class_name": "RateLimiter"
+					},
+					// Spec section 4.6 / decision-log step 14. One shared price-feed
+					// object per (exchange, pair), addressed by
+					// `idFromName("<exchange>:<pair>")`. It owns one outbound market-data
+					// WebSocket and fans closed candles to the bots subscribed to that
+					// pair. An outbound socket cannot hibernate, so this object stays in
+					// memory while connected and reconnects from an alarm after eviction.
+					{
+						"name": "PRICE_FEED",
+						"class_name": "PriceFeed"
 					}
 				]
 			},
@@ -134,6 +144,12 @@
 					"tag": "v2",
 					"new_sqlite_classes": [
 						"RateLimiter"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"PriceFeed"
 					]
 				}
 			],
@@ -222,6 +238,12 @@
 					{
 						"name": "RATE_LIMITER",
 						"class_name": "RateLimiter"
+					},
+					// Spec section 4.6 / decision-log step 14. See the testnet block
+					// above for what this shared price-feed object does.
+					{
+						"name": "PRICE_FEED",
+						"class_name": "PriceFeed"
 					}
 				]
 			},
@@ -236,6 +258,12 @@
 					"tag": "v2",
 					"new_sqlite_classes": [
 						"RateLimiter"
+					]
+				},
+				{
+					"tag": "v3",
+					"new_sqlite_classes": [
+						"PriceFeed"
 					]
 				}
 			],

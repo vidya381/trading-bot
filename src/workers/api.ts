@@ -5,6 +5,7 @@ import { version } from "../../package.json";
 // the class keeps its own module.
 export { BotInstance } from "../durable-objects/bot-instance";
 export { RateLimiter } from "../durable-objects/rate-limiter";
+export { PriceFeed } from "../durable-objects/price-feed";
 
 import { scheduled as reconciliationScheduled } from "./reconciliation";
 import { runNotificationDispatch } from "./notifications";
