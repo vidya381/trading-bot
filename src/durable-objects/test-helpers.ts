@@ -8,7 +8,36 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import type { BotInstance } from "./bot-instance";
 import type { RateLimiter } from "./rate-limiter";
-import type { PriceFeed } from "./price-feed";
+import type { PriceFeed, PriceFeedConfig, PriceFeedPort } from "./price-feed";
+
+/**
+ * A price-feed port that does nothing — for tests that drive a bot's lifecycle
+ * but not its feed wiring. It MUST be injected wherever a test reaches a status
+ * transition, because the real `PRICE_FEED` binding's `subscribe` opens a live
+ * socket, exactly as `FakeExchange` is injected in place of the real client.
+ */
+export const noopFeed: PriceFeedPort = {
+  subscribe: async () => {},
+  unsubscribe: async () => {},
+};
+
+/** A recording price-feed port, for the step 14 D wiring tests. */
+export function recordingFeed(): {
+  readonly port: PriceFeedPort;
+  readonly subscribes: Array<{ botInstanceId: string; config: PriceFeedConfig }>;
+  readonly unsubscribes: string[];
+} {
+  const subscribes: Array<{ botInstanceId: string; config: PriceFeedConfig }> = [];
+  const unsubscribes: string[] = [];
+  return {
+    subscribes,
+    unsubscribes,
+    port: {
+      subscribe: async (botInstanceId, config) => void subscribes.push({ botInstanceId, config }),
+      unsubscribe: async (botInstanceId) => void unsubscribes.push(botInstanceId),
+    },
+  };
+}
 
 /**
  * The `BOT_INSTANCE` namespace, narrowed.

@@ -25,7 +25,7 @@ import type { GridParams } from "../strategies/grid";
 import type { BotInstance, CreateDcaBotRequest, CreateGridBotRequest } from "./bot-instance";
 import { BotInstanceError } from "./bot-instance";
 import { FakeExchange, TEST_PAIR } from "./fake-exchange";
-import { inBot, rateLimiterStub } from "./test-helpers";
+import { inBot, noopFeed, rateLimiterStub } from "./test-helpers";
 
 const T0 = 1_760_000_000_000;
 const ACTOR = "owner@example.com";
@@ -106,6 +106,7 @@ async function run<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
       },
       limiterFor: () => rateLimiterStub(`limiter-${objectName}`),
       sleep: async () => undefined,
+      feedFor: () => noopFeed,
     });
     return await body(instance);
   });

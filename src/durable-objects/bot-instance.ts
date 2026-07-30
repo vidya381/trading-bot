@@ -90,6 +90,7 @@ import type {
 } from "../shared/exchange-client";
 import { isUsable } from "../shared/downtime";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
+import type { PriceFeedConfig, PriceFeedPort } from "./price-feed";
 import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
 import { assertAccountArmed } from "../reconciliation/circuit-breaker";
@@ -231,6 +232,15 @@ export interface BotInstanceDependencies {
   readonly limiterFor?: (accountLabel: string) => RateLimiterPort;
   /** How the rate-limit wait is performed. Injected so tests need no delay. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /**
+   * The `PriceFeed` Durable Object for a market (step 14 D).
+   *
+   * Defaults to the `PRICE_FEED` binding, keyed by `${exchange}:${pair}`.
+   * Overridable so a test can supply a double — and MUST be in every test that
+   * drives a status transition, since the real feed's `subscribe` opens a live
+   * socket, exactly as the exchange client is faked everywhere.
+   */
+  readonly feedFor?: (exchange: string, pair: string) => PriceFeedPort;
 }
 
 /**
@@ -412,6 +422,7 @@ export class BotInstance extends DurableObject<Env> {
       newId: dependencies.newId ?? (() => crypto.randomUUID()),
       limiterFor: dependencies.limiterFor ?? this.#dependencies?.limiterFor,
       sleep: dependencies.sleep ?? this.#dependencies?.sleep,
+      feedFor: dependencies.feedFor ?? this.#dependencies?.feedFor,
     };
     // The gated views wrap a specific client and a specific limiter. Attaching
     // new ones must not leave the object still calling through the old pair.
@@ -529,6 +540,75 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
     return namespace.get(namespace.idFromName(accountLabel));
+  }
+
+  // -------------------------------------------------------------------------
+  // Price feed (step 14 D): subscribe on entering `running`, unsubscribe on
+  // leaving it. The registry is idempotent (C2), so no extra guard is needed
+  // here against a redelivered transition.
+  // -------------------------------------------------------------------------
+
+  /** The `PriceFeed` port for a market, injected or from the binding. */
+  #feed(exchange: string, pair: string): PriceFeedPort {
+    if (this.#dependencies === undefined) this.attach({});
+    const deps = this.#dependencies!;
+    return (deps.feedFor ?? ((ex, pr) => this.#feedFromEnv(ex, pr)))(exchange, pair);
+  }
+
+  #feedFromEnv(exchange: string, pair: string): PriceFeedPort {
+    const namespace = this.env.PRICE_FEED;
+    if (namespace === undefined) {
+      throw new BotInstanceError(
+        "not_attached",
+        "no PRICE_FEED binding in this environment, so a bot cannot subscribe to " +
+          "its price feed. Only testnet and production declare one; a deploy with " +
+          "no --env has neither.",
+      );
+    }
+    return namespace.get(namespace.idFromName(`${exchange}:${pair}`));
+  }
+
+  /**
+   * Subscribe this bot to its market's feed. FAIL-CLOSED: a bot must not enter
+   * `running` without a confirmed subscription, so this is awaited BEFORE the
+   * status flip in `start`/`resume` and any failure propagates — the bot stays
+   * where it was and the operator retries. Safe, because a bot that does not
+   * start takes no action and holds no position.
+   */
+  async #subscribeToFeed(config: BotConfigBase): Promise<void> {
+    if (!isExchangeId(config.exchange)) {
+      // A corrupt exchange the account registry prevents in practice (step 11).
+      // Do NOT subscribe to a nonsense feed and do NOT block the transition here:
+      // the existing exchange-resolution guard (step 13) is the single place that
+      // halts such a bot, at its first trade. For every real bot the exchange is
+      // valid and this always subscribes.
+      return;
+    }
+    const feedConfig: PriceFeedConfig = { exchange: config.exchange, pair: config.pair };
+    await this.#feed(config.exchange, config.pair).subscribe(config.botInstanceId, feedConfig);
+  }
+
+  /**
+   * Unsubscribe this bot from its market's feed. BEST-EFFORT: leaving `running`
+   * is a safety action (halt/close) that must never be blocked by a feed-registry
+   * hiccup, and a stale subscriber is harmless — the feed's fan-out gets an
+   * `"ignored"` from a non-running bot, and section 9 reconciliation sees the
+   * drift. A failure is alerted, never thrown.
+   */
+  async #unsubscribeFromFeed(config: BotConfigBase): Promise<void> {
+    try {
+      await this.#feed(config.exchange, config.pair).unsubscribe(config.botInstanceId);
+    } catch (error) {
+      await this.#alert(config, {
+        severity: "warning",
+        category: "system",
+        alertType: "price_feed_unsubscribe_failed",
+        message:
+          `could not unsubscribe bot ${config.botInstanceId} from its price feed ` +
+          `(${config.exchange}:${config.pair}): ${(error as Error).message}. The bot ` +
+          `has still left running; the stale subscriber is harmless and reconciliation-visible.`,
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -785,6 +865,11 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
 
+    // Fail-closed: subscribe to the price feed BEFORE flipping to running. If the
+    // feed is unreachable the bot does not start (nothing has changed yet), rather
+    // than entering running with no price connection.
+    await this.#subscribeToFeed(config);
+
     const now = this.#now();
     await this.#putState({ ...state, status: "running" });
     await this.#mirrorStatus(config, "running", null, null, now);
@@ -929,6 +1014,11 @@ export class BotInstance extends DurableObject<Env> {
     // 7.2 step 5. Global first: it is the broader condition.
     await assertGlobalArmed(this.#db(), `resume bot ${config.botInstanceId}`);
     await assertAccountArmed(this.#db(), config.accountLabel, `resume bot ${config.botInstanceId}`);
+
+    // Fail-closed, as in `start`: re-subscribe to the feed before re-entering
+    // running. A resume is another entry into the trading state, so it needs a
+    // confirmed price connection just as much as a first start does.
+    await this.#subscribeToFeed(config);
 
     const now = this.#now();
     // `halt_reason` is deliberately NOT cleared: migration 0001's
@@ -1080,6 +1170,11 @@ export class BotInstance extends DurableObject<Env> {
     const latest = await this.#state();
     await this.#putState({ ...latest, status: "stopped", openOrderIds: [] });
     await this.#audit(config, "bot.closed", actor, { cycles_completed: latest.cycleCount }, now);
+
+    // Closing can go running -> stopped directly (bypassing #halt), so this is a
+    // genuine "leaving running" point. Best-effort, like the halt path; a bot
+    // closed from `created` (never subscribed) unsubscribes as a harmless no-op.
+    await this.#unsubscribeFromFeed(config);
 
     return { status: "stopped", action: "closed" };
   }
@@ -2152,6 +2247,11 @@ export class BotInstance extends DurableObject<Env> {
       message: recorded,
     });
     await this.#audit(config, "bot.halted", actor, { reason, detail }, now);
+
+    // The bot has left running: unsubscribe from the price feed (best-effort;
+    // never blocks the halt). A DCA take-profit that AUTO-RESTARTS never reaches
+    // here — it stays running — so it correctly stays subscribed.
+    await this.#unsubscribeFromFeed(config);
 
     // 5. Never auto-resume: there is no path from `halted` back to `running`
     //    except `resume()`, which takes an actor.

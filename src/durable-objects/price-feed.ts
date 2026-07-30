@@ -49,6 +49,17 @@ export interface PriceFeedConfig {
 }
 
 /**
+ * The subset of a `PriceFeed` a subscriber (a bot) calls. The real
+ * `DurableObjectStub<PriceFeed>` satisfies it structurally; a test injects a
+ * double. Declared here because it is the feed's public contract for callers, not
+ * a bot-internal type.
+ */
+export interface PriceFeedPort {
+  subscribe(botInstanceId: string, config: PriceFeedConfig): Promise<void>;
+  unsubscribe(botInstanceId: string): Promise<void>;
+}
+
+/**
  * The only state that must survive eviction. `#current`, the live socket, and
  * `#primed` are deliberately NOT here — they are rebuilt from the exchange's
  * replay batch on every (re)connect.

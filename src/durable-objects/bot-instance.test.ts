@@ -22,7 +22,8 @@ import type { DcaParams } from "../strategies/dca";
 import type { BotInstance, CreateDcaBotRequest, PipelineResult } from "./bot-instance";
 import { BotInstanceError } from "./bot-instance";
 import { FakeExchange, TEST_PAIR } from "./fake-exchange";
-import { inBot, inLimiter, rateLimiterStub } from "./test-helpers";
+import { inBot, inLimiter, noopFeed, rateLimiterStub, recordingFeed } from "./test-helpers";
+import type { PriceFeedPort } from "./price-feed";
 import type { AcquireRequest, AcquireResult } from "./rate-limiter";
 import { BINANCE_METHOD_WEIGHTS, type RateLimiterPort } from "../exchange/rate-limited";
 
@@ -83,7 +84,10 @@ function priceAt(value: string): Price {
  * The tests that care about the BINDING being wired, rather than about the
  * budget, attach no `limiterFor` at all. See "wired to the account's limiter".
  */
-async function run<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
+async function run<T>(
+  body: (bot: BotInstance) => Promise<T>,
+  feed: PriceFeedPort = noopFeed,
+): Promise<T> {
   return await inBot(objectName, async (instance) => {
     instance.attach({
       db,
@@ -95,6 +99,7 @@ async function run<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
       },
       limiterFor: () => rateLimiterStub(`limiter-${objectName}`),
       sleep: async () => undefined,
+      feedFor: () => feed,
     });
     return await body(instance);
   });
@@ -644,6 +649,7 @@ describe("halt (section 7.2)", () => {
           idCounter += 1;
           return `generated-${idCounter}`;
         },
+        feedFor: () => noopFeed,
       });
       await instance.resume(ACTOR);
       return await instance.onPriceUpdate(priceAt("102"));
@@ -876,6 +882,7 @@ async function runSpied<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
       },
       limiterFor: () => spy,
       sleep: async () => undefined,
+      feedFor: () => noopFeed,
     });
     return await body(instance);
   });
@@ -898,7 +905,7 @@ describe("wired to the account's limiter (section 5.4)", () => {
     );
 
     await inBot(objectName, async (instance) => {
-      instance.attach({ db, exchange, now: () => clock, newId: () => "generated-x" });
+      instance.attach({ db, exchange, now: () => clock, newId: () => "generated-x", feedFor: () => noopFeed });
       await instance.create(creation({ accountLabel: account }));
       await instance.start(ACTOR);
       await instance.onPriceUpdate(priceAt("100"));
@@ -1073,5 +1080,96 @@ describe("a refused budget (section 5.4) is not a halt", () => {
     const alerts = await db.alerts.findMany({ where: { alert_type: "cancel_failed" } });
     expect(alerts).toHaveLength(1);
     expect(alerts[0]!.message).toContain("rate_limited");
+  });
+});
+
+describe("price feed wiring (step 14 D)", () => {
+  it("subscribes on start, with the bot's id, exchange, and pair", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation()), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port);
+
+    expect(feed.subscribes).toEqual([
+      { botInstanceId: BOT_ID, config: { exchange: "binance", pair: TEST_PAIR } },
+    ]);
+    expect(feed.unsubscribes).toEqual([]);
+  });
+
+  it("unsubscribes on a manual halt", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation()), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port);
+    await run((bot) => bot.halt("manual", "operator review", ACTOR), feed.port);
+
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+  });
+
+  it("unsubscribes on a stop-loss halt driven by a price update", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation()), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port);
+    await run((bot) => bot.onPriceUpdate(priceAt("100")), feed.port); // base buy
+    const base = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(base, exchange.fillFor(base)), feed.port);
+    // A price far below the 20% stop-loss from entry halts the bot.
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("70")), feed.port);
+
+    expect(result.status).toBe("halted");
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+  });
+
+  it("re-subscribes on resume after a halt", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation()), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port);
+    await run((bot) => bot.halt("manual", "review", ACTOR), feed.port);
+    await run((bot) => bot.resume(ACTOR), feed.port);
+
+    // Two subscribes (start + resume), one unsubscribe (the halt in between).
+    expect(feed.subscribes.map((s) => s.botInstanceId)).toEqual([BOT_ID, BOT_ID]);
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+  });
+
+  it("unsubscribes on close (which can leave running directly)", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation()), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port);
+    await run((bot) => bot.close(ACTOR), feed.port);
+
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+  });
+
+  it("does NOT unsubscribe on a DCA take-profit that auto-restarts (it stays running)", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation({ params: { ...params, autoRestart: true } })), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port); // subscribe
+    await run((bot) => bot.onPriceUpdate(priceAt("100")), feed.port);
+    const base = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(base, exchange.fillFor(base)), feed.port);
+    await run((bot) => bot.onPriceUpdate(priceAt("102")), feed.port); // take-profit exit
+    const exit = exchange.placed[1]!.clientOrderId;
+    const result = await run((bot) => bot.onFill(exit, exchange.fillFor(exit)), feed.port);
+
+    // The cycle completed and the bot stayed running — so it must NOT have left
+    // the feed. Only the initial start subscribed; nothing unsubscribed.
+    expect(result.status).toBe("running");
+    expect(feed.subscribes).toHaveLength(1);
+    expect(feed.unsubscribes).toEqual([]);
+  });
+
+  it("DOES unsubscribe on a DCA take-profit that halts (autoRestart off)", async () => {
+    const feed = recordingFeed();
+    await run((bot) => bot.create(creation({ params: { ...params, autoRestart: false } })), feed.port);
+    await run((bot) => bot.start(ACTOR), feed.port);
+    await run((bot) => bot.onPriceUpdate(priceAt("100")), feed.port);
+    const base = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(base, exchange.fillFor(base)), feed.port);
+    await run((bot) => bot.onPriceUpdate(priceAt("102")), feed.port);
+    const exit = exchange.placed[1]!.clientOrderId;
+    const result = await run((bot) => bot.onFill(exit, exchange.fillFor(exit)), feed.port);
+
+    // take-profit-off halts via #halt, which is the unsubscribe funnel.
+    expect(result.status).toBe("halted");
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
   });
 });
