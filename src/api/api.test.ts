@@ -374,7 +374,8 @@ describe("bots", () => {
     expect(res.body.data.result).toMatchObject({ status: "running", action: "started" });
     // The refreshed bot in the response already shows the new status.
     expect(res.body.data.bot).toMatchObject({ id, status: "running" });
-    // start places NO order -- it only moves status; nothing hit the exchange.
+    // start places no order in this call -- it subscribes and moves status; the
+    // order comes on the next price update, so nothing hit the exchange here.
     expect(exchange.placed).toEqual([]);
     // The D1 row was mirrored and the start audited to the verified human actor.
     const row = await db.botInstances.findOne({ id });

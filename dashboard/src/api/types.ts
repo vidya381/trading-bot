@@ -376,12 +376,14 @@ export interface LiquidateResponse {
 // the bot object's own `PipelineResult` from `BotInstance.start` -- and the
 // crucial fact, confirmed from source (src/durable-objects/bot-instance.ts): a
 // successful start is ALWAYS `{ status: "running", action: "started" }`. It
-// places NO order and makes NO exchange call. The base order (DCA) / ladder
-// (grid) fires on the next `onPriceUpdate`, so start cannot return a price,
-// reachability, or order-filter outcome. Its ONE failure is a bot whose status
-// is not `created`, which arrives as a thrown `ApiError` with code
-// `invalid_status` (409) -- there is no success-with-a-different-action path to
-// branch on the way liquidate has, because start does not touch the exchange.
+// subscribes the bot to its live price feed (fail-closed) but places no order in
+// this call: the base order (DCA) / ladder (grid) fires on the next
+// `onPriceUpdate`, which since step 14 is a real closed candle roughly a minute
+// out. So start still cannot return a price, reachability, or order-filter
+// outcome, and has no success-with-a-different-action path to branch on the way
+// liquidate has. Its named failure is a bot whose status is not `created`,
+// arriving as a thrown `ApiError` with code `invalid_status` (409); a refused
+// feed subscribe can also throw, and lands in the generic error branch.
 // ---------------------------------------------------------------------------
 
 /** The `PipelineResult` a start returns -- always `action: "started"` on success. */

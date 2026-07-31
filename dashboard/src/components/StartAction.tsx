@@ -8,16 +8,19 @@
  *
  * WHAT STARTING ACTUALLY DOES (confirmed from source, not assumed)
  * ---------------------------------------------------------------
- * `BotInstance.start` moves the status `created -> running`, mirrors it to D1,
- * and audits `bot.started`. It places NO order and makes NO exchange call. The
- * base order (DCA) or the full ladder (grid) is designed to fire on the NEXT
+ * `BotInstance.start` subscribes the bot to the live `PriceFeed` for its
+ * (exchange, pair) -- fail-closed, BEFORE the flip, so an unreachable feed means
+ * the bot does not start -- then moves the status `created -> running`, mirrors
+ * it to D1, and audits `bot.started`. It places no order in this call itself:
+ * the base order (DCA) or the full ladder (grid) fires on the NEXT
  * `onPriceUpdate`, because placing needs a price and reading one is an exchange
- * call that can fail (§5.6). And right now nothing in this build drives that
- * update -- there is no wired price feed, and the bot object has no exchange
- * connection in any deployed environment yet. So the dialog copy is honest about
- * both halves: it names the real order the config WILL place once running, and
- * it says plainly that starting sets the status but will not place an order
- * until the execution path is wired. It does not pretend an order fires now.
+ * call that can fail (§5.6). That price now genuinely arrives -- the feed is
+ * wired (step 14.1-14.5) and verified live (14.6 Tier 0, 14.7 Tier 1), and the
+ * bot object resolves a real exchange client (step 13). So starting is a real,
+ * capital-committing action whose order lands on the next closed 1-minute
+ * candle, and the dialog says exactly that. It carried a "no order will be
+ * placed yet" caveat through step 12; that caveat was removed, not softened,
+ * once the price-feed arc landed, because it had become actively misleading.
  *
  * WHAT THIS RENDERS AND WHEN (brief items 2, 3)
  * ---------------------------------------------
@@ -30,11 +33,14 @@
  *
  * THE OUTCOMES (brief items 5, 6, 7)
  * ----------------------------------
- * `start`'s ONLY failure is a bot that is no longer `created` (`invalid_status`,
- * 409) -- it cannot return a price, reachability, or order-filter error, because
- * it never reaches the exchange. So there are no distinct branches here for
- * failures the endpoint cannot produce; the honest set is invalid_status, an
- * expired session, a network drop, and the generic fallback. On success the
+ * `start`'s named failure is a bot that is no longer `created` (`invalid_status`,
+ * 409); it still cannot return a price, reachability, or order-filter error,
+ * because it places no order itself. Since step 14 the fail-closed feed subscribe
+ * can also reject (e.g. `not_attached` where no PRICE_FEED binding exists), which
+ * the generic branch reports verbatim with "Nothing was started" -- accurate,
+ * because the subscribe runs before the status flip. So the honest set is
+ * invalid_status, an expired session, a network drop, and the generic fallback
+ * that now also covers a refused feed subscription. On success the
  * caller's `onStarted` refetches immediately so the new `running` status shows
  * without waiting for the poll. While a request is in flight both buttons are
  * disabled and the confirm button shows a loading state, so a double-click
@@ -196,10 +202,9 @@ function ConfirmDialog({
             this one bot.
           </p>
           <div className="rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[0.8125rem] text-amber-200/90">
-            Honest note: no live price feed is wired into this build yet, and the bot has no exchange
-            connection in this environment. So starting will set the status to{" "}
-            <span className="font-medium">running</span> but will not place any order yet — the order
-            above fires only once that execution path exists.
+            This commits real capital. Starting subscribes the bot to the live price feed, and the
+            next closed 1-minute candle — normally within a minute — drives a real order on the real
+            exchange. There is no dry run and no further prompt after this one.
           </div>
         </div>
 
@@ -270,9 +275,9 @@ export function StartAction({
         tone: "success",
         title: "Bot started — now running",
         text:
-          "The status moved to running. No order was placed yet (the price feed and exchange " +
-          "connection are not wired in this build); a started bot places its first order once that " +
-          "execution path exists.",
+          "The status moved to running and the bot is subscribed to the live price feed. Its first " +
+          "order goes to the exchange on the next closed 1-minute candle — watch the orders and " +
+          "alerts below.",
       });
       setDialogOpen(false);
       // A successful response is the one case we refresh immediately (item 7);

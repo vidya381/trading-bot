@@ -289,13 +289,18 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
  * envelope's code map, NOT flattened into a generic failure.
  *
  * WHAT `start` DOES AND DOES NOT DO (confirmed from source, not assumed):
- * `start` moves the status `created -> running`, mirrors it to D1, and audits
- * `bot.started`. It places NO order and makes NO exchange call -- the base order
- * (DCA) or the ladder (grid) fires on the next `onPriceUpdate`, because placing
- * needs a price and reading one is an exchange call that can fail (§5.6). So
- * this endpoint cannot return a price-unusable, unreachable-exchange, or
- * order-filter error: `start`'s only failure is `invalid_status`. Returns the
- * pipeline result and the refreshed bot so the new status shows immediately.
+ * `start` subscribes the bot to its `PriceFeed` fail-closed, then moves the
+ * status `created -> running`, mirrors it to D1, and audits `bot.started`. It
+ * places no order in this call -- the base order (DCA) or the ladder (grid)
+ * fires on the next `onPriceUpdate`, because placing needs a price and reading
+ * one is an exchange call that can fail (§5.6). Since step 14 that next price is
+ * real: the feed is wired and verified live, so this endpoint returning 200 means
+ * a real order attempt follows within about a minute. It still cannot return a
+ * price-unusable, unreachable-exchange, or order-filter error, but its failures
+ * are no longer only `invalid_status` -- a fail-closed feed subscribe can also
+ * reject (e.g. `not_attached` with no PRICE_FEED binding), leaving the bot
+ * untouched. Returns the pipeline result and the refreshed bot so the new status
+ * shows immediately.
  */
 export async function startBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
