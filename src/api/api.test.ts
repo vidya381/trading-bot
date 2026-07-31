@@ -396,6 +396,103 @@ describe("bots", () => {
     expect(res.body.error.code).toBe("invalid_status");
   });
 
+  it("resumes a halted bot, keeping its halt reason and auditing the human actor", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rs${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) =>
+      bot.halt("order_rejected", "exchange refused the order", HUMAN),
+    );
+
+    const res = await api("POST", `/api/bots/${id}/resume`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "running", action: "resumed" });
+    // The refreshed bot in the response already shows the new status, AND still
+    // carries WHY it halted -- `resume` deliberately does not clear the reason,
+    // so the detail view keeps the history after coming back.
+    expect(res.body.data.bot).toMatchObject({ id, status: "running" });
+    expect(res.body.data.bot.haltReason).toContain("order_rejected");
+    // Resume places no order in this call, exactly like start: it re-subscribes
+    // and moves the status; the order attempt comes on the next price update.
+    expect(exchange.placed.filter((o) => o.side === "sell")).toEqual([]);
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("running");
+    expect(row!.halt_reason).toContain("order_rejected");
+    const audit = await db.auditLog.findMany({ where: { action: "bot.resumed" } });
+    expect(audit[0]!.actor).toBe(HUMAN);
+  });
+
+  it("refuses to resume a bot that is not halted, surfacing invalid_status (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rr${suffix}`;
+    await createDcaBot(id, account); // still `created`, never halted
+
+    const res = await api("POST", `/api/bots/${id}/resume`);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+  });
+
+  /**
+   * Resume asserts BOTH risk latches and `start` asserts neither, so these two
+   * are the endpoint's genuinely distinct failures. Each also proves the refusal
+   * happens BEFORE the status flip: the bot must still be halted afterwards, or
+   * the latch would last exactly as long as it takes someone to click resume
+   * (sections 7.3 step 7, 7.4).
+   */
+  it("refuses to resume while this account's circuit breaker is tripped (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rcb${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.halt("manual", "operator review", HUMAN));
+    await tripAccountCircuitBreaker(db, {
+      accountLabel: account,
+      reason: "severe drift",
+      runId: null,
+      actor: "reconciliation",
+      now: T0,
+      haltBot: async () => undefined,
+      newId: () => `cb-${(idCounter += 1)}`,
+    });
+
+    const res = await api("POST", `/api/bots/${id}/resume`);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("account_tripped");
+    // Nothing changed: the bot is still halted.
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("halted");
+  });
+
+  it("refuses to resume while the global kill switch is pulled (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rks${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    // The pull halts the bot itself, which is the realistic path to this state.
+    const trip = await api("POST", "/api/kill-switch/trigger", {
+      body: { reason: "genuine emergency" },
+    });
+    expect(trip.body.data.result.haltedBotIds).toContain(id);
+
+    const res = await api("POST", `/api/bots/${id}/resume`);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("globally_tripped");
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("halted");
+
+    // And after a human re-arms the switch, the same request succeeds -- proof
+    // the refusal was the latch and not a permanent block on the bot.
+    await api("POST", "/api/kill-switch/reset", { body: { note: "resolved" } });
+    const after = await api("POST", `/api/bots/${id}/resume`);
+    expect(after.status).toBe(200);
+    expect(after.body.data.result).toMatchObject({ status: "running", action: "resumed" });
+  });
+
   it("refuses to liquidate a RUNNING bot, reusing the existing rejection (409)", async () => {
     const account = `acct-${suffix}`;
     await seedBalance(account);

@@ -25,6 +25,7 @@ import type {
   LiquidateResponse,
   ManualAdjustment,
   ManualAdjustmentRequest,
+  ResumeResponse,
   StartResponse,
   TriggerKillSwitchResponse,
 } from "./types";
@@ -181,6 +182,27 @@ export function liquidateBot(id: string, signal?: AbortSignal): Promise<Liquidat
  */
 export function startBot(id: string, signal?: AbortSignal): Promise<StartResponse> {
   return requestJson<StartResponse>(`/api/bots/${encodeURIComponent(id)}/start`, "POST", { signal });
+}
+
+/**
+ * Resume a halted bot (`POST /api/bots/:id/resume`). No request body -- the
+ * backend takes the actor from the verified Access identity. Section 7.2 step 5:
+ * the only path out of `halted`, and human-only by construction.
+ *
+ * Like start, there is no success-with-a-different-action to inspect: a success
+ * is always `result.action: "resumed"`. Its refusals, ALL raised before the
+ * status flip so a failure leaves the bot halted:
+ *   - `invalid_status`   (409) -- the bot is not halted anymore.
+ *   - `globally_tripped` (409) -- the global kill switch is pulled. Start cannot
+ *                                 produce this; resume asserts both latches.
+ *   - `account_tripped`  (409) -- this account's circuit breaker is tripped.
+ *                                 Likewise unique to resume.
+ *   - `not_attached`     (503) -- no PRICE_FEED binding in this environment.
+ * An unreachable feed/exchange is NOT among them: that path reconnects in the
+ * background and the resume still succeeds (see types.ts for why).
+ */
+export function resumeBot(id: string, signal?: AbortSignal): Promise<ResumeResponse> {
+  return requestJson<ResumeResponse>(`/api/bots/${encodeURIComponent(id)}/resume`, "POST", { signal });
 }
 
 /**

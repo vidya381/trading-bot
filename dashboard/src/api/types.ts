@@ -401,6 +401,48 @@ export interface StartResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Resume (`POST /api/bots/:id/resume`, `resumeBot` handler)
+//
+// Section 7.2 step 5's explicit human action, the only path out of `halted`.
+// Same `{ result, bot }` shape as start and liquidate, and like start there is
+// no success-with-a-different-action to branch on: `BotInstance.resume` returns
+// `{ status: "running", action: "resumed" }` or throws.
+//
+// ITS ERROR SURFACE IS WIDER THAN START'S, confirmed from
+// src/durable-objects/bot-instance.ts rather than assumed by analogy. Resume
+// asserts BOTH risk latches before it subscribes or flips (`assertGlobalArmed`,
+// `assertAccountArmed`) — `start` asserts neither — so on top of start's
+// `invalid_status` (409) and `not_attached` (503, no PRICE_FEED binding) it can
+// also throw `globally_tripped` (409) and `account_tripped` (409). Every one of
+// them is raised BEFORE the status flip, so a failed resume leaves the bot
+// halted exactly as it was.
+//
+// What it CANNOT throw: an unreachable price feed or exchange. The subscribe
+// bottoms out in `PriceFeed.#ensureConnected`, which catches a failed connect,
+// schedules a backoff reconnect and returns — so that case is a 200 with the bot
+// running blind, reported by the feed's own `price_feed_blind` alert, not by
+// this endpoint.
+//
+// `halt_reason` is NOT cleared on resume (migration 0001's CHECK is
+// one-directional precisely so it survives), so `bot.haltReason` still names why
+// it stopped after a successful resume.
+// ---------------------------------------------------------------------------
+
+/** The `PipelineResult` a resume returns -- always `action: "resumed"` on success. */
+export interface ResumeResult {
+  readonly status: BotStatus;
+  readonly action: string;
+  readonly detail?: string;
+}
+
+/** The body of a successful `POST /api/bots/:id/resume`. */
+export interface ResumeResponse {
+  readonly result: ResumeResult;
+  /** The refreshed summary (now `running`), or null if the row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
 // Global kill switch (spec section 7.4; `killSwitchView` in serialize.ts,
 // `GET /api/kill-switch`, `POST /api/kill-switch/{trigger,reset}`).
 //

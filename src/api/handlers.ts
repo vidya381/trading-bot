@@ -313,6 +313,49 @@ export async function startBot(ctx: ApiContext): Promise<Response> {
 }
 
 /**
+ * POST /api/bots/:id/resume -- section 7.2 step 5's explicit human action.
+ *
+ * Calls `BotInstance.resume(actor)`, designed for exactly this from the first
+ * Durable Object session and until now reachable only from a test. Thin, the
+ * same shape as `startBot` and `liquidateBot`: `resume` is the ONLY authority on
+ * whether the transition is allowed, and each of its typed refusals is surfaced
+ * with its own code rather than flattened.
+ *
+ * ITS FAILURE SURFACE IS WIDER THAN `start`'s (confirmed from source, not
+ * assumed by analogy). In order, all BEFORE the status flip, so every one of
+ * them leaves the bot halted and untouched:
+ *   - `not_created` (404)      -- the object holds no config.
+ *   - `invalid_status` (409)   -- the bot is not `halted`. `start`'s mirror.
+ *   - `globally_tripped` (409) -- section 7.4's kill switch is pulled. NOT a
+ *                                 failure `start` can produce: `resume` calls
+ *                                 `assertGlobalArmed`, `start` does not, because
+ *                                 resume is the other way a latched account's
+ *                                 bot could trade again.
+ *   - `account_tripped` (409)  -- section 7.3's breaker for this bot's account.
+ *                                 Also unique to resume, same reason.
+ *   - `not_attached` (503)     -- no PRICE_FEED binding in this environment.
+ *
+ * WHAT IT IS *NOT*: an unreachable feed or exchange is NOT a failure here. The
+ * fail-closed subscribe reaches `PriceFeed.subscribe`, whose `#ensureConnected`
+ * CATCHES a failed connect, schedules a backoff reconnect and returns normally.
+ * So a resume with Gemini unreachable returns 200 and the bot enters `running`
+ * blind, with the feed's own `price_feed_blind` alert as the signal. No error
+ * branch is written for a failure that cannot arrive.
+ *
+ * `halt_reason` is deliberately NOT cleared by `resume`, so the refreshed bot in
+ * the response still carries why it stopped.
+ */
+export async function resumeBot(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const result = await botStub(ctx, id).resume(ctx.actor);
+  const [row, snapshot] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+}
+
+/**
  * POST /api/bots/:id/liquidate -- the unified human close-out (endpoint 4).
  *
  * Calls `liquidatePosition(actor)` from step 10.3 verbatim. It is valid only on

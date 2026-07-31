@@ -27,6 +27,7 @@ import { usePolling } from "../api/usePolling";
 import type { BotDetail as BotDetailData } from "../api/types";
 import { BotSummary } from "../components/BotSummary";
 import { StartAction } from "../components/StartAction";
+import { ResumeAction } from "../components/ResumeAction";
 import { LiquidateAction } from "../components/LiquidateAction";
 import { StrategyState } from "../components/StrategyState";
 import { OrderHistory } from "../components/OrderHistory";
@@ -140,6 +141,14 @@ function BotDetailView({ id }: { id: string }) {
            * successful start refetches immediately (item 7) via `poll.refetch`.
            */}
           {bot.status === "created" && <StartAction bot={bot} onStarted={poll.refetch} />}
+          {/*
+           * The resume control renders only for a halted bot, and never for any
+           * other status. It sits ABOVE liquidate deliberately: both apply to a
+           * halted bot, and the recoverable action should be read before the
+           * irreversible one. Its dialog shows the real halt reason so resuming
+           * is an informed decision. A successful resume refetches immediately.
+           */}
+          {bot.status === "halted" && <ResumeAction bot={bot} onResumed={poll.refetch} />}
           {/*
            * The liquidate control renders only for a halted bot (brief item 1);
            * the component itself further hides the button when the position is
