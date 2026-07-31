@@ -528,6 +528,50 @@ export function parseBalances(body: unknown): Balance[] {
 }
 
 // ---------------------------------------------------------------------------
+// Master-group accounts
+// ---------------------------------------------------------------------------
+
+/** One account in a master group, as `/v1/account/list` reports it. */
+export interface GeminiGroupAccount {
+  /** The display name given at creation, e.g. `"Primary"`. Not the API value. */
+  readonly name: string;
+  /** The API nickname the `account` payload field wants, e.g. `"primary"`. */
+  readonly account: string;
+  /** `"exchange"` or `"custody"`. Only exchange accounts can place orders. */
+  readonly type: string;
+  /** `"open"` or `"closed"`. */
+  readonly status: string;
+}
+
+/**
+ * Parse `/v1/account/list`.
+ *
+ * The two name fields are kept DISTINCT and both surfaced, because conflating
+ * them is the mistake this endpoint exists here to prevent: `name` is what an
+ * operator sees in Gemini's UI ("Primary"), `account` is what the API accepts
+ * ("primary"), and sending the former earns `InvalidAccountName`.
+ *
+ * `type` and `status` are carried through unvalidated -- an unknown value is
+ * Gemini's to define, and this is a diagnostic read, not a trading path.
+ */
+export function parseGroupAccounts(body: unknown): GeminiGroupAccount[] {
+  if (!Array.isArray(body)) {
+    throw new ParseError("/v1/account/list: expected an array of accounts");
+  }
+
+  return body.map((entry, index) => {
+    const context = `account ${index}`;
+    const record = asRecord(entry, context);
+    return {
+      name: requireString(record, "name", context),
+      account: requireString(record, "account", context),
+      type: requireString(record, "type", context),
+      status: requireString(record, "status", context),
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Candles
 // ---------------------------------------------------------------------------
 

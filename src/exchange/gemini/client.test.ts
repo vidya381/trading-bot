@@ -84,6 +84,48 @@ function clientWith(handler: Handler): { client: GeminiClient; requests: Recorde
   return { client, requests };
 }
 
+/**
+ * The same harness, but with a MASTER key and a configured account nickname --
+ * the configuration a Gemini sub-account group needs.
+ */
+function masterKeyClientWith(
+  handler: Handler,
+  // `null` means "no account name configured at all" -- distinct from omitting
+  // the argument, which a JS default parameter cannot tell apart from `undefined`.
+  accountName: string | null = "primary",
+): { client: GeminiClient; requests: Recorded[] } {
+  const requests: Recorded[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = new URL(input);
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const bodyText = typeof init?.body === "string" ? init.body : "";
+    let payload: Record<string, unknown> | undefined;
+    const rawPayload = headers["X-GEMINI-PAYLOAD"];
+    if (rawPayload !== undefined) {
+      payload = JSON.parse(atob(rawPayload)) as Record<string, unknown>;
+    }
+    const recorded: Recorded = { url, method: init?.method ?? "GET", headers, payload, bodyText };
+    requests.push(recorded);
+    return handler(url, recorded);
+  };
+  const client = new GeminiClient({
+    baseUrl: BASE,
+    credentials: fakeCredentialProvider({ apiKey: "master-abc123" }),
+    accountName: accountName ?? undefined,
+    fetch: fetchLike,
+    now: () => AT,
+    filterCache: new SymbolFilterCache(),
+  });
+  return { client, requests };
+}
+
+/** A recorded payload with its nonce removed, for exact-shape comparison. */
+function payloadWithoutNonce(recorded: Recorded): Record<string, unknown> {
+  const { nonce, ...rest } = recorded.payload!;
+  expect(typeof nonce).toBe("number");
+  return rest;
+}
+
 const ORDER: OrderRequest = {
   pair: "BTCUSD",
   clientOrderId: "gemini-dca-btc-7",
@@ -285,6 +327,226 @@ describe("getAccountBalances", () => {
     expect(isUsable(outcome)).toBe(true);
     if (isUsable(outcome)) expect(outcome.value[0]).toEqual({ asset: "USD", free: m("600"), locked: m("400") });
     expect(requests[0]!.method).toBe("POST");
+  });
+});
+
+/**
+ * The master-key `account` field (Gemini's sub-account rule).
+ *
+ * These assert the WHOLE payload with `toEqual`, not a subset with
+ * `toMatchObject`: the bug being fixed was a MISSING key, which a subset match
+ * cannot see. The expected objects are written from Gemini's own request-body
+ * tables -- a top-level `account` string, and no other field gained or lost -- so
+ * a payload that spelled it `accounts`, nested it, or sent it on only some
+ * endpoints fails here.
+ */
+describe("the account field on signed requests", () => {
+  it("places an order with a top-level account and nothing else changed", async () => {
+    const { client, requests } = masterKeyClientWith((url) => {
+      if (url.pathname === "/v1/symbols/details/btcusd") return json(SYMBOL_DETAILS);
+      return json(RESTING_ORDER);
+    });
+
+    const outcome = await client.placeOrder(ORDER);
+    expect(isUsable(outcome)).toBe(true);
+
+    const orderReq = requests.find((r) => r.url.pathname === "/v1/order/new")!;
+    expect(payloadWithoutNonce(orderReq)).toEqual({
+      request: "/v1/order/new",
+      account: "primary",
+      symbol: "btcusd",
+      amount: "0.001",
+      price: "43210.56",
+      side: "buy",
+      type: "exchange limit",
+      client_order_id: "gemini-dca-btc-7",
+    });
+    // The field is a plain top-level string, not an array and not `accounts`.
+    expect(typeof orderReq.payload!["account"]).toBe("string");
+    expect(orderReq.payload).not.toHaveProperty("accounts");
+    // And the signature covers the payload that CARRIES it: the header the
+    // exchange verifies is the base64 of exactly these bytes.
+    expect(JSON.parse(atob(orderReq.headers["X-GEMINI-PAYLOAD"]!))).toEqual(orderReq.payload);
+  });
+
+  it("sends the account on balances, the endpoint that marks it required", async () => {
+    const { client, requests } = masterKeyClientWith(() =>
+      json([{ type: "exchange", currency: "USD", amount: "1000", available: "600" }]),
+    );
+    await client.getAccountBalances();
+    expect(payloadWithoutNonce(requests[0]!)).toEqual({
+      request: "/v1/balances",
+      account: "primary",
+    });
+  });
+
+  it("sends the account on the open-orders read", async () => {
+    const { client, requests } = masterKeyClientWith(() => json([]));
+    await client.getOpenOrders("BTCUSD");
+    expect(payloadWithoutNonce(requests[0]!)).toEqual({
+      request: "/v1/orders",
+      account: "primary",
+    });
+  });
+
+  it("sends the account on the order-status read", async () => {
+    const { client, requests } = masterKeyClientWith(() => json(RESTING_ORDER));
+    await client.getOrderStatus("BTCUSD", "gemini-dca-btc-7");
+    expect(payloadWithoutNonce(requests[0]!)).toEqual({
+      request: "/v1/order/status",
+      account: "primary",
+      client_order_id: "gemini-dca-btc-7",
+      include_trades: true,
+    });
+  });
+
+  it("sends the account on BOTH halves of a cancel, the lookup and the cancel", async () => {
+    const { client, requests } = masterKeyClientWith((url) => {
+      if (url.pathname === "/v1/order/status") return json(RESTING_ORDER);
+      return json({ ...RESTING_ORDER, is_live: false, is_cancelled: true });
+    });
+    await client.cancelOrder("BTCUSD", "gemini-dca-btc-7");
+
+    const lookup = requests.find((r) => r.url.pathname === "/v1/order/status")!;
+    expect(payloadWithoutNonce(lookup)).toEqual({
+      request: "/v1/order/status",
+      account: "primary",
+      client_order_id: "gemini-dca-btc-7",
+    });
+    const cancel = requests.find((r) => r.url.pathname === "/v1/order/cancel")!;
+    expect(payloadWithoutNonce(cancel)).toEqual({
+      request: "/v1/order/cancel",
+      account: "primary",
+      order_id: "555",
+    });
+  });
+
+  it("adds nothing to an unsigned public request", async () => {
+    const { client, requests } = masterKeyClientWith(() =>
+      json({ bid: "1", ask: "2", last: "1.5" }),
+    );
+    await client.getCurrentPrice("BTCUSD");
+    expect(requests[0]!.method).toBe("GET");
+    expect(requests[0]!.payload).toBeUndefined();
+    expect(requests[0]!.url.search).toBe("");
+  });
+
+  it("omits the field entirely when no account name is configured", async () => {
+    // The single-account case: an `account` key here would be rejected by Gemini
+    // with AccountsOnGroupOnlyApi, so it must be absent, not empty.
+    const { client, requests } = clientWith((url) => {
+      if (url.pathname === "/v1/symbols/details/btcusd") return json(SYMBOL_DETAILS);
+      return json(RESTING_ORDER);
+    });
+    await client.placeOrder(ORDER);
+    const orderReq = requests.find((r) => r.url.pathname === "/v1/order/new")!;
+    expect(orderReq.payload).not.toHaveProperty("account");
+    expect(Object.keys(orderReq.payload!)).toEqual([
+      "request",
+      "nonce",
+      "symbol",
+      "amount",
+      "price",
+      "side",
+      "type",
+      "client_order_id",
+    ]);
+  });
+
+  it("refuses to send at all when a master key has no account name", async () => {
+    const { client, requests } = masterKeyClientWith((url) => {
+      if (url.pathname === "/v1/symbols/details/btcusd") return json(SYMBOL_DETAILS);
+      return json(RESTING_ORDER);
+    }, null);
+
+    const outcome = await client.placeOrder(ORDER);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      // Not a transport unknown: nothing was sent, and re-sending is pointless.
+      expect(outcome.kind).toBe("exchange_error");
+      expect(outcome.retryable).toBe(false);
+      expect(outcome.message).toContain("MissingAccounts");
+    }
+    // The order never left, so its fate is not in doubt.
+    expect(requests.some((r) => r.url.pathname === "/v1/order/new")).toBe(false);
+  });
+
+  it("sends NO account field on the group-level /v1/account/list", async () => {
+    // A group-level API acts on the master group, not on one account, and Gemini
+    // documents no `account` field for it. Sending one anyway would be inventing
+    // a parameter — the exact failure mode this whole area has already produced
+    // once, in the other direction.
+    const { client, requests } = masterKeyClientWith(() => json([]));
+    await client.listMasterGroupAccounts();
+    expect(payloadWithoutNonce(requests[0]!)).toEqual({ request: "/v1/account/list" });
+    expect(requests[0]!.payload).not.toHaveProperty("account");
+  });
+
+  it("pairs each display name with the nickname the API actually wants", async () => {
+    // Gemini's own published example response, verbatim.
+    const { client } = masterKeyClientWith(() =>
+      json([
+        {
+          name: "Primary",
+          account: "primary",
+          type: "exchange",
+          counterparty_id: "EMONNYXH",
+          created: 1495127793000,
+          status: "open",
+        },
+        {
+          name: "My Custody Account",
+          account: "my-custody-account",
+          type: "custody",
+          counterparty_id: null,
+          created: 1565970772000,
+          status: "open",
+        },
+      ]),
+    );
+    const outcome = await client.listMasterGroupAccounts();
+    expect(isUsable(outcome)).toBe(true);
+    if (isUsable(outcome)) {
+      expect(outcome.value).toEqual([
+        { name: "Primary", account: "primary", type: "exchange", status: "open" },
+        {
+          name: "My Custody Account",
+          account: "my-custody-account",
+          type: "custody",
+          status: "open",
+        },
+      ]);
+      // The two names are NOT the same value, and the second is the one to send.
+      expect(outcome.value[0]!.name).not.toBe(outcome.value[0]!.account);
+    }
+  });
+
+  it("refuses an account-level key that was given an account name", async () => {
+    const requests: Recorded[] = [];
+    const client = new GeminiClient({
+      baseUrl: BASE,
+      credentials: fakeCredentialProvider({ apiKey: "account-abc123" }),
+      accountName: "primary",
+      fetch: async (input) => {
+        requests.push({
+          url: new URL(input),
+          method: "POST",
+          headers: {},
+          payload: undefined,
+          bodyText: "",
+        });
+        return json([]);
+      },
+      now: () => AT,
+    });
+
+    const outcome = await client.getAccountBalances();
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.retryable).toBe(false);
+      expect(outcome.message).toContain("AccountsOnGroupOnlyApi");
+    }
+    expect(requests).toHaveLength(0);
   });
 });
 

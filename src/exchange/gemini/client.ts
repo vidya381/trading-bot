@@ -20,6 +20,12 @@
  *  - EVERY private call is a POST with an EMPTY body; the signed base64 payload
  *    and the signature ride in headers (`gemini/signing.ts`). There is no signed
  *    query string.
+ *  - A MASTER key must name the account it acts on, in a top-level `account`
+ *    field on every signed payload. That is a property of the KEY, not of the
+ *    endpoint, so it is applied once in `#request` (`#accountParams`) and covers
+ *    orders, cancels, status, open orders and balances alike. See
+ *    `resolveAccountField` for the rule and for the two Gemini error codes that
+ *    police it in both directions.
  *  - There is NO clock sync. Gemini authenticates with a monotonic nonce, so the
  *    `ClockOffset`/`getServerTime` machinery Binance needed does not exist here.
  *    `getServerTime` is implemented honestly (it reports that Gemini exposes no
@@ -64,6 +70,8 @@ import {
 import {
   classifyFailure,
   parseBalances,
+  parseGroupAccounts,
+  type GeminiGroupAccount,
   parseCancelledOrder,
   parseCandles,
   parseOrderResult,
@@ -76,6 +84,7 @@ import {
 import {
   GeminiSigner,
   NonceGenerator,
+  resolveAccountField,
   type PayloadValue,
 } from "./signing";
 
@@ -125,6 +134,15 @@ export interface GeminiClientOptions {
   /** One of `GEMINI_BASE_URLS`, or any override for testing. */
   baseUrl: string;
   credentials: CredentialProvider;
+  /**
+   * The account nickname to act on, sent as the top-level `account` field of
+   * every signed payload (see `resolveAccountField` in `signing.ts`).
+   *
+   * REQUIRED when the API key is a master key (`master-...`), and must be absent
+   * for an account-level key (`account-...`). Left undefined for the ordinary
+   * single-account case.
+   */
+  accountName?: string;
   /** Defaults to the runtime's global `fetch`. */
   fetch?: FetchLike;
   /** Injected so tests control the nonce and timing exactly. Defaults to `Date.now`. */
@@ -138,6 +156,13 @@ interface RequestSpec<T> {
   /** The Gemini endpoint path, e.g. `/v1/order/new`. Also the payload `request`. */
   path: string;
   signed: boolean;
+  /**
+   * A GROUP-level API: one that acts on the master group itself rather than on a
+   * single account, so it takes NO `account` field and must not be given one.
+   * `/v1/account/list` is the only such endpoint here; every other signed call is
+   * per-account and gets the field (see `#accountParams`).
+   */
+  groupLevel?: boolean;
   /** Extra payload params for a signed request, beyond `request` and `nonce`. */
   params?: readonly (readonly [string, PayloadValue])[];
   parse: (body: unknown, at: Timestamp) => T;
@@ -153,6 +178,7 @@ export class GeminiClient implements RestExchangeClient {
   readonly #fetch: FetchLike;
   readonly #now: () => Timestamp;
   readonly #signer: GeminiSigner;
+  readonly #accountName: string | undefined;
   readonly #nonce = new NonceGenerator();
   readonly #filters: SymbolFilterCache;
   readonly #timeoutMs: number;
@@ -162,6 +188,7 @@ export class GeminiClient implements RestExchangeClient {
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#now = options.now ?? (() => Date.now());
     this.#signer = new GeminiSigner(options.credentials);
+    this.#accountName = options.accountName;
     this.#filters = options.filterCache ?? new SymbolFilterCache();
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
@@ -380,6 +407,27 @@ export class GeminiClient implements RestExchangeClient {
     );
   }
 
+  /**
+   * The accounts in this master key's group, from `/v1/account/list`.
+   *
+   * NOT part of `RestExchangeClient` and not used in trading -- it exists so the
+   * `account` nickname a master key must send can be LOOKED UP instead of
+   * guessed. That mattered: a wrong nickname is refused with `InvalidAccountName`,
+   * whose message ("Expected a JSON array with valid accounts, instead got: X")
+   * invites exactly the wrong fix. Each entry pairs the display `name` an
+   * operator recognises with the `account` nickname the API actually wants.
+   *
+   * Group-level, so it sends no `account` field of its own. Read-only.
+   */
+  async listMasterGroupAccounts(): Promise<ExchangeOutcome<GeminiGroupAccount[]>> {
+    return this.#request<GeminiGroupAccount[]>({
+      path: "/v1/account/list",
+      signed: true,
+      groupLevel: true,
+      parse: (body) => parseGroupAccounts(body),
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
@@ -409,7 +457,52 @@ export class GeminiClient implements RestExchangeClient {
     } satisfies Extract<ExchangeOutcome<T>, { ok: false }>;
   }
 
+  /**
+   * The `account` field this key must send, or a refusal to send anything.
+   *
+   * Applied to EVERY signed request, in one place, rather than at the five call
+   * sites -- the field is a property of the key, not of the endpoint, and Gemini
+   * documents it on all of `/v1/order/new`, `/v1/order/status`,
+   * `/v1/order/cancel`, `/v1/orders` and `/v1/balances` (marked required on
+   * `/v1/balances`). Adding it per call site would leave the next signed endpoint
+   * to remember it; adding it here means it cannot be forgotten.
+   *
+   * A misconfiguration is a NON-RETRYABLE `exchange_error` returned before the
+   * request leaves: the same request would be refused identically, and routing it
+   * through the thrown-error path would classify it as a retryable transport
+   * fault, which it is not. Nothing is sent, so no order state is in doubt.
+   */
+  #accountParams<T>():
+    | { readonly ok: true; readonly params: readonly (readonly [string, PayloadValue])[] }
+    | { readonly ok: false; readonly outcome: ExchangeOutcome<T> } {
+    const resolved = resolveAccountField(this.#signer.apiKey, this.#accountName);
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        outcome: {
+          ok: false,
+          kind: "exchange_error",
+          message: `Gemini account field misconfigured: ${resolved.reason}`,
+          retryable: false,
+          at: this.#now(),
+        },
+      };
+    }
+    // Written FIRST, so it lands immediately after `request` and `nonce` -- the
+    // position in Gemini's own documented example bodies.
+    return {
+      ok: true,
+      params: resolved.account === undefined ? [] : [["account", resolved.account]],
+    };
+  }
+
   async #request<T>(spec: RequestSpec<T>): Promise<ExchangeOutcome<T>> {
+    if (spec.signed && spec.groupLevel !== true) {
+      const account = this.#accountParams<T>();
+      if (!account.ok) return account.outcome;
+      spec = { ...spec, params: [...account.params, ...(spec.params ?? [])] };
+    }
+
     const transport = await this.#transport(spec);
 
     if (!transport.reached) {

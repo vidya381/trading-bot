@@ -40,6 +40,16 @@ published reference:
 - **Cancel is by numeric `order_id` only**, so `cancelOrder` resolves the
   `client_order_id` to an `order_id` first, then cancels — the cancel response
   still carries the final filled quantity.
+- **A master key must name its account.** Gemini groups accounts under a master
+  group; a `master-…` key is not bound to one account, so *every* signed payload
+  needs a top-level `account` string holding the account's nickname. It is a
+  property of the **key**, not of the endpoint, so `GeminiClient` adds it once in
+  `#request` and it reaches `/v1/order/new`, `/v1/order/status`,
+  `/v1/order/cancel`, `/v1/orders` and `/v1/balances` alike. Both directions are
+  errors — a master key without it is `MissingAccounts`, an `account-…` key with
+  it is `AccountsOnGroupOnlyApi` — so it is derived from the key's documented
+  prefix (`resolveAccountField`, `gemini/signing.ts`) and fails closed rather than
+  being sent unconditionally. Set `GEMINI_ACCOUNT_NAME` for a master key only.
 
 `validateOrder` and `SymbolFilterCache` are exchange-agnostic and have one
 implementation, physically under `binance/filters.ts` (a step-3 accident, when
@@ -47,11 +57,10 @@ there was one exchange); `gemini/filters.ts` re-exports them so the Gemini clien
 never reaches across into `binance/`. Hoisting them to a neutral module is a
 deferred refactor.
 
-The Gemini implementation is built and tested but **not yet dispatched to**:
-nothing chooses Gemini over Binance for a bot yet, exactly as production Binance
-was left unwired at step 3.2. `src/workers/exchange-gemini.ts` holds the ready
-`ENVIRONMENT`-derived base URL and fail-closed `GEMINI_API_KEY`/`GEMINI_API_SECRET`
-resolver for when that dispatch step arrives.
+`src/workers/exchange-gemini.ts` holds the `ENVIRONMENT`-derived base URL and the
+fail-closed `GEMINI_API_KEY` / `GEMINI_API_SECRET` / `GEMINI_ACCOUNT_NAME`
+resolver; step 11 wired the Binance-vs-Gemini dispatch to it through
+`resolveExchangeForAccount`.
 
 ## The gate (`rate-limited.ts`, step 8)
 

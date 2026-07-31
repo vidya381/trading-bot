@@ -6,7 +6,9 @@
  * (developer.gemini.com) rather than assumed from Binance's shape:
  *
  *   1. The request parameters are collected into a JSON object that also carries
- *      the endpoint path under `request` and a `nonce`.
+ *      the endpoint path under `request` and a `nonce` -- plus, for a MASTER key,
+ *      a top-level `account` naming which account in the group to act on
+ *      (`resolveAccountField` below).
  *   2. That JSON is UTF-8 encoded and base64-encoded -- this base64 string is the
  *      "payload".
  *   3. The signature is `hex(HMAC-SHA384(payload, apiSecret))` -- SHA-384, not
@@ -44,6 +46,197 @@ export class SigningError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SigningError";
+  }
+}
+
+/**
+ * Which kind of key a Gemini API key is, read off its documented prefix.
+ *
+ * Gemini's API-key reference states it plainly: "Master API keys are formatted
+ * with a prepending `master-`, while account level API keys are formatted with a
+ * prepending `account-`." That prefix is the ONLY local signal for whether the
+ * `account` payload field (below) is required, forbidden, or unknowable, so it is
+ * read here rather than inferred from a rejection.
+ *
+ * `"unknown"` is a real answer, not a failure: a key that carries neither prefix
+ * cannot be classified locally, and this returns that rather than guessing.
+ */
+export type GeminiKeyScope = "master" | "account" | "unknown";
+
+export function geminiKeyScope(apiKey: string): GeminiKeyScope {
+  if (apiKey.startsWith("master-")) return "master";
+  if (apiKey.startsWith("account-")) return "account";
+  return "unknown";
+}
+
+/**
+ * Gemini's own derivation of an account's API nickname from its display name.
+ *
+ * A Gemini account carries TWO different names, and the payload wants the second:
+ *
+ *   `name`    — the display name given at creation, e.g. `"Primary"`
+ *   `account` — the API nickname, e.g. `"primary"`
+ *
+ * `/v1/account/list` documents exactly how the second is derived from the first:
+ * *"Nickname of the specific account (will take the name given, remove all
+ * symbols, replace all `" "` with `"-"` and make letters lowercase)"*, and its
+ * example response shows all three of `"Primary"`->`"primary"`,
+ * `"My Custody Account"`->`"my-custody-account"` and `"Other exchange account!"`
+ * ->`"other-exchange-account"`.
+ *
+ * This function exists to CHECK a configured value, not to silently rewrite one:
+ * a display name pasted where a nickname belongs is rejected with this as the
+ * suggestion, rather than transformed behind the operator's back. Quietly
+ * lower-casing a value that selects which real account gets traded is not a
+ * correction this code is entitled to make on its own.
+ *
+ * Order matters and follows the sentence: symbols are removed FIRST, then spaces
+ * become dashes, then letters are lower-cased. (Removing symbols after the space
+ * substitution would strip the dashes it just inserted.)
+ */
+export function geminiAccountNickname(displayName: string): string {
+  return displayName
+    .replace(/[^A-Za-z0-9 ]/g, "")
+    .replace(/ /g, "-")
+    .toLowerCase();
+}
+
+/**
+ * Whether a value could be a Gemini account nickname at all.
+ *
+ * Follows directly from the derivation above: a nickname is the output of that
+ * function, so it can only contain lowercase letters, digits and dashes. Anything
+ * else -- an upper-case letter, a space, punctuation -- cannot be a nickname
+ * Gemini ever issued, which makes it locally detectable without a round trip.
+ */
+export function isGeminiAccountNickname(value: string): boolean {
+  return /^[a-z0-9-]+$/.test(value);
+}
+
+/** Either the `account` value to send (or `undefined`: send none), or why not. */
+export type AccountFieldResolution =
+  | { readonly ok: true; readonly account: string | undefined }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Decide what the `account` payload field must be for this key (Gemini's
+ * sub-account rule).
+ *
+ * Gemini groups multiple accounts under a master group. A MASTER key is not bound
+ * to one account, so every single-account private API needs to be told which one
+ * to act on: per Gemini's reference, "To invoke an API on behalf of an account,
+ * add that account's nickname as an `account` parameter to your request payload",
+ * and "The `account` parameter may be used on any API that performs an action for
+ * or against a single account." Each endpoint's own request-body table repeats it
+ * -- `account`, type `string`, "Required for Master API keys ... The name of the
+ * account within the subaccount group" -- and it is a TOP-LEVEL sibling of
+ * `request` and `nonce`, not a nested object and not an array.
+ *
+ * Both directions are errors, and Gemini has a distinct error code for each:
+ *
+ *  - master key WITHOUT the field -> `MissingAccounts`, "A required account field
+ *    was not specified". This is exactly the rejection that halted the live DCA
+ *    base order; the plural in Gemini's message names the error code, not the
+ *    field, which is singular `account`.
+ *  - account-level key WITH the field -> `AccountsOnGroupOnlyApi`, "The account
+ *    field was specified on a non-master API key".
+ *
+ * So the field cannot simply be sent always, and a wrong nickname is its own
+ * refusal (`InvalidAccountName`, "The specified name did not match any accounts
+ * within the master group"). Hence: required for a `master-` key, refused for an
+ * `account-` key, and for an unclassifiable key the caller's explicit
+ * configuration is trusted -- there is nothing honest to derive.
+ *
+ * ON GEMINI'S PLURAL, MISLEADING MESSAGES. Two of these refusals SAY "accounts"
+ * while the field is `account`:
+ *
+ *     MissingAccounts      "Expected a JSON payload with accounts"
+ *     InvalidAccountName   "Expected a JSON array with valid accounts,
+ *                           instead got: Primary"
+ *
+ * Neither is a statement about the field's type. The plural is the ERROR CODE's
+ * name and an artefact of Gemini resolving the field into an internal list --
+ * which is also why sibling codes `MoreThanOneAccount`, `AccountLimitExceeded`
+ * and `NoAccountOfTypeRequired` are phrased as they are. The field itself is
+ * documented as `account`, type `string`, on all 65 endpoint pages that carry it,
+ * with a string in every request example and not one array anywhere in Gemini's
+ * reference. The second message above was earned by sending the field CORRECTLY
+ * (the first no longer fires) with a wrong VALUE: the account's display `name`
+ * instead of its `account` nickname. Reading either message as "send an array"
+ * would be pattern-matching the prose over the specification.
+ *
+ * Pure: this decides, and never sends anything.
+ */
+export function resolveAccountField(
+  apiKey: string,
+  accountName: string | undefined,
+): AccountFieldResolution {
+  const configured = accountName?.trim();
+  const named = configured !== undefined && configured !== "" ? configured : undefined;
+
+  // A value that is not a possible nickname is refused HERE, before it can be
+  // signed and sent. Gemini answers a wrong one with `InvalidAccountName` -- and
+  // its message, "Expected a JSON array with valid accounts, instead got: X",
+  // describes Gemini's internal list-shaped validation rather than the field's
+  // documented type, so it reads like a shape complaint when it is a name
+  // complaint. Catching the common case (a DISPLAY name pasted in) locally, with
+  // the derived nickname as the suggestion, is worth more than the round trip.
+  if (named !== undefined && !isGeminiAccountNickname(named)) {
+    const suggestion = geminiAccountNickname(named);
+    return {
+      ok: false,
+      reason:
+        `${JSON.stringify(named)} cannot be a Gemini account nickname. Gemini derives ` +
+        `the nickname from the account's display name by removing symbols, replacing ` +
+        `spaces with "-" and lower-casing, so a nickname only ever contains ` +
+        `[a-z0-9-] -- and an account's display "name" (e.g. "Primary") is NOT its ` +
+        `"account" nickname (e.g. "primary"). Gemini refuses the mismatch with ` +
+        `InvalidAccountName.` +
+        (suggestion !== "" && suggestion !== named
+          ? ` Did you mean ${JSON.stringify(suggestion)}?`
+          : "") +
+        ` The authoritative list of nicknames is the "account" field of Gemini's ` +
+        `/v1/account/list response.`,
+    };
+  }
+
+  switch (geminiKeyScope(apiKey)) {
+    case "master":
+      if (named === undefined) {
+        return {
+          ok: false,
+          reason:
+            `this Gemini API key is a MASTER key (its name begins "master-"), so every ` +
+            `private request must carry the top-level "account" field naming which ` +
+            `account in the master group to act on, and none is configured. Gemini ` +
+            `refuses the request otherwise with MissingAccounts ("A required account ` +
+            `field was not specified"). Set GEMINI_ACCOUNT_NAME to the account's ` +
+            `nickname (Gemini's own example value is "primary"; the exact nicknames in ` +
+            `a group are listed by Gemini's Get Accounts endpoint).`,
+        };
+      }
+      return { ok: true, account: named };
+
+    case "account":
+      if (named !== undefined) {
+        return {
+          ok: false,
+          reason:
+            `an account name (${JSON.stringify(named)}) is configured, but this Gemini ` +
+            `API key is an ACCOUNT-LEVEL key (its name begins "account-"), which is ` +
+            `already bound to one account. Sending the "account" field on it is refused ` +
+            `by Gemini with AccountsOnGroupOnlyApi ("The account field was specified on ` +
+            `a non-master API key"). Unset GEMINI_ACCOUNT_NAME, or use the master key ` +
+            `the name belongs to.`,
+        };
+      }
+      return { ok: true, account: undefined };
+
+    case "unknown":
+      // Neither documented prefix, so the key's scope cannot be established here.
+      // The explicit configuration is the only information available; trust it
+      // rather than overriding it on a guess.
+      return { ok: true, account: named };
   }
 }
 

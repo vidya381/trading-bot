@@ -35,6 +35,7 @@
  */
 
 import { GeminiClient, GEMINI_BASE_URLS } from "../exchange/gemini/client";
+import { resolveAccountField } from "../exchange/gemini/signing";
 import { CredentialError, StaticCredentialProvider } from "../exchange/credentials";
 import type { RestExchangeClient, Timestamp } from "../shared/exchange-client";
 import type { ExchangeFactory } from "./reconciliation";
@@ -54,6 +55,19 @@ declare global {
      */
     readonly GEMINI_API_KEY?: string;
     readonly GEMINI_API_SECRET?: string;
+    /**
+     * The account nickname a MASTER Gemini key acts on, sent as the top-level
+     * `account` field of every signed payload (`gemini/signing.ts`,
+     * `resolveAccountField`).
+     *
+     * Not a secret -- it is a nickname within the group, not a credential -- but
+     * it is set the same way for symmetry and because it is per-environment:
+     * `wrangler secret put GEMINI_ACCOUNT_NAME --env <env>` (a per-environment
+     * `var` works equally well). Required exactly when `GEMINI_API_KEY` is a
+     * master key (`master-...`); it must NOT be set for an account-level key
+     * (`account-...`), which Gemini refuses with `AccountsOnGroupOnlyApi`.
+     */
+    readonly GEMINI_ACCOUNT_NAME?: string;
   }
 }
 
@@ -133,12 +147,29 @@ export function resolveGeminiExchange(
     };
   }
 
+  // The master-key `account` rule (section 4.2, Gemini's sub-account model),
+  // checked HERE and not only inside the client: a resolution failure becomes a
+  // `not_attached` halt naming the misconfiguration, which is what an operator
+  // needs, whereas discovering it per-request means every order is refused one at
+  // a time. `resolveAccountField` is the same pure decision the client applies, so
+  // the two cannot disagree.
+  const accountName = env.GEMINI_ACCOUNT_NAME;
+  const account = resolveAccountField(apiKey!, accountName);
+  if (!account.ok) {
+    return {
+      ok: false,
+      reason:
+        `Gemini credentials in the ${environment} environment cannot be used: ` +
+        `${account.reason}`,
+    };
+  }
+
   // StaticCredentialProvider re-checks blankness and throws CredentialError; the
   // check above returns a clean reason first, so it only ever sees good values.
   const credentials = new StaticCredentialProvider({ apiKey: apiKey!, apiSecret: apiSecret! });
 
   const exchangeFor: ExchangeFactory = (_accountLabel: string): RestExchangeClient =>
-    new GeminiClient({ baseUrl, credentials, now });
+    new GeminiClient({ baseUrl, credentials, accountName: account.account, now });
 
   return { ok: true, exchangeFor };
 }

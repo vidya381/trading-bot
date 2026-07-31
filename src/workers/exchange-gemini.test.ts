@@ -77,6 +77,72 @@ describe("resolveGeminiExchange", () => {
     if (!result.ok) expect(result.reason).not.toContain("super-secret-key");
   });
 
+  it("fails closed on a master key with no GEMINI_ACCOUNT_NAME", () => {
+    // The live failure this check exists for: Gemini refuses every signed request
+    // from a master key that does not name an account (MissingAccounts). Catching
+    // it here turns "each order is rejected in turn" into one `not_attached` halt
+    // reason naming the missing setting.
+    const result = resolveGeminiExchange(
+      env({
+        ENVIRONMENT: "testnet",
+        GEMINI_API_KEY: "master-abc123",
+        GEMINI_API_SECRET: "s",
+      }),
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("GEMINI_ACCOUNT_NAME");
+      expect(result.reason).toContain("MissingAccounts");
+      expect(result.reason).toContain("testnet");
+    }
+  });
+
+  it("fails closed on an account-level key that was given an account name", () => {
+    const result = resolveGeminiExchange(
+      env({
+        ENVIRONMENT: "testnet",
+        GEMINI_API_KEY: "account-abc123",
+        GEMINI_API_SECRET: "s",
+        GEMINI_ACCOUNT_NAME: "primary",
+      }),
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("AccountsOnGroupOnlyApi");
+  });
+
+  it("fails closed on a display name where a nickname belongs", () => {
+    // The value that reached the live sandbox and came back InvalidAccountName.
+    const result = resolveGeminiExchange(
+      env({
+        ENVIRONMENT: "testnet",
+        GEMINI_API_KEY: "master-abc123",
+        GEMINI_API_SECRET: "s",
+        GEMINI_ACCOUNT_NAME: "Primary",
+      }),
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("InvalidAccountName");
+      expect(result.reason).toContain('Did you mean "primary"?');
+    }
+  });
+
+  it("accepts a master key once the account name is set", () => {
+    const result = resolveGeminiExchange(
+      env({
+        ENVIRONMENT: "testnet",
+        GEMINI_API_KEY: "master-abc123",
+        GEMINI_API_SECRET: "s",
+        GEMINI_ACCOUNT_NAME: "primary",
+      }),
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+  });
+
   it("returns a factory when both secrets are present, without any network call", () => {
     const result = resolveGeminiExchange(
       env({ ENVIRONMENT: "testnet", GEMINI_API_KEY: "k", GEMINI_API_SECRET: "s" }),
