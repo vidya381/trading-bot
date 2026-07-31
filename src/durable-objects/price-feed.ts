@@ -188,6 +188,26 @@ export async function openOutboundSocket(
   };
 }
 
+/**
+ * TEMPORARY (decision-log 14.7, Tier 1) — the shape `debugSnapshot()` returns. See
+ * the marked block on the class for why it exists and how to remove it. Nothing in
+ * production reads this type; only the temporary `/api/debug/feed-check` route does.
+ */
+export interface PriceFeedDebugSnapshot {
+  /** The market this instance serves, or null if nothing has configured it yet. */
+  readonly config: PriceFeedConfig | null;
+  /** Whether an outbound socket is live in memory RIGHT NOW. */
+  readonly connected: boolean;
+  /** Every id currently in the durable subscriber registry. */
+  readonly subscribers: readonly string[];
+  /** Close time of the last candle forwarded. Advancing = a candle was fanned out. */
+  readonly watermark: number | null;
+  /** Receipt time of the last inbound frame; advancing = the socket is alive. */
+  readonly lastMessageAt: number;
+  readonly reconnectAttempts: number;
+  readonly blindSince: number | null;
+}
+
 export class PriceFeed extends DurableObject<Env> {
   #state: PersistedFeedState = INITIAL_STATE;
 
@@ -604,6 +624,40 @@ export class PriceFeed extends DurableObject<Env> {
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscribers")
       .one().n;
   }
+
+  // ─── TEMPORARY DIAGNOSTIC READ PATH — decision-log 14.7 (Tier 1) ────────────
+  // DELETE WITH THE `/api/debug/feed-check` ROUTE, AFTER ONE CONFIRMING RUN.
+  //
+  // WHY IT EXISTS: Tier 1 has to confirm that THIS object — not a standalone
+  // lookalike, which is what Tier 0's `/api/debug/ws-check` was — connects from the
+  // edge, survives a real minute boundary, and forwards a real closed candle to a
+  // subscriber. Everything that proves that is private: `#socket`, `#current`, the
+  // persisted `watermark`, and the subscriber table. A Durable Object's storage is
+  // unreadable from outside, and every existing RPC is a WRITE path, so there was no
+  // way to observe the object without giving it a read path.
+  //
+  // WHAT MAKES IT SAFE: it is READ-ONLY. It mutates nothing, arms no alarm, opens no
+  // socket, and has no production caller — the only caller is the temporary route.
+  // The watermark is the load-bearing field: `#forwardClosed` writes it ONLY after
+  // `await this.#deps.forward(price)` resolves, and in production `forward` IS
+  // `#fanOut` over the subscriber table, so a watermark that advances past its
+  // primed baseline while an id is in `subscribers` proves a real closed candle went
+  // through the real fan-out with that id in the list.
+  //
+  // REMOVAL: delete this block (the interface above the class and this method), then
+  // the route, its test, and the wiring block — full steps in `debug-feed-check.ts`.
+  debugSnapshot(): PriceFeedDebugSnapshot {
+    return {
+      config: this.#state.config,
+      connected: this.#socket !== null,
+      subscribers: this.#subscriberIds(),
+      watermark: this.#state.watermark,
+      lastMessageAt: this.#lastMessageAt,
+      reconnectAttempts: this.#state.reconnectAttempts,
+      blindSince: this.#state.blindSince,
+    };
+  }
+  // ─── END TEMPORARY DIAGNOSTIC READ PATH ─────────────────────────────────────
 
   // -------------------------------------------------------------------------
   // Internals

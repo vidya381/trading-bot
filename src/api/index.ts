@@ -24,6 +24,7 @@
  */
 
 import { accessConfigFromEnv, authenticate, type AccessConfig } from "./access";
+import { handleFeedCheck } from "./debug-feed-check"; // TEMPORARY DIAGNOSTIC — see block below.
 import { errorResponse, fail, ApiError } from "./envelope";
 import * as handlers from "./handlers";
 import { resolveRoute, route, type ApiContext, type Route } from "./router";
@@ -95,6 +96,23 @@ export async function handleApiRequest(
     // 1. Authenticate before anything else.
     const config = accessConfigFromEnv(env, options.access ?? {});
     const actor = await authenticate(request, config);
+
+    // ─── TEMPORARY DIAGNOSTIC — /api/debug/feed-check (decision-log 14.7, Tier 1) ─
+    // DELETE AFTER ONE CONFIRMING RUN. Removal = delete this block and the
+    // `handleFeedCheck` import above, delete src/api/debug-feed-check.ts and its
+    // test, and delete the marked `debugSnapshot` block in price-feed.ts.
+    // Wired here — AFTER authenticate() (behind Access + the JWT re-check, exactly
+    // like every real route, with no new Access surface) but BEFORE the schema guard
+    // and ApiContext, because it needs neither the BOT_INSTANCE binding nor the
+    // guard: it runs its OWN, narrower `alerts` table check and explains what a
+    // missing schema would do to the result. Same placement as the removed
+    // /api/debug/ws-check (14.6) and /api/debug/exchange-check (decision-log 03).
+    // Read-only market data; no bot, no order path, no credentials.
+    // NOTE: this route deliberately holds the request open for up to ~3 minutes.
+    if (request.method === "GET" && url.pathname === "/api/debug/feed-check") {
+      return await handleFeedCheck(url, env);
+    }
+    // ─── END TEMPORARY DIAGNOSTIC ───────────────────────────────────────────────
 
     // 2. Route.
     const resolution = resolveRoute(ROUTES, request.method, url.pathname);
