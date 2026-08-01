@@ -18,10 +18,17 @@
  *   - `emptyMessage`  -- what an empty list says (per-bot vs "no matches").
  *   - `heading`       -- the section label, or `null` to suppress it when the
  *                        page already provides its own title.
+ *
+ * One row type carries an extra affordance: an OPEN order-state-drift alert on a
+ * linked row points at the bot detail view's "Apply missed fills" control
+ * (`#apply-missed-fills`) rather than the top of the page, because seeing that
+ * alert and wanting to act on it is one motion. See `driftAlerts.ts` for which
+ * types qualify; nothing is triggered by the link itself.
  */
 
 import { Link } from "react-router-dom";
 import type { Alert, AlertCategory, AlertSeverity } from "../api/types";
+import { APPLY_MISSED_FILLS_ANCHOR, isOpenDriftAlert } from "../driftAlerts";
 import { formatTime } from "../format";
 
 const SEVERITY_ACCENT: Record<AlertSeverity, string> = {
@@ -43,6 +50,18 @@ const CATEGORY_CLASS: Record<AlertCategory, string> = {
 
 function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
   const linked = linkToBot && alert.botInstanceId !== null;
+  /*
+   * The natural real-world path is "see an alert, act on it", so an OPEN
+   * order-state-drift alert in the cross-bot feed links to the repair control
+   * itself rather than to the top of the bot page. The chip only renders on a
+   * LINKED row: on the per-bot list the control is already on the same page, and
+   * a chip that looks like an action but is not a link would be a lie.
+   *
+   * It links, and deliberately does not act: the hash scrolls the control into
+   * view, and the confirmation dialog still has to be opened by hand. A
+   * confirmation a link can open is not a confirmation.
+   */
+  const repairable = linked && isOpenDriftAlert(alert);
 
   const body = (
     <>
@@ -73,6 +92,11 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
       <p className={`mt-1 text-sm ${alert.resolved ? "text-zinc-400" : "text-zinc-200"}`}>
         {alert.message}
       </p>
+      {repairable && (
+        <span className="mt-1.5 inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] font-medium text-amber-200">
+          Apply missed fills →
+        </span>
+      )}
     </>
   );
 
@@ -85,7 +109,7 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
   if (linked) {
     return (
       <Link
-        to={`/bots/${encodeURIComponent(alert.botInstanceId!)}`}
+        to={`/bots/${encodeURIComponent(alert.botInstanceId!)}${repairable ? `#${APPLY_MISSED_FILLS_ANCHOR}` : ""}`}
         className={`group block transition-colors hover:bg-zinc-900 ${className}`}
       >
         {body}

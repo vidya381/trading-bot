@@ -26,7 +26,7 @@ import { tripAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { isGloballyTripped } from "../reconciliation/kill-switch";
 import type { DcaParams } from "../strategies/dca";
 import type { GridParams } from "../strategies/grid";
-import { fromDecimalString as m } from "../shared/money";
+import { fromDecimalString as m, toDecimalString } from "../shared/money";
 import type { Jwks } from "./access";
 import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
@@ -530,6 +530,187 @@ describe("bots", () => {
     expect(exchange.placed.some((o) => o.side === "sell")).toBe(true);
     const audit = await db.auditLog.findMany({ where: { action: "bot.liquidated" } });
     expect(audit[0]!.actor).toBe(HUMAN);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Apply missed fills (step 18's repair) -- the endpoint, over the wire
+//
+// `BotInstance.applyMissedFills` has its own tests (bot-instance.test.ts,
+// grid-bot-instance.test.ts). These are the ENDPOINT's, added with its dashboard
+// control: every one of them asserts a fact the UI states to an operator, so a
+// backend change that made the copy a lie would fail here rather than silently
+// on screen.
+// ---------------------------------------------------------------------------
+
+describe("apply missed fills", () => {
+  /**
+   * A halted DCA bot with one order it still believes open -- the shape of the
+   * 2026-07-31 incident. The cancellation is forced to fail exactly as it did
+   * live, so the order stays believed-open rather than being recorded cancelled.
+   */
+  async function haltedWithRestingOrder(id: string, account: string): Promise<string> {
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "reconciliation found drift", HUMAN));
+    return clientOrderId;
+  }
+
+  it("returns exactly what it corrected, leaves the bot halted, and audits the human", async () => {
+    const account = `acct-${suffix}`;
+    const id = `amf${suffix}`;
+    const clientOrderId = await haltedWithRestingOrder(id, account);
+    const resting = exchange.resting.get(clientOrderId)!.request;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        // The exchange's OWN id, as `include_trades` reports it. Never synthesised.
+        fillId: "gemini-tid-4242",
+        price: resting.price,
+        quantity: resting.quantity,
+        feeAmount: 0n,
+        feeAsset: "USDT",
+        executedAt: clock + 1000,
+      },
+    ]);
+
+    const res = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    expect(res.status).toBe(200);
+    // The dashboard renders these four fields per applied fill, and the two
+    // money fields as decimal strings -- not numbers.
+    expect(res.body.data.result.applied).toEqual([
+      {
+        clientOrderId,
+        fillId: "gemini-tid-4242",
+        quantity: toDecimalString(resting.quantity),
+        price: toDecimalString(resting.price),
+      },
+    ]);
+    expect(res.body.data.result.skipped).toEqual([]);
+    // It never resumes: halted before, halted after, in the result AND the
+    // refreshed bot the response carries.
+    expect(res.body.data.result.status).toBe("halted");
+    expect(res.body.data.bot).toMatchObject({ id, status: "halted" });
+
+    // The books actually moved: the order is filled and the trade row exists.
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("filled");
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(1);
+
+    // And the actor is the verified human, not "cron" -- the reason this is an
+    // Access-gated endpoint rather than part of reconciliation.
+    const audit = await db.auditLog.findMany({ where: { action: "bot.missed_fills_applied" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(HUMAN);
+  });
+
+  it("refuses on a bot that is not halted, surfacing invalid_status (409)", async () => {
+    // The refusal the dashboard mirrors BEFORE sending: a repair must not race
+    // the bot's own pipeline.
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `amfr${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN)); // running
+
+    const res = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(0);
+  });
+
+  it("reports an unreadable order in `skipped` as a 200 -- a success is not a repair", async () => {
+    // The distinction the UI must not flatten: this is HTTP 200 with nothing
+    // applied. A frontend that only awaited success would call it done.
+    const account = `acct-${suffix}`;
+    const id = `amfu${suffix}`;
+    await haltedWithRestingOrder(id, account);
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+
+    const res = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result.applied).toEqual([]);
+    expect(res.body.data.result.skipped.join(" ")).toContain("connection reset");
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(0);
+  });
+
+  it("distinguishes 'no per-fill detail reported' from 'nothing filled'", async () => {
+    // The venue answered, but carried no `trades`. There is no real fill id to
+    // apply, so the order is reported as UNREAD rather than treated as unfilled.
+    const account = `acct-${suffix}`;
+    const id = `amfn${suffix}`;
+    await haltedWithRestingOrder(id, account);
+
+    const res = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result.applied).toEqual([]);
+    expect(res.body.data.result.skipped.join(" ")).toContain("no per-fill detail");
+  });
+
+  it("is idempotent over the wire: a second call applies nothing and double-counts nothing", async () => {
+    // The dashboard's "outcome unknown -- retrying is safe" copy is a claim about
+    // this. It holds because `applyFill` deduplicates on the exchange's fill id.
+    const account = `acct-${suffix}`;
+    const id = `amfi${suffix}`;
+    const clientOrderId = await haltedWithRestingOrder(id, account);
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-9" }),
+    ]);
+
+    const first = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+    const second = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    expect(first.body.data.result.applied).toHaveLength(1);
+    expect(second.status).toBe(200);
+    expect(second.body.data.result.applied).toEqual([]);
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(1);
+  });
+
+  it("on a GRID bot, records the fill and places NO replacement order", async () => {
+    // The claim the grid confirmation dialog makes, asserted through the real
+    // endpoint: the paired sell a normal fill would have placed is suppressed,
+    // because placing a live order from a correction path on a halted bot would
+    // be resuming trading through the back door.
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `amfg${suffix}`;
+    await inBotId(id, (bot) =>
+      bot.createGrid({
+        botInstanceId: id,
+        accountLabel: account,
+        exchange: "binance",
+        pair: TEST_PAIR,
+        capitalAsset: "USDT",
+        allocatedCapital: m("500"),
+        params: gridParams,
+        actor: HUMAN,
+      }),
+    );
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const buy = exchange.placed.find((order) => order.side === "buy")!.clientOrderId;
+    // Every cancellation fails, as it did live, so the ladder stays intact.
+    exchange.cancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "reconciliation found drift", HUMAN));
+
+    const placedBefore = exchange.placed.length;
+    exchange.fillsByOrder.set(buy, [exchange.fillFor(buy, { fillId: "gemini-tid-500" })]);
+
+    const res = await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result.applied).toHaveLength(1);
+    expect(res.body.data.result.applied[0].fillId).toBe("gemini-tid-500");
+    // Nothing new reached the exchange -- the ladder comes back a rung short.
+    expect(exchange.placed).toHaveLength(placedBefore);
+    expect(res.body.data.result.status).toBe("halted");
   });
 });
 

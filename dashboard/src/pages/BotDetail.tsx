@@ -27,6 +27,7 @@ import { usePolling } from "../api/usePolling";
 import type { BotDetail as BotDetailData } from "../api/types";
 import { BotSummary } from "../components/BotSummary";
 import { StartAction } from "../components/StartAction";
+import { ApplyMissedFillsAction } from "../components/ApplyMissedFillsAction";
 import { ResumeAction } from "../components/ResumeAction";
 import { LiquidateAction } from "../components/LiquidateAction";
 import { StrategyState } from "../components/StrategyState";
@@ -141,6 +142,17 @@ function BotDetailView({ id }: { id: string }) {
            * successful start refetches immediately (item 7) via `poll.refetch`.
            */}
           {bot.status === "created" && <StartAction bot={bot} onStarted={poll.refetch} />}
+          {/*
+           * The order-state-drift repair. Unlike the three controls around it,
+           * its gate is not the status: it renders only while this bot has an
+           * OPEN drift alert, because it writes trades and moves a position, and
+           * section 9's whole stance is that doing so needs a human acting on a
+           * specific finding. It sits ABOVE resume deliberately — the books are
+           * repaired first, and only then is resuming an informed decision. The
+           * component itself handles the not-halted case (it explains rather
+           * than offering a button that could only 409).
+           */}
+          <ApplyMissedFillsAction bot={bot} onApplied={poll.refetch} />
           {/*
            * The resume control renders only for a halted bot, and never for any
            * other status. It sits ABOVE liquidate deliberately: both apply to a

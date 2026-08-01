@@ -19,6 +19,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { readCircuitBreaker } from "./circuit-breaker";
 import { reconcileAccount, type ReconciliationPorts } from "./reconcile";
+import { alertView } from "../api/serialize";
+// The dashboard's own gate for the "Apply missed fills" control, executed here
+// against what this module really writes. See src/shared/alert-types.test.ts.
+import { isOpenDriftAlert } from "../../dashboard/src/driftAlerts";
 import type { Database } from "../db/database";
 import type { AlertRow } from "../db/schema";
 import {
@@ -472,6 +476,51 @@ describe("meaningful drift", () => {
     // The action: the circuit breaker is NOT tripped.
     expect(result.circuitBreakerTripped).toBe(false);
     expect(await readCircuitBreaker(db, ACCOUNT)).toBeNull();
+  });
+
+  it("writes a drift alert the dashboard's repair control actually recognises", async () => {
+    /**
+     * The end-to-end half of the alert-type contract (`shared/alert-types.test.ts`
+     * covers the derivation half). This drives the REAL detection, the REAL
+     * `raiseStandingAlert` and the REAL serializer, then asks the dashboard's own
+     * predicate whether it would offer "Apply missed fills" for what came out.
+     *
+     * Without it, the two sides could be renamed apart and nothing would fail:
+     * the repair button would simply stop appearing on a bot that has drift,
+     * which on screen is indistinguishable from having no drift at all.
+     */
+    await exchange.placeOrder({
+      pair: TEST_PAIR,
+      clientOrderId: "v1-dca-btc-1-0",
+      side: "buy",
+      type: "limit",
+      price: m("65000"),
+      quantity: m("0.01"),
+    });
+    exchange.fillFor("v1-dca-btc-1-0", { quantity: m("0.005") });
+
+    const order = trackedOrder();
+    snapshots.set(
+      "dca-btc-1",
+      snapshotFor("dca-btc-1", [order], { openOrderIds: [order.clientOrderId] }),
+    );
+    await db.orders.insert(
+      orderRow({
+        id: order.clientOrderId,
+        bot_instance_id: "dca-btc-1",
+        client_order_id: order.clientOrderId,
+        price: order.price,
+        quantity: order.quantity,
+        filled_quantity: ZERO,
+        status: "pending",
+      }),
+    );
+
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const [raised] = await alerts();
+    // Serialized exactly as `GET /api/bots/:id` serves it to the dashboard.
+    expect(isOpenDriftAlert(alertView(raised!))).toBe(true);
   });
 
   it("classifies a balance residual between the two thresholds as meaningful", async () => {

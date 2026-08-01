@@ -18,6 +18,7 @@ import type {
   Alert,
   AlertCategory,
   AlertSeverity,
+  ApplyMissedFillsResponse,
   Bot,
   BotDetail,
   CreateBotRequest,
@@ -203,6 +204,37 @@ export function startBot(id: string, signal?: AbortSignal): Promise<StartRespons
  */
 export function resumeBot(id: string, signal?: AbortSignal): Promise<ResumeResponse> {
   return requestJson<ResumeResponse>(`/api/bots/${encodeURIComponent(id)}/resume`, "POST", { signal });
+}
+
+/**
+ * Repair order-state drift on a halted bot (`POST /api/bots/:id/apply-missed-fills`).
+ * No request body -- the backend takes the actor from the verified Access
+ * identity, and that identity is the point: section 9 never auto-corrects drift,
+ * so this is a named human's decision in the audit log, not "cron".
+ *
+ * THE CALLER MUST INSPECT `result.skipped`, not merely await success. A 200 does
+ * not mean everything was repaired: an order the exchange could not be read for,
+ * or one whose response carried no per-fill detail, lands in `skipped` and is
+ * still a 200. Treating success as "done" would report a half-finished repair as
+ * finished.
+ *
+ * Its refusals, both from the bot object:
+ *   - `invalid_status` (409) -- the bot is not halted. The repair must not race a
+ *     live pipeline, so this is refused rather than queued.
+ *   - `not_attached`  (503) -- no exchange client could be built for this account
+ *     in this environment.
+ *   - `not_created`   (404) -- the object holds no config for this id.
+ *
+ * It is IDEMPOTENT by construction (the exchange's own fill ids, deduplicated by
+ * `applyFill`), so a retry after a lost response cannot double-count. It never
+ * changes the bot's status and never places an order.
+ */
+export function applyMissedFills(id: string, signal?: AbortSignal): Promise<ApplyMissedFillsResponse> {
+  return requestJson<ApplyMissedFillsResponse>(
+    `/api/bots/${encodeURIComponent(id)}/apply-missed-fills`,
+    "POST",
+    { signal },
+  );
 }
 
 /**

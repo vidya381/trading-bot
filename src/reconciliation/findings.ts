@@ -46,6 +46,7 @@
  */
 
 import type { DriftClassification } from "../db/schema";
+import { ALERTING_TIERS, ORDER_STATE_DRIFT_KINDS } from "../shared/alert-types";
 import { abs, ONE, ZERO, type Money } from "../shared/money";
 
 /**
@@ -76,6 +77,22 @@ export type FindingKind =
   | "balance_drift"
   /** sum(bot allocations) disagrees with capital_ledger.total_allocated. */
   | "ledger_allocation_drift";
+
+/**
+ * The two links that tie `shared/alert-types.ts` -- which the DASHBOARD also
+ * imports, and which therefore cannot import this file -- back to the real
+ * unions here.
+ *
+ * Both are type assertions doing real work rather than documentation: renaming a
+ * `FindingKind`, or dropping/renaming a `DriftClassification`, fails the Worker
+ * typecheck at these two lines instead of silently emptying the dashboard's
+ * drift-alert set and taking the "Apply missed fills" control off screen with no
+ * other signal. `shared/alert-types.test.ts` covers the runtime half.
+ */
+export const ORDER_STATE_DRIFT_FINDING_KINDS: readonly FindingKind[] = ORDER_STATE_DRIFT_KINDS;
+
+/** The tiers that raise an alert row. `minor` never does (section 9). */
+export const ALERTING_DRIFT_TIERS: readonly DriftClassification[] = ALERTING_TIERS;
 
 /**
  * The floor each kind carries, before any magnitude is considered.

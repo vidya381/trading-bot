@@ -450,6 +450,77 @@ export interface ResumeResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Apply missed fills (`POST /api/bots/:id/apply-missed-fills`, step 18)
+//
+// The order-state-drift REPAIR: section 9 halts and alerts on drift and
+// deliberately never auto-corrects it, because correcting means writing trades
+// and moving a position away from a belief the system has just proved wrong.
+// This endpoint is that correction as a human action.
+//
+// Same `{ result, bot }` shape as start/resume/liquidate. `result` is the DO's
+// own `MissedFillsResult`, mirrored from src/durable-objects/bot-instance.ts.
+//
+// THE CRUCIAL PROPERTY FOR A CALLER: a 200 does NOT mean everything was
+// repaired. `skipped` carries every order or fill this pass could not read or
+// could not apply, and it is a normal part of a success -- section 5.6 again:
+// an unreadable order is REPORTED, never assumed to have not filled. A frontend
+// that only awaited success would silently report a half-done repair as done.
+//
+// Two more facts the UI must not misstate:
+//   - `status` is always the status the bot STARTED with. This never resumes a
+//     bot; halted before, halted after.
+//   - No order is ever placed. For a GRID bot that is load-bearing: a fill
+//     normally places the paired replacement sell, and this path passes
+//     `placeReplacement: false`, so the repaired rung comes back empty and
+//     stays empty (`#placeInitialLadder` runs once, so a later resume does not
+//     place it either).
+// ---------------------------------------------------------------------------
+
+/**
+ * One execution the repair recorded. `fillId` is the EXCHANGE's own id (Gemini's
+ * `tid`), never a synthesised one -- `applyFill` deduplicates on it, so a made-up
+ * id would make the real fill either double-count or be silently swallowed. That
+ * same identity check is what makes the whole operation idempotent: a second run
+ * finds every id already applied and does nothing.
+ */
+export interface AppliedFill {
+  readonly clientOrderId: string;
+  readonly fillId: string;
+  /** Decimal string, like every other quantity. */
+  readonly quantity: string;
+  /** Decimal string, like every other price. */
+  readonly price: string;
+}
+
+/** The `MissedFillsResult` the repair returns. */
+export interface MissedFillsResult {
+  /** Always the status it started with -- this operation never resumes a bot. */
+  readonly status: BotStatus;
+  readonly applied: readonly AppliedFill[];
+  /**
+   * Orders or fills this pass could NOT account for, each with its reason, as
+   * the backend worded it. Non-empty means the repair is INCOMPLETE. Two
+   * distinct causes live in here and the backend words them differently on
+   * purpose:
+   *   - an unusable `getOrderStatus` read (transport/exchange error);
+   *   - a response carrying no `trades` at all, which is NOT the same as "no
+   *     executions" -- it means the per-fill detail was not reported, so there is
+   *     no real fill id to apply and the order is reported as unread.
+   * Rendered verbatim rather than parsed: the distinction lives in the prose,
+   * and re-deriving it from string matching would be a second, weaker copy of a
+   * judgement the backend already made.
+   */
+  readonly skipped: readonly string[];
+}
+
+/** The body of a successful `POST /api/bots/:id/apply-missed-fills`. */
+export interface ApplyMissedFillsResponse {
+  readonly result: MissedFillsResult;
+  /** The refreshed summary -- still `halted` -- or null if the row vanished. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
 // Global kill switch (spec section 7.4; `killSwitchView` in serialize.ts,
 // `GET /api/kill-switch`, `POST /api/kill-switch/{trigger,reset}`).
 //

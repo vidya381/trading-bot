@@ -85,6 +85,11 @@ import type {
   OrderRow,
 } from "../db/schema";
 import type { BotSnapshot } from "../durable-objects/bot-instance";
+import {
+  isReconciliationAlertType,
+  reconciliationAlertType,
+  type AlertingTier,
+} from "../shared/alert-types";
 import { isUsable } from "../shared/downtime";
 import type {
   Balance,
@@ -375,11 +380,17 @@ async function resolveClearedAlerts(
 ): Promise<void> {
   if (!observed) return;
 
+  // Built through the same function the raise side uses, so the key this
+  // compares against cannot drift from the `alert_type` actually written. A
+  // `minor` finding raises no row, so it can never match one and is skipped.
   const stillOpen = new Set(
-    findings.map(
-      (finding) =>
-        `reconciliation_${finding.tier}_${finding.kind}::${finding.botInstanceId ?? ""}`,
-    ),
+    findings
+      .filter((finding) => finding.tier !== "minor")
+      .map(
+        (finding) =>
+          `${reconciliationAlertType(finding.tier as AlertingTier, finding.kind)}::` +
+          `${finding.botInstanceId ?? ""}`,
+      ),
   );
 
   const open = await db.alerts.findMany({
@@ -387,10 +398,10 @@ async function resolveClearedAlerts(
   });
 
   for (const row of open) {
-    if (!row.alert_type.startsWith("reconciliation_severe_") &&
-        !row.alert_type.startsWith("reconciliation_meaningful_")) {
-      continue;
-    }
+    // Only rows this naming scheme produced -- `reconciliation_blind`,
+    // `reconciliation_halt_failed` and `orphaned_bot_row` are this module's too,
+    // but they have their own lifecycles and are not findings.
+    if (!isReconciliationAlertType(row.alert_type)) continue;
     // Only this account's bots (or its account-scoped alerts).
     if (row.bot_instance_id !== null && !botIds.includes(row.bot_instance_id)) continue;
     if (stillOpen.has(`${row.alert_type}::${row.bot_instance_id ?? ""}`)) continue;
@@ -1184,7 +1195,7 @@ async function act(
 
     for (const finding of severe) {
       await raiseStandingAlert(db, newId, {
-        alertType: `reconciliation_severe_${finding.kind}`,
+        alertType: reconciliationAlertType("severe", finding.kind),
         botInstanceId: finding.botInstanceId,
         message: `SEVERE drift (run ${runId}): ${finding.detail}`,
         at,
@@ -1213,7 +1224,7 @@ async function act(
     // --- Meaningful: halt THAT bot only, alert, do not auto-correct. ------
     for (const finding of meaningful) {
       await raiseStandingAlert(db, newId, {
-        alertType: `reconciliation_meaningful_${finding.kind}`,
+        alertType: reconciliationAlertType("meaningful", finding.kind),
         botInstanceId: finding.botInstanceId,
         message: `MEANINGFUL drift (run ${runId}): ${finding.detail}`,
         at,
