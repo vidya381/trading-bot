@@ -15,6 +15,33 @@ export function trimDecimal(value: string): string {
   return value.replace(/\.?0+$/, "");
 }
 
+/**
+ * Round a decimal string to `places` decimals, half-up, WITHOUT a float.
+ *
+ * For figures that are derived rather than held: an unrealized-profit percentage
+ * comes back at SCALE 8 ("3.21400000"), and `trimDecimal` alone would render
+ * "3.214" -- more precision than a percentage can honestly carry, and visual
+ * noise on a number read at a glance. Money is deliberately NOT put through this;
+ * money keeps `trimDecimal` and its full exactness, as everywhere else here.
+ *
+ * A value that rounds to nothing keeps its zero rather than gaining a "-0.00":
+ * a loss too small to show at this precision is not a negative number on screen.
+ */
+export function roundDecimal(value: string, places: number): string {
+  const negative = value.startsWith("-");
+  const [whole, fraction = ""] = (negative ? value.slice(1) : value).split(".");
+  if (fraction.length <= places) return value;
+
+  const kept = fraction.slice(0, places);
+  const roundUp = fraction.charCodeAt(places) - 48 >= 5;
+  const scaled = BigInt(`${whole}${kept}`) + (roundUp ? 1n : 0n);
+
+  const digits = scaled.toString().padStart(places + 1, "0");
+  const cut = digits.length - places;
+  const rounded = places === 0 ? digits : `${digits.slice(0, cut)}.${digits.slice(cut)}`;
+  return negative && /[1-9]/.test(rounded) ? `-${rounded}` : rounded;
+}
+
 /** A signed decimal string's sign, for colouring gains/losses. */
 export function signOf(value: string): "positive" | "negative" | "zero" {
   if (value.startsWith("-")) return "negative";

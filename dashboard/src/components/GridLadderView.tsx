@@ -17,7 +17,10 @@
 
 import type { GridLadder, GridParams } from "../api/types";
 import { compareDecimal, trimDecimal } from "../format";
+import { unrealizedPnl } from "../derive";
 import { SideBadge } from "./SideBadge";
+import { ConfigItem, ConfigSection, enabled, percent } from "./ConfigSection";
+import { UnrealizedValue, unrealizedHint } from "./UnrealizedValue";
 
 interface Rung {
   readonly price: string;
@@ -56,11 +59,27 @@ export function GridLadderView({
   ladder,
   currentPrice,
   params,
+  capitalAsset,
 }: {
   ladder: GridLadder;
   currentPrice: string | null;
   params: GridParams;
+  capitalAsset: string;
 }) {
+  /*
+   * Mark-to-market on the base the ladder is holding. `heldCost` is a true cost
+   * basis for exactly `heldQuantity`: a buy fill adds the executed cost and a
+   * sell fill subtracts the `releasedCost` of what it sold (grid.ts), so the two
+   * stay paired and no closed round-trip leaks into this figure. That closed
+   * profit is what "Realized (gross)" beside it already reports.
+   *
+   * NOTE there is no grid analogue of DCA's take-profit PRICE, and none is shown:
+   * `takeProfitAmount` is an accumulated realized-profit AMOUNT, not a price
+   * level (spec 6.1/6.2), so there is no single price at which a grid "sells".
+   * It appears in the configuration block below, as the amount it is.
+   */
+  const pnl = unrealizedPnl(ladder.heldQuantity, ladder.heldCost, currentPrice);
+
   // Pair each level with its slot, then sort descending (highest at top),
   // keeping the level<->slot alignment intact.
   const rungs: Rung[] = ladder.levels
@@ -118,7 +137,7 @@ export function GridLadderView({
         )}
       </div>
 
-      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Held quantity</dt>
           <dd className="tabular text-sm text-zinc-200">{trimDecimal(ladder.heldQuantity)}</dd>
@@ -127,11 +146,71 @@ export function GridLadderView({
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Held cost</dt>
           <dd className="tabular text-sm text-zinc-200">{trimDecimal(ladder.heldCost)}</dd>
         </div>
+        {/* Closed round-trips only -- the open position is the card beside it. */}
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Realized (gross)</dt>
           <dd className="tabular text-sm text-zinc-200">{trimDecimal(ladder.realizedGross)}</dd>
         </div>
+        <div>
+          <dt className="text-xs uppercase tracking-wide text-zinc-500">Unrealized (gross)</dt>
+          <dd className="tabular text-sm text-zinc-200">
+            <UnrealizedValue pnl={pnl} capitalAsset={capitalAsset} />
+          </dd>
+          {unrealizedHint(ladder.heldQuantity, currentPrice) && (
+            <div className="text-xs text-zinc-600">
+              {unrealizedHint(ladder.heldQuantity, currentPrice)}
+            </div>
+          )}
+        </div>
       </dl>
+
+      {/*
+       * What this bot was created with (section 6.2). Read-only -- see
+       * ConfigSection's note. The bounds/lines/spacing/size also appear in the
+       * header line above; that summary is left exactly as it was, and this block
+       * is the complete record beside it.
+       */}
+      <ConfigSection>
+        <ConfigItem label="Lower bound">{trimDecimal(params.lowerBound)}</ConfigItem>
+        <ConfigItem label="Upper bound">{trimDecimal(params.upperBound)}</ConfigItem>
+        <ConfigItem label="Grid lines" hint="including both bounds">
+          {params.gridLines}
+        </ConfigItem>
+        <ConfigItem label="Spacing">{params.spacing}</ConfigItem>
+        {/* Quote spent per buy line, and recovered plus profit per sell line. */}
+        <ConfigItem label="Order size per line" hint={capitalAsset}>
+          {trimDecimal(params.orderSize)}
+        </ConfigItem>
+        <ConfigItem label="Stop-loss">{percent(params.stopLossPct)}</ConfigItem>
+        {/*
+         * An accumulated realized-profit AMOUNT, not a percentage, and OPTIONAL
+         * for grid. Null is stated as what it means -- the bot then relies on its
+         * stop-loss and breakout exit -- rather than shown as a bare "—".
+         */}
+        <ConfigItem
+          label="Take-profit amount"
+          hint={params.takeProfitAmount === null ? "not set" : `accumulated realized, ${capitalAsset}`}
+        >
+          {params.takeProfitAmount === null ? (
+            <span className="text-zinc-600">Not set</span>
+          ) : (
+            trimDecimal(params.takeProfitAmount)
+          )}
+        </ConfigItem>
+        <ConfigItem label="Breakout take-profit" hint="cash out on an upside breakout">
+          {enabled(params.breakoutTakeProfit)}
+        </ConfigItem>
+        <ConfigItem
+          label="Breakout threshold"
+          hint={params.breakoutThresholdPct === null ? "not set" : "above the upper bound"}
+        >
+          {params.breakoutThresholdPct === null ? (
+            <span className="text-zinc-600">Not set</span>
+          ) : (
+            percent(params.breakoutThresholdPct)
+          )}
+        </ConfigItem>
+      </ConfigSection>
     </section>
   );
 }

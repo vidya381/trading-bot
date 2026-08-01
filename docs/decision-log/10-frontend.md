@@ -1181,3 +1181,304 @@ New:
    exclusions (multi-exchange, multi-user, listing-snipe). None of these is a
    missing screen; they are the operating/verification work section 17 exists to
    gate.
+
+---
+
+## Step 10.14: Dashboard frontend — derived position figures and read-only configuration
+Date: 2026-07-31
+
+Three additions to the bot detail view's strategy section, applied to both arms
+where they genuinely apply: the **take-profit price** a DCA cycle exits at, the
+**unrealized (mark-to-market) profit** on a position still being held, and a
+read-only **Configuration** block showing the parameters a bot was created with.
+UI-only and purely additive — no endpoint, no handler, no action, and no change
+to the polling pattern. Backend source was read extensively but only one backend
+file was added (a test); no backend behaviour changed.
+
+The motivating gap: the detail view showed average entry and take-profit% as two
+separate numbers and left the operator to multiply them in their head, and showed
+"Realized (gross)" — which counts **closed cycles only** — with nothing at all
+about the open position beside it. Both of those are read on the screen where the
+decision to intervene gets made.
+
+### 1. The arithmetic is imported, not re-derived — `src/shared/money.ts` is the second cross-seam file
+
+`dashboard/src/derive.ts` imports `fromDecimalString`, `toDecimalString`, `mul`,
+`divideRounded` and `ONE` from **the Worker's own `src/shared/money.ts`**. That
+makes it the second file the dashboard imports across the seam after
+`src/shared/alert-types.ts`, and it earns the crossing on exactly the terms 18.1's
+addendum set:
+
+- **Dependency-free by contract.** `money.ts` has *no imports at all*, so both
+  toolchains compile it unchanged despite the deliberate TypeScript 5.7 / 7 split
+  (10.6 decision 3). Verified by building, not by reading: `tsc -b && vite build`
+  clean, 73 → **77 modules**.
+- **A re-derived copy is what fails silently.** A second decimal parser in the
+  dashboard would not fail to compile and would not throw; it would quietly
+  disagree with the backend by a rounding step, on a money figure, on the
+  intervention screen. That is the same failure mode the alert-type crossing was
+  made to close.
+
+Every value is therefore exact `bigint` Money at SCALE 8. **No float is ever
+constructed**, which is the discipline `format.ts` already kept for display.
+
+### 2. The ideal import was tried and REJECTED for a concrete reason
+
+The better design would call `takeProfitPrice` from `src/strategies/dca.ts`
+directly, so the price shown is produced by *the very function the bot decides
+with*. That was attempted first, not assumed away. It fails: the dashboard's
+`tsconfig.app.json` sets **`noUnusedLocals: true` where the Worker's does not**,
+and `dca.ts` carries a dead `mulInt` import, so pulling it in fails `tsc -b` on
+backend code —
+
+```
+../src/strategies/dca.ts(37,44): error TS6133: 'mulInt' is declared but its value is never read.
+```
+
+Removing that import is a backend edit and this session is UI-only, so
+`applyPercent` in `derive.ts` is a **documented one-line mirror** of `applyPercent`
+in `dca.ts`, pinned to its original by a comment — and, more usefully, by a test
+(section 5). Worth recording that the strictness runs the *other* way from what
+one would guess: it is the dashboard, not the Worker, whose config blocks the
+import.
+
+### 3. Every convention was taken from backend source, not chosen by taste
+
+| Figure | Where it comes from |
+| --- | --- |
+| Take-profit price | `takeProfitPrice` (dca.ts:269): `ceil(avg x (100% + tpPct) / 100%)` |
+| Mark-to-market value | `mul(price, qty, "half-even")` — the same call *and* mode the books use for cost (`NOTIONAL_ROUNDING`, order-state.ts:251; grid.ts:715) |
+| DCA cost basis | `position.cost` |
+| Grid cost basis | `ladder.heldCost` |
+
+Three points that were checked rather than assumed:
+
+**CEIL, not half-even.** The take-profit trigger rounds away from the operator's
+favour so the realised gain is *at least* what was configured. A mirror that
+rounded to nearest would be wrong by a tick and look right.
+
+**ONE rounding step, not two.** `applyPercent` divides the whole product in a
+single `divideRounded`. Multiplying and then dividing with separate roundings
+gives a different last digit.
+
+**The figure is GROSS, and is labelled so.** `cost` is the bare notional:
+`applyFill` returns `quoteDelta = mul(price, quantity)` and carries `feeAmount` as
+a **separate** field that never enters the position; grid's `heldCost` accumulates
+the same bare product. So fees paid on the way in are already excluded and the fee
+due on the way out has not happened. Calling it "Unrealized (gross)" makes it read
+against "Realized (gross)" beside it instead of implying a net number the data
+cannot support.
+
+**Grid's `heldCost` is a true basis, checked not assumed:** a buy fill adds the
+executed cost and a sell fill subtracts `releasedCost`, so the two stay paired and
+no closed round-trip leaks into the unrealized figure — that profit is what
+"Realized (gross)" already reports.
+
+### 4. The percentage denominator — the one genuine judgement call, recorded as such
+
+The unrealized percentage is **of the cost basis**, `(value - cost) / cost`, NOT
+`(price - averageEntry) / averageEntry`. The two differ by a rounding step,
+because `averageEntryPrice` is itself a stored `half-even` quotient of
+cost/quantity (dca.ts:409). Cost basis wins on two counts: it is exact against the
+money actually spent, and it is the **only** form grid can use at all, since a
+ladder stores no average entry — so one formula serves both views rather than two
+that could drift apart. Sign: **positive is a gain**.
+
+This was the item flagged in the brief as the thing not to guess silently at. It
+is a choice, it is defensible, and it is now pinned by a test rather than by this
+paragraph.
+
+### 5. Tested, in the Worker's suite, against the real function — 18 tests, 9 mutants
+
+`src/strategies/dca-dashboard-parity.test.ts` runs **both implementations over
+the same inputs and asserts they agree**. It lives in the Worker's suite and
+imports the dashboard's module, for the reason `shared/alert-types.test.ts`
+already established: the dashboard still has no test runner, and `derive.ts` is
+plain TypeScript with no React, so it imports cleanly. Inputs are deliberately
+awkward — the 8-decimal minimum tick, a percentage below one, a price large enough
+that a float would already have lost the low digits — because the risk being
+tested is a **last-digit** disagreement, which round numbers cannot expose.
+
+**Mutation testing caught a real hole in the tests, and then a real hole in the
+harness.** The first pass reported `value: half-even -> floor` as *surviving*.
+Two separate faults, in order:
+
+1. The value test's product was **exact**, so every rounding mode agreed on it —
+   the test could not have failed. Fixed by adding two cases that land the product
+   exactly ON a half: `1.5 x 0.00000001` (quotient odd) and `2.5 x 0.00000001`
+   (quotient even). half-even resolves those in opposite directions relative to
+   the quotient, so between them they exclude floor, trunc, ceil and half-up.
+   **One tie case would not do**: half-up matches half-even on the odd one, and
+   both cases happen to expect the same string, which is exactly why one alone
+   looks sufficient and is not.
+2. Even after that fix the mutant still "survived" — because `perl -0p` without
+   `/g` had replaced the **first** match in the file, which was the string inside
+   `derive.ts`'s own docblock, leaving the executable line untouched. The mutation
+   harness was silently testing nothing. The re-run now **verifies the mutation
+   landed on the code line before trusting the result**, which is the only reason
+   the first fault was distinguishable from the second.
+
+Nine mutants, all caught:
+
+| mutant | result |
+| --- | --- |
+| take-profit `ceil` → `half-even` | 7 failures |
+| take-profit `ceil` → `floor` | 8 failures |
+| take-profit computed in two rounding steps instead of one | 8 failures |
+| value `half-even` → `floor` | 2 failures |
+| value `half-even` → `half-up` | 1 failure |
+| value `half-even` → `ceil` | 2 failures |
+| unrealized sign inverted | 2 failures |
+| percentage denominator basis → value | 1 failure |
+| flat position no longer reported as absent | 1 failure |
+| zero average entry rendered as a price | 1 failure |
+
+Backend `tsc --noEmit` clean, dashboard `tsc -b && vite build` clean (77 modules),
+full suite 1416 → **1434 pass**. The single teardown warning ("close timed out /
+something prevents Vite server from exiting") **pre-exists this change** —
+confirmed by running the suite with the new file removed and getting the identical
+error at 1416.
+
+### 6. Absence is stated as a cause, never as a zero
+
+Both derived figures return `null` rather than a number when there is nothing
+honest to say, and the two causes are distinguished on screen because an operator
+needs to tell them apart:
+
+- **No average entry yet** → take-profit shows "—" with "no average entry yet".
+  Showing `0` would read as *"it sells at any price"*.
+- **No position held** → unrealized shows "—" with "no position held", not a
+  profit of zero.
+- **No usable price** → unrealized shows "—" with "no price yet". Section 5.6
+  applied to a derived figure: an unusable price is *reported*, never guessed at.
+
+`derive.ts` also catches a decimal-parse failure and degrades to `null`. Every API
+money value is `toDecimalString` output, so `fromDecimalString` cannot reject it —
+but a throw during render would take the **whole detail page** down and replace a
+working page with a blank one. These figures are additive context; they get out of
+the way rather than break the page around them. That is a deliberate trade of a
+loud failure for a contained one, and it is the right way round *here* because the
+value is decoration on a page whose other content is the real record.
+
+### 7. Configuration is read-only by design, not by omission
+
+The block shows what `config.params` actually holds on `GET /api/bots/:id` — the
+object's own config, not the create-form's input shape. It is not editable and
+that is a design decision worth naming: these values were validated against
+allocated capital at creation (`validateDcaParams` and the grid equivalent) and
+the running Durable Object has been acting on them since. Editing one from here
+would change a live bot's risk profile mid-cycle, which is a whole design of its
+own, not a form field.
+
+DCA shows nine parameters, one more than the brief listed. **`sellOnStopLoss` was
+added deliberately**, because it is the config value an operator is most likely to
+assume wrongly: a stop-loss **halt cancels open orders and leaves the position
+held**. The backend rejects `true` as unimplemented, so it always reads "Disabled"
+— and saying so on screen is the entire point of including it.
+
+Grid shows nine too. `takeProfitAmount` and `breakoutThresholdPct` render "Not
+set" rather than a bare "—", since null there has a specific meaning (the bot then
+relies on its stop-loss and breakout exit) that a dash does not carry. The
+existing header line that already shows bounds/lines/spacing/size was left
+**exactly as it was**; the fuller block sits beside it rather than replacing it,
+because the brief was additive and a working summary line is not a thing to
+rewrite in passing.
+
+**There is deliberately no grid take-profit PRICE.** `takeProfitAmount` is an
+accumulated realized-profit **amount**, not a price level (spec 6.1/6.2), so there
+is no single price at which a grid "sells" and inventing one would be a fiction.
+It appears in the configuration block as the amount it is.
+
+### Open questions
+
+1. **No figure has been rendered against a live bot yet.** The formulas are
+   pinned to the backend's own by 18 tests and 9 mutants, and both builds are
+   clean, but nothing here has been seen on the deployed, Access-gated origin
+   against the two real bots. Same shape as every UI surface before it; a
+   deployed manual check is the remaining step, not a code change.
+
+   *(Since verified live, 2026-08-01: the session's own verification plan stated
+   that both bots were halted and that unrealized PnL would therefore read static
+   rather than ticking. **That was false when written.** Queried against testnet
+   D1 `--remote`: `bot-b23y63` (dca) and `bot-328qgw` (grid) both read
+   `status = running`, `halt_reason` NULL, `halted_at` NULL. `audit_log` gives the
+   sequence — halted by `reconciliation` 07-31 20:00 UTC, then
+   `bot.missed_fills_applied` 08-01 01:29 UTC and `bot.resumed` 08-01 01:39 UTC,
+   both by `d.vidya381@gmail.com` — so they had been running for ~12.6 hours by
+   the time the claim was made. The drift criticals are `resolved = 1`; the
+   correction worked. Both bots are subscribed to the feed, so **the unrealized
+   figures should tick**, and the static-PnL caveat is withdrawn.*
+
+   *The error is worth recording precisely, because it is cheap to repeat: step
+   18's "Deliberately not done" section says "The bots are not resumed", and this
+   session **read an append-only historical entry as current state**. It is not,
+   and cannot be — every entry here states what was true on the day it was
+   written, which is the whole point of an append-only log. Bot status is live
+   state with exactly one authority: D1 and the Durable Object, queried. The
+   general rule for a future session: **anything that can change after an entry is
+   written — status, position, price, open orders, alert resolution — must be read
+   from the system, never quoted from this log**, no matter how recent the entry
+   or how confidently it is phrased. 18.md now carries the matching annotation at
+   the line that was misread.*
+
+   *One limit stated honestly rather than glossed: `state.lastPrice` lives in the
+   Durable Object, not D1, so the feed's liveness could not be proven from these
+   queries. The supporting evidence is that **no `price_feed_blind` alert has ever
+   been raised** and none has appeared since the resume, against a policy that is
+   alert-only with a 30-minute escalation (§14) — strong, but evidence, not proof.
+   The detail page's own freshness indicator and "Current price" card settle it
+   directly.*
+
+2. **`dca.ts`'s dead `mulInt` import is still there**, and it is the only thing
+   standing between this view and calling the bot's own `takeProfitPrice`
+   directly. Removing it (a one-line backend change) would let `derive.ts` drop
+   its mirror entirely and delete the parity test's whole reason to exist. Left
+   alone because this session was UI-only, but it is the cheapest available
+   upgrade from "verified equal" to "the same code".
+
+3. **No stop-loss PRICE is shown**, only the stop-loss percentage in the config
+   block. `stopLossPrice` exists in `dca.ts` and is the natural symmetric partner
+   to "Take-profit at" — arguably the more urgent of the two to see at a glance.
+   Not added because the brief named three additions and this would be a fourth;
+   recorded as an obvious follow-up rather than quietly included.
+
+4. **HALT ALERTS HAVE NO LIFECYCLE, so a recovered bot still advertises the
+   failure it recovered from.** Found while verifying open question 1 above, and
+   not captured anywhere else in this log — hence naming it here rather than
+   leaving it as a session observation.
+
+   Live at the time of writing: 11 unresolved alerts, **none newer than the
+   resume**. Two `halt_manual` criticals (one per bot) and one
+   `halt_order_rejected` on `bot-b23y63`, all raised before the 08-01 01:39 UTC
+   resume and all still `resolved = 0` against bots that are **running and
+   demonstrably recovered** — the drift criticals that actually caused the halt
+   were resolved correctly. (The other 8 are `price_feed_fanout_failed` warnings
+   from 07-31, a separate and older matter.)
+
+   The mechanism, confirmed in source rather than inferred: `#halt` writes its
+   alert with `#alert` — an unconditional insert — at bot-instance.ts:2421,
+   `alertType: \`halt_${reason}\``. It does **not** use step 18's
+   `raiseStandingAlert`, and `resume` does not resolve it. Step 18 gave a
+   lifecycle to *reconciliation* standing alerts only; halt alerts were never in
+   scope, so they are written on halt and closed by nothing, ever.
+
+   **This is the same shape as step 16's bug 3** — a `running` bot advertising an
+   already-fixed `MissingAccounts` failure, which was fixed by having `resume`
+   clear `halt_reason`/`halted_at` and moving the history to the `bot.resumed`
+   audit entry. The same reasoning applies one layer out: an unresolved
+   **critical** is a current-state claim, and "how many unresolved criticals" stops
+   meaning anything if the count includes incidents the operator has already
+   closed — which is, word for word, step 18's own argument for standing alerts.
+
+   Not fixed here: it is a backend lifecycle change and this session was UI-only.
+   Two things a future session should weigh rather than assume. First, the fix is
+   *probably* not simply "resume resolves the halt alert" — a halt is a discrete
+   historical event, unlike a re-detected condition, so the honest question is
+   whether it should be a standing alert keyed `(halt_*, bot_instance_id)`, or
+   stay an event row whose `resolved` flag the resume path clears, or whether
+   `alerts` needs the event/condition distinction made explicit instead of
+   implied. Second, **it is visible on the dashboard today**: the cross-bot alert
+   feed (10.12) and the detail view's `AlertList` both render these rows, so a
+   running, healthy bot currently shows stale criticals to an operator. That is a
+   correctness problem in what the UI reports, even though the defect is not in
+   the UI.

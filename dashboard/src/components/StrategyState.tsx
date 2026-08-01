@@ -36,9 +36,24 @@ export function StrategyState({ bot }: { bot: BotDetail }) {
       );
     }
     return (
-      <GridLadderView ladder={state.ladder} currentPrice={state.lastPrice} params={config.params} />
+      <GridLadderView
+        ladder={state.ladder}
+        currentPrice={state.lastPrice}
+        params={config.params}
+        capitalAsset={bot.capitalAsset}
+      />
     );
   }
 
-  return <DcaPositionView position={state.position} params={config.params} />;
+  // `state.lastPrice` is the SAME value the summary's "Current price" card reads
+  // (BotSummary), so the derived unrealized figure and the price it is derived
+  // from can never disagree on one render -- both come from this one fetch.
+  return (
+    <DcaPositionView
+      position={state.position}
+      params={config.params}
+      currentPrice={state.lastPrice}
+      capitalAsset={bot.capitalAsset}
+    />
+  );
 }
