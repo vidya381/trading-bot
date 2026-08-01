@@ -396,7 +396,7 @@ describe("bots", () => {
     expect(res.body.error.code).toBe("invalid_status");
   });
 
-  it("resumes a halted bot, keeping its halt reason and auditing the human actor", async () => {
+  it("resumes a halted bot, clearing its halt reason and auditing the human actor", async () => {
     const account = `acct-${suffix}`;
     await seedBalance(account);
     const id = `rs${suffix}`;
@@ -409,19 +409,24 @@ describe("bots", () => {
     const res = await api("POST", `/api/bots/${id}/resume`);
     expect(res.status).toBe(200);
     expect(res.body.data.result).toMatchObject({ status: "running", action: "resumed" });
-    // The refreshed bot in the response already shows the new status, AND still
-    // carries WHY it halted -- `resume` deliberately does not clear the reason,
-    // so the detail view keeps the history after coming back.
+    // The refreshed bot in the response shows the new status AND a cleared
+    // reason. This assertion was inverted before: resume used to keep the
+    // reason, so the detail view showed a running bot still advertising the
+    // failure it had already recovered from. The history lives in the audit
+    // entry below, which is where a past event belongs.
     expect(res.body.data.bot).toMatchObject({ id, status: "running" });
-    expect(res.body.data.bot.haltReason).toContain("order_rejected");
+    expect(res.body.data.bot.haltReason).toBeNull();
     // Resume places no order in this call, exactly like start: it re-subscribes
     // and moves the status; the order attempt comes on the next price update.
     expect(exchange.placed.filter((o) => o.side === "sell")).toEqual([]);
     const row = await db.botInstances.findOne({ id });
     expect(row!.status).toBe("running");
-    expect(row!.halt_reason).toContain("order_rejected");
+    expect(row!.halt_reason).toBeNull();
+    expect(row!.halted_at).toBeNull();
     const audit = await db.auditLog.findMany({ where: { action: "bot.resumed" } });
     expect(audit[0]!.actor).toBe(HUMAN);
+    expect(String((audit[0]!.details_json as unknown as Record<string, unknown>)["previous_halt_reason"]))
+      .toContain("order_rejected");
   });
 
   it("refuses to resume a bot that is not halted, surfacing invalid_status (409)", async () => {

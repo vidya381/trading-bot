@@ -22,7 +22,7 @@ import { FakeExchange } from "../durable-objects/fake-exchange";
 import { inLimiter } from "../durable-objects/test-helpers";
 import { BINANCE_METHOD_WEIGHTS, type RateLimiterPort } from "../exchange/rate-limited";
 import { fromDecimalString as m } from "../shared/money";
-import { runScheduledReconciliation } from "./reconciliation";
+import { BLIND_AFTER_MS, runScheduledReconciliation } from "./reconciliation";
 
 const T0 = 1_760_000_000_000;
 const ACTOR = "owner@example.com";
@@ -67,6 +67,18 @@ beforeEach(async () => {
   exchange = new FakeExchange();
   exchange.balances = [{ asset: "USDT", free: m("1000"), locked: m("0") }];
   limiter = new SpyLimiter();
+
+  // The account must be REGISTERED, not merely present in the ledger. It used
+  // not to matter, because every account got a Binance client regardless; now
+  // the pass reads each account's exchange to decide where to look, and an
+  // account with no registered venue is refused rather than guessed at. That is
+  // the production requirement too (docs/d1-provisioning.md, step 11).
+  await db.accounts.insert({
+    account_label: ACCOUNT,
+    exchange: "binance",
+    created_at: T0,
+    updated_at: T0,
+  });
 
   await seedPlaceholderTotalBalance(
     db,
@@ -170,5 +182,281 @@ describe("what the pass actually costs", () => {
     await runScheduledReconciliation(env, options());
     const total = limiter.requests.reduce((sum, request) => sum + request.weight, 0);
     expect(total).toBe(BINANCE_METHOD_WEIGHTS.getAccountBalances);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: the wrong-venue bug
+// ---------------------------------------------------------------------------
+
+const GEMINI_ACCOUNT = "recon-gemini";
+
+/** Register a second account on Gemini, with funds, so a pass must visit both. */
+async function seedGeminiAccount(): Promise<void> {
+  await db.accounts.insert({
+    account_label: GEMINI_ACCOUNT,
+    exchange: "gemini",
+    created_at: T0,
+    updated_at: T0,
+  });
+  await seedPlaceholderTotalBalance(
+    db,
+    { accountLabel: GEMINI_ACCOUNT, asset: "USD", totalBalance: m("1000"), note: "test fixture" },
+    { actor: ACTOR, now: T0 },
+  );
+}
+
+describe("each account is reconciled against the exchange it is registered on", () => {
+  it("routes per account, not to one hardcoded venue", async () => {
+    // THE TEST THAT WAS MISSING. The old assertions checked that reconciliation
+    // called "an" exchange client, which a single Binance client for every
+    // account satisfies perfectly -- and did, in production, against a Gemini
+    // account, for eleven hours. What has to be asserted is WHICH venue each
+    // account was routed to, so the seam records the pair.
+    await seedGeminiAccount();
+
+    const routed: Array<{ label: string; exchange: string }> = [];
+    const result = await runScheduledReconciliation(
+      env,
+      options({
+        exchangeFor: (label: string, ex: string) => {
+          routed.push({ label, exchange: ex });
+          return exchange;
+        },
+      }),
+    );
+
+    expect(result.ran).toBe(true);
+    expect(routed).toEqual(
+      expect.arrayContaining([
+        { label: ACCOUNT, exchange: "binance" },
+        { label: GEMINI_ACCOUNT, exchange: "gemini" },
+      ]),
+    );
+    // And specifically: the Gemini account was NOT handed a Binance client.
+    expect(routed.find((r) => r.label === GEMINI_ACCOUNT)!.exchange).toBe("gemini");
+  });
+
+  it("reaches the Gemini resolver for a Gemini account, on the real dispatch path", async () => {
+    // No injected factory: this exercises `resolveExchangeForAccount` itself.
+    // The technique is the one exchange-attachment.test.ts uses -- withhold the
+    // secret and read which one the failure names. No network call is made,
+    // because resolution fails before any client is constructed.
+    //
+    // Under the old code this account would have been handed a Binance client
+    // built from the BINANCE_* secrets below and the pass would have "succeeded"
+    // while reading the wrong exchange. That is precisely the silent success
+    // this asserts against.
+    // A database holding ONLY the Gemini account, so the pass has exactly one
+    // account to resolve and no secrets to resolve it with. Resolution fails
+    // before any client is constructed, so nothing reaches the network.
+    db = await freshDatabase();
+    await seedGeminiAccount();
+
+    const trading = { ...env, ENVIRONMENT: "testnet" } as unknown as Env;
+    const result = await runScheduledReconciliation(trading, {
+      now: () => T0,
+      newId: () => crypto.randomUUID(),
+      limiterFor: () => limiter,
+      sleep: async () => undefined,
+      db,
+    });
+
+    expect(result.ran).toBe(false);
+    // Names the GEMINI secret, which it can only do if `resolveGeminiExchange`
+    // was the resolver it reached. Under the old code this account would have
+    // gone to `resolveDefaultExchange` and been given a Binance client.
+    expect(result.reason).toContain("GEMINI_API_KEY");
+    expect(result.reason).not.toContain("BINANCE_API_KEY");
+    // It never got as far as spending budget against the wrong venue.
+    expect(limiter.requests).toHaveLength(0);
+  });
+
+  it("visits every account, so one account's missing secret cannot abort the pass", async () => {
+    // The old code resolved ONE client above the account loop and returned
+    // `ran: false` for the WHOLE pass the moment that resolution failed --
+    // every other account went unreconciled with no record naming it. Now each
+    // account is resolved on its own and each failure is attributed.
+    await seedGeminiAccount();
+
+    const trading = { ...env, ENVIRONMENT: "testnet" } as unknown as Env;
+    await runScheduledReconciliation(trading, {
+      now: () => T0,
+      newId: () => crypto.randomUUID(),
+      limiterFor: () => limiter,
+      sleep: async () => undefined,
+      db,
+    });
+
+    const binanceAlert = await db.alerts.findMany({
+      where: { alert_type: "reconciliation_blind", source: `reconciliation:${ACCOUNT}` },
+    });
+    const geminiAlert = await db.alerts.findMany({
+      where: { alert_type: "reconciliation_blind", source: `reconciliation:${GEMINI_ACCOUNT}` },
+    });
+
+    // Both accounts were reached, and each failure names ITS OWN exchange's
+    // secret rather than one generic reason for the pass.
+    expect(binanceAlert).toHaveLength(1);
+    expect(binanceAlert[0]!.message).toContain("BINANCE_API_KEY");
+    expect(geminiAlert).toHaveLength(1);
+    expect(geminiAlert[0]!.message).toContain("GEMINI_API_KEY");
+  });
+
+  it("prefers the accounts registry over an inference from the bots", async () => {
+    // Registration is the authoritative record (migration 0006). A bot row's
+    // own `exchange` is only a fallback for an account that was never
+    // registered, and must not override a deliberate human registration.
+    await seedGeminiAccount();
+
+    const routed = new Map<string, string>();
+    await runScheduledReconciliation(
+      env,
+      options({
+        exchangeFor: (label: string, ex: string) => {
+          routed.set(label, ex);
+          return exchange;
+        },
+      }),
+    );
+
+    expect(routed.get(GEMINI_ACCOUNT)).toBe("gemini");
+  });
+
+  it("refuses an account with no registered exchange rather than guessing one", async () => {
+    // A ledger-only account with nothing to infer from. Defaulting it to
+    // Binance is exactly how a Gemini account came to be read from Binance, so
+    // the safe answer is to refuse -- loudly.
+    await seedPlaceholderTotalBalance(
+      db,
+      { accountLabel: "orphan-acct", asset: "USDT", totalBalance: m("500"), note: "test fixture" },
+      { actor: ACTOR, now: T0 },
+    );
+
+    const routed: string[] = [];
+    const result = await runScheduledReconciliation(
+      env,
+      options({
+        exchangeFor: (label: string) => {
+          routed.push(label);
+          return exchange;
+        },
+      }),
+    );
+
+    expect(result.ran).toBe(true);
+    expect(routed).not.toContain("orphan-acct");
+
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "reconciliation_blind", source: "reconciliation:orphan-acct" },
+    });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("critical");
+    expect(alerts[0]!.message).toMatch(/no registered exchange/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: reconciliation failing silently
+// ---------------------------------------------------------------------------
+
+describe("a pass that runs but observes nothing says so", () => {
+  const BLIND = { kind: "exchange_error" as const, message: "Service unavailable from a restricted location" };
+
+  it("raises a critical alert when it cannot read an account at all", async () => {
+    // THE ELEVEN-HOUR BUG. `reconcile.ts` correctly declines to invent a
+    // balance it could not read -- but the only trace was a string in the run's
+    // audit `details_json`. 143 consecutive passes read nothing, wrote nothing,
+    // and alerted nothing. This is the assertion whose absence allowed that.
+    exchange.balancesFailure = BLIND;
+
+    const result = await runScheduledReconciliation(env, options());
+
+    expect(result.ran).toBe(true);
+    expect(await db.balanceSnapshots.count()).toBe(0); // still refuses to invent
+
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "reconciliation_blind", source: `reconciliation:${ACCOUNT}` },
+    });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("critical");
+    expect(alerts[0]!.category).toBe("system");
+    expect(alerts[0]!.resolved).toBe(false);
+    // It carries the exchange's own reason, so the alert is actionable rather
+    // than just "something is wrong".
+    expect(alerts[0]!.message).toContain("restricted location");
+  });
+
+  it("stays quiet for a single transient failure", async () => {
+    // One failed read is a blip, not an incident: the account was observed
+    // moments ago. Alerting on every transient error is how an alert channel
+    // becomes something people mute, which is its own way of failing silently.
+    await runScheduledReconciliation(env, options()); // a good observation at T0
+    exchange.balancesFailure = BLIND;
+
+    await runScheduledReconciliation(env, options({ now: () => T0 + 5 * 60_000 }));
+
+    const alerts = await db.alerts.findMany({ where: { alert_type: "reconciliation_blind" } });
+    expect(alerts).toHaveLength(0);
+  });
+
+  it("escalates once the account has been unobserved past the threshold", async () => {
+    await runScheduledReconciliation(env, options()); // good observation at T0
+    exchange.balancesFailure = BLIND;
+
+    await runScheduledReconciliation(env, options({ now: () => T0 + BLIND_AFTER_MS + 1 }));
+
+    const alerts = await db.alerts.findMany({ where: { alert_type: "reconciliation_blind" } });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.message).toMatch(/minute\(s\) ago/);
+  });
+
+  it("opens ONE incident, not one alert per pass", async () => {
+    // At a five-minute cron an alert per pass is 288 rows a day for one
+    // incident. The dispatcher's cooldown throttles the pings; this keeps the
+    // table itself readable as a list of incidents.
+    exchange.balancesFailure = BLIND;
+
+    for (let i = 0; i < 5; i++) {
+      await runScheduledReconciliation(env, options({ now: () => T0 + i * 5 * 60_000 }));
+    }
+
+    const alerts = await db.alerts.findMany({ where: { alert_type: "reconciliation_blind" } });
+    expect(alerts).toHaveLength(1);
+  });
+
+  it("resolves the incident when observation resumes", async () => {
+    exchange.balancesFailure = BLIND;
+    await runScheduledReconciliation(env, options());
+
+    const opened = await db.alerts.findMany({ where: { alert_type: "reconciliation_blind" } });
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.resolved).toBe(false);
+
+    // The exchange comes back.
+    exchange.balancesFailure = null;
+    await runScheduledReconciliation(env, options({ now: () => T0 + 5 * 60_000 }));
+
+    const after = await db.alerts.findMany({ where: { alert_type: "reconciliation_blind" } });
+    expect(after).toHaveLength(1);
+    // Closed, not deleted: the incident stays in the record, but the dashboard
+    // no longer shows a resolved failure as if it were current.
+    expect(after[0]!.resolved).toBe(true);
+    expect(await db.balanceSnapshots.count()).toBeGreaterThan(0);
+  });
+
+  it("reopens if the account goes blind again after recovering", async () => {
+    exchange.balancesFailure = BLIND;
+    await runScheduledReconciliation(env, options());
+    exchange.balancesFailure = null;
+    await runScheduledReconciliation(env, options({ now: () => T0 + 5 * 60_000 }));
+
+    exchange.balancesFailure = BLIND;
+    await runScheduledReconciliation(env, options({ now: () => T0 + 5 * 60_000 + BLIND_AFTER_MS + 1 }));
+
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "reconciliation_blind", resolved: false },
+    });
+    expect(alerts).toHaveLength(1);
   });
 });

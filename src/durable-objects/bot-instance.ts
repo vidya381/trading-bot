@@ -369,6 +369,28 @@ export interface CreateGridBotRequest {
   readonly actor: string;
 }
 
+/** One execution `applyMissedFills` recorded, as decimal strings for transport. */
+export interface AppliedFill {
+  readonly clientOrderId: string;
+  /** The exchange's OWN fill id (Gemini's `tid`), never a synthesised one. */
+  readonly fillId: string;
+  readonly quantity: string;
+  readonly price: string;
+}
+
+/** The outcome of a `applyMissedFills` repair. */
+export interface MissedFillsResult {
+  /** Always the status it started with: this operation never resumes a bot. */
+  readonly status: BotStatus;
+  readonly applied: readonly AppliedFill[];
+  /**
+   * Orders or fills this pass could NOT account for, each with its reason.
+   * Non-empty means the repair is incomplete -- deliberately reported rather
+   * than swallowed, per section 5.6.
+   */
+  readonly skipped: readonly string[];
+}
+
 /** What happened on one pass of the event pipeline, for tests and the dashboard. */
 export interface PipelineResult {
   readonly status: BotStatus;
@@ -971,7 +993,7 @@ export class BotInstance extends DurableObject<Env> {
 
     try {
       if (config.strategy === "grid") {
-        return await this.#applyGridFillToOrder(config, state, order, fill);
+        return await this.#applyGridFillToOrder(config, state, order, fill, true);
       }
       return await this.#applyFillToOrder(config, state, order, fill);
     } catch (error) {
@@ -980,6 +1002,134 @@ export class BotInstance extends DurableObject<Env> {
       }
       return await this.#haltOnUnexpected(config, error);
     }
+  }
+
+  /**
+   * Record fills the exchange already executed but this bot never saw.
+   *
+   * THE REPAIR PATH, and it exists because of a real incident: on 2026-07-31
+   * two Gemini parsing bugs (step 17) meant reconciliation could not read order
+   * status at all, so three orders filled on the exchange while this system went
+   * on believing them `pending`. Section 9 deliberately never auto-corrects
+   * order-state drift -- it halts and alerts and waits for a human -- so this is
+   * that human's action, and nothing else calls it. No cron reaches it.
+   *
+   * WHAT IT REUSES, and why that mattered more than convenience. Every number it
+   * writes comes from the SAME `applyFill` / `applyEntry` / `planFill` chain that
+   * a live fill goes through, so a repaired position cannot disagree with a
+   * normally-recorded one. It invents nothing.
+   *
+   * In particular it does NOT synthesise fill ids. `#recordCancellation`'s
+   * docblock explains why that would be corrupting: `applyFill` deduplicates on
+   * `fillId`, so a made-up id means the real fill either double-counts or is
+   * silently swallowed. The ids here are Gemini's own `tid` values, read back via
+   * `getOrderStatus`, which already asks for `include_trades` precisely so the
+   * per-fill detail is available. That also makes this operation IDEMPOTENT for
+   * free: a second run finds every id already applied and does nothing.
+   *
+   * TWO SAFETY PROPERTIES, both deliberate:
+   *
+   *   1. It refuses unless the bot is HALTED. Repairing the books under a bot
+   *      that is actively trading would race its own pipeline.
+   *   2. It never places an order. A grid fill normally places the paired sell
+   *      (`#applyGridFillToOrder`), and doing that here would put live orders on
+   *      the exchange from a halted bot -- resuming trading through the back
+   *      door. `placeReplacement: false` suppresses exactly that and nothing
+   *      else. This is clean rather than a fudge: `planFill` clears the FILLED
+   *      level's slot itself and returns the replacement as a separate intent, so
+   *      skipping placement leaves no phantom order -- the ladder honestly shows
+   *      the acquired base, its cost, and an empty rung.
+   *
+   * It also never changes status. The bot is halted when this starts and halted
+   * when it finishes; resuming stays a separate, explicit decision.
+   *
+   * A failed read is skipped and reported, never guessed at (section 5.6).
+   */
+  async applyMissedFills(actor: string): Promise<MissedFillsResult> {
+    const config = await this.#config();
+    const state = await this.#state();
+
+    if (state.status !== "halted") {
+      throw new BotInstanceError(
+        "invalid_status",
+        `missed fills can only be applied to a halted bot; this one is ` +
+          `${JSON.stringify(state.status)}. Halt it first, or let reconciliation ` +
+          `halt it, so the books are not repaired underneath a live pipeline.`,
+      );
+    }
+
+    const applied: AppliedFill[] = [];
+    const skipped: string[] = [];
+    // ROUTINE: this is a read-driven repair on a stopped bot, not a risk exit.
+    const exchange = this.#exchange(config, "routine");
+
+    for (const clientOrderId of [...state.openOrderIds]) {
+      const outcome = await exchange.getOrderStatus(config.pair, clientOrderId);
+      if (!isUsable(outcome)) {
+        skipped.push(`${clientOrderId}: ${outcome.kind} ${outcome.message}`);
+        continue;
+      }
+
+      const remote = outcome.value;
+      if (remote.fills === undefined) {
+        // No `trades` in the response at all. That is NOT the same as "no
+        // executions" -- it means the detail was not reported -- so it is
+        // reported as unread rather than treated as nothing to do.
+        skipped.push(
+          `${clientOrderId}: the exchange reported no per-fill detail, so there ` +
+            `is nothing with a real fill id to apply. Filled quantity is ` +
+            `${toDecimalString(remote.filledQuantity)}.`,
+        );
+        continue;
+      }
+
+      for (const fill of remote.fills) {
+        // Re-read each time: the previous fill mutated this order.
+        const order = await this.#order(clientOrderId);
+        if (order === undefined) {
+          skipped.push(`${clientOrderId}: no local record of this order`);
+          break;
+        }
+        if (order.fills.some((existing) => existing.fillId === fill.fillId)) {
+          continue; // Already recorded. The idempotency this relies on.
+        }
+
+        const fresh = await this.#state();
+        try {
+          if (config.strategy === "grid") {
+            await this.#applyGridFillToOrder(config, fresh, order, fill, false);
+          } else {
+            await this.#applyFillToOrder(config, fresh, order, fill);
+          }
+          applied.push({
+            clientOrderId,
+            fillId: fill.fillId,
+            quantity: toDecimalString(fill.quantity),
+            price: toDecimalString(fill.price),
+          });
+        } catch (error) {
+          // An `OrderStateError` here (overfill, terminal order) means the local
+          // record and the exchange genuinely disagree in a way this repair must
+          // not paper over. Report it; do not halt (already halted) and do not
+          // continue guessing at this order.
+          skipped.push(
+            `${clientOrderId} fill ${fill.fillId}: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+          break;
+        }
+      }
+    }
+
+    await this.#audit(
+      config,
+      "bot.missed_fills_applied",
+      actor,
+      { applied, skipped },
+      this.#now(),
+    );
+
+    return { status: (await this.#state()).status, applied, skipped };
   }
 
   /**
@@ -1021,12 +1171,31 @@ export class BotInstance extends DurableObject<Env> {
     await this.#subscribeToFeed(config);
 
     const now = this.#now();
-    // `halt_reason` is deliberately NOT cleared: migration 0001's
-    // halt_requires_reason CHECK is one-directional precisely so a resumed row
-    // may keep the last reason rather than discarding why it stopped.
-    await this.#putState({ ...state, status: "running" });
-    await this.#mirrorStatus(config, "running", state.haltReason, state.haltedAt, now);
-    await this.#audit(config, "bot.resumed", actor, { previous_halt_reason: state.haltReason }, now);
+    // `halt_reason`/`halted_at` ARE cleared, and this is a reversal of the
+    // previous comment here, which read: "deliberately NOT cleared: migration
+    // 0001's halt_requires_reason CHECK is one-directional precisely so a
+    // resumed row may keep the last reason rather than discarding why it
+    // stopped." The CHECK does permit keeping it -- but permitting is not
+    // requiring, and keeping it was wrong in practice. `halt_reason` is a
+    // CURRENT-state column: the dashboard reads the row, sees a non-null
+    // reason, and shows a resolved failure as if it were live. A real bot sat
+    // `running` for hours advertising an `order_rejected ... MissingAccounts`
+    // that had already been fixed.
+    //
+    // Nothing is discarded. The reason is written into this resume's own audit
+    // entry as `previous_halt_reason` below, which is where the history of why
+    // a bot stopped belongs -- an append-only log, not a mutable status column
+    // that the next halt would overwrite anyway. `start` has always cleared
+    // both (see above); resume was the inconsistent one.
+    await this.#putState({ ...state, status: "running", haltReason: null, haltedAt: null });
+    await this.#mirrorStatus(config, "running", null, null, now);
+    await this.#audit(
+      config,
+      "bot.resumed",
+      actor,
+      { previous_halt_reason: state.haltReason, previous_halted_at: state.haltedAt },
+      now,
+    );
 
     return { status: "running", action: "resumed" };
   }
@@ -1937,11 +2106,17 @@ export class BotInstance extends DurableObject<Env> {
    * realized profit, and hands back the replacement to place one level over --
    * a sell above a filled buy, a buy below a filled sell.
    */
+  /**
+   * `placeReplacement` is false ONLY for `applyMissedFills`, which repairs the
+   * books on a halted bot and must not put a live order on the exchange. Every
+   * other caller passes true and behaves exactly as before.
+   */
   async #applyGridFillToOrder(
     config: GridConfig,
     state: BotRuntimeState,
     order: TrackedOrder,
     fill: Fill,
+    placeReplacement: boolean,
   ): Promise<PipelineResult> {
     const effect = applyFill(order, fill);
     await this.#putOrder(effect.order);
@@ -1971,7 +2146,7 @@ export class BotInstance extends DurableObject<Env> {
     await this.#mirrorOrderUpdate(effect.order);
     await this.#mirrorTrade(config, effect.order, fill);
 
-    if (plan.replacement !== null) {
+    if (plan.replacement !== null && placeReplacement) {
       // Place the replacement at the level's own price (a resting limit), routine
       // priority: rebuilding the ladder is ordinary work, not a risk exit.
       const placed = await this.#placeGridOrder(config, plan.replacement, plan.replacement.price, "routine");

@@ -1169,3 +1169,117 @@ describe("against a real BotInstance", () => {
     ).rejects.toThrow(/circuit breaker/i);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Standing alerts: one row per open incident, not one per pass (step 18)
+// ---------------------------------------------------------------------------
+
+describe("a persistent finding does not re-alert on every pass", () => {
+  beforeEach(async () => {
+    await seedBot("dca-btc-1");
+    await seedLedger("400");
+    await seedBaseline("USDT", "5000");
+    exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
+  });
+
+  /** Put the account into the unchanged meaningful-drift state and run a pass. */
+  async function passWithDrift(): Promise<void> {
+    const order = trackedOrder();
+    snapshots.set(
+      "dca-btc-1",
+      snapshotFor("dca-btc-1", [order], { openOrderIds: [order.clientOrderId] }),
+    );
+    await reconcileAccount(ports(), ACCOUNT);
+  }
+
+  beforeEach(async () => {
+    await exchange.placeOrder({
+      pair: TEST_PAIR,
+      clientOrderId: "v1-dca-btc-1-0",
+      side: "buy",
+      type: "limit",
+      price: m("65000"),
+      quantity: m("0.01"),
+    });
+    exchange.fillFor("v1-dca-btc-1-0", { quantity: m("0.005") });
+    await db.orders.insert(
+      orderRow({
+        id: "v1-dca-btc-1-0",
+        bot_instance_id: "dca-btc-1",
+        client_order_id: "v1-dca-btc-1-0",
+        price: m("65000"),
+        quantity: m("0.01"),
+        filled_quantity: ZERO,
+        status: "pending",
+      }),
+    );
+  });
+
+  it("writes ONE alert row across many passes of the same unchanged condition", async () => {
+    // The measured bug: 186 identical unresolved criticals in four hours,
+    // because reconciliation re-detects every 5 minutes and deliberately never
+    // auto-corrects order-state drift. The row count stops meaning anything.
+    for (let i = 0; i < 5; i++) await passWithDrift();
+
+    const raised = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(raised).toHaveLength(1);
+  });
+
+  it("keeps the full per-pass record in the audit log, which is where history belongs", async () => {
+    // This is what makes deduplicating the alert safe rather than lossy.
+    for (let i = 0; i < 3; i++) await passWithDrift();
+
+    const runs = await db.auditLog.findMany({ where: { action: "reconciliation.run" } });
+    expect(runs).toHaveLength(3);
+    for (const entry of runs) {
+      const details = entry.details_json as unknown as { findings: unknown[] };
+      expect(details.findings.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("resolves the standing alert once the finding stops recurring", async () => {
+    await passWithDrift();
+    expect(await alerts({ resolved: false })).not.toHaveLength(0);
+
+    // The drift is corrected: the bot now agrees with the exchange.
+    const corrected = trackedOrder({ filledQuantity: m("0.005"), state: "partially_filled" });
+    snapshots.set(
+      "dca-btc-1",
+      snapshotFor("dca-btc-1", [corrected], { openOrderIds: [corrected.clientOrderId] }),
+    );
+    await db.orders.update({ id: "v1-dca-btc-1-0" }, { filled_quantity: m("0.005"), status: "partially_filled" });
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const drift = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(drift).toHaveLength(1);
+    expect(drift[0]!.resolved).toBe(true);
+  });
+
+  it("does NOT resolve on a pass that could not read the exchange", async () => {
+    // Section 5.6, applied to the alert lifecycle: a run that saw nothing found
+    // nothing, and treating that as "the problem went away" would clear a live
+    // incident on the strength of an outage. The nastiest possible failure here.
+    await passWithDrift();
+    exchange.openOrdersFailure = { kind: "transport", message: "unreachable" };
+    exchange.balancesFailure = { kind: "transport", message: "unreachable" };
+
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const drift = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(drift).toHaveLength(1);
+    expect(drift[0]!.resolved).toBe(false);
+  });
+
+  it("raises a fresh incident if the same drift returns after being resolved", async () => {
+    await passWithDrift();
+    // Resolve it by hand, standing in for a corrected pass.
+    const [first] = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    await db.alerts.update({ id: first!.id }, { resolved: true });
+
+    await passWithDrift();
+
+    const drift = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(drift).toHaveLength(2);
+    expect(drift.filter((row) => !row.resolved)).toHaveLength(1);
+  });
+});

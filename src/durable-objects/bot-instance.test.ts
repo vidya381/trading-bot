@@ -712,12 +712,60 @@ describe("resume (section 7.2 step 5)", () => {
     expect(result.status).toBe("running");
     const row = await db.botInstances.findOne({ id: BOT_ID });
     expect(row!.status).toBe("running");
-    // The reason is deliberately kept, per migration 0001's one-directional
-    // halt_requires_reason CHECK.
-    expect(row!.halt_reason).toMatch(/manual/);
 
     const audit = await db.auditLog.findMany({ where: { action: "bot.resumed" } });
     expect(audit[0]!.actor).toBe(ACTOR);
+  });
+
+  it("clears halt_reason and halted_at, so a resolved failure stops reading as current", async () => {
+    // This REVERSES the previous behaviour, which kept the reason on the row
+    // and was asserted here as deliberate ("migration 0001's CHECK is
+    // one-directional"). The CHECK does permit keeping it -- but `halt_reason`
+    // is a current-state column that the dashboard renders, so a running bot
+    // kept advertising a failure that had already been fixed. A real bot sat
+    // `running` for hours showing an `order_rejected ... MissingAccounts` that
+    // no longer applied.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const halted = await db.botInstances.findOne({ id: BOT_ID });
+    expect(halted!.halt_reason).toMatch(/manual/);
+    expect(halted!.halted_at).not.toBeNull();
+
+    await run((bot) => bot.resume(ACTOR));
+
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.status).toBe("running");
+    expect(row!.halt_reason).toBeNull();
+    expect(row!.halted_at).toBeNull();
+  });
+
+  it("keeps the reason in the audit log, which is where history belongs", async () => {
+    // Clearing the column must not lose why the bot stopped. The append-only
+    // log is the right home for that: a status column would be overwritten by
+    // the next halt anyway.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    await run((bot) => bot.resume(ACTOR));
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.resumed" } });
+    // `details_json` is decoded by the repository layer, not a raw string.
+    const details = audit[0]!.details_json as unknown as Record<string, unknown>;
+    expect(String(details["previous_halt_reason"])).toMatch(/manual/);
+    expect(details["previous_halted_at"]).not.toBeNull();
+  });
+
+  it("clears the in-object state too, not just the D1 mirror", async () => {
+    // The row and the Durable Object's own storage must agree. A snapshot that
+    // still carried the old reason would put it straight back on the next
+    // mirror write.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    await run((bot) => bot.resume(ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.haltReason).toBeNull();
+    expect(snapshot.state.haltedAt).toBeNull();
   });
 
   it("refuses to resume a bot that is not halted", async () => {
@@ -1171,5 +1219,133 @@ describe("price feed wiring (step 14 D)", () => {
     // take-profit-off halts via #halt, which is the unsubscribe funnel.
     expect(result.status).toBe("halted");
     expect(feed.unsubscribes).toEqual([BOT_ID]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyMissedFills: the order-state-drift repair (step 18)
+// ---------------------------------------------------------------------------
+
+describe("applyMissedFills (the human correction path)", () => {
+  /** A bot with one resting, unfilled order, halted -- the incident's shape. */
+  async function haltedWithRestingOrder(): Promise<string> {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    // Halting tries to cancel; make that fail, exactly as it did live, so the
+    // order stays believed-open rather than being recorded cancelled.
+    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await run((bot) => bot.halt("manual", "reconciliation found drift", ACTOR));
+    return clientOrderId;
+  }
+
+  it("records the exchange's real fill, moves the position, and writes the trade", async () => {
+    const clientOrderId = await haltedWithRestingOrder();
+    const order = exchange.resting.get(clientOrderId)!;
+    // The exchange's OWN fill id, as `include_trades` would report it.
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-4242",
+        price: order.request.price,
+        quantity: order.request.quantity,
+        feeAmount: ZERO,
+        feeAsset: "USD",
+        executedAt: T0 + 1000,
+      },
+    ]);
+
+    const result = await run((bot) => bot.applyMissedFills(ACTOR));
+
+    expect(result.applied).toHaveLength(1);
+    expect(result.applied[0]!.fillId).toBe("gemini-tid-4242");
+    expect(result.skipped).toEqual([]);
+
+    // The order moved pending -> filled in D1, and the trade row now exists.
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("filled");
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+
+    // And the position moved, through the same applyEntry the live path uses.
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.position.quantity).toBe(order.request.quantity);
+    expect(snapshot.state.position.averageEntryPrice).toBe(order.request.price);
+  });
+
+  it("leaves the bot HALTED -- repairing the books is not resuming", async () => {
+    const clientOrderId = await haltedWithRestingOrder();
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-1" }),
+    ]);
+
+    const result = await run((bot) => bot.applyMissedFills(ACTOR));
+
+    expect(result.status).toBe("halted");
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.status).toBe("halted");
+  });
+
+  it("is idempotent: a second run applies nothing", async () => {
+    // Guaranteed by `applyFill`'s fillId dedup, which is exactly why a
+    // synthesised id would have been corrupting.
+    const clientOrderId = await haltedWithRestingOrder();
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-9" }),
+    ]);
+
+    const first = await run((bot) => bot.applyMissedFills(ACTOR));
+    const second = await run((bot) => bot.applyMissedFills(ACTOR));
+
+    expect(first.applied).toHaveLength(1);
+    expect(second.applied).toHaveLength(0);
+    // No double-counted trade, no double-counted position.
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+  });
+
+  it("refuses on a bot that is not halted", async () => {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await expect(run((bot) => bot.applyMissedFills(ACTOR))).rejects.toThrow(
+      /only be applied to a halted bot/,
+    );
+  });
+
+  it("reports an unreadable order rather than assuming it did not fill", async () => {
+    // Section 5.6: an unreachable exchange is not evidence of anything.
+    await haltedWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+
+    const result = await run((bot) => bot.applyMissedFills(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join(" ")).toMatch(/connection reset/);
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(0);
+  });
+
+  it("distinguishes 'no per-fill detail reported' from 'no executions'", async () => {
+    // The venue answered but carried no `trades`. There is no real fill id to
+    // apply, so nothing is applied and the gap is reported -- not silently
+    // treated as an unfilled order.
+    await haltedWithRestingOrder();
+
+    const result = await run((bot) => bot.applyMissedFills(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join(" ")).toMatch(/no per-fill detail/);
+  });
+
+  it("audits the repair against the human actor", async () => {
+    const clientOrderId = await haltedWithRestingOrder();
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-77" }),
+    ]);
+
+    await run((bot) => bot.applyMissedFills(ACTOR));
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.missed_fills_applied" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(ACTOR);
+    const details = audit[0]!.details_json as unknown as Record<string, unknown>;
+    expect(JSON.stringify(details["applied"])).toContain("gemini-tid-77");
   });
 });

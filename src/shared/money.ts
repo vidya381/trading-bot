@@ -120,6 +120,104 @@ export function fromDecimalString(input: string): Money {
 }
 
 /**
+ * Parse a decimal string that may carry MORE precision than SCALE, resolving the
+ * excess with an explicitly named `Rounding`.
+ *
+ * WHY THIS EXISTS. `fromDecimalString` throws on excess precision, and that is
+ * right for anything this system *sends* -- a price or quantity we invented and
+ * must not silently alter. It is wrong for a value an exchange *reports*, which
+ * we do not control and cannot refuse. Gemini returns balances at higher
+ * precision than 8 decimal places: a real sandbox response carried
+ * `"99829.54180779832"` (11 places), the strict parser rejected it, and the
+ * account became unreadable ENTIRELY -- no balance snapshot, no drift detection.
+ * Representing it to 8 places while stating the direction is strictly better
+ * than refusing to represent it at all.
+ *
+ * This does NOT weaken the no-silent-rounding discipline; it follows it. The
+ * direction is a required argument reusing this module's existing `Rounding`
+ * vocabulary (there is deliberately no default anywhere here), `"exact"` still
+ * throws, and `fromDecimalString` is untouched and remains the only way to bring
+ * in a value that is going back out to an exchange.
+ *
+ * Rounding is exact integer arithmetic on the digit string -- no float, no
+ * `Number` -- so a 30-digit fraction resolves as precisely as a 9-digit one.
+ *
+ * @throws MoneyError on malformed input, or on excess precision when `"exact"`.
+ */
+export function fromDecimalStringRounded(input: string, rounding: Rounding): Money {
+  if (typeof input !== "string") {
+    throw new MoneyError(`expected a decimal string, got ${typeof input}`);
+  }
+
+  const match = DECIMAL_PATTERN.exec(input);
+  if (match === null) {
+    throw new MoneyError(`malformed decimal string: ${JSON.stringify(input)}`);
+  }
+
+  const [, sign, whole, fraction = ""] = match as unknown as [
+    string,
+    string,
+    string,
+    string | undefined,
+  ];
+  const negative = sign === "-";
+
+  if (fraction.length <= SCALE) {
+    // Nothing to resolve; identical to `fromDecimalString` on this input.
+    const exact = BigInt(whole + fraction.padEnd(SCALE, "0"));
+    return negative ? -exact : exact;
+  }
+
+  const kept = fraction.slice(0, SCALE);
+  const discarded = fraction.slice(SCALE);
+  const magnitude = BigInt(whole + kept);
+  const lostSomething = /[1-9]/.test(discarded);
+
+  if (!lostSomething) {
+    // Trailing zeros beyond SCALE are not a loss of precision, so no rounding
+    // rule may nudge the value -- and `"exact"` must NOT throw, because the
+    // result IS exact. `"1.500000000"` is exactly `1.5`. This check therefore
+    // comes BEFORE the `"exact"` refusal, not after it.
+    return negative ? -magnitude : magnitude;
+  }
+  if (rounding === "exact") {
+    throw new MoneyError(
+      `${JSON.stringify(input)} has ${fraction.length} decimal places, more than ` +
+        `the supported ${SCALE}, and "exact" rounding was requested`,
+    );
+  }
+
+  // Compare the discarded tail against one half: -1 below, 0 exactly half, 1 above.
+  const firstDigit = discarded.charCodeAt(0) - 48;
+  const versusHalf =
+    firstDigit > 5 ? 1 : firstDigit < 5 ? -1 : /[1-9]/.test(discarded.slice(1)) ? 1 : 0;
+
+  let bumpMagnitude: boolean;
+  switch (rounding) {
+    case "trunc":
+      bumpMagnitude = false;
+      break;
+    case "floor":
+      // Toward negative infinity: away from zero only when negative.
+      bumpMagnitude = negative;
+      break;
+    case "ceil":
+      // Toward positive infinity: away from zero only when positive.
+      bumpMagnitude = !negative;
+      break;
+    case "half-up":
+      bumpMagnitude = versusHalf >= 0;
+      break;
+    case "half-even":
+      bumpMagnitude = versusHalf > 0 || (versusHalf === 0 && magnitude % 2n === 1n);
+      break;
+  }
+
+  const resolved = bumpMagnitude ? magnitude + 1n : magnitude;
+  return negative ? -resolved : resolved;
+}
+
+/**
  * Render Money as a decimal string with exactly SCALE decimal places.
  *
  * Use this for exchange request parameters, log lines, and anything a person

@@ -356,6 +356,39 @@ export async function resumeBot(ctx: ApiContext): Promise<Response> {
 }
 
 /**
+ * POST /api/bots/:id/apply-missed-fills -- the order-state-drift repair.
+ *
+ * Calls `BotInstance.applyMissedFills(actor)`, which owns every rule; this is a
+ * thin wrapper in the same shape as `startBot`, `resumeBot` and `liquidateBot`.
+ *
+ * WHY THIS IS AN ENDPOINT AND NOT PART OF RECONCILIATION. Section 9 halts and
+ * alerts on order-state drift and deliberately never auto-corrects it, because
+ * correcting means writing trades and moving a position from a belief the system
+ * has just proved wrong. That judgement is a human's. Putting it behind an
+ * Access-authenticated POST is what makes `ctx.actor` a real person's identity in
+ * the audit entry rather than "cron".
+ *
+ * Failure surface, all from the DO:
+ *   - `invalid_status` (409) -- the bot is not halted. The repair is refused on a
+ *     live bot so it cannot race the bot's own pipeline.
+ *   - `not_attached` (503) -- no exchange client could be built.
+ *
+ * A 200 does NOT mean everything was repaired: `skipped` carries whatever could
+ * not be read or could not be applied, and a caller must look at it. It also does
+ * not resume the bot -- the response's `bot` still shows `halted`, and resuming
+ * remains a separate, explicit action.
+ */
+export async function applyMissedFills(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const result = await botStub(ctx, id).applyMissedFills(ctx.actor);
+  const [row, snapshot] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+}
+
+/**
  * POST /api/bots/:id/liquidate -- the unified human close-out (endpoint 4).
  *
  * Calls `liquidatePosition(actor)` from step 10.3 verbatim. It is valid only on

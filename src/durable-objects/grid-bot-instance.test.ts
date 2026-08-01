@@ -362,3 +362,71 @@ describe("grid halt reuses the shared, throttled cancel path (section 5.4/7.2)",
     expect(row!.status).toBe("halted");
   });
 });
+
+// ---------------------------------------------------------------------------
+// applyMissedFills on a GRID bot: the repair must not trade (step 18)
+// ---------------------------------------------------------------------------
+
+describe("applyMissedFills never places an order", () => {
+  /** A halted grid bot whose ladder is intact and whose buy is still believed open. */
+  async function haltedWithLadder(): Promise<string> {
+    await startAt("100");
+    const buy = placedAtPrice("95");
+    // Halting cancels; make it fail, as it did live, so the order stays open and
+    // the ladder keeps its slots -- the exact state the incident left behind.
+    exchange.cancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await run((bot) => bot.halt("manual", "reconciliation found drift", ACTOR));
+    return buy;
+  }
+
+  it("records the fill but does NOT place the paired sell", async () => {
+    // THE HAZARD THIS GUARDS. A grid fill normally places the replacement sell
+    // (`#applyGridFillToOrder`). Doing that during a repair would put a live
+    // order on the exchange from a HALTED bot -- resuming trading by the back
+    // door, which is precisely what the operator withheld consent for.
+    const buy = await haltedWithLadder();
+    const before = exchange.placed.length;
+    exchange.fillsByOrder.set(buy, [exchange.fillFor(buy, { fillId: "gemini-tid-500" })]);
+
+    const result = await run((bot) => bot.applyMissedFills(ACTOR));
+
+    expect(result.applied).toHaveLength(1);
+    // Nothing new was sent to the exchange.
+    expect(exchange.placed).toHaveLength(before);
+    expect(result.status).toBe("halted");
+  });
+
+  it("still updates held quantity and cost through planFill", async () => {
+    // Suppressing the PLACEMENT must not suppress the ACCOUNTING -- otherwise
+    // the repair would trade one wrong number for another.
+    const buy = await haltedWithLadder();
+    const order = exchange.resting.get(buy)!;
+    exchange.fillsByOrder.set(buy, [exchange.fillFor(buy, { fillId: "gemini-tid-501" })]);
+
+    await run((bot) => bot.applyMissedFills(ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.ladder!.heldQuantity).toBe(order.request.quantity);
+    expect(snapshot.state.ladder!.heldCost).toBeGreaterThan(ZERO);
+  });
+
+  it("leaves NO phantom order on the ladder", async () => {
+    // `planFill` clears the filled level itself and returns the replacement as a
+    // separate intent, so skipping placement cannot leave the ladder believing
+    // in an order that was never sent. Asserted, not assumed: a phantom would
+    // make the very next reconciliation pass raise fresh drift.
+    const buy = await haltedWithLadder();
+    exchange.fillsByOrder.set(buy, [exchange.fillFor(buy, { fillId: "gemini-tid-502" })]);
+
+    await run((bot) => bot.applyMissedFills(ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const liveIds = snapshot.state.openOrderIds;
+    for (const id of liveIds) {
+      // Every id the bot still believes open was genuinely placed.
+      expect(exchange.placed.some((o) => o.clientOrderId === id)).toBe(true);
+    }
+    // And the filled level's own slot is cleared.
+    expect(liveIds).not.toContain(buy);
+  });
+});

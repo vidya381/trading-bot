@@ -234,6 +234,13 @@ export async function reconcileAccount(
   // 6. Act.
   const outcome = await act(ports, accountLabel, runId, at, entries);
 
+  // 6b. Close standing alerts whose finding did not recur -- the other half of
+  // the one-row-per-incident lifecycle `raiseStandingAlert` introduces. Gated on
+  // the pass having actually READ something: a run that skipped its exchange
+  // reads saw no findings because it saw nothing, and treating that as "resolved"
+  // would clear a live incident on the strength of an outage (section 5.6).
+  await resolveClearedAlerts(db, accountLabel, findings, skipped.length === 0, botIds);
+
   await db.auditLog.insert({
     id: newId(),
     actor: "reconciliation",
@@ -274,6 +281,122 @@ export async function reconcileAccount(
     consumedAlertIds: outcome.consumedAlertIds,
     skipped,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Standing alerts: one row per open incident, not one per detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Raise a finding's alert ONCE per open incident.
+ *
+ * WHY THIS IS NOT AN UNCONDITIONAL INSERT ANY MORE. Reconciliation re-detects a
+ * persistent condition every five minutes, and it deliberately never
+ * auto-corrects order-state drift -- it halts, alerts, and waits for a human. So
+ * an unconditional insert writes an identical `critical`, `resolved: false` row
+ * 288 times a day for one unchanged fact. Measured on the 2026-07-31 incident:
+ * 186 rows in four hours, all identical, against ONE for the standing
+ * `reconciliation_blind` alert. The cost is not storage, it is that "how many
+ * unresolved critical alerts are there" stops meaning anything, which is the one
+ * number that most needs to mean something.
+ *
+ * NOTHING HISTORICAL IS LOST, which is what makes this safe: every run already
+ * records its complete findings list in `audit_log.details_json`, so the
+ * per-detection record still exists in the place built for history. `alerts`
+ * becomes what its `resolved` column always implied it was -- a list of open
+ * incidents.
+ *
+ * THE NOTIFICATION COOLDOWN IS UNTOUCHED and remains a separate concern. Section
+ * 10's KV cooldown throttles the outbound ping (15 minutes per alert type per
+ * bot); it never governed row-writing, and `notifications/cooldown.ts` says so.
+ * That layer keeps working exactly as before -- this only stops the table itself
+ * from accumulating duplicates underneath it.
+ *
+ * The key is (alert_type, bot_instance_id), matching the cooldown's own key, so
+ * the two layers agree on what "the same alert" means. The message is
+ * deliberately NOT compared: a re-detection whose wording drifts (a run id, a
+ * changing quantity) is the same incident, and keying on text would defeat the
+ * whole point.
+ */
+async function raiseStandingAlert(
+  db: Database,
+  newId: () => string,
+  alert: {
+    alertType: string;
+    botInstanceId: string | null;
+    message: string;
+    at: Timestamp;
+  },
+): Promise<void> {
+  const open = await db.alerts.findMany({
+    where: {
+      alert_type: alert.alertType,
+      bot_instance_id: alert.botInstanceId,
+      source: "reconciliation",
+      resolved: false,
+    },
+    limit: 1,
+  });
+  if (open.length > 0) return;
+
+  await db.alerts.insert({
+    id: newId(),
+    severity: "critical",
+    category: "trading",
+    alert_type: alert.alertType,
+    bot_instance_id: alert.botInstanceId,
+    source: "reconciliation",
+    message: alert.message,
+    resolved: false,
+    created_at: alert.at,
+    notified_at: null,
+  } satisfies AlertRow);
+}
+
+/**
+ * Close standing alerts whose finding did NOT recur on this pass.
+ *
+ * The other half of the incident lifecycle. Without it, deduplicating the raise
+ * would be strictly worse than the old behaviour: one row that never clears and
+ * suppresses every future alert of that kind for that bot, forever.
+ *
+ * Only alerts this module raises (`source: "reconciliation"`) are considered, and
+ * only kinds this pass was actually in a position to observe. A pass that
+ * skipped its reads must not read "no finding" as "resolved" -- that is section
+ * 5.6 again, and it is why `observedKinds` is passed in rather than inferred from
+ * an empty findings list.
+ */
+async function resolveClearedAlerts(
+  db: Database,
+  accountLabel: string,
+  findings: readonly ClassifiedFinding[],
+  observed: boolean,
+  botIds: readonly string[],
+): Promise<void> {
+  if (!observed) return;
+
+  const stillOpen = new Set(
+    findings.map(
+      (finding) =>
+        `reconciliation_${finding.tier}_${finding.kind}::${finding.botInstanceId ?? ""}`,
+    ),
+  );
+
+  const open = await db.alerts.findMany({
+    where: { source: "reconciliation", resolved: false },
+  });
+
+  for (const row of open) {
+    if (!row.alert_type.startsWith("reconciliation_severe_") &&
+        !row.alert_type.startsWith("reconciliation_meaningful_")) {
+      continue;
+    }
+    // Only this account's bots (or its account-scoped alerts).
+    if (row.bot_instance_id !== null && !botIds.includes(row.bot_instance_id)) continue;
+    if (stillOpen.has(`${row.alert_type}::${row.bot_instance_id ?? ""}`)) continue;
+
+    await db.alerts.update({ id: row.id }, { resolved: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,18 +1183,12 @@ async function act(
     const reason = severe.map((finding) => `[${finding.kind}] ${finding.detail}`).join(" | ");
 
     for (const finding of severe) {
-      await db.alerts.insert({
-        id: newId(),
-        severity: "critical",
-        category: "trading",
-        alert_type: `reconciliation_severe_${finding.kind}`,
-        bot_instance_id: finding.botInstanceId,
-        source: "reconciliation",
+      await raiseStandingAlert(db, newId, {
+        alertType: `reconciliation_severe_${finding.kind}`,
+        botInstanceId: finding.botInstanceId,
         message: `SEVERE drift (run ${runId}): ${finding.detail}`,
-        resolved: false,
-        created_at: at,
-        notified_at: null,
-      } satisfies AlertRow);
+        at,
+      });
     }
 
     const trip = await tripAccountCircuitBreaker(db, {
@@ -1095,18 +1212,12 @@ async function act(
   } else {
     // --- Meaningful: halt THAT bot only, alert, do not auto-correct. ------
     for (const finding of meaningful) {
-      await db.alerts.insert({
-        id: newId(),
-        severity: "critical",
-        category: "trading",
-        alert_type: `reconciliation_meaningful_${finding.kind}`,
-        bot_instance_id: finding.botInstanceId,
-        source: "reconciliation",
+      await raiseStandingAlert(db, newId, {
+        alertType: `reconciliation_meaningful_${finding.kind}`,
+        botInstanceId: finding.botInstanceId,
         message: `MEANINGFUL drift (run ${runId}): ${finding.detail}`,
-        resolved: false,
-        created_at: at,
-        notified_at: null,
-      } satisfies AlertRow);
+        at,
+      });
 
       if (finding.scope !== "bot" || finding.botInstanceId === null) {
         // Nothing to halt. An account-scoped meaningful finding -- a ledger

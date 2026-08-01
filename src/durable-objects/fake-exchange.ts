@@ -76,12 +76,23 @@ export class FakeExchange implements RestExchangeClient {
   nextPlaceFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force the next `cancelOrder` to fail, then cleared. */
   nextCancelFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  /** Set to force EVERY `cancelOrder` to fail. Stays set until cleared. */
+  cancelFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force `getSymbolFilters` to fail. Stays set until cleared. */
   filtersFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force `getOpenOrders` to fail. Stays set until cleared. */
   openOrdersFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force `getAccountBalances` to fail. Stays set until cleared. */
   balancesFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  /** Set to force `getOrderStatus` to fail. Stays set until cleared. */
+  orderStatusFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  /**
+   * Per-fill detail `getOrderStatus` reports for an order, keyed by
+   * clientOrderId -- the `trades` array a real venue returns for
+   * `include_trades`. An ABSENT entry means the venue reported no detail at all,
+   * which `applyMissedFills` treats differently from an empty one.
+   */
+  readonly fillsByOrder = new Map<string, Fill[]>();
   /**
    * What `getCurrentPrice` returns, for the human-triggered liquidation path
    * (step 10.3), which fetches a fresh price rather than being driven by a price
@@ -189,6 +200,13 @@ export class FakeExchange implements RestExchangeClient {
   }
 
   async cancelOrder(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>> {
+    // Persistent form, for a halt that cancels a whole ladder and must see EVERY
+    // cancellation fail -- the state the 2026-07-31 incident actually left behind
+    // (all five cancellations failed on one parse bug). `nextCancelFailure` is
+    // one-shot and cannot express that.
+    if (this.cancelFailure !== null) {
+      return failure(this.cancelFailure.message, this.cancelFailure.kind, this.now);
+    }
     const forced = this.nextCancelFailure;
     if (forced !== null) {
       this.nextCancelFailure = null;
@@ -225,10 +243,19 @@ export class FakeExchange implements RestExchangeClient {
   }
 
   async getOrderStatus(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>> {
+    if (this.orderStatusFailure !== null) {
+      return failure(this.orderStatusFailure.message, this.orderStatusFailure.kind, this.now);
+    }
     const order = this.resting.get(clientOrderId);
     if (order === undefined) {
       return failure(`unknown order ${clientOrderId}`, "exchange_error", this.now);
     }
+    // Executions the exchange reports for this order, when a test has said what
+    // they are. `undefined` means the venue reported no per-fill detail at all,
+    // which is deliberately NOT the same as "no executions" -- `applyMissedFills`
+    // distinguishes the two.
+    const fills = this.fillsByOrder.get(clientOrderId);
+    const filled = fills?.reduce((sum, fill) => sum + fill.quantity, ZERO) ?? order.filledQuantity;
     return {
       ok: true,
       value: {
@@ -238,11 +265,18 @@ export class FakeExchange implements RestExchangeClient {
         side: order.request.side,
         price: order.request.price,
         quantity: order.request.quantity,
-        filledQuantity: order.filledQuantity,
+        filledQuantity: filled,
         cumulativeQuoteQuantity: ZERO,
-        state: order.cancelled ? "cancelled" : "pending",
+        state: order.cancelled
+          ? "cancelled"
+          : filled >= order.request.quantity
+            ? "filled"
+            : filled > ZERO
+              ? "partially_filled"
+              : "pending",
         createdAt: this.now,
         updatedAt: this.now,
+        ...(fills !== undefined ? { fills } : {}),
       },
       at: this.now,
     };

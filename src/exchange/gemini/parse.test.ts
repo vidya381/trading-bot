@@ -283,6 +283,59 @@ describe("parseBalances", () => {
   it("rejects a non-array", () => {
     expect(() => parseBalances({})).toThrow(ParseError);
   });
+
+  // -------------------------------------------------------------------------
+  // Regression: the live 11-decimal balance that made the account unreadable
+  // -------------------------------------------------------------------------
+
+  it("accepts the REAL 11-decimal balance Gemini returned on 2026-07-31", () => {
+    // Not a synthetic example. This is the exact string from the incident: the
+    // strict parser threw `has 11 decimal places, more than the supported 8`,
+    // no balance snapshot could be written, and the account was unobservable.
+    const balances = parseBalances([
+      {
+        type: "exchange",
+        currency: "USD",
+        amount: "99829.54180779832",
+        available: "99829.54180779832",
+      },
+    ]);
+
+    // Truncated toward zero at 8 places: ...54180779|832 -> ...54180779.
+    expect(balances).toEqual([
+      { asset: "USD", free: m("99829.54180779"), locked: ZERO },
+    ]);
+  });
+
+  it("rounds a reported balance DOWN, never up", () => {
+    // Direction matters more than magnitude here: rounding up would overstate
+    // the account by up to 1e-8 and let the capital ledger believe in money
+    // that is not there. Down can only ever be over-cautious.
+    const balances = parseBalances([
+      { currency: "BTC", amount: "1.999999999", available: "1.999999999" },
+    ]);
+    expect(balances[0]!.free).toBe(m("1.99999999"));
+    expect(balances[0]!.free).toBeLessThan(m("2"));
+  });
+
+  it("keeps locked correct when both fields are rounded", () => {
+    // `locked = amount - available`, so both operands must round the same way
+    // or the derived figure drifts. Rounding both down keeps the difference
+    // within one unit and can never make it negative when amount >= available.
+    const balances = parseBalances([
+      { currency: "ETH", amount: "10.123456789123", available: "4.987654321987" },
+    ]);
+    expect(balances[0]!.free).toBe(m("4.98765432"));
+    expect(balances[0]!.locked).toBe(m("10.12345678") - m("4.98765432"));
+    expect(balances[0]!.locked).toBeGreaterThan(ZERO);
+  });
+
+  it("still refuses a genuinely malformed balance string", () => {
+    // The rounding policy must not become a general-purpose "accept anything".
+    expect(() =>
+      parseBalances([{ currency: "USD", amount: "not-a-number", available: "1.0" }]),
+    ).toThrow(ParseError);
+  });
 });
 
 describe("parseSymbolList", () => {
@@ -343,5 +396,130 @@ describe("parseCandles", () => {
     expect(() => parseCandles("BTCUSD", [[AT, 1, 2, 3]], AT, MIN)).toThrow(ParseError);
     // A monetary field that is a string, not the number Gemini's candle feed sends.
     expect(() => parseCandles("BTCUSD", [[AT, "1", 2, 3, 4, 5]], AT, MIN)).toThrow(ParseError);
+  });
+});
+
+describe("shape errors name the real shape", () => {
+  it("says ARRAY, not 'got object', when handed an array", () => {
+    // The message that halted both bots on 2026-07-31 read:
+    //   "order status: expected an object, got object"
+    // because `typeof []` is "object". It named nothing actionable. An array is
+    // exactly what Gemini returned, so the message has to say so.
+    // Asserted through `parsePrice`, whose pubticker payload is a single object
+    // with no wrapped form -- `parseOrderStatus` now legitimately UNWRAPS a
+    // one-element array, so it is no longer the right subject for this.
+    let message = "";
+    try {
+      parsePrice("BTCUSD", [{ bid: "1", ask: "2", last: "1.5" }], AT);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("pubticker");
+    expect(message).toContain("array of 1");
+    expect(message).not.toContain("got object");
+    // And it lists the keys, so the correct parse can be written from the alert.
+    expect(message).toContain("bid");
+    expect(message).toContain("last");
+  });
+
+  it("distinguishes null from an object", () => {
+    // `typeof null` is also "object" -- the same trap, one layer along.
+    expect(() => parsePrice("BTCUSD", null, AT)).toThrow(/got null/);
+  });
+
+  it("describes an empty array without inventing a first element", () => {
+    expect(() => parsePrice("BTCUSD", [], AT)).toThrow(/an empty array/);
+  });
+
+  it("still names a plain scalar correctly", () => {
+    expect(() => parsePrice("BTCUSD", "nope", AT)).toThrow(/got a string/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: /v1/order/status returning a ONE-ELEMENT ARRAY (2026-07-31)
+// ---------------------------------------------------------------------------
+
+/**
+ * The exact key set captured from the live sandbox during the incident, read
+ * off the alert text the improved shape message produced:
+ *
+ *   "expected a single object, got an array of 1 whose first element has keys
+ *    [avg_execution_price, client_order_id, exchange, executed_amount, id,
+ *     is_cancelled, is_hidden, is_live, options, order_id, original_amount,
+ *     price, remaining_amount, side, symbol, timestamp, timestampms, trades,
+ *     type, was_forced]"
+ *
+ * Keys are the real ones; values are representative of a resting buy.
+ */
+const CAPTURED_WRAPPED_STATUS = [
+  {
+    avg_execution_price: "0.00",
+    client_order_id: "v1-bot-b23y63-1",
+    exchange: "gemini",
+    executed_amount: "0",
+    id: "73798699082135660",
+    is_cancelled: false,
+    is_hidden: false,
+    is_live: true,
+    options: [],
+    order_id: "73798699082135660",
+    original_amount: "0.00077893",
+    price: "64190.42",
+    remaining_amount: "0.00077893",
+    side: "buy",
+    symbol: "btcusd",
+    timestamp: "1785484088",
+    timestampms: 1_785_484_088_705,
+    trades: [],
+    type: "exchange limit",
+    was_forced: false,
+  },
+];
+
+describe("parseOrderStatus accepts Gemini's real wrapped shape", () => {
+  it("unwraps the captured one-element array from the live incident", () => {
+    // This exact payload shape halted both bots. It must now parse.
+    const status = parseOrderStatus(CAPTURED_WRAPPED_STATUS);
+    expect(status.clientOrderId).toBe("v1-bot-b23y63-1");
+    expect(status.exchangeOrderId).toBe("73798699082135660");
+    expect(status.price).toBe(m("64190.42"));
+    expect(status.quantity).toBe(m("0.00077893"));
+    expect(status.state).toBe("pending");
+  });
+
+  it("parses the wrapped and unwrapped forms identically", () => {
+    // Gemini's reference documents a bare object and it does return one for
+    // some requests, so both shapes must work -- not one swapped for the other.
+    expect(parseOrderStatus(CAPTURED_WRAPPED_STATUS)).toEqual(
+      parseOrderStatus(CAPTURED_WRAPPED_STATUS[0]),
+    );
+  });
+
+  it("carries an empty trades array through as no fills", () => {
+    // `trades: []` is present in the captured keys. An empty array must not be
+    // read as "no executions asserted" incorrectly -- it is an explicit empty.
+    expect(parseOrderStatus(CAPTURED_WRAPPED_STATUS).fills).toEqual([]);
+  });
+
+  it("REFUSES an empty array instead of calling it 'no such order'", () => {
+    // The dangerous silent success. An order that exists but cannot be found is
+    // exactly what section 9 exists to catch.
+    expect(() => parseOrderStatus([])).toThrow(/no order matched/);
+  });
+
+  it("REFUSES more than one order rather than picking the first", () => {
+    expect(() =>
+      parseOrderStatus([CAPTURED_WRAPPED_STATUS[0], CAPTURED_WRAPPED_STATUS[0]]),
+    ).toThrow(/ambiguous/);
+  });
+
+  it("applies the same unwrap to a cancelled-order payload", () => {
+    const cancelled = parseCancelledOrder(
+      [{ ...CAPTURED_WRAPPED_STATUS[0], is_live: false, is_cancelled: true }],
+      AT,
+    );
+    expect(cancelled.state).toBe("cancelled");
+    expect(cancelled.clientOrderId).toBe("v1-bot-b23y63-1");
   });
 });

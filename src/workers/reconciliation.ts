@@ -22,31 +22,61 @@
  * `/src/reconciliation` with no knowledge of a cron at all.
  *
  * ---------------------------------------------------------------------------
- * THE EXCHANGE CLIENT (step 3.2 -- resolved)
+ * THE EXCHANGE CLIENT (step 3.2 -- resolved; wrong-venue bug fixed)
  * ---------------------------------------------------------------------------
- * When nothing is injected, the client is now built from real, secret-backed
- * credentials by `resolveDefaultExchange` in `./exchange.ts`: it reads
- * BINANCE_API_KEY / BINANCE_API_SECRET and points a `BinanceClient` at the base
- * URL for THIS environment, chosen purely from `env.ENVIRONMENT` (testnet ->
- * testnet.binance.vision, production -> api.binance.com) so the two can never
- * be pointed at each other's exchange. See that file's header for the full
- * enforcement argument.
+ * When nothing is injected, each account's client is built PER ACCOUNT by
+ * `resolveExchangeForAccount` (./exchange-dispatch.ts), keyed by the account's
+ * registered `ExchangeId` -- the same single dispatch seam `BotInstance` uses.
+ * That resolver picks `resolveDefaultExchange` (Binance) or
+ * `resolveGeminiExchange` (Gemini), each of which derives its base URL purely
+ * from `env.ENVIRONMENT` so testnet and production can never be pointed at each
+ * other. See those files for the full enforcement argument.
  *
- * If either secret is missing this FAILS CLOSED with a specific reason and the
- * pass does not run -- the same shape as the RATE_LIMITER, BOT_INSTANCE and
- * schema guards below, and as `./notifications.ts`'s DISCORD_WEBHOOK_URL check.
- * The credential resolution deliberately happens AFTER the schema guard AND
- * only when there is at least one account to reconcile. Two reasons: an
- * environment deployed empty before go-live (production today) still no-ops on
- * "no schema"; and an environment with a schema but no bots yet has nothing
- * that needs the exchange, so it is not made to fail for a secret it does not
- * yet need. Once accounts exist, a missing secret is a hard refusal. Step 6's
- * decision 13 reasoning still holds where it applies: there is no client built
- * against credentials that do not exist -- the absence is now a clear refusal
- * instead of a silent skip.
+ * THIS WAS THE BUG. Until now this file called `resolveDefaultExchange`
+ * directly, once, above the account loop -- a Binance client for EVERY account,
+ * whatever it was registered as. `BotInstance` had dispatched correctly since
+ * step 11, so a Gemini account's orders went to Gemini while its balances were
+ * read from Binance. It stayed invisible for two compounding reasons: the
+ * account's Binance reads initially SUCCEEDED (a Binance testnet faucet balance
+ * of 445 assets was recorded under a Gemini account, and `1MBABYDOGE` in a
+ * Gemini account is not a thing anyone was reading for); and reconciliation
+ * measures each run against the PREVIOUS run's exchange figure, so two reads of
+ * the same wrong venue always differ by zero. The control could not detect that
+ * it was auditing the wrong exchange, because it only ever compared the wrong
+ * exchange against itself. Then Binance began geo-blocking the Worker and every
+ * read failed instead -- silently, for eleven hours; see BLINDNESS below.
  *
- * Tests inject `exchangeFor` (a `FakeExchange`) and so never reach this path
- * and never make a real network call.
+ * The account's exchange comes from the `accounts` registry (migration 0006),
+ * falling back to its bots' `exchange` column. An account with neither is
+ * REFUSED, not defaulted: guessing a venue is the whole failure mode above.
+ *
+ * A missing secret is now per-account rather than an abort of the whole pass,
+ * so a missing GEMINI_API_KEY cannot stop a Binance account being reconciled --
+ * and it raises an alert, because an account nobody is reconciling must not be
+ * a quiet fact. Credential resolution still happens AFTER the schema guard so
+ * an environment deployed empty before go-live no-ops on "no schema".
+ *
+ * Tests inject `exchangeFor` (a `FakeExchange`), which now receives the
+ * account's exchange as its second argument and so can assert WHICH venue an
+ * account was routed to -- the assertion whose absence let this ship.
+ *
+ * ---------------------------------------------------------------------------
+ * BLINDNESS (the second bug: silent failure of the thing that catches failures)
+ * ---------------------------------------------------------------------------
+ * `reconcile.ts` correctly refuses to invent data it could not read: a failed
+ * balance read is pushed onto the run's `skipped` list and NO snapshot is
+ * written, because recording an unread balance as an unchanged one would make
+ * the next run measure from a fiction (section 5.6). But `skipped` was only
+ * ever written into the run's `audit_log` details and a `console.log`. No
+ * alert, no notification, no escalation. So reconciliation -- the control that
+ * exists to catch everything else -- could fail completely on every pass, in
+ * total silence. It did, 143 times in a row.
+ *
+ * `auditBlindness` below closes that: an account with no balance observation
+ * newer than `BLIND_AFTER_MS` gets one standing critical alert, resolved
+ * automatically when observation resumes. See its own comment for why it is one
+ * row per incident rather than per pass, and for what it deliberately does NOT
+ * cover (a cron that never fires at all).
  *
  * ---------------------------------------------------------------------------
  * NO SCHEMA -> NO-OP
@@ -66,6 +96,7 @@
  */
 
 import { databaseFrom, type Database } from "../db";
+import { isExchangeId, type AlertRow, type ExchangeId } from "../db/schema";
 import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import {
@@ -74,7 +105,7 @@ import {
   type ReconciliationRunResult,
 } from "../reconciliation";
 import type { RestExchangeClient, Timestamp } from "../shared/exchange-client";
-import { resolveDefaultExchange } from "./exchange";
+import { resolveExchangeForAccount } from "./exchange-dispatch";
 
 /**
  * How the handler obtains a client for one exchange account.
@@ -82,16 +113,37 @@ import { resolveDefaultExchange } from "./exchange";
  * A factory rather than a single client because section 3's isolation principle
  * is per exchange account, and two accounts will one day mean two key pairs.
  *
+ * This is the type the two RESOLVERS return, and it stays keyed on the account
+ * label alone: `resolveDefaultExchange` and `resolveGeminiExchange` are each
+ * already specific to one exchange, so telling them which exchange to build
+ * would be telling them what they are. Choosing BETWEEN them is
+ * `resolveExchangeForAccount`'s job, one level up.
+ *
  * The `| null` return is for INJECTED factories (a test that wants an account
- * skipped) -- the production factory from `resolveDefaultExchange` always
- * returns a client, because the "no credentials" case is caught once, up front,
- * as a fail-closed refusal rather than a per-account null. A null is still
- * honoured here (skip, no alert) so that seam stays usable.
+ * skipped). The production path returns null for no account: a client that
+ * cannot be built is an ALERT, not a silent skip -- see `runScheduledReconciliation`.
  */
 export type ExchangeFactory = (accountLabel: string) => RestExchangeClient | null;
 
+/**
+ * How a TEST supplies a client, standing in for the whole per-account dispatch.
+ *
+ * Distinct from `ExchangeFactory` because it receives the account's REGISTERED
+ * exchange as well as its label, which is the entire point: this seam is where
+ * a test asserts that an account was routed to the venue it actually trades on.
+ * The production code used to resolve one Binance client above the account loop
+ * and hand it to every account, and no test could tell -- the seam only ever
+ * saw a label, so "reconciled the Gemini account against Binance" and
+ * "reconciled the Gemini account against Gemini" were indistinguishable from
+ * inside a test. Widening this type is what makes that assertable.
+ */
+export type TestExchangeFactory = (
+  accountLabel: string,
+  exchange: ExchangeId,
+) => RestExchangeClient | null;
+
 export interface ScheduledOptions {
-  readonly exchangeFor?: ExchangeFactory;
+  readonly exchangeFor?: TestExchangeFactory;
   readonly now?: () => Timestamp;
   readonly newId?: () => string;
   readonly thresholds?: DriftThresholds;
@@ -117,23 +169,56 @@ export interface ScheduledResult {
   readonly runs: readonly ReconciliationRunResult[];
 }
 
+/** An account to reconcile, and the venue its funds actually live on. */
+interface ReconcilableAccount {
+  readonly label: string;
+  /**
+   * `null` when no registered or inferable exchange could be determined. NOT a
+   * reason to guess one -- reading the wrong venue is exactly the failure this
+   * type exists to prevent, so a null becomes a refusal plus an alert.
+   */
+  readonly exchange: ExchangeId | null;
+}
+
 /**
- * Every exchange account this system knows about.
+ * Every exchange account this system knows about, WITH its exchange.
  *
  * The union of accounts that have bots and accounts that have a capital ledger
  * row. The second half matters: an account whose bots were all closed still
  * holds funds, and section 9's severe tier is about unexplained balance
  * changes, which do not require a bot to exist in order to happen.
+ *
+ * The exchange comes from the `accounts` registry first (migration 0006, the
+ * authoritative record), falling back to the `exchange` on the account's own
+ * bot rows for an account that predates registration or was never registered
+ * by hand. An unrecognised string resolves to `null` rather than to a default:
+ * `isExchangeId` guards it here for the same reason `BotInstance` guards its
+ * own stored value before dispatching.
  */
-async function accountLabels(db: Database): Promise<string[]> {
+async function reconcilableAccounts(db: Database): Promise<ReconcilableAccount[]> {
   const bots = await db.botInstances.findMany();
   const ledger = await db.capitalLedger.findMany();
-  return [
-    ...new Set([
-      ...bots.map((bot) => bot.account_label),
-      ...ledger.map((row) => row.account_label),
-    ]),
-  ].sort();
+  const registry = await db.accounts.findMany();
+
+  const exchangeByLabel = new Map<string, unknown>();
+  // Registry first, so a hand-registered account wins over an inference.
+  for (const row of registry) exchangeByLabel.set(row.account_label, row.exchange);
+  for (const bot of bots) {
+    if (!exchangeByLabel.has(bot.account_label)) {
+      exchangeByLabel.set(bot.account_label, bot.exchange);
+    }
+  }
+  // A ledger-only account contributes a label but no exchange to infer from.
+  for (const row of ledger) {
+    if (!exchangeByLabel.has(row.account_label)) exchangeByLabel.set(row.account_label, undefined);
+  }
+
+  return [...exchangeByLabel.entries()]
+    .map(([label, exchange]) => ({
+      label,
+      exchange: isExchangeId(exchange) ? exchange : null,
+    }))
+    .sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 }
 
 /**
@@ -201,36 +286,57 @@ export async function runScheduledReconciliation(
     };
   }
 
-  const labels = await accountLabels(db);
+  const accounts = await reconcilableAccounts(db);
+  const labels = accounts.map((account) => account.label);
   const runs: ReconciliationRunResult[] = [];
+  const unresolvable: string[] = [];
 
-  // The exchange client. Injected in tests; otherwise built from this
-  // environment's secrets, but ONLY once we know there is something to
-  // reconcile. Resolving after `accountLabels` and gating on it is deliberate:
-  //   - an environment with a schema but no bots (e.g. right after go-live)
-  //     has nothing that needs the exchange, so it must not be made to fail
-  //     for a secret it does not yet need;
-  //   - it comes after the schema guard, so production deployed empty still
-  //     no-ops on "no schema" rather than on a missing secret.
-  // When accounts DO exist, a missing secret fails closed with a specific
-  // reason -- see ./exchange.ts and this file's header.
-  let exchangeFor = options.exchangeFor;
-  if (exchangeFor === undefined && labels.length > 0) {
-    const resolved = resolveDefaultExchange(env, now);
-    if (!resolved.ok) {
-      return { ran: false, reason: resolved.reason, runs: [] };
+  for (const account of accounts) {
+    const accountLabel = account.label;
+
+    // ---- Dispatch, per account, to the venue the account actually trades on.
+    //
+    // This used to be one `resolveDefaultExchange(env, now)` hoisted above the
+    // loop: a Binance client for every account regardless of its registered
+    // exchange. `BotInstance` had dispatched correctly since step 11, so orders
+    // went to Gemini while reconciliation read Binance for the same account --
+    // and because reconciliation compares each run against the PREVIOUS run's
+    // exchange figure, the drift between two reads of the same wrong venue was
+    // always zero and nothing ever flagged it. Resolution is per account and
+    // inside the loop so one account's missing secret cannot blind another's.
+    let exchange: RestExchangeClient | null;
+    if (account.exchange === null) {
+      // No known venue. Refusing is the only safe move: picking a default is
+      // precisely how the wrong-venue bug read a Gemini account from Binance.
+      unresolvable.push(
+        `${accountLabel}: no registered exchange (and none inferable from its bots), ` +
+          `so there is no venue to read. Register it -- see docs/d1-provisioning.md.`,
+      );
+      await alertUnreconcilable(db, options, accountLabel, now(), unresolvable.at(-1)!);
+      continue;
     }
-    exchangeFor = resolved.exchangeFor;
-  }
 
-  for (const accountLabel of labels) {
-    // Non-null: the loop only runs when labels.length > 0, and in that case the
-    // block above set `exchangeFor` (injected, or resolved-or-returned).
-    const exchange = exchangeFor!(accountLabel);
+    if (options.exchangeFor !== undefined) {
+      exchange = options.exchangeFor(accountLabel, account.exchange);
+    } else {
+      const resolved = resolveExchangeForAccount(account.exchange, env, now);
+      if (!resolved.ok) {
+        // A missing secret for THIS account's exchange. Previously this aborted
+        // the whole pass with `ran: false`; now it is per-account, and it
+        // ALERTS. A monitoring job that cannot see an account must say so out
+        // loud -- the eleven-hour blind spot was silent precisely because the
+        // "could not read" path only ever wrote to an audit JSON field.
+        unresolvable.push(`${accountLabel} (${account.exchange}): ${resolved.reason}`);
+        await alertUnreconcilable(db, options, accountLabel, now(), unresolvable.at(-1)!);
+        continue;
+      }
+      exchange = resolved.exchangeFor(accountLabel);
+    }
+
     if (exchange === null) {
       // An injected factory chose to skip this account. Not an alert and not a
-      // failure: the production factory never returns null (a missing secret is
-      // caught up front, above), so this is only reachable via a test seam.
+      // failure: the production path above never yields null, so this is only
+      // reachable via a test seam.
       continue;
     }
 
@@ -261,44 +367,173 @@ export async function runScheduledReconciliation(
       ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
     });
 
-    runs.push(
-      await reconcileAccount(
-        {
-          db,
-          exchange: gatedExchange,
-          now,
-          newId,
-          thresholds: options.thresholds,
-          snapshotBot: async (botInstanceId: string): Promise<BotSnapshot | null> =>
-            await stubFor(botInstanceId).snapshotIfCreated(),
-          haltBot: async (botInstanceId: string, detail: string): Promise<void> => {
-            // `manual` is the documented reason for a halt driven by section
-            // 7.3 or 7.4 rather than by the strategy's own rules, and the
-            // detail carries which run concluded it. `halt` is idempotent:
-            // an already-halted bot returns `already_halted` and changes
-            // nothing.
-            await stubFor(botInstanceId).halt("manual", detail, "reconciliation");
-          },
+    const run = await reconcileAccount(
+      {
+        db,
+        exchange: gatedExchange,
+        now,
+        newId,
+        thresholds: options.thresholds,
+        snapshotBot: async (botInstanceId: string): Promise<BotSnapshot | null> =>
+          await stubFor(botInstanceId).snapshotIfCreated(),
+        haltBot: async (botInstanceId: string, detail: string): Promise<void> => {
+          // `manual` is the documented reason for a halt driven by section
+          // 7.3 or 7.4 rather than by the strategy's own rules, and the
+          // detail carries which run concluded it. `halt` is idempotent:
+          // an already-halted bot returns `already_halted` and changes
+          // nothing.
+          await stubFor(botInstanceId).halt("manual", detail, "reconciliation");
         },
-        accountLabel,
-      ),
+      },
+      accountLabel,
     );
+    runs.push(run);
+
+    // The run happened; whether it SAW anything is a separate question, and it
+    // is the question nothing used to ask.
+    await auditBlindness(db, options, accountLabel, run, now());
   }
 
   if (labels.length > 0 && runs.length === 0) {
-    // Only reachable now via an injected factory that returned null for every
-    // account: the production factory never returns null (a missing secret is a
-    // fail-closed refusal up front). Kept because that test seam is still valid.
+    // Every account was refused or skipped. Reachable in production now that a
+    // missing secret is per-account rather than an up-front abort, so the reason
+    // carries the specifics instead of assuming a test seam.
     return {
       ran: false,
       reason:
-        `${labels.length} account(s) exist but the exchange factory returned no ` +
-        `client for any of them, so nothing could be reconciled.`,
+        `${labels.length} account(s) exist but no exchange client could be obtained ` +
+        `for any of them, so nothing could be reconciled` +
+        (unresolvable.length > 0 ? `: ${unresolvable.join("; ")}` : "."),
       runs: [],
     };
   }
 
   return { ran: true, runs };
+}
+
+// ---------------------------------------------------------------------------
+// Blindness: a pass that runs but observes nothing
+// ---------------------------------------------------------------------------
+
+/**
+ * How long an account may go unobserved before it is an alert rather than a
+ * blip. Three missed passes at the five-minute cron, so a single transient
+ * exchange error stays quiet and a sustained outage does not.
+ */
+export const BLIND_AFTER_MS = 16 * 60 * 1000;
+
+/** `alert_type` for an account reconciliation cannot see at all. */
+export const RECONCILIATION_BLIND_ALERT = "reconciliation_blind";
+
+/**
+ * Raise (or clear) the standing "this account is unobserved" alert.
+ *
+ * THE GAP THIS CLOSES. `reconcile.ts` already refuses to invent data it could
+ * not read: an unreadable balance is pushed onto `skipped` and no snapshot is
+ * written, because recording an unread balance as an unchanged one would make
+ * the next run measure its delta from a fiction (section 5.6). That is right.
+ * What was missing is that `skipped` went ONLY into the run's `audit_log`
+ * `details_json` and a `console.log` -- no alert row, no notification, no
+ * escalation. Reconciliation is the control that catches everything else, and
+ * it could fail totally, every five minutes, in complete silence. It did:
+ * 143 consecutive passes read nothing and said nothing.
+ *
+ * So: after every pass, if the account has no balance observation newer than
+ * `BLIND_AFTER_MS`, there is an open alert saying so. One row per incident, not
+ * one per pass -- an existing unresolved alert is left alone rather than
+ * duplicated 288 times a day, and section 10's dispatcher applies its own
+ * cooldown on top. When observation resumes, the alert is RESOLVED, so the
+ * table reads as incidents rather than as noise.
+ *
+ * Scope worth stating plainly: this detects "the pass ran and saw nothing". It
+ * cannot detect "the cron never fired at all", because it is itself run by that
+ * cron. That needs an external dead-man's switch and is deliberately not
+ * invented here; it is recorded as an open question in the decision log.
+ */
+async function auditBlindness(
+  db: Database,
+  options: ScheduledOptions,
+  accountLabel: string,
+  run: ReconciliationRunResult,
+  at: Timestamp,
+): Promise<void> {
+  const source = `reconciliation:${accountLabel}`;
+  const open = await db.alerts.findMany({
+    where: { alert_type: RECONCILIATION_BLIND_ALERT, source, resolved: false },
+  });
+
+  const latest = await db.balanceSnapshots.findMany({
+    where: { account_label: accountLabel },
+    orderBy: [{ column: "checked_at", direction: "desc" }],
+    limit: 1,
+  });
+  const lastSeen = latest[0]?.checked_at ?? null;
+  const blindFor = lastSeen === null ? null : at - lastSeen;
+  const blind = blindFor === null || blindFor > BLIND_AFTER_MS;
+
+  if (!blind) {
+    // Observation is current again. Close the incident rather than leaving a
+    // resolved failure standing on the dashboard.
+    for (const alert of open) {
+      await db.alerts.update({ id: alert.id }, { resolved: true });
+    }
+    return;
+  }
+
+  if (open.length > 0) return; // Incident already open.
+
+  const howLong =
+    blindFor === null
+      ? "there is no balance observation for this account at all"
+      : `the last balance observation was ${Math.floor(blindFor / 60000)} minute(s) ago`;
+
+  await db.alerts.insert({
+    id: (options.newId ?? (() => crypto.randomUUID()))(),
+    severity: "critical",
+    category: "system",
+    alert_type: RECONCILIATION_BLIND_ALERT,
+    bot_instance_id: null,
+    source,
+    message:
+      `reconciliation has not observed account ${accountLabel} for longer than ` +
+      `${Math.floor(BLIND_AFTER_MS / 60000)} minutes: ${howLong}. The pass is running ` +
+      `but reading nothing, so section 9's drift detection is NOT protecting this ` +
+      `account. Reported by the run itself: ` +
+      `${run.skipped.length > 0 ? run.skipped.join(" | ") : "no reason recorded"}`,
+    resolved: false,
+    created_at: at,
+    notified_at: null,
+  } satisfies AlertRow);
+}
+
+/** The same standing-alert treatment for an account no client could be built for. */
+async function alertUnreconcilable(
+  db: Database,
+  options: ScheduledOptions,
+  accountLabel: string,
+  at: Timestamp,
+  reason: string,
+): Promise<void> {
+  const source = `reconciliation:${accountLabel}`;
+  const open = await db.alerts.findMany({
+    where: { alert_type: RECONCILIATION_BLIND_ALERT, source, resolved: false },
+  });
+  if (open.length > 0) return;
+
+  await db.alerts.insert({
+    id: (options.newId ?? (() => crypto.randomUUID()))(),
+    severity: "critical",
+    category: "system",
+    alert_type: RECONCILIATION_BLIND_ALERT,
+    bot_instance_id: null,
+    source,
+    message:
+      `reconciliation cannot build an exchange client for account ${accountLabel}, so ` +
+      `it is not being reconciled at all: ${reason}`,
+    resolved: false,
+    created_at: at,
+    notified_at: null,
+  } satisfies AlertRow);
 }
 
 /** The `scheduled` handler itself, wired into the Worker's default export. */

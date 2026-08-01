@@ -423,9 +423,16 @@ export interface StartResponse {
 // running blind, reported by the feed's own `price_feed_blind` alert, not by
 // this endpoint.
 //
-// `halt_reason` is NOT cleared on resume (migration 0001's CHECK is
-// one-directional precisely so it survives), so `bot.haltReason` still names why
-// it stopped after a successful resume.
+// `halt_reason` and `halted_at` ARE cleared on resume, and this note used to say
+// the opposite. Migration 0001's CHECK permits keeping the reason, but permitting
+// is not requiring: `haltReason` is a CURRENT-state field, and a `running` bot
+// that still carried it made the detail view advertise a failure the operator had
+// already fixed. After a successful resume `bot.haltReason` is therefore null.
+// The reason it stopped is preserved in the `bot.resumed` audit entry
+// (`previous_halt_reason`), which is where a past event belongs.
+//
+// The resume dialog is unaffected: it reads the bot while it is still `halted`,
+// so it shows the real reason at the moment it matters.
 // ---------------------------------------------------------------------------
 
 /** The `PipelineResult` a resume returns -- always `action: "resumed"` on success. */

@@ -162,7 +162,16 @@ function incrementToMoney(value: unknown, field: string, pair: Pair): Money {
  */
 export function parseSymbolDetails(body: unknown, fetchedAt: Timestamp): SymbolFilters {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    throw new FilterError(`symbol details: expected an object, got ${typeof body}`);
+    // Same defect `parse.ts`'s `describeShape` was written for: `typeof []` is
+    // "object", so the old message here could also say the useless "expected an
+    // object, got object". Naming the real shape is what makes such a failure
+    // diagnosable from the alert text alone.
+    const shape = Array.isArray(body)
+      ? `an array of ${body.length}`
+      : body === null
+        ? "null"
+        : `a ${typeof body}`;
+    throw new FilterError(`symbol details: expected a single object, got ${shape}`);
   }
   const record = body as Record<string, unknown>;
 

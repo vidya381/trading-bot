@@ -7,6 +7,7 @@ import {
   divInt,
   divideRounded,
   fromDecimalString,
+  fromDecimalStringRounded,
   fromStorageString,
   INT64_MAX,
   INT64_MIN,
@@ -400,5 +401,84 @@ describe("utilities", () => {
     expect(fromDecimalString("0.1") + fromDecimalString("0.2")).toBe(
       fromDecimalString("0.3"),
     );
+  });
+});
+
+describe("fromDecimalStringRounded", () => {
+  it("accepts the REAL 11-decimal Gemini balance that broke the strict parser", () => {
+    // The exact string from the 2026-07-31 incident. `fromDecimalString` throws
+    // on it, which is correct for a value we SEND and wrong for one an exchange
+    // REPORTS -- refusing it made the whole account unreadable.
+    expect(() => fromDecimalString("99829.54180779832")).toThrow(MoneyError);
+    expect(fromDecimalStringRounded("99829.54180779832", "floor")).toBe(
+      fromDecimalString("99829.54180779"),
+    );
+  });
+
+  it("leaves a value that already fits untouched, whatever the rounding", () => {
+    for (const mode of ["exact", "trunc", "floor", "ceil", "half-up", "half-even"] as const) {
+      expect(fromDecimalStringRounded("1.5", mode)).toBe(fromDecimalString("1.5"));
+    }
+  });
+
+  it("treats trailing zeros beyond SCALE as no loss at all", () => {
+    // "1.500000000" is exactly 1.5, so no rounding rule may nudge it -- not even
+    // ceil, and not even "exact", which must not throw on a lossless input.
+    for (const mode of ["exact", "trunc", "floor", "ceil", "half-up", "half-even"] as const) {
+      expect(fromDecimalStringRounded("1.5000000000000", mode)).toBe(fromDecimalString("1.5"));
+    }
+  });
+
+  it("still throws on excess precision when asked for exact", () => {
+    // The strict behaviour remains reachable by name; the escape hatch is opt-in.
+    expect(() => fromDecimalStringRounded("1.123456789", "exact")).toThrow(MoneyError);
+  });
+
+  it("rounds each direction correctly for a positive value", () => {
+    const input = "1.123456789"; // one digit too many; discarded "9"
+    expect(fromDecimalStringRounded(input, "trunc")).toBe(fromDecimalString("1.12345678"));
+    expect(fromDecimalStringRounded(input, "floor")).toBe(fromDecimalString("1.12345678"));
+    expect(fromDecimalStringRounded(input, "ceil")).toBe(fromDecimalString("1.12345679"));
+    expect(fromDecimalStringRounded(input, "half-up")).toBe(fromDecimalString("1.12345679"));
+  });
+
+  it("distinguishes trunc from floor on a NEGATIVE value", () => {
+    // The case that makes "floor" the stronger guarantee for a balance: trunc
+    // moves toward zero (understating a debt), floor moves away from it.
+    const input = "-1.123456789";
+    expect(fromDecimalStringRounded(input, "trunc")).toBe(fromDecimalString("-1.12345678"));
+    expect(fromDecimalStringRounded(input, "floor")).toBe(fromDecimalString("-1.12345679"));
+    expect(fromDecimalStringRounded(input, "ceil")).toBe(fromDecimalString("-1.12345678"));
+  });
+
+  it("breaks exact halves away from zero for half-up and to even for half-even", () => {
+    // ...0000_0005 exactly: half-up goes to ...06, half-even to the even ...06;
+    // ...0000_0015 exactly: half-up ...02, half-even stays ...02? -- assert both
+    // against explicitly computed neighbours rather than by restating the rule.
+    expect(fromDecimalStringRounded("0.000000005", "half-up")).toBe(
+      fromDecimalString("0.00000001"),
+    );
+    expect(fromDecimalStringRounded("0.000000005", "half-even")).toBe(
+      fromDecimalString("0.00000000"),
+    );
+    expect(fromDecimalStringRounded("0.000000015", "half-even")).toBe(
+      fromDecimalString("0.00000002"),
+    );
+  });
+
+  it("is exact for a fraction far longer than any float could hold", () => {
+    // 30 fractional digits. A `Number` round-trip would have lost this long
+    // before the 8th place; the digit-string arithmetic does not.
+    expect(fromDecimalStringRounded(`1.${"0".repeat(29)}9`, "ceil")).toBe(
+      fromDecimalString("1.00000001"),
+    );
+    expect(fromDecimalStringRounded(`1.${"0".repeat(29)}9`, "floor")).toBe(
+      fromDecimalString("1"),
+    );
+  });
+
+  it("rejects malformed input rather than rounding it", () => {
+    expect(() => fromDecimalStringRounded("not-a-number", "floor")).toThrow(MoneyError);
+    expect(() => fromDecimalStringRounded("", "floor")).toThrow(MoneyError);
   });
 });

@@ -37,7 +37,14 @@ import type {
 import type { ExchangeOutcome } from "../../shared/downtime";
 import { classifyStatus } from "../../shared/downtime";
 import type { OrderState } from "../../shared/order-state";
-import { fromDecimalString, mul, SCALE, ZERO, type Money } from "../../shared/money";
+import {
+  fromDecimalString,
+  fromDecimalStringRounded,
+  mul,
+  SCALE,
+  ZERO,
+  type Money,
+} from "../../shared/money";
 
 export class ParseError extends Error {
   constructor(message: string) {
@@ -135,11 +142,74 @@ export function classifyFailure<T>(
 // Field readers
 // ---------------------------------------------------------------------------
 
+/**
+ * Describe an unexpected payload accurately enough to act on.
+ *
+ * `typeof` alone produced the single most useless error this system has emitted:
+ * `expected an object, got object`, thrown for an ARRAY, because `typeof []` is
+ * `"object"`. It halted both bots and named nothing that could be fixed from the
+ * message. So arrays report their length and the keys of their first element,
+ * and null reports as null rather than as "object".
+ */
+function describeShape(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    const first = value[0];
+    const keys =
+      typeof first === "object" && first !== null && !Array.isArray(first)
+        ? ` whose first element has keys [${Object.keys(first).sort().join(", ")}]`
+        : ` whose first element is ${first === null ? "null" : typeof first}`;
+    return value.length === 0 ? "an empty array" : `an array of ${value.length}${keys}`;
+  }
+  return `a ${typeof value}`;
+}
+
 function asRecord(value: unknown, context: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new ParseError(`${context}: expected an object, got ${typeof value}`);
+    throw new ParseError(`${context}: expected a single object, got ${describeShape(value)}`);
   }
   return value as Record<string, unknown>;
+}
+
+/**
+ * Accept `POST /v1/order/status`'s real shape: sometimes ONE-ELEMENT ARRAY.
+ *
+ * OBSERVED, not assumed. On 2026-07-31 every order-status read failed with
+ * `expected an object, got object` -- `typeof []` being "object" -- and the
+ * captured payload was an array of 1 whose element carried exactly the
+ * documented order-status keys:
+ *
+ *   [avg_execution_price, client_order_id, exchange, executed_amount, id,
+ *    is_cancelled, is_hidden, is_live, options, order_id, original_amount,
+ *    price, remaining_amount, side, symbol, timestamp, timestampms, trades,
+ *    type, was_forced]
+ *
+ * Gemini's reference documents a single object here, and it does return one for
+ * some requests, so BOTH shapes are accepted rather than swapping one rigid
+ * assumption for another. This mirrors the 14.10 lesson exactly: the wire shape
+ * was established from a real response, not from the prose.
+ *
+ * Only a SINGLE-element array is unwrapped. An empty array and a multi-element
+ * array are refused, loudly and specifically:
+ *
+ *   - empty: the order was not found. Silently treating that as "no such order"
+ *     would let a real order vanish from reconciliation's view, which is the
+ *     class of thing section 9 exists to catch.
+ *   - more than one: genuinely ambiguous. `/v1/order/status` is asked about ONE
+ *     order, so several answers means an assumption here is wrong, and picking
+ *     `[0]` would bury that under a plausible-looking result.
+ */
+function unwrapSingleOrder(body: unknown, context: string): unknown {
+  if (!Array.isArray(body)) return body;
+  if (body.length === 1) return body[0];
+  throw new ParseError(
+    body.length === 0
+      ? `${context}: Gemini returned an empty array, so no order matched the ` +
+        `request. Refusing to report this as "no such order" -- an order that ` +
+        `exists but cannot be found is exactly what reconciliation must not miss.`
+      : `${context}: Gemini returned ${body.length} orders for a single-order ` +
+        `status request, which is ambiguous; refusing to guess which one is meant.`,
+  );
 }
 
 function requireString(
@@ -235,6 +305,42 @@ function requireMoney(
   }
   try {
     return fromDecimalString(value);
+  } catch (cause) {
+    throw new ParseError(`${context}: ${field}: ${(cause as Error).message}`);
+  }
+}
+
+/**
+ * `requireMoney` for a REPORTED balance, which may carry more precision than
+ * this system's 8-decimal scale.
+ *
+ * Rounds with `"floor"`, deliberately. A balance is a statement of what the
+ * account holds, and the two directions are not symmetric in consequence:
+ * rounding up would overstate funds by up to 1e-8 and let the capital ledger
+ * believe in money that is not there, which is the direction that can overspend.
+ * `"floor"` (toward negative infinity) never overstates for either sign -- it
+ * understates a credit and overstates a debt, both of which are the cautious
+ * side. `"trunc"` would coincide for the positive balances seen in practice but
+ * would understate a negative one, so `"floor"` is the stronger guarantee.
+ *
+ * The sub-satoshi remainder is genuinely discarded. That is a real (if tiny)
+ * loss of fidelity, and it is the reason this is a named function with this
+ * comment rather than a quiet `try/catch` around the strict parser.
+ */
+function requireReportedBalance(
+  source: Record<string, unknown>,
+  field: string,
+  context: string,
+): Money {
+  const value = source[field];
+  if (typeof value !== "string") {
+    throw new ParseError(
+      `${context}: expected ${field} to be a decimal string, got ${typeof value}; ` +
+        `refusing to convert a non-string into Money`,
+    );
+  }
+  try {
+    return fromDecimalStringRounded(value, "floor");
   } catch (cause) {
     throw new ParseError(`${context}: ${field}: ${(cause as Error).message}`);
   }
@@ -443,7 +549,7 @@ export function parseOrderResult(body: unknown): OrderResult {
  */
 export function parseOrderStatus(body: unknown): OrderStatus {
   const context = "order status";
-  const record = asRecord(body, context);
+  const record = asRecord(unwrapSingleOrder(body, context), context);
   const createdAt = requireEpochMs(record, "timestampms", context);
   const fills = record["trades"] !== undefined ? parseFills(record["trades"]) : undefined;
 
@@ -474,7 +580,12 @@ export function parseOrderStatus(body: unknown): OrderStatus {
  */
 export function parseCancelledOrder(body: unknown, at: Timestamp): OrderStatus {
   const context = "cancelled order";
-  const record = asRecord(body, context);
+  // Same unwrap as order-status, because this docblock's own claim is that the
+  // two payloads are the SAME shape -- so if one can arrive wrapped, so can the
+  // other. Stated honestly: a wrapped CANCEL response has not been observed,
+  // only a wrapped status one. This is precautionary, and it is safe to apply
+  // because it changes behaviour only for arrays, which today throw outright.
+  const record = asRecord(unwrapSingleOrder(body, context), context);
 
   return {
     ...parseCommonOrderFields(record, context),
@@ -510,8 +621,12 @@ export function parseBalances(body: unknown): Balance[] {
   return body.map((entry, index) => {
     const context = `balance ${index}`;
     const record = asRecord(entry, context);
-    const total = requireMoney(record, "amount", context);
-    const free = requireMoney(record, "available", context);
+    // Reported values, not ones we send: Gemini carries more precision here than
+    // SCALE supports (a live sandbox balance was "99829.54180779832"), so these
+    // round toward zero rather than refusing the whole account. See
+    // `requireReportedBalance`.
+    const total = requireReportedBalance(record, "amount", context);
+    const free = requireReportedBalance(record, "available", context);
     const locked = total - free;
     if (locked < ZERO) {
       throw new ParseError(
