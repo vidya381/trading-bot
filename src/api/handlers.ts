@@ -313,6 +313,54 @@ export async function startBot(ctx: ApiContext): Promise<Response> {
 }
 
 /**
+ * POST /api/bots/:id/halt -- halt ONE bot, on purpose, right now.
+ *
+ * Calls `BotInstance.halt("manual", reason, actor)` -- the same public method the
+ * kill-switch and reconciliation Workers already call, with the same `"manual"`
+ * halt reason, differing only in that the actor is a verified human rather than
+ * `"kill-switch"` or `"reconciliation"`. Thin, the same shape as `startBot`,
+ * `resumeBot` and `liquidateBot`: `halt` owns every rule.
+ *
+ * WHY IT EXISTS SEPARATELY FROM THE OTHER TWO HALT PATHS. Section 7.4's kill
+ * switch is deliberately all-or-nothing -- "a single dashboard control that halts
+ * every bot, on every account" -- and section 9's halts are reactions to drift
+ * the system detected. Neither covers a human looking at one misbehaving bot and
+ * wanting it stopped, which until now meant either halting everything or waiting
+ * for an automated trigger. It is also the precondition the other endpoints
+ * assume: `liquidate` and `apply-missed-fills` both refuse a running bot and tell
+ * the caller to "halt it first", which was, until this endpoint, not something a
+ * caller could actually do.
+ *
+ * `reason` is the operator's free-text explanation and is REQUIRED. It is stored
+ * as `manual: <reason>` in `halt_reason` (the DO composes `${reason}: ${detail}`),
+ * so a halted bot always says why it stopped, not just that it did.
+ *
+ * Failure surface, all from the DO (confirmed from source, not assumed):
+ *   - `not_created` (404)    -- the object holds no config.
+ *   - `invalid_status` (409) -- the bot is `stopped`; its capital is already
+ *     released, so there is nothing to halt.
+ * An ALREADY-HALTED bot is NOT an error: `#halt` returns `already_halted` and
+ * changes nothing, which is the idempotence the circuit breaker relies on and
+ * which makes a double-click here harmless. `created` and `running` both halt.
+ *
+ * Unlike `resume`, this asserts NEITHER latch. A halt is a risk-reducing action
+ * and must stay available while the kill switch is pulled or an account's breaker
+ * is tripped.
+ */
+export async function haltBot(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const body = await readJsonObject(ctx.request);
+  const reason = requireString(body, "reason");
+
+  const result = await botStub(ctx, id).halt("manual", reason, ctx.actor);
+  const [row, snapshot] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+}
+
+/**
  * POST /api/bots/:id/resume -- section 7.2 step 5's explicit human action.
  *
  * Calls `BotInstance.resume(actor)`, designed for exactly this from the first

@@ -23,7 +23,7 @@ import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
 import { inBot, rateLimiterStub } from "../durable-objects/test-helpers";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import { tripAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
-import { isGloballyTripped } from "../reconciliation/kill-switch";
+import { isGloballyTripped, tripGlobalKillSwitch } from "../reconciliation/kill-switch";
 import type { DcaParams } from "../strategies/dca";
 import type { GridParams } from "../strategies/grid";
 import { fromDecimalString as m, toDecimalString } from "../shared/money";
@@ -394,6 +394,138 @@ describe("bots", () => {
     const res = await api("POST", `/api/bots/${id}/start`);
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe("invalid_status");
+  });
+
+  /**
+   * `BotInstance.halt` has thorough tests of its own (bot-instance.test.ts: the
+   * order of marking vs cancelling, idempotence, the stopped-bot refusal). These
+   * are the ENDPOINT's, and the fact each one exists to pin is that a HUMAN can
+   * now reach that path for ONE bot -- previously only the kill switch (all bots)
+   * and reconciliation (automated) could.
+   */
+  it("halts a running bot, recording the operator's reason and the human actor", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `h${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+
+    const res = await api("POST", `/api/bots/${id}/halt`, {
+      body: { reason: "spread looks wrong, stopping to look" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "halted", action: "halted" });
+    // The refreshed bot already shows the halt, so no second fetch is needed.
+    expect(res.body.data.bot).toMatchObject({ id, status: "halted" });
+    expect(res.body.data.bot.haltReason).toContain("spread looks wrong");
+
+    // Mirrored to D1 as `manual: <reason>` -- the enum, then the operator's text.
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("halted");
+    expect(row!.halt_reason).toBe("manual: spread looks wrong, stopping to look");
+    expect(row!.halted_at).toBe(clock);
+
+    // The audit actor is the VERIFIED email, not "kill-switch" or
+    // "reconciliation" -- the whole point of exposing this at the API layer.
+    const audit = await db.auditLog.findMany({ where: { action: "bot.halted" } });
+    expect(audit[0]!.actor).toBe(HUMAN);
+    expect(audit[0]!.details_json).toMatchObject({ reason: "manual" });
+  });
+
+  it("requires a reason (400)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hnr${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: {} });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+    // Refused before anything happened: the bot is untouched.
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("running");
+  });
+
+  /**
+   * A double-click must not be a failure, and must not overwrite the first
+   * halt's reason. This is `#halt`'s existing idempotence, over the wire.
+   */
+  it("is idempotent: halting an already-halted bot succeeds and changes nothing", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hh${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+
+    const first = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "first" } });
+    expect(first.status).toBe(200);
+    const second = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "second" } });
+    expect(second.status).toBe(200);
+    expect(second.body.data.result).toMatchObject({ status: "halted", action: "already_halted" });
+
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.halt_reason).toBe("manual: first");
+  });
+
+  /**
+   * The composition this endpoint unblocks. `liquidate` refuses a running bot and
+   * tells the caller to halt it first; before this endpoint existed, a caller
+   * following that instruction had nowhere to go short of the global kill switch.
+   */
+  it("makes a running bot liquidatable, which is what the refusal tells you to do", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hl${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const base = exchange.placed[0]!.clientOrderId;
+    await inBotId(id, (bot) => bot.onFill(base, exchange.fillFor(base)));
+
+    const refused = await api("POST", `/api/bots/${id}/liquidate`);
+    expect(refused.status).toBe(409);
+
+    const halted = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "closing out" } });
+    expect(halted.status).toBe(200);
+
+    exchange.currentPrice = m("100");
+    const res = await api("POST", `/api/bots/${id}/liquidate`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "halted", action: "liquidating" });
+  });
+
+  /**
+   * A halt is risk-REDUCING, so unlike `resume` it asserts neither latch. A
+   * pulled kill switch must not block stopping a bot it somehow left running.
+   */
+  it("halts even while the global kill switch is pulled", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hks${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    // Latch the switch WITHOUT its sweep, the same way the resume test above
+    // trips the account breaker: a real trip halts every running bot itself, so
+    // it cannot produce the state under test. This is the bot the sweep failed to
+    // reach (`failures`, section 7.4) -- still running, switch still pulled.
+    await tripGlobalKillSwitch(db, {
+      reason: "genuine emergency",
+      actor: HUMAN,
+      now: T0,
+      haltBot: async () => undefined,
+      newId: () => `ks-${(idCounter += 1)}`,
+    });
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "missed by the sweep" } });
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "halted", action: "halted" });
+  });
+
+  it("404s a halt on a bot that was never created", async () => {
+    const res = await api("POST", `/api/bots/nosuch-${suffix}/halt`, { body: { reason: "x" } });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("not_created");
   });
 
   it("resumes a halted bot, clearing its halt reason and auditing the human actor", async () => {

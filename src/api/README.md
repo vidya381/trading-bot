@@ -63,6 +63,8 @@ rather than trusting the header alone.
 | `GET /api/bots/:id` | DO snapshot + D1 order/trade/alert history |
 | `POST /api/bots` | `BotInstance.create`/`createGrid` (ledger check + SL/TP reused); exchange derived from the `accounts` registry (step 11) |
 | `POST /api/bots/:id/start` | `BotInstance.start` (step 6); `created -> running` only, its `invalid_status` refusal surfaced as 409 |
+| `POST /api/bots/:id/halt` | `BotInstance.halt("manual", …)` (section 7.2) for ONE bot, with a required free-text `reason` and the verified human as actor. Idempotent (`already_halted`); asserts neither latch, since a halt reduces risk |
+| `POST /api/bots/:id/apply-missed-fills` | `BotInstance.applyMissedFills` (step 18's order-state-drift repair); halted bots only |
 | `POST /api/bots/:id/resume` | `BotInstance.resume` (section 7.2 step 5); `halted -> running` only. Refuses with `invalid_status` (409), and — unlike `start` — also `globally_tripped` / `account_tripped` (409), since resume asserts both latches |
 | `POST /api/bots/:id/liquidate` | `BotInstance.liquidatePosition` (step 10.3) |
 | `GET /api/accounts` | registered accounts and their exchange, from the `accounts` table (step 11) |

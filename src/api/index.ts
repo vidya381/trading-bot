@@ -36,6 +36,7 @@ const ROUTES: readonly Route[] = [
   route("POST", "/api/bots", handlers.createBot),
   route("GET", "/api/bots/:id", handlers.getBot),
   route("POST", "/api/bots/:id/start", handlers.startBot),
+  route("POST", "/api/bots/:id/halt", handlers.haltBot),
   route("POST", "/api/bots/:id/resume", handlers.resumeBot),
   route("POST", "/api/bots/:id/liquidate", handlers.liquidateBot),
   route("POST", "/api/bots/:id/apply-missed-fills", handlers.applyMissedFills),
