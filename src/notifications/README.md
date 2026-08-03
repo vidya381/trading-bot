@@ -1,10 +1,13 @@
 # `/src/notifications` — alerts outbound notification (section 10, step 8)
 
-The **notifying** half of section 10. The **recording** half already exists:
-every alert in the system is written to the D1 `alerts` table by the pipeline
-that raises it (the `BotInstance` Durable Object, reconciliation, the circuit
-breaker), always and unthrottled. Nothing here writes an alert row; this code
-reads recorded alerts and turns them into outbound pings, subject to a cooldown.
+The **notifying** half of section 10. The **recording** half is the pipeline
+that raises each alert (the `BotInstance` Durable Object, reconciliation, the
+circuit breaker) plus [`/src/alerts`](../alerts), which owns the one case where
+a row is written *conditionally*: a condition re-detected on a schedule gets one
+row per open incident rather than one per detection, keyed on the same
+`(alert type, bot instance)` the cooldown here uses. Everything else is written
+unconditionally. Nothing here writes an alert row; this code reads recorded
+alerts and turns them into outbound pings, subject to a cooldown.
 
 ## Files
 

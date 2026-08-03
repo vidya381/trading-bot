@@ -54,6 +54,33 @@ one event: Durable Object storage first, D1 second — section 8.1 makes this
 object's storage authoritative, so a crash between the two leaves the mirror
 behind rather than ahead.
 
+### The alarm (step 20)
+
+One alarm, holding one instant, computed from every scheduled concern by
+`#nextAlarmAt` — the platform allows a Durable Object exactly one, and
+`PriceFeed` already learned that two concerns each calling `setAlarm` means the
+second silently cancels the first. Today the only concern is the open-order
+poll; the shape is written for more.
+
+**Arming hangs off `#putState`, not off the lifecycle methods.** That is the
+single point every `openOrderIds` mutation already passes through, so a bot
+with a resting order cannot end up without a timer because a seventh call site
+forgot to arm one. Armed when `openOrderIds` becomes non-empty on a non-stopped
+bot, disarmed when it empties. A `halted` bot is still polled — observing costs
+nothing and a halt whose cancellation failed leaves live orders — but the poll
+never places a replacement, which is enforced inside `#pollOpenOrders` by
+deriving `placeReplacement` from `status === "running"`.
+
+**Backoff and blindness mirror the price feed's policy**: 30s healthy, doubling
+to a 5-minute floor while reads fail, one `poll_blind` warning after five
+consecutive unreadable passes, one `poll_blind_escalated` critical if it stays
+blind past 30 minutes, and a slow retry that keeps going so an outage
+self-heals. Both alerts, and `unattributable_fill`, go through the SHARED
+standing-alert mechanism in [`/src/alerts`](../alerts) — the same one
+reconciliation's cron uses — because at 30 seconds an undeduplicated re-detected
+condition is ~2,880 rows per bot per day. `alarm()` never throws: a handler that
+does is retried by the runtime on its own schedule.
+
 ## `RateLimiter` (section 5.4, step 8)
 
 One per exchange account, named by the account label. `WeightBudget` in

@@ -26,7 +26,7 @@ import { freshDatabase } from "../db/test-helpers";
 import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
 
-const T0 = 1_760_000_000_000;
+const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const HUMAN = "owner@example.com";
 
 let key: SigningKey;

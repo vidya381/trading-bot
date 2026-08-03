@@ -86,6 +86,11 @@ import type {
 } from "../db/schema";
 import type { BotSnapshot } from "../durable-objects/bot-instance";
 import {
+  raiseStandingAlert,
+  resolveClearedStandingAlerts,
+  standingAlertKey,
+} from "../alerts";
+import {
   isReconciliationAlertType,
   reconciliationAlertType,
   type AlertingTier,
@@ -293,37 +298,24 @@ export async function reconcileAccount(
 // ---------------------------------------------------------------------------
 
 /**
+ * This module's `source`. Scopes BOTH halves of the standing-alert lifecycle,
+ * so reconciliation deduplicates against, and resolves, only its own rows.
+ */
+const RECONCILIATION_SOURCE = "reconciliation";
+
+/**
  * Raise a finding's alert ONCE per open incident.
  *
- * WHY THIS IS NOT AN UNCONDITIONAL INSERT ANY MORE. Reconciliation re-detects a
- * persistent condition every five minutes, and it deliberately never
- * auto-corrects order-state drift -- it halts, alerts, and waits for a human. So
- * an unconditional insert writes an identical `critical`, `resolved: false` row
- * 288 times a day for one unchanged fact. Measured on the 2026-07-31 incident:
- * 186 rows in four hours, all identical, against ONE for the standing
- * `reconciliation_blind` alert. The cost is not storage, it is that "how many
- * unresolved critical alerts are there" stops meaning anything, which is the one
- * number that most needs to mean something.
- *
- * NOTHING HISTORICAL IS LOST, which is what makes this safe: every run already
- * records its complete findings list in `audit_log.details_json`, so the
- * per-detection record still exists in the place built for history. `alerts`
- * becomes what its `resolved` column always implied it was -- a list of open
- * incidents.
- *
- * THE NOTIFICATION COOLDOWN IS UNTOUCHED and remains a separate concern. Section
- * 10's KV cooldown throttles the outbound ping (15 minutes per alert type per
- * bot); it never governed row-writing, and `notifications/cooldown.ts` says so.
- * That layer keeps working exactly as before -- this only stops the table itself
- * from accumulating duplicates underneath it.
- *
- * The key is (alert_type, bot_instance_id), matching the cooldown's own key, so
- * the two layers agree on what "the same alert" means. The message is
- * deliberately NOT compared: a re-detection whose wording drifts (a run id, a
- * changing quantity) is the same incident, and keying on text would defeat the
- * whole point.
+ * The mechanism itself now lives in `/src/alerts/standing.ts`, because step 20's
+ * 30-second `BotInstance` poll is a second writer that re-detects conditions on
+ * a schedule and needs the identical lifecycle -- not a parallel one that could
+ * drift from this one. Read that file's header for why an unconditional insert
+ * is wrong for a re-detected condition (the measured 186 identical criticals in
+ * four hours), why the message is not part of the key, and why the notification
+ * cooldown is untouched. What stays here is only what is reconciliation's:
+ * every finding it raises is `critical` / `trading`.
  */
-async function raiseStandingAlert(
+async function raiseFindingAlert(
   db: Database,
   newId: () => string,
   alert: {
@@ -333,43 +325,32 @@ async function raiseStandingAlert(
     at: Timestamp;
   },
 ): Promise<void> {
-  const open = await db.alerts.findMany({
-    where: {
-      alert_type: alert.alertType,
-      bot_instance_id: alert.botInstanceId,
-      source: "reconciliation",
-      resolved: false,
-    },
-    limit: 1,
-  });
-  if (open.length > 0) return;
-
-  await db.alerts.insert({
-    id: newId(),
+  await raiseStandingAlert(db, newId, {
+    alertType: alert.alertType,
+    botInstanceId: alert.botInstanceId,
     severity: "critical",
     category: "trading",
-    alert_type: alert.alertType,
-    bot_instance_id: alert.botInstanceId,
-    source: "reconciliation",
+    source: RECONCILIATION_SOURCE,
     message: alert.message,
-    resolved: false,
-    created_at: alert.at,
-    notified_at: null,
-  } satisfies AlertRow);
+    at: alert.at,
+  });
 }
 
 /**
  * Close standing alerts whose finding did NOT recur on this pass.
  *
- * The other half of the incident lifecycle. Without it, deduplicating the raise
- * would be strictly worse than the old behaviour: one row that never clears and
+ * The other half of the incident lifecycle, and it must never be separated from
+ * the raise: deduplicating without it would leave one row that never clears and
  * suppresses every future alert of that kind for that bot, forever.
  *
- * Only alerts this module raises (`source: "reconciliation"`) are considered, and
- * only kinds this pass was actually in a position to observe. A pass that
- * skipped its reads must not read "no finding" as "resolved" -- that is section
- * 5.6 again, and it is why `observedKinds` is passed in rather than inferred from
- * an empty findings list.
+ * What this function contributes is reconciliation's own three answers to the
+ * shared mechanism's questions -- which rows it OWNS (only the ones its
+ * `reconciliation_{tier}_{kind}` scheme produced: `reconciliation_blind`,
+ * `reconciliation_halt_failed` and `orphaned_bot_row` are this module's too but
+ * have their own lifecycles), which are IN SCOPE (this account's bots), and
+ * whether the pass actually OBSERVED anything. That last one is section 5.6
+ * applied to the alert lifecycle and is passed in rather than inferred, because
+ * "found nothing" and "saw nothing" are indistinguishable from inside.
  */
 async function resolveClearedAlerts(
   db: Database,
@@ -378,36 +359,27 @@ async function resolveClearedAlerts(
   observed: boolean,
   botIds: readonly string[],
 ): Promise<void> {
-  if (!observed) return;
-
-  // Built through the same function the raise side uses, so the key this
+  // Built through the same two functions the raise side uses, so the key this
   // compares against cannot drift from the `alert_type` actually written. A
   // `minor` finding raises no row, so it can never match one and is skipped.
   const stillOpen = new Set(
     findings
       .filter((finding) => finding.tier !== "minor")
-      .map(
-        (finding) =>
-          `${reconciliationAlertType(finding.tier as AlertingTier, finding.kind)}::` +
-          `${finding.botInstanceId ?? ""}`,
+      .map((finding) =>
+        standingAlertKey(
+          reconciliationAlertType(finding.tier as AlertingTier, finding.kind),
+          finding.botInstanceId,
+        ),
       ),
   );
 
-  const open = await db.alerts.findMany({
-    where: { source: "reconciliation", resolved: false },
+  await resolveClearedStandingAlerts(db, {
+    source: RECONCILIATION_SOURCE,
+    owns: isReconciliationAlertType,
+    stillOpen,
+    observed,
+    inScope: (botInstanceId) => botInstanceId === null || botIds.includes(botInstanceId),
   });
-
-  for (const row of open) {
-    // Only rows this naming scheme produced -- `reconciliation_blind`,
-    // `reconciliation_halt_failed` and `orphaned_bot_row` are this module's too,
-    // but they have their own lifecycles and are not findings.
-    if (!isReconciliationAlertType(row.alert_type)) continue;
-    // Only this account's bots (or its account-scoped alerts).
-    if (row.bot_instance_id !== null && !botIds.includes(row.bot_instance_id)) continue;
-    if (stillOpen.has(`${row.alert_type}::${row.bot_instance_id ?? ""}`)) continue;
-
-    await db.alerts.update({ id: row.id }, { resolved: true });
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,7 +1166,7 @@ async function act(
     const reason = severe.map((finding) => `[${finding.kind}] ${finding.detail}`).join(" | ");
 
     for (const finding of severe) {
-      await raiseStandingAlert(db, newId, {
+      await raiseFindingAlert(db, newId, {
         alertType: reconciliationAlertType("severe", finding.kind),
         botInstanceId: finding.botInstanceId,
         message: `SEVERE drift (run ${runId}): ${finding.detail}`,
@@ -1223,7 +1195,7 @@ async function act(
   } else {
     // --- Meaningful: halt THAT bot only, alert, do not auto-correct. ------
     for (const finding of meaningful) {
-      await raiseStandingAlert(db, newId, {
+      await raiseFindingAlert(db, newId, {
         alertType: reconciliationAlertType("meaningful", finding.kind),
         botInstanceId: finding.botInstanceId,
         message: `MEANINGFUL drift (run ${runId}): ${finding.detail}`,

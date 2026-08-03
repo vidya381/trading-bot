@@ -41,7 +41,7 @@ import { fromDecimalString as m, ZERO } from "../shared/money";
 import type { TrackedOrder } from "../shared/order-state";
 import { DCA_SCHEMA_VERSION, EMPTY_POSITION, type DcaParams } from "../strategies/dca";
 
-const T0 = 1_770_000_000_000;
+const T0 = 1_910_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const ACCOUNT = "main";
 
 let db: Database;

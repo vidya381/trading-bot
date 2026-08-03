@@ -59,6 +59,15 @@ whose amount and reference are the same asset at account scale.
 | meaningful | Halt that one bot, write a critical alert, **do not** auto-correct. |
 | severe | Trip the account circuit breaker: halt every bot on the account, latch it, alert immediately. |
 
+Those alerts are **standing** ones: one row per open incident, not one per
+detection. The mechanism moved to [`/src/alerts/standing.ts`](../alerts) at step
+20, when `BotInstance`'s 30-second open-order poll became a second writer that
+re-detects conditions on a schedule; `raiseFindingAlert` and
+`resolveClearedAlerts` here are now thin adapters that supply reconciliation's
+own three answers (which rows it owns, which are in scope, and whether the pass
+actually observed anything). Behaviour is unchanged — a private copy in this
+file would have been a second lifecycle free to drift from the poll's.
+
 Auto-correct only ever touches the **D1 mirror**. Section 8.1 makes each Durable
 Object the source of truth for its own state; a cron writing into a running
 bot's position would be a second writer, from outside the object that

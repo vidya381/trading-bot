@@ -27,7 +27,21 @@ import type { PriceFeedPort } from "./price-feed";
 import type { AcquireRequest, AcquireResult } from "./rate-limiter";
 import { BINANCE_METHOD_WEIGHTS, type RateLimiterPort } from "../exchange/rate-limited";
 
-const T0 = 1_760_000_000_000;
+/**
+ * The fake clock's origin, and it is deliberately in the FUTURE.
+ *
+ * Step 20 arms a real Durable Object alarm, and the runtime fires an alarm
+ * whose time has passed as soon as it is set. With the old origin (2025) every
+ * armed alarm was already overdue the instant it was written, so the runtime
+ * raced each test with a spurious poll -- sometimes against this file's
+ * injected clock and exchange, sometimes against a re-created instance with
+ * neither. Every assertion below is relative to `T0`, so moving it forward
+ * costs nothing and makes the alarm fire only when a test fires it.
+ *
+ * `FakeExchange.now` is set to match in `beforeEach`; the two were equal by
+ * construction before and the trade-timestamp assertions rely on it.
+ */
+const T0 = 1_900_000_000_000;
 const ACTOR = "owner@example.com";
 const BOT_ID = "dca-btc-1";
 
@@ -108,6 +122,7 @@ async function run<T>(
 beforeEach(async () => {
   db = await freshDatabase();
   exchange = new FakeExchange();
+  exchange.now = T0;
   clock = T0;
   idCounter = 0;
   nameCounter += 1;
@@ -1528,5 +1543,378 @@ describe("checkOpenOrders (the resting-order observation gap)", () => {
     expect(audit).toHaveLength(1);
     expect(audit[0]!.actor).toBe(ACTOR);
     expect(JSON.stringify(audit[0]!.details_json)).toContain("gemini-tid-77");
+  });
+
+  it("writes ONE unattributable_fill row however many passes re-detect it", async () => {
+    // Step 19 recorded this as an explicit PRECONDITION for scheduling the
+    // poll: at 30 seconds an unconditional insert is ~2,880 rows per bot per
+    // day, which is step 18's measured 186-identical-criticals problem 60x
+    // faster. The dedup is the shared one reconciliation uses.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.filledQuantity = m("1");
+
+    for (let i = 0; i < 10; i++) await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "unattributable_fill" })).toBe(1);
+  });
+
+  it("resolves the standing alert once the condition clears", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.filledQuantity = m("1");
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    // The venue now reports the same quantity this bot has recorded.
+    exchange.resting.get(clientOrderId)!.filledQuantity = ZERO;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await db.alerts.findMany({ where: { alert_type: "unattributable_fill" } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.resolved).toBe(true);
+  });
+
+  it("never resolves this bot's OTHER alerts, which it does not re-detect", async () => {
+    // `cancel_failed`, `order_state_drift` and the rest are discrete events
+    // written by this same object under this same source, and three of them are
+    // reconciliation's to ingest and close (`INGESTED_ALERT_TYPES`). A poll
+    // that claimed them would silently close incidents it never observed --
+    // and, since step 18.1 gates the "Apply missed fills" control on an
+    // UNRESOLVED drift row, would make the repair button disappear from a bot
+    // that still needs it.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.halt("manual", "operator halted it", ACTOR));
+    expect(await db.alerts.count({ alert_type: "cancel_failed", resolved: false })).toBe(1);
+
+    // Clean passes: everything read, nothing amiss, so the poll's own standing
+    // conditions would all resolve here.
+    exchange.cancelFailure = null;
+    for (let i = 0; i < 3; i++) await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "cancel_failed", resolved: false })).toBe(1);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([clientOrderId]);
+  });
+
+  it("does NOT resolve it on a pass that could not read the order", async () => {
+    // Section 5.6 applied to the alert lifecycle: a pass that saw nothing found
+    // nothing, and closing the incident on that basis would clear a live
+    // problem on the strength of an outage.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.filledQuantity = m("1");
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await db.alerts.findMany({ where: { alert_type: "unattributable_fill" } });
+    expect(rows[0]!.resolved).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The alarm: the poll, on a timer (step 20)
+// ---------------------------------------------------------------------------
+
+describe("alarm (the scheduled open-order poll)", () => {
+  /** The single alarm this object is allowed to hold, as stored. */
+  async function alarmAt(): Promise<number | null> {
+    return await inBot(objectName, async (_bot, state) => await state.storage.getAlarm());
+  }
+
+  async function pollSchedule(): Promise<{
+    nextPollAt: number | null;
+    failures: number;
+    blindSince: number | null;
+    escalated: boolean;
+  }> {
+    return await inBot(objectName, async (_bot, state) => {
+      return (await state.storage.get("poll-schedule")) as never;
+    });
+  }
+
+  /** A RUNNING bot with one resting, unfilled base order. */
+  async function runningWithRestingOrder(): Promise<string> {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    return exchange.placed[0]!.clientOrderId;
+  }
+
+  /** Advance to the moment the alarm is due, then fire it as the runtime would. */
+  async function fireAlarm(): Promise<void> {
+    const due = await alarmAt();
+    if (due !== null) clock = Math.max(clock, due);
+    await run((bot) => bot.alarm());
+  }
+
+  // --- arming and disarming ------------------------------------------------
+
+  it("arms nothing for a bot that has never placed an order", async () => {
+    await run((bot) => bot.create(creation()));
+    expect(await alarmAt()).toBeNull();
+
+    await run((bot) => bot.start(ACTOR));
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it("arms the alarm the moment an order starts resting", async () => {
+    await runningWithRestingOrder();
+    expect(await alarmAt()).toBe(T0 + 30_000);
+  });
+
+  it("disarms when the last open order leaves", async () => {
+    // A timer firing against an empty list is rate-limit cost with no possible
+    // finding.
+    const clientOrderId = await runningWithRestingOrder();
+    await run((bot) => bot.onFill(clientOrderId, exchange.fillFor(clientOrderId)));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([]);
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it("disarms when the bot is closed", async () => {
+    await runningWithRestingOrder();
+    await run((bot) => bot.close(ACTOR));
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it("re-arms a lost alarm on the next state write", async () => {
+    // The recovery path. A Durable Object's alarm lives in storage and survives
+    // eviction on its own; what this covers is the alarm going missing for any
+    // other reason (a deploy that placed orders before this step existed), and
+    // it works because arming hangs off `#putState` rather than off the
+    // lifecycle methods.
+    await runningWithRestingOrder();
+    await inBot(objectName, async (_bot, state) => await state.storage.deleteAlarm());
+    expect(await alarmAt()).toBeNull();
+
+    clock += 10_000;
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    // Restored to the instant it was already due at, not pushed out by the
+    // recovery: the schedule is what survives, and the alarm is derived from it.
+    expect(await alarmAt()).toBe(T0 + 30_000);
+  });
+
+  it("keeps its whole schedule in storage, so an eviction loses nothing", async () => {
+    // Nothing about the schedule is an in-memory field: the object can be
+    // evicted between any two passes and the alarm still fires with the right
+    // backoff state.
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
+    await fireAlarm();
+
+    expect(await pollSchedule()).toMatchObject({ failures: 1, nextPollAt: clock + 60_000 });
+  });
+
+  // --- what a firing actually does ----------------------------------------
+
+  it("folds in a resting fill when it fires, through the ordinary live path", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    const order = exchange.resting.get(clientOrderId)!;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-2020",
+        price: order.request.price,
+        quantity: order.request.quantity,
+        feeAmount: ZERO,
+        feeAsset: "USDT",
+        executedAt: T0 + 1000,
+      },
+    ]);
+
+    await fireAlarm();
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.position.quantity).toBe(order.request.quantity);
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+    // And the order is no longer open, so the alarm has disarmed itself.
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it("audits a scheduled pass as `system`, and only when something moved", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    await fireAlarm();
+    expect(await db.auditLog.count({ action: "bot.open_orders_checked" })).toBe(0);
+
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-99" }),
+    ]);
+    await fireAlarm();
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.open_orders_checked" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe("system");
+  });
+
+  it("re-arms 30 seconds later after a clean pass that found nothing", async () => {
+    await runningWithRestingOrder();
+
+    await fireAlarm();
+
+    expect(await alarmAt()).toBe(T0 + 30_000 + 30_000);
+  });
+
+  it("keeps polling a HALTED bot, and places nothing", async () => {
+    // Step 19: observing a halted bot is safe and useful -- a halt whose
+    // cancellation failed leaves live orders on the exchange, and a human is
+    // about to make a decision about exactly those books. What it must never
+    // do is put an order back on the exchange.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.halt("manual", "operator halted it", ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.status).toBe("halted");
+    expect(snapshot.state.openOrderIds).toEqual([clientOrderId]);
+    expect(await alarmAt()).not.toBeNull();
+
+    const placedBefore = exchange.placed.length;
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-halted" }),
+    ]);
+    await fireAlarm();
+
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+    expect(exchange.placed).toHaveLength(placedBefore);
+  });
+
+  it("refuses to poll a STOPPED bot even if one somehow holds an open order", async () => {
+    // `close()` empties `openOrderIds`, so this state is not reachable through
+    // the public API -- it is written directly, because the guard exists for
+    // the case that is not reachable rather than the one that is. A stopped
+    // bot's capital is released and `checkOpenOrders` refuses outright, so a
+    // poll would be work whose result nothing may use.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-stopped" }),
+    ]);
+
+    await inBot(objectName, async (_bot, state) => {
+      const stored = (await state.storage.get("state")) as Record<string, unknown>;
+      await state.storage.put("state", { ...stored, status: "stopped" });
+      await state.storage.put("poll-schedule", {
+        nextPollAt: clock,
+        failures: 0,
+        blindSince: null,
+        escalated: false,
+      });
+    });
+
+    await run((bot) => bot.alarm());
+
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(0);
+    expect(await alarmAt()).toBeNull();
+  });
+
+  it("neither throws nor re-arms on an object that holds no bot", async () => {
+    // An alarm can outlive a bot that was never finished: capital is reserved
+    // and the D1 row written before this object's storage (step 6, open
+    // question 6). A throwing handler would be retried by the runtime.
+    await expect(run((bot) => bot.alarm())).resolves.toBeUndefined();
+    expect(await alarmAt()).toBeNull();
+  });
+
+  // --- backoff, blindness, escalation --------------------------------------
+
+  it("applies the backoff even when the same pass read some orders successfully", async () => {
+    // The mixed pass writes state (it applied something), and that write
+    // re-arms through `#putState` at the healthy cadence. The failure has to
+    // win, or a bot that can read one order and not another polls the
+    // unreadable one every 30 seconds forever.
+    const first = await runningWithRestingOrder();
+    exchange.fillsByOrder.set(first, [exchange.fillFor(first, { fillId: "gemini-tid-mixed" })]);
+    // A second id the venue has never heard of, so its read fails while the
+    // first succeeds. Written straight into storage because DCA will not place
+    // a second order while one is open -- the shape is reachable in production
+    // (a grid ladder, or an order placed before a restart), not through this
+    // strategy's own pipeline.
+    await inBot(objectName, async (_bot, state) => {
+      const stored = (await state.storage.get("state")) as { openOrderIds: string[] };
+      await state.storage.put("state", {
+        ...stored,
+        openOrderIds: [first, "v1-ghost-order-0"],
+      });
+    });
+
+    const firedAt = (await alarmAt())!;
+    clock = firedAt;
+    await run((bot) => bot.alarm());
+
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+    expect(await alarmAt()).toBe(firedAt + 60_000);
+  });
+
+  it("backs off on repeated unreadable passes: 30s, 60, 120, 240, then a 5-minute floor", async () => {
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
+
+    const delays: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const firedAt = (await alarmAt())!;
+      clock = firedAt;
+      await run((bot) => bot.alarm());
+      delays.push((await alarmAt())! - firedAt);
+    }
+
+    expect(delays).toEqual([60_000, 120_000, 240_000, 300_000, 300_000]);
+  });
+
+  it("goes blind after five consecutive failures, with ONE alert row", async () => {
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
+
+    for (let i = 0; i < 10; i++) await fireAlarm();
+
+    const blind = await db.alerts.findMany({ where: { alert_type: "poll_blind" } });
+    expect(blind).toHaveLength(1);
+    expect(blind[0]!.severity).toBe("warning");
+    expect(blind[0]!.resolved).toBe(false);
+    // Still retrying: an outage must self-heal rather than dying silently.
+    expect(await alarmAt()).not.toBeNull();
+  });
+
+  it("escalates ONCE if it stays blind past thirty minutes", async () => {
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
+    for (let i = 0; i < 5; i++) await fireAlarm();
+    expect(await db.alerts.count({ alert_type: "poll_blind_escalated" })).toBe(0);
+
+    clock += 31 * 60_000;
+    for (let i = 0; i < 5; i++) await fireAlarm();
+
+    const escalated = await db.alerts.findMany({ where: { alert_type: "poll_blind_escalated" } });
+    expect(escalated).toHaveLength(1);
+    expect(escalated[0]!.severity).toBe("critical");
+  });
+
+  it("recovers: a readable pass resolves both blind alerts and restores the 30s cadence", async () => {
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
+    for (let i = 0; i < 5; i++) await fireAlarm();
+    clock += 31 * 60_000;
+    await fireAlarm();
+    expect(await db.alerts.count({ resolved: false, alert_type: "poll_blind" })).toBe(1);
+
+    exchange.orderStatusFailure = null;
+    const firedAt = (await alarmAt())!;
+    clock = firedAt;
+    await run((bot) => bot.alarm());
+
+    expect(await db.alerts.count({ resolved: false, alert_type: "poll_blind" })).toBe(0);
+    expect(await db.alerts.count({ resolved: false, alert_type: "poll_blind_escalated" })).toBe(0);
+    expect(await alarmAt()).toBe(firedAt + 30_000);
+    expect(await pollSchedule()).toMatchObject({ failures: 0, blindSince: null, escalated: false });
+  });
+
+  it("writes ONE unattributable_fill row across many firings", async () => {
+    // The same standing-alert guarantee the manual path has, at 60x the rate.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.filledQuantity = m("1");
+
+    for (let i = 0; i < 20; i++) await fireAlarm();
+
+    expect(await db.alerts.count({ alert_type: "unattributable_fill" })).toBe(1);
   });
 });

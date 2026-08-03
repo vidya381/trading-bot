@@ -72,6 +72,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
+import { raiseStandingAlert, resolveClearedStandingAlerts, standingAlertKey } from "../alerts";
 import { createBotInstanceWithCapital, releaseBotCapital } from "../capital";
 import { databaseFrom, type Database } from "../db";
 import type { AlertRow, AuditLogRow, BotStatus, OrderRow, TradeRow } from "../db/schema";
@@ -147,6 +148,8 @@ import { DurableObjectAttemptStore } from "./attempt-store";
 const CONFIG_KEY = "config";
 const STATE_KEY = "state";
 const ORDER_KEY_PREFIX = "order:";
+/** Step 20's scheduling state. Deliberately NOT part of `BotRuntimeState`. */
+const POLL_KEY = "poll-schedule";
 
 function orderKey(clientOrderId: string): string {
   return `${ORDER_KEY_PREFIX}${clientOrderId}`;
@@ -429,6 +432,106 @@ export interface BotSnapshot {
 const FILTER_MAX_AGE_MS = 3_600_000;
 
 // ---------------------------------------------------------------------------
+// The scheduled open-order poll (step 20)
+// ---------------------------------------------------------------------------
+
+/**
+ * How often a bot with resting orders re-reads them (step 19's open question 3:
+ * a decision, not a measurement). Four bots make the rate-limit cost trivial --
+ * one `getOrderStatus` per open order at ROUTINE priority, which may only draw
+ * on `limit - reserveForRiskExit` and can never eat into the slice section 5.4
+ * holds back for getting OUT of a position.
+ */
+const POLL_INTERVAL_MS = 30_000;
+/** Slow retry once the reads are failing, so a long outage self-heals. */
+const POLL_BACKOFF_CAP_MS = 300_000;
+/** Consecutive unreadable passes before the poll is declared blind. */
+const MAX_POLL_FAILURES = 5;
+/** A blind poll gets louder after this long, mirroring the price feed's policy. */
+const POLL_BLIND_ESCALATION_MS = 30 * 60_000;
+
+/** `audit_log.actor` for a pass the alarm drove rather than a human. */
+const POLL_ACTOR = "system";
+
+/**
+ * The `alerts.source` this object writes under. Scopes BOTH halves of the
+ * standing-alert lifecycle, so this object deduplicates against, and resolves,
+ * only its own rows -- never reconciliation's.
+ */
+const BOT_ALERT_SOURCE = "bot-instance";
+
+/**
+ * The alert types the poll RE-DETECTS on every pass, and is therefore competent
+ * to both raise once and resolve.
+ *
+ * Every other alert this object writes stays an unconditional insert, and that
+ * is the right treatment for them: `unknown_order_fill`, `order_state_drift`,
+ * `cancel_failed` and the rest mark DISCRETE EVENTS at the moment they happen.
+ * Nothing re-derives them on a schedule, so they cannot accumulate duplicates,
+ * and three of them are ingested and resolved by reconciliation's own loop
+ * (`INGESTED_ALERT_TYPES`) -- taking them over here would give one row two
+ * owners.
+ */
+const POLL_STANDING_ALERT_TYPES: ReadonlySet<string> = new Set([
+  "unattributable_fill",
+  "poll_blind",
+  "poll_blind_escalated",
+]);
+
+/**
+ * When the alarm should next fire, and what the poll has been failing at.
+ *
+ * Stored under its own key rather than inside `BotRuntimeState` deliberately:
+ * that record is mirrored, snapshotted, and compared against by reconciliation,
+ * and scheduling bookkeeping is none of those things. Keeping it separate also
+ * means no `schemaVersion` bump and no risk to state written before this step.
+ */
+interface PollSchedule {
+  /** When the next poll is due; null means the poll is not armed. */
+  readonly nextPollAt: Timestamp | null;
+  /** Consecutive passes that could not read this bot's open orders at all. */
+  readonly failures: number;
+  /** When the poll first went blind, or null while it can still see. */
+  readonly blindSince: Timestamp | null;
+  /** Whether this blind episode has already escalated. */
+  readonly escalated: boolean;
+}
+
+const INITIAL_POLL_SCHEDULE: PollSchedule = {
+  nextPollAt: null,
+  failures: 0,
+  blindSince: null,
+  escalated: false,
+};
+
+/**
+ * One observation pass, plus the two things the alert lifecycle needs to know
+ * about it that `OrderCheckResult` deliberately does not carry.
+ *
+ * `skipped` is not a substitute for `unreadable`: it also holds fills that were
+ * read perfectly well and then refused (an unattributable quantity, a fill the
+ * state machine would not accept). Gating the alert lifecycle on `skipped`
+ * would mean a standing `unattributable_fill` kept `poll_blind` open forever,
+ * conflating "we cannot see" with "we can see something wrong".
+ */
+interface PollPass {
+  readonly applied: AppliedFill[];
+  readonly skipped: string[];
+  readonly closed: string[];
+  /** Open orders this pass attempted to read. */
+  readonly reads: number;
+  /** How many of those reads failed. Section 5.6: an unreachable venue is not data. */
+  readonly unreadable: number;
+  /** Standing incident keys this pass FOUND, for the resolve half. */
+  readonly standing: Set<string>;
+}
+
+/** True when a pass is entitled to close a standing alert it did not re-find. */
+function observedEverything(pass: PollPass): boolean {
+  return pass.reads > 0 && pass.unreadable === 0;
+}
+
+// ---------------------------------------------------------------------------
 
 export class BotInstance extends DurableObject<Env> {
   #dependencies: BotInstanceDependencies | undefined;
@@ -687,8 +790,16 @@ export class BotInstance extends DurableObject<Env> {
     return state;
   }
 
+  /**
+   * Write this object's state, and keep the alarm consistent with it.
+   *
+   * The alarm is reconciled HERE rather than at each lifecycle method because
+   * this is the single point every `openOrderIds` mutation already passes
+   * through. See `#syncAlarm`.
+   */
   async #putState(state: BotRuntimeState): Promise<void> {
     await this.ctx.storage.put(STATE_KEY, state);
+    await this.#syncAlarm(state);
   }
 
   async #order(clientOrderId: string): Promise<TrackedOrder | undefined> {
@@ -1188,23 +1299,84 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
 
-    const outcome = await this.#pollOpenOrders(config, state);
+    const pass = await this.#observeOpenOrders(config, state, actor);
 
-    // Audited only when something actually MOVED. Once this runs on a timer the
-    // no-op pass is the overwhelmingly common one, and a row per pass would
-    // measure how long the bot has been running rather than what happened to
-    // it -- the same reasoning that made reconciliation's standing alerts one
-    // row per incident instead of one per detection.
-    if (outcome.applied.length > 0 || outcome.closed.length > 0) {
-      await this.#audit(config, "bot.open_orders_checked", actor, outcome, this.#now());
-    }
-
-    return { status: (await this.#state()).status, ...outcome };
+    return {
+      status: (await this.#state()).status,
+      applied: pass.applied,
+      skipped: pass.skipped,
+      closed: pass.closed,
+    };
   }
 
   /**
-   * One observation pass. Split from `checkOpenOrders` so the alarm added in the
-   * next step calls the same body without re-deciding the audit rule.
+   * One observation pass, its audit row, and its half of the alert lifecycle.
+   *
+   * THE ONE BODY BOTH CALLERS RUN. `checkOpenOrders` (a human, through the DO's
+   * RPC) and `alarm` (step 20's 30-second timer) reach the exchange through
+   * here, so the manual and the scheduled path cannot disagree about what a
+   * pass records, what it alerts, or what it closes. The alarm adds only
+   * SCHEDULING on top -- backoff and the blind escalation -- which is the one
+   * thing a manual call has no opinion about.
+   */
+  async #observeOpenOrders(
+    config: BotConfig,
+    state: BotRuntimeState,
+    actor: string,
+  ): Promise<PollPass> {
+    const pass = await this.#pollOpenOrders(config, state);
+
+    // Audited only when something actually MOVED. Now that this runs on a timer
+    // the no-op pass is the overwhelmingly common one, and a row per pass would
+    // measure how long the bot has been running rather than what happened to
+    // it -- the same reasoning that made reconciliation's standing alerts one
+    // row per incident instead of one per detection.
+    if (pass.applied.length > 0 || pass.closed.length > 0) {
+      await this.#audit(
+        config,
+        "bot.open_orders_checked",
+        actor,
+        { applied: pass.applied, skipped: pass.skipped, closed: pass.closed },
+        this.#now(),
+      );
+    }
+
+    // The other half of the standing-alert lifecycle, and it is gated on this
+    // pass having actually READ every open order. A pass that could not reach
+    // the venue found no unattributable fill because it looked at nothing, and
+    // closing an incident on that basis would clear a live problem on the
+    // strength of an outage -- section 5.6 applied to the alert lifecycle,
+    // exactly as reconciliation applies it.
+    if (observedEverything(pass)) {
+      // A successful read is also proof that polling works, so the blind
+      // episode ends here rather than only inside the alarm -- keeping the
+      // persisted flags and the alert rows in lockstep. If the flags survived a
+      // resolution, `poll_blind` could never be raised again.
+      const schedule = await this.#pollSchedule();
+      if (schedule.failures !== 0 || schedule.blindSince !== null || schedule.escalated) {
+        await this.#putPollSchedule({
+          ...schedule,
+          failures: 0,
+          blindSince: null,
+          escalated: false,
+        });
+      }
+
+      await resolveClearedStandingAlerts(this.#db(), {
+        source: BOT_ALERT_SOURCE,
+        owns: (alertType) => POLL_STANDING_ALERT_TYPES.has(alertType),
+        stillOpen: pass.standing,
+        observed: true,
+        inScope: (botInstanceId) => botInstanceId === config.botInstanceId,
+      });
+    }
+
+    return pass;
+  }
+
+  /**
+   * One observation pass. Split from `checkOpenOrders` so the alarm calls the
+   * same body without re-deciding the audit rule.
    *
    * Three cases per order, and the difference between them is entirely about
    * what the exchange was willing to tell us:
@@ -1220,22 +1392,26 @@ export class BotInstance extends DurableObject<Env> {
    *     `#recordCancellation` already exercises, for the same reason.
    *  3. **Nothing new** -- the common case, and it writes nothing.
    */
-  async #pollOpenOrders(
-    config: BotConfig,
-    state: BotRuntimeState,
-  ): Promise<Omit<OrderCheckResult, "status">> {
+  async #pollOpenOrders(config: BotConfig, state: BotRuntimeState): Promise<PollPass> {
     const applied: AppliedFill[] = [];
     const skipped: string[] = [];
     const closed: string[] = [];
+    const standing = new Set<string>();
+    let reads = 0;
+    let unreadable = 0;
 
-    if (state.openOrderIds.length === 0) return { applied, skipped, closed };
+    if (state.openOrderIds.length === 0) {
+      return { applied, skipped, closed, standing, reads, unreadable };
+    }
     const exchange = this.#exchange(config, "routine");
 
     for (const clientOrderId of [...state.openOrderIds]) {
+      reads += 1;
       const outcome = await exchange.getOrderStatus(config.pair, clientOrderId);
       if (!isUsable(outcome)) {
         // Section 5.6: an unreachable exchange is not data. The order keeps its
         // local state and stays open, to be read again on the next pass.
+        unreadable += 1;
         skipped.push(`${clientOrderId}: ${outcome.kind} ${outcome.message}`);
         continue;
       }
@@ -1249,7 +1425,15 @@ export class BotInstance extends DurableObject<Env> {
               `filled against ${toDecimalString(local.filledQuantity)} recorded, but sent no ` +
               `per-fill detail, so there is no real fill id to apply.`,
           );
-          await this.#alert(config, {
+          // A STANDING alert, not an unconditional insert, and step 20 is where
+          // that stopped being optional: this condition is re-detected on every
+          // pass and is deliberately never auto-corrected, so at 30 seconds an
+          // unconditional insert writes ~2,880 identical criticals per bot per
+          // day -- step 18's measured 186-in-four-hours problem, 60x faster.
+          // Through the SAME mechanism reconciliation uses, so the two writers
+          // cannot drift apart.
+          standing.add(standingAlertKey("unattributable_fill", config.botInstanceId));
+          await this.#raiseStanding(config, {
             severity: "critical",
             category: "trading",
             alertType: "unattributable_fill",
@@ -1317,7 +1501,7 @@ export class BotInstance extends DurableObject<Env> {
       }
     }
 
-    return { applied, skipped, closed };
+    return { applied, skipped, closed, standing, reads, unreadable };
   }
 
   /**
@@ -1382,6 +1566,244 @@ export class BotInstance extends DurableObject<Env> {
       openOrderIds: state.openOrderIds.filter((id) => id !== clientOrderId),
     });
     return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // The alarm (step 20): one timer, every scheduled concern
+  // -------------------------------------------------------------------------
+
+  /**
+   * The single alarm handler, multiplexed from day one.
+   *
+   * ONE ALARM PER DURABLE OBJECT. That is the platform's rule and it is also
+   * `PriceFeed`'s own hard-won lesson: its heartbeat check and its reconnect
+   * backoff cannot each own a timer, so they are folded into one instant and
+   * the handler works out what is due. This object has exactly one scheduled
+   * concern today -- the open-order poll -- and is written as if it had
+   * several, because the version that assumes one is the version where the
+   * second one silently cancels the first by calling `setAlarm` again.
+   *
+   * IT NEVER THROWS. An alarm has no caller to report to; a handler that
+   * throws is retried by the runtime on its own schedule, which would double
+   * up on a poll that is already failing. Every failure path here ends in a
+   * recorded failure and a re-armed alarm instead.
+   */
+  override async alarm(): Promise<void> {
+    const schedule = await this.#pollSchedule();
+    const now = this.#now();
+
+    // Consume the firing FIRST. Everything this pass writes goes through
+    // `#putState`, which re-arms -- and it must re-arm from a fresh instant
+    // rather than reuse the one that has just fired, which is in the past and
+    // would fire again immediately, forever.
+    await this.#putPollSchedule({ ...schedule, nextPollAt: null });
+
+    let config: BotConfig;
+    let state: BotRuntimeState;
+    try {
+      config = await this.#config();
+      state = await this.#state();
+    } catch {
+      // No config, no state, or a schema this build cannot read. Nothing to
+      // schedule, and nothing to escalate: capital is reserved and the D1 row
+      // written before this object's own storage (step 6, open question 6), so
+      // an alarm can outlive a bot that was never finished. Leave it off.
+      await this.#armAlarm(null);
+      return;
+    }
+
+    const pollDue = schedule.nextPollAt !== null && now >= schedule.nextPollAt;
+    if (pollDue && this.#pollArmed(state)) {
+      await this.#runScheduledPoll(config, state);
+    }
+
+    // Re-read: the pass may have emptied `openOrderIds`, which disarms.
+    await this.#syncAlarm(await this.#state());
+  }
+
+  /**
+   * One scheduled pass, and what its outcome does to the schedule.
+   *
+   * The pass itself is `#observeOpenOrders`, byte for byte the one a human's
+   * `checkOpenOrders` runs. What is added here is only scheduling: a pass that
+   * could not read backs off, and a poll that has been unable to read for long
+   * enough says so.
+   *
+   * A POLL ON A HALTED BOT IS DELIBERATELY ALLOWED (step 19): observing costs
+   * nothing and keeps the books current for whoever is reviewing it. What it
+   * must never do is place a replacement order, which is not defended here but
+   * inside `#pollOpenOrders`, where `placeReplacement` is derived from
+   * `fresh.status === "running"` rather than hardcoded.
+   */
+  async #runScheduledPoll(config: BotConfig, state: BotRuntimeState): Promise<void> {
+    let pass: PollPass | null = null;
+    let thrown: string | null = null;
+    try {
+      pass = await this.#observeOpenOrders(config, state, POLL_ACTOR);
+    } catch (error) {
+      // Anything at all: an unresolvable exchange client, a refused rate-limit
+      // budget, a storage error. All of it means this pass did not observe.
+      thrown = error instanceof Error ? error.message : String(error);
+    }
+
+    if (pass !== null && (pass.reads === 0 || pass.unreadable === 0)) {
+      // Either there was nothing to read, or everything was read.
+      // `#observeOpenOrders` has already cleared the failure state.
+      return;
+    }
+
+    await this.#recordPollFailure(
+      config,
+      thrown ??
+        `${pass!.unreadable} of ${pass!.reads} open orders could not be read: ` +
+          pass!.skipped.join("; "),
+    );
+  }
+
+  /**
+   * Count a failed pass, and go loud once the poll has been blind long enough.
+   *
+   * MIRRORS THE PRICE FEED'S BLIND POLICY, which is the closest precedent in
+   * this system for "a thing that should be watching has stopped being able
+   * to": fast backoff first, then one `warning` when the fast cycle is
+   * exhausted, then one `critical` if the condition persists past the
+   * escalation window, then a slow retry that keeps trying forever so a long
+   * outage self-heals rather than dying silently.
+   *
+   * Both alerts go through the STANDING path, which the feed's do not. That is
+   * belt and braces on purpose: the `blindSince` / `escalated` flags already
+   * stop a re-raise, but they are this object's own bookkeeping, and if they
+   * were ever reset while the condition persisted the alert would begin
+   * repeating at the poll's cadence. The shared dedup makes a duplicate row
+   * impossible independently of them, and gives both alerts a real resolution
+   * the moment a pass reads cleanly again.
+   */
+  async #recordPollFailure(config: BotConfig, detail: string): Promise<void> {
+    const schedule = await this.#pollSchedule();
+    const now = this.#now();
+    // `nextPollAt` is cleared as well as the count incremented, so the
+    // re-arming that follows recomputes the delay from the NEW failure count.
+    // A pass that read some orders and failed on others writes state, and that
+    // write re-arms at the healthy 30s through `#putState` -- without this, the
+    // backoff would silently not apply to exactly the mixed case.
+    let next: PollSchedule = { ...schedule, nextPollAt: null, failures: schedule.failures + 1 };
+
+    if (next.failures >= MAX_POLL_FAILURES) {
+      if (next.blindSince === null) {
+        next = { ...next, blindSince: now };
+        await this.#raiseStanding(config, {
+          severity: "warning",
+          category: "system",
+          alertType: "poll_blind",
+          message:
+            `bot ${config.botInstanceId} has failed to read its own open orders on ` +
+            `${next.failures} consecutive passes (${detail}). Retrying every ` +
+            `${POLL_BACKOFF_CAP_MS / 1000}s. Until it succeeds, a fill on a resting order ` +
+            `reaches this bot's position through nothing at all, and reconciliation is the ` +
+            `only thing that would notice.`,
+        });
+      } else if (!next.escalated && now - next.blindSince >= POLL_BLIND_ESCALATION_MS) {
+        next = { ...next, escalated: true };
+        await this.#raiseStanding(config, {
+          severity: "critical",
+          category: "system",
+          alertType: "poll_blind_escalated",
+          message:
+            `bot ${config.botInstanceId} has been unable to read its own open orders for over ` +
+            `${Math.round(POLL_BLIND_ESCALATION_MS / 60_000)} minutes (${detail}). Its books ` +
+            `have been unverified for that entire period, so its position, its take-profit ` +
+            `target and its stop-loss may all be computed from a quantity that is no longer true.`,
+        });
+      }
+    }
+
+    await this.#putPollSchedule(next);
+  }
+
+  /**
+   * Reconcile the single alarm with what this object currently needs scheduled.
+   *
+   * Called from `#putState`, which is the one choke point every mutation of
+   * `openOrderIds` already passes through -- placement, fills, cancellation,
+   * the ladder, halt, close. Arming at each of those call sites instead would
+   * work exactly until someone adds a seventh and forgets, and the failure
+   * would be silent: a bot with a resting order and no timer, which is the
+   * precise condition step 19 exists to end.
+   */
+  async #syncAlarm(state: BotRuntimeState): Promise<void> {
+    const schedule = await this.#pollSchedule();
+    const armed = this.#pollArmed(state);
+    let nextPollAt = schedule.nextPollAt;
+
+    if (armed && nextPollAt === null) {
+      nextPollAt = this.#now() + this.#pollDelay(schedule);
+      await this.#putPollSchedule({ ...schedule, nextPollAt });
+    } else if (!armed && nextPollAt !== null) {
+      // Disarmed: there are no open orders to read. The failure COUNT resets,
+      // because a bot with nothing to poll is not failing to poll -- but a
+      // standing `poll_blind` is deliberately NOT resolved here. Only a pass
+      // that actually read cleanly can close it; "there is nothing to read any
+      // more" is not evidence that reading works, and the orders may well have
+      // left `openOrderIds` precisely because this object's view of them is
+      // wrong.
+      nextPollAt = null;
+      await this.#putPollSchedule({ ...schedule, nextPollAt: null, failures: 0 });
+    }
+
+    await this.#armAlarm(this.#nextAlarmAt({ nextPollAt }));
+  }
+
+  /**
+   * Fold every scheduled concern into the ONE instant this object may hold.
+   *
+   * The earliest wins; a concern that is not scheduled contributes nothing. Its
+   * handler is responsible for noticing it was not the reason the alarm fired,
+   * which is why `alarm()` checks `nextPollAt` against the clock rather than
+   * assuming the poll is why it woke up.
+   */
+  #nextAlarmAt(concerns: { nextPollAt: Timestamp | null }): Timestamp | null {
+    const due = [concerns.nextPollAt].filter((at): at is Timestamp => at !== null);
+    return due.length === 0 ? null : Math.min(...due);
+  }
+
+  /**
+   * Whether this bot needs its open orders polled at all.
+   *
+   * `openOrderIds` non-empty is the whole condition on the order side: no
+   * resting order means nothing can fill unobserved, and a timer that keeps
+   * firing against an empty list is a rate-limit cost with no possible finding.
+   *
+   * STATUS, deliberately, is only consulted to exclude `stopped`. A `halted`
+   * bot is still polled -- step 19 established that observing a halted bot is
+   * both safe and useful, since a halt that failed to cancel leaves live orders
+   * on the exchange and a human is about to make a decision about exactly those
+   * books. A `stopped` bot has released its capital and `checkOpenOrders`
+   * refuses outright, so polling it would be work whose result nothing may use.
+   */
+  #pollArmed(state: BotRuntimeState): boolean {
+    return state.openOrderIds.length > 0 && state.status !== "stopped";
+  }
+
+  /** 30s healthy; doubling to a 5-minute floor while the reads keep failing. */
+  #pollDelay(schedule: PollSchedule): number {
+    return Math.min(POLL_INTERVAL_MS * 2 ** schedule.failures, POLL_BACKOFF_CAP_MS);
+  }
+
+  async #armAlarm(at: Timestamp | null): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (at === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    if (current !== at) await this.ctx.storage.setAlarm(at);
+  }
+
+  async #pollSchedule(): Promise<PollSchedule> {
+    return (await this.ctx.storage.get<PollSchedule>(POLL_KEY)) ?? INITIAL_POLL_SCHEDULE;
+  }
+
+  async #putPollSchedule(schedule: PollSchedule): Promise<void> {
+    await this.ctx.storage.put(POLL_KEY, schedule);
   }
 
   /**
@@ -2888,6 +3310,41 @@ export class BotInstance extends DurableObject<Env> {
     await this.#db().trades.insert(row);
   }
 
+  /**
+   * Raise a condition the poll RE-DETECTS, as one row per open incident.
+   *
+   * The counterpart to `#alert`, and the difference is entirely about what kind
+   * of fact is being recorded. `#alert` records a discrete EVENT at the moment
+   * it happens, and one row per event is exactly right. This records a
+   * CONDITION that is re-derived on every 30-second pass and deliberately never
+   * auto-corrected, where one row per detection would measure how long the
+   * condition has persisted instead of what is wrong.
+   *
+   * The mechanism is `/src/alerts/standing.ts` -- the same one reconciliation's
+   * cron uses, not a second copy of it. Its resolve half runs once per pass in
+   * `#observeOpenOrders`; the two must never be separated (see that module's
+   * header).
+   */
+  async #raiseStanding(
+    config: BotConfigBase,
+    alert: {
+      severity: AlertRow["severity"];
+      category: AlertRow["category"];
+      alertType: string;
+      message: string;
+    },
+  ): Promise<void> {
+    await raiseStandingAlert(this.#db(), () => this.#newId(), {
+      alertType: alert.alertType,
+      botInstanceId: config.botInstanceId,
+      severity: alert.severity,
+      category: alert.category,
+      source: BOT_ALERT_SOURCE,
+      message: alert.message,
+      at: this.#now(),
+    });
+  }
+
   async #alert(
     config: BotConfigBase,
     alert: {
@@ -2903,7 +3360,7 @@ export class BotInstance extends DurableObject<Env> {
       category: alert.category,
       alert_type: alert.alertType,
       bot_instance_id: config.botInstanceId,
-      source: "bot-instance",
+      source: BOT_ALERT_SOURCE,
       message: alert.message,
       resolved: false,
       created_at: this.#now(),

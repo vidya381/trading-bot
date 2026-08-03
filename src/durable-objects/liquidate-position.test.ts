@@ -27,7 +27,7 @@ import { BotInstanceError } from "./bot-instance";
 import { FakeExchange, TEST_PAIR } from "./fake-exchange";
 import { inBot, noopFeed, rateLimiterStub } from "./test-helpers";
 
-const T0 = 1_760_000_000_000;
+const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const ACTOR = "owner@example.com";
 
 let db: Database;
