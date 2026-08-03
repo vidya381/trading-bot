@@ -391,6 +391,28 @@ export interface MissedFillsResult {
   readonly skipped: readonly string[];
 }
 
+/**
+ * The outcome of one `checkOpenOrders` pass.
+ *
+ * Deliberately the same reporting shape as `MissedFillsResult`: `applied` is
+ * what moved, `skipped` is what this pass could NOT account for, and a caller
+ * has to read the second one. The two operations differ in when they may run
+ * and in whether they place orders, not in how honestly they report.
+ */
+export interface OrderCheckResult {
+  /** The status the bot holds after the pass. This operation never changes it. */
+  readonly status: BotStatus;
+  /** Executions newly folded into the position, each with the exchange's own id. */
+  readonly applied: readonly AppliedFill[];
+  /**
+   * Orders this pass could not fully account for, each with its reason.
+   * Non-empty means the bot's books are still behind the exchange.
+   */
+  readonly skipped: readonly string[];
+  /** Orders whose local record was closed to match a terminal exchange state. */
+  readonly closed: readonly string[];
+}
+
 /** What happened on one pass of the event pipeline, for tests and the dashboard. */
 export interface PipelineResult {
   readonly status: BotStatus;
@@ -1130,6 +1152,236 @@ export class BotInstance extends DurableObject<Env> {
     );
 
     return { status: (await this.#state()).status, applied, skipped };
+  }
+
+  /**
+   * Observe this bot's own open orders and fold in anything it has not seen.
+   *
+   * THE GAP THIS CLOSES. `onFill` has exactly four callers, all of them the
+   * order-placement sites, and each only drains `result.fills` -- the
+   * executions attached to the placement RESPONSE. Nothing observes an order
+   * that RESTS and fills later. A DCA base order that does not fill immediately
+   * therefore leaves the position empty forever, `decide` returns `hold` on
+   * every tick (it short-circuits on `position.quantity <= ZERO` before it ever
+   * reaches the stop-loss or take-profit branches), and the bot does not
+   * progress at all until section 9's reconciliation notices the drift and
+   * halts it. Reconciliation is a BACKSTOP that halts and alerts; it
+   * deliberately never auto-corrects. This is the path that actually keeps a
+   * running bot's books current.
+   *
+   * NOT SCHEDULED YET. This step builds the observation primitive only; arming
+   * it on an alarm is the next one. Every caller today is explicit, so this
+   * cannot yet interleave with `onPriceUpdate` -- and making that interleaving
+   * safe is its own step, deliberately not rushed here.
+   *
+   * `routine` priority: keeping the books current is ordinary work. It must not
+   * draw on the slice section 5.4 reserves for getting OUT of a position.
+   */
+  async checkOpenOrders(actor: string): Promise<OrderCheckResult> {
+    const config = await this.#config();
+    const state = await this.#state();
+
+    if (state.status === "stopped") {
+      throw new BotInstanceError(
+        "invalid_status",
+        "a stopped bot has no open orders to check; its capital is released",
+      );
+    }
+
+    const outcome = await this.#pollOpenOrders(config, state);
+
+    // Audited only when something actually MOVED. Once this runs on a timer the
+    // no-op pass is the overwhelmingly common one, and a row per pass would
+    // measure how long the bot has been running rather than what happened to
+    // it -- the same reasoning that made reconciliation's standing alerts one
+    // row per incident instead of one per detection.
+    if (outcome.applied.length > 0 || outcome.closed.length > 0) {
+      await this.#audit(config, "bot.open_orders_checked", actor, outcome, this.#now());
+    }
+
+    return { status: (await this.#state()).status, ...outcome };
+  }
+
+  /**
+   * One observation pass. Split from `checkOpenOrders` so the alarm added in the
+   * next step calls the same body without re-deciding the audit rule.
+   *
+   * Three cases per order, and the difference between them is entirely about
+   * what the exchange was willing to tell us:
+   *
+   *  1. **Per-fill detail present** -- apply each unseen `fillId` through the
+   *     ordinary live path. Gemini supplies this: `getOrderStatus` has always
+   *     sent `include_trades: true`, so the ids are its own `tid` values.
+   *  2. **No per-fill detail, but more filled than we recorded** -- alerted and
+   *     SKIPPED. Binance's order-status endpoint carries no fills array at all,
+   *     so there is no real id to apply and `applyFill` deduplicates on exactly
+   *     that id. Synthesising one means the real execution later either
+   *     double-counts or is silently swallowed. This is the same restraint
+   *     `#recordCancellation` already exercises, for the same reason.
+   *  3. **Nothing new** -- the common case, and it writes nothing.
+   */
+  async #pollOpenOrders(
+    config: BotConfig,
+    state: BotRuntimeState,
+  ): Promise<Omit<OrderCheckResult, "status">> {
+    const applied: AppliedFill[] = [];
+    const skipped: string[] = [];
+    const closed: string[] = [];
+
+    if (state.openOrderIds.length === 0) return { applied, skipped, closed };
+    const exchange = this.#exchange(config, "routine");
+
+    for (const clientOrderId of [...state.openOrderIds]) {
+      const outcome = await exchange.getOrderStatus(config.pair, clientOrderId);
+      if (!isUsable(outcome)) {
+        // Section 5.6: an unreachable exchange is not data. The order keeps its
+        // local state and stays open, to be read again on the next pass.
+        skipped.push(`${clientOrderId}: ${outcome.kind} ${outcome.message}`);
+        continue;
+      }
+      const remote = outcome.value;
+
+      if (remote.fills === undefined) {
+        const local = await this.#order(clientOrderId);
+        if (local !== undefined && remote.filledQuantity > local.filledQuantity) {
+          skipped.push(
+            `${clientOrderId}: the exchange reports ${toDecimalString(remote.filledQuantity)} ` +
+              `filled against ${toDecimalString(local.filledQuantity)} recorded, but sent no ` +
+              `per-fill detail, so there is no real fill id to apply.`,
+          );
+          await this.#alert(config, {
+            severity: "critical",
+            category: "trading",
+            alertType: "unattributable_fill",
+            message:
+              `${clientOrderId} has filled ${toDecimalString(remote.filledQuantity)} on the ` +
+              `exchange but this bot recorded ${toDecimalString(local.filledQuantity)}, and the ` +
+              `status response carries no per-fill breakdown and therefore no trade id. The ` +
+              `difference is NOT applied here: a synthesised id would make the real execution ` +
+              `either double-count or be silently swallowed. Reconciliation owns it.`,
+          });
+          // Deliberately NOT folded to its terminal state below: `#foldTerminalState`
+          // would refuse this exact case anyway, and continuing here keeps the
+          // order to one reported reason rather than two saying the same thing.
+          continue;
+        }
+        // No per-fill detail AND no gap: there is no unattributed execution, so a
+        // terminal exchange state can still be folded in safely below. Its own
+        // quantity gate is what makes that true, not this branch.
+      }
+
+      for (const fill of remote.fills ?? []) {
+        // Re-read both each time: the previous fill mutated this order, and a
+        // grid replacement placement mutated the state.
+        const order = await this.#order(clientOrderId);
+        if (order === undefined) {
+          skipped.push(`${clientOrderId}: no local record of this order`);
+          break;
+        }
+        if (order.fills.some((existing) => existing.fillId === fill.fillId)) {
+          continue; // Already recorded. Idempotent by real identity, not by a flag.
+        }
+
+        const fresh = await this.#state();
+        try {
+          if (config.strategy === "grid") {
+            // TRUE here, unlike `applyMissedFills`. A buy filling on a running
+            // bot's ladder SHOULD place its paired sell -- that is the grid
+            // working, not a repair resuming trading behind the operator's
+            // back. Gated on `running` all the same: a halted bot must not put
+            // a live order on the exchange, which is the invariant the repair
+            // path's `false` exists to protect.
+            await this.#applyGridFillToOrder(config, fresh, order, fill, fresh.status === "running");
+          } else {
+            await this.#applyFillToOrder(config, fresh, order, fill);
+          }
+          applied.push({
+            clientOrderId,
+            fillId: fill.fillId,
+            quantity: toDecimalString(fill.quantity),
+            price: toDecimalString(fill.price),
+          });
+        } catch (error) {
+          // An `OrderStateError` means the local record and the exchange
+          // genuinely disagree in a way this pass must not paper over.
+          skipped.push(
+            `${clientOrderId} fill ${fill.fillId}: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+          break;
+        }
+      }
+
+      if (await this.#foldTerminalState(config, clientOrderId, remote, skipped)) {
+        closed.push(clientOrderId);
+      }
+    }
+
+    return { applied, skipped, closed };
+  }
+
+  /**
+   * Close a local order whose exchange record has reached a terminal state.
+   *
+   * Without this, an order cancelled or expired ON THE EXCHANGE never leaves
+   * `openOrderIds`, and every future pass re-reads it forever.
+   *
+   * GATED ON THE FILL QUANTITIES AGREEING, which is the whole safety of it. An
+   * order that ended with more filled than this bot recorded is left OPEN and
+   * reported, never closed. Closing it would bake a position that is known to
+   * be understated into a terminal record -- and a terminal order can never
+   * accept a fill afterwards (`ALLOWED_TRANSITIONS` gives every terminal state
+   * an empty successor list), so the understatement would be permanent and
+   * unrepairable. That is exactly how one incident's base order became
+   * unrecoverable, and it is not repeated here.
+   *
+   * `filled` is deliberately not a case: an order is recorded as filled by
+   * applying its fills, never by asserting the end state over them.
+   */
+  async #foldTerminalState(
+    config: BotConfig,
+    clientOrderId: string,
+    remote: OrderStatus,
+    skipped: string[],
+  ): Promise<boolean> {
+    if (remote.state !== "cancelled" && remote.state !== "expired" && remote.state !== "rejected") {
+      return false;
+    }
+
+    const order = await this.#order(clientOrderId);
+    if (order === undefined || isTerminal(order.state)) return false;
+
+    if (order.filledQuantity < remote.filledQuantity) {
+      skipped.push(
+        `${clientOrderId}: ended ${remote.state} on the exchange with ` +
+          `${toDecimalString(remote.filledQuantity)} filled against ` +
+          `${toDecimalString(order.filledQuantity)} recorded. Left open rather than closed: a ` +
+          `terminal order can never accept the missing fill afterwards.`,
+      );
+      return false;
+    }
+
+    const ended = closeOrder(order, remote.state, remote.updatedAt);
+    await this.#putOrder(ended);
+    await this.#mirrorOrderUpdate(ended);
+
+    const state = await this.#state();
+    if (config.strategy === "grid" && state.ladder !== undefined) {
+      // The ladder owns `openOrderIds` for a grid, so clearing the slot IS the
+      // removal; filtering the array directly would be undone by the next fill.
+      const levelIndex = levelOf(state.ladder, clientOrderId);
+      if (levelIndex >= 0) {
+        const slots = state.ladder.slots.map((slot, index) => (index === levelIndex ? null : slot));
+        const ladder: GridLadder = { ...state.ladder, slots };
+        await this.#putState({ ...state, ladder, openOrderIds: ladderOpenOrderIds(ladder) });
+        return true;
+      }
+    }
+    await this.#putState({
+      ...state,
+      openOrderIds: state.openOrderIds.filter((id) => id !== clientOrderId),
+    });
+    return true;
   }
 
   /**

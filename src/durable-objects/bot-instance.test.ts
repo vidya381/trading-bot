@@ -1349,3 +1349,184 @@ describe("applyMissedFills (the human correction path)", () => {
     expect(JSON.stringify(details["applied"])).toContain("gemini-tid-77");
   });
 });
+
+// ---------------------------------------------------------------------------
+// checkOpenOrders: observing fills on RESTING orders (step 19)
+// ---------------------------------------------------------------------------
+
+describe("checkOpenOrders (the resting-order observation gap)", () => {
+  /** A RUNNING bot with one resting, unfilled base order. */
+  async function runningWithRestingOrder(): Promise<string> {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    return exchange.placed[0]!.clientOrderId;
+  }
+
+  it("folds in a fill the placement response never carried, on a RUNNING bot", async () => {
+    // The gap itself. `onFill` is only ever called with the fills attached to a
+    // placement response, so an order that RESTS and fills later reaches the
+    // position through nothing at all until this runs.
+    const clientOrderId = await runningWithRestingOrder();
+    const order = exchange.resting.get(clientOrderId)!;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-5150",
+        price: order.request.price,
+        quantity: order.request.quantity,
+        feeAmount: ZERO,
+        feeAsset: "USDT",
+        executedAt: T0 + 1000,
+      },
+    ]);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.status).toBe("running");
+    expect(result.applied).toHaveLength(1);
+    expect(result.applied[0]!.fillId).toBe("gemini-tid-5150");
+    expect(result.skipped).toEqual([]);
+
+    // Through the same path the live one uses: order, trade, and position.
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("filled");
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.position.quantity).toBe(order.request.quantity);
+    expect(snapshot.state.position.averageEntryPrice).toBe(order.request.price);
+  });
+
+  it("is idempotent: a second pass applies nothing", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-1" }),
+    ]);
+
+    const first = await run((bot) => bot.checkOpenOrders(ACTOR));
+    const second = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(first.applied).toHaveLength(1);
+    expect(second.applied).toHaveLength(0);
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
+  });
+
+  it("reports an unreadable order rather than assuming it did not fill", async () => {
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join(" ")).toMatch(/connection reset/);
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(0);
+  });
+
+  it("alerts and skips a filled quantity with no fill id behind it", async () => {
+    // Binance's order-status endpoint carries no fills array at all. A
+    // synthesised id would make the real execution double-count or vanish, so
+    // the gap is reported and left for reconciliation.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.filledQuantity = m("1");
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join(" ")).toMatch(/no real fill id/);
+    expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(0);
+    const alerts = await db.alerts.findMany({ where: { alert_type: "unattributable_fill" } });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("critical");
+  });
+
+  it("closes an order the exchange cancelled, so openOrderIds drains", async () => {
+    // Without this the id is re-read forever and the bot never places again.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.cancelled = true;
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.closed).toEqual([clientOrderId]);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([]);
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("cancelled");
+  });
+
+  it("leaves an unattributable fill's order open rather than closing it", async () => {
+    // Cancelled on the exchange AND filled beyond what was recorded, with no
+    // per-fill detail: the bot-44400a shape exactly. Reported, not closed.
+    const clientOrderId = await runningWithRestingOrder();
+    const resting = exchange.resting.get(clientOrderId)!;
+    resting.cancelled = true;
+    resting.filledQuantity = m("1");
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.closed).toEqual([]);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([clientOrderId]);
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("pending");
+  });
+
+  it("REFUSES to close a terminal order whose fill could not be applied", async () => {
+    // The quantity gate on its own. The venue DID report per-fill detail, so
+    // the unattributable branch does not fire -- but the fill overfills the
+    // order and cannot be applied, leaving the local record behind. Closing it
+    // would be permanent: a terminal order can never accept a fill afterwards,
+    // which is precisely how bot-44400a's base order became unrecoverable.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.cancelled = true;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-overfill",
+        price: m("100"),
+        quantity: m("5"), // the order is for 1
+        feeAmount: ZERO,
+        feeAsset: "USDT",
+        executedAt: T0 + 1000,
+      },
+    ]);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(result.closed).toEqual([]);
+    expect(result.skipped.join(" ")).toMatch(/never accept the missing fill/);
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("pending");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([clientOrderId]);
+  });
+
+  it("refuses on a stopped bot", async () => {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.close(ACTOR));
+    await expect(run((bot) => bot.checkOpenOrders(ACTOR))).rejects.toThrow(/stopped bot/);
+  });
+
+  it("writes no audit row for a pass that changed nothing", async () => {
+    // Once this runs every 30s the no-op pass is the common one, and a row per
+    // pass would measure uptime rather than events.
+    await runningWithRestingOrder();
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await db.auditLog.count({ action: "bot.open_orders_checked" })).toBe(0);
+  });
+
+  it("audits a pass that did move something", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.fillsByOrder.set(clientOrderId, [
+      exchange.fillFor(clientOrderId, { fillId: "gemini-tid-77" }),
+    ]);
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.open_orders_checked" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(ACTOR);
+    expect(JSON.stringify(audit[0]!.details_json)).toContain("gemini-tid-77");
+  });
+});

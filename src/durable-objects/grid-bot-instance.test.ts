@@ -430,3 +430,60 @@ describe("applyMissedFills never places an order", () => {
     expect(liveIds).not.toContain(buy);
   });
 });
+
+// ---------------------------------------------------------------------------
+// checkOpenOrders on a ladder (step 19)
+// ---------------------------------------------------------------------------
+
+describe("checkOpenOrders on a grid ladder", () => {
+  it("places the paired sell for a fill it observed rather than received", async () => {
+    // The grid working, not a repair. A buy that filled while resting must
+    // replace itself one level up exactly as a pushed fill would -- which is
+    // why this path passes `placeReplacement` true where the halted-bot repair
+    // passes false.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.fillsByOrder.set(buyAt95, [exchange.fillFor(buyAt95, { fillId: "gemini-tid-31" })]);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toHaveLength(1);
+    const sells = exchange.placed.filter((o) => o.side === "sell");
+    expect(sells).toHaveLength(1);
+    expect(sells[0]!.price).toBe(m("100"));
+  });
+
+  it("places NOTHING when the bot is halted, even though the fill is applied", async () => {
+    // A halted bot must not put a live order on the exchange. This is the
+    // invariant the repair path's `false` protects, and it has to survive a
+    // path whose normal answer is `true`.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    // Persistent cancel failure: the halt leaves the ladder intact, so the
+    // order is still believed open and still gets polled.
+    exchange.cancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await run((bot) => bot.halt("manual", "reconciliation found drift", ACTOR));
+    const placedBefore = exchange.placed.length;
+    exchange.fillsByOrder.set(buyAt95, [exchange.fillFor(buyAt95, { fillId: "gemini-tid-32" })]);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.status).toBe("halted");
+    expect(result.applied).toHaveLength(1);
+    expect(exchange.placed).toHaveLength(placedBefore);
+  });
+
+  it("clears the ladder slot when the exchange cancelled a level's order", async () => {
+    // The ladder owns openOrderIds for a grid, so the slot is the removal.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.resting.get(buyAt95)!.cancelled = true;
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.closed).toEqual([buyAt95]);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).not.toContain(buyAt95);
+    expect(snapshot.state.ladder!.slots.filter((s) => s !== null)).toHaveLength(1);
+  });
+});
