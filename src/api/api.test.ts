@@ -528,6 +528,172 @@ describe("bots", () => {
     expect(res.body.error.code).toBe("not_created");
   });
 
+  /**
+   * The six tests above are the endpoint's. These five are the DASHBOARD
+   * CONTROL's: each one pins a specific sentence the halt dialog or its outcome
+   * banner puts in front of an operator, at the layer the control actually talks
+   * to. `#halt`'s own mechanics are covered in bot-instance.test.ts; what is
+   * unpinned until now is whether the claims the UI makes about them survive the
+   * round trip.
+   */
+
+  /**
+   * The dialog's central claim -- "halting cancels every order this bot has
+   * resting on the exchange" -- and the number it prints, which it reads from
+   * `state.openOrderIds` on the detail payload. Both, end to end.
+   */
+  it("cancels the resting order the dialog names, and empties the list the dialog counts", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hc${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+
+    // What the dialog reads to say "its 1 open order is cancelled".
+    const before = await api("GET", `/api/bots/${id}`);
+    expect(before.body.data.state.openOrderIds).toEqual([clientOrderId]);
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "spread looks wrong" } });
+    expect(res.status).toBe(200);
+
+    // The cancellation actually went to the exchange, and the order is closed in
+    // D1 rather than merely forgotten locally.
+    expect(exchange.cancelled).toContain(clientOrderId);
+    const order = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(order!.status).toBe("cancelled");
+
+    const after = await api("GET", `/api/bots/${id}`);
+    expect(after.body.data.status).toBe("halted");
+    expect(after.body.data.state.openOrderIds).toEqual([]);
+  });
+
+  /**
+   * "The position is NOT sold" -- the assumption an operator is most likely to
+   * make about a control labelled halt, and the one the dialog spends a box
+   * correcting. A halt stops trading; exiting is `liquidate`, a separate action.
+   */
+  it("keeps the position and its capital: halting stops trading, it does not sell", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hp${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const base = exchange.placed[0]!.clientOrderId;
+    const fill = exchange.fillFor(base);
+    await inBotId(id, (bot) => bot.onFill(base, fill));
+    const placedBefore = exchange.placed.length;
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "stepping away" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.bot.status).toBe("halted");
+    // Still holding EXACTLY what it bought, and no sell was placed on the way
+    // out. Compared against the fill rather than asserted non-zero: an empty DCA
+    // position serialises as "0.00000000", so a `not.toBe("0")` here would pass
+    // against a position that had been zeroed (found by mutation, see 23.md).
+    expect(res.body.data.bot.position.heldQuantity).toBe(toDecimalString(fill.quantity));
+    expect(exchange.placed).toHaveLength(placedBefore);
+    // A halt is not a close: the reservation stands (`bot.closed` is what
+    // releases it, and nothing audited one here).
+    const closed = await db.auditLog.findMany({ where: { action: "bot.closed" } });
+    expect(closed).toHaveLength(0);
+  });
+
+  /**
+   * The banner that refuses to report a clean book it cannot verify. Section 5.6
+   * forbids treating an unconfirmable cancellation as a cancellation, so the
+   * order stays open and alerted -- and the halt still succeeds, which is the
+   * combination the success copy has to survive.
+   */
+  it("still halts when a cancellation cannot be confirmed, leaving the order open and alerted", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hcf${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    exchange.cancelFailure = { kind: "transport", message: "connection reset" };
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "halting anyway" } });
+
+    // A halt that half happened is still a halt: the status flip is durable and
+    // comes first, so this is a 200 even though the exchange is not clear.
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "halted", action: "halted" });
+
+    const after = await api("GET", `/api/bots/${id}`);
+    expect(after.body.data.status).toBe("halted");
+    // NOT assumed cancelled -- still open, and the alert the banner sends the
+    // operator to look for is really there.
+    expect(after.body.data.state.openOrderIds).toEqual([clientOrderId]);
+    expect(
+      after.body.data.alerts.filter((alert: any) => alert.alertType === "cancel_failed"),
+    ).toHaveLength(1);
+  });
+
+  /**
+   * The gate the confirm button mirrors. `requireString` trims before testing,
+   * so a reason of spaces is refused exactly like a missing one -- which is why
+   * the dialog disables on the TRIMMED value rather than on emptiness.
+   */
+  it("rejects a whitespace-only reason (400), the same as a missing one", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hws${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "   \n  " } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("running");
+  });
+
+  /**
+   * The one status the endpoint actually refuses, and the only error branch in
+   * the control that is a backend rule rather than a UI choice. Documented in
+   * the handler since the endpoint was written; untested at this layer until
+   * now.
+   */
+  it("refuses a STOPPED bot with invalid_status (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hst${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.halt("manual", "first", HUMAN));
+    await inBotId(id, (bot) => bot.close(HUMAN));
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "too late" } });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+  });
+
+  /**
+   * The backend accepts `created`; the dashboard deliberately offers no button
+   * there. Pinned so the UI gate is readable as the scope choice it is rather
+   * than as a limit being mirrored -- if this ever starts failing, the reasoning
+   * in `HaltAction`'s docblock is what changed, not the button.
+   */
+  it("halts a CREATED bot, so the button's absence there is a UI choice, not a limit", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `hcr${suffix}`;
+    await createDcaBot(id, account); // never started
+
+    const res = await api("POST", `/api/bots/${id}/halt`, { body: { reason: "never mind" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "halted", action: "halted" });
+  });
+
   it("resumes a halted bot, clearing its halt reason and auditing the human actor", async () => {
     const account = `acct-${suffix}`;
     await seedBalance(account);

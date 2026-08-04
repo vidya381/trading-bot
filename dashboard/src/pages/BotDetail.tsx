@@ -29,6 +29,7 @@ import { BotSummary } from "../components/BotSummary";
 import { StartAction } from "../components/StartAction";
 import { ApplyMissedFillsAction } from "../components/ApplyMissedFillsAction";
 import { CheckOpenOrdersAction } from "../components/CheckOpenOrdersAction";
+import { HaltAction } from "../components/HaltAction";
 import { ResumeAction } from "../components/ResumeAction";
 import { LiquidateAction } from "../components/LiquidateAction";
 import { StrategyState } from "../components/StrategyState";
@@ -171,6 +172,22 @@ function BotDetailView({ id }: { id: string }) {
            * highlights itself when such an alert is open.
            */}
           <CheckOpenOrdersAction bot={bot} onChecked={poll.refetch} />
+          {/*
+           * The manual halt, and the only control here gated on `running`. It
+           * sits BELOW the observation pass and ABOVE resume/liquidate because
+           * that is the order the decisions actually happen in: find out what is
+           * true, stop the bot, then choose whether to bring it back or sell out
+           * — and the two controls below it are reachable ONLY through this one,
+           * since both refuse a running bot and say to halt it first.
+           *
+           * `created` is excluded deliberately even though the backend accepts
+           * it (`#halt` allows `created` and `running`): a bot that has placed
+           * nothing and holds nothing does not need halting, and doing so would
+           * strand it in a status whose only exit is the heavier, latch-
+           * asserting resume. The component explains this and re-checks the
+           * status itself.
+           */}
+          {bot.status === "running" && <HaltAction bot={bot} onHalted={poll.refetch} />}
           {/*
            * The resume control renders only for a halted bot, and never for any
            * other status. It sits ABOVE liquidate deliberately: both apply to a

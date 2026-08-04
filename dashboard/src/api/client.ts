@@ -23,6 +23,7 @@ import type {
   BotDetail,
   CheckOpenOrdersResponse,
   CreateBotRequest,
+  HaltResponse,
   KillSwitchStatus,
   LiquidateResponse,
   ManualAdjustment,
@@ -184,6 +185,38 @@ export function liquidateBot(id: string, signal?: AbortSignal): Promise<Liquidat
  */
 export function startBot(id: string, signal?: AbortSignal): Promise<StartResponse> {
   return requestJson<StartResponse>(`/api/bots/${encodeURIComponent(id)}/start`, "POST", { signal });
+}
+
+/**
+ * Halt one bot on purpose (`POST /api/bots/:id/halt`). The ONLY bot action that
+ * takes a request body: `reason` is the operator's free-text explanation, stored
+ * as `manual: <reason>` so a halted bot always says why it stopped. The backend
+ * rejects a missing or whitespace-only reason with `missing_field` (400), so
+ * callers must gate on the TRIMMED value rather than sending a request that can
+ * only fail. The actor is still the verified Access identity, never sent.
+ *
+ * Two success actions, and they are not interchangeable: `halted` (this call
+ * stopped the bot) and `already_halted` (it was stopped before this call --
+ * `#halt` returned early, changed nothing, and KEPT the original reason). A
+ * caller that reports every 200 as "halted by you" is lying in the second case.
+ *
+ * Its refusals are narrower than every other write on this page:
+ *   - `invalid_status` (409) -- the bot is `stopped`, so its capital is already
+ *     released and there is nothing to halt. The only status refused.
+ *   - `not_created`    (404) -- the object holds no config for this id.
+ * It asserts NEITHER latch, the inverse of resume: halting reduces risk and must
+ * work while the kill switch is pulled or an account breaker is tripped.
+ *
+ * A 200 does NOT prove the exchange is clear. The status is marked halted before
+ * the cancellations run, and a cancellation whose outcome cannot be confirmed
+ * leaves that order open with a `cancel_failed` alert rather than being assumed
+ * cancelled (section 5.6). The alerts are the evidence, not this response.
+ */
+export function haltBot(id: string, reason: string, signal?: AbortSignal): Promise<HaltResponse> {
+  return requestJson<HaltResponse>(`/api/bots/${encodeURIComponent(id)}/halt`, "POST", {
+    signal,
+    body: { reason },
+  });
 }
 
 /**

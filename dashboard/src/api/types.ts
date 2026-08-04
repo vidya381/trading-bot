@@ -401,6 +401,59 @@ export interface StartResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Halt (`POST /api/bots/:id/halt`, `haltBot` handler)
+//
+// Section 7.2 for ONE bot, on purpose, right now. Same `{ result, bot }` shape
+// as start and resume, and like them there is no success-with-a-different-action
+// to branch on -- but there ARE two success actions, and they mean different
+// things: `halted` (this call stopped it) and `already_halted` (it was stopped
+// before this call; `#halt` returns early and changes NOTHING, including the
+// halt reason, which keeps the FIRST reason). That idempotence is what makes a
+// double-click harmless, and it is why the caller must read `result.action`
+// rather than reporting every 200 as "halted by you".
+//
+// IT IS THE ONLY BOT ACTION THAT TAKES A REQUEST BODY. `reason` is required
+// free-text and is stored as `manual: <reason>` in `halt_reason` (the DO
+// composes `${reason}: ${detail}`), so a halted bot always says why. The backend
+// rejects a missing OR whitespace-only reason with `missing_field` (400) --
+// `requireString` trims before testing -- so the form must gate on the trimmed
+// value or it will send a request that can only fail.
+//
+// ITS ERROR SURFACE IS NARROWER THAN EVERY OTHER WRITE HERE, confirmed from
+// src/durable-objects/bot-instance.ts rather than assumed by symmetry with
+// resume:
+//   - `not_created`   (404) -- the object holds no config.
+//   - `invalid_status` (409) -- the bot is `stopped`. The ONLY status it refuses;
+//     a stopped bot's capital is already released, so there is nothing to halt.
+//     `created` and `running` both halt, and `halted` is the no-op above.
+// It asserts NEITHER latch -- not `assertGlobalArmed`, not `assertAccountArmed`
+// -- which is the exact inverse of resume and deliberate: a halt REDUCES risk
+// and must stay available while the kill switch is pulled or an account's
+// breaker is tripped (that is precisely the bot a sweep failed to reach).
+//
+// WHAT A 200 DOES NOT PROVE: that every open order is off the exchange. `#halt`
+// marks the status halted FIRST (durably), then cancels; a cancellation whose
+// outcome cannot be confirmed leaves that order in `openOrderIds`, raises a
+// `cancel_failed` critical alert, and the halt still succeeds. Section 5.6
+// forbids treating an unknown outcome as a cancellation. So the success copy
+// must send the operator to the alerts rather than promising a clean book.
+// ---------------------------------------------------------------------------
+
+/** The `PipelineResult` a halt returns. `action` is `halted` or `already_halted`. */
+export interface HaltResult {
+  readonly status: BotStatus;
+  readonly action: string;
+  readonly detail?: string;
+}
+
+/** The body of a successful `POST /api/bots/:id/halt`. */
+export interface HaltResponse {
+  readonly result: HaltResult;
+  /** The refreshed summary (now `halted`), or null if the row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
 // Resume (`POST /api/bots/:id/resume`, `resumeBot` handler)
 //
 // Section 7.2 step 5's explicit human action, the only path out of `halted`.
