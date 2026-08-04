@@ -847,6 +847,143 @@ describe("apply missed fills", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Check open orders (step 22): the manual observation pass
+// ---------------------------------------------------------------------------
+
+describe("check open orders", () => {
+  /** A RUNNING bot with one resting, unfilled base order. */
+  async function runningWithRestingOrder(id: string, account: string): Promise<string> {
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    return exchange.placed[0]!.clientOrderId;
+  }
+
+  it("folds a resting fill on a RUNNING bot and audits the verified human", async () => {
+    // The difference from `apply-missed-fills` that matters most: this one's
+    // NORMAL case is a running bot. The repair refuses anything but halted.
+    const account = `acct-${suffix}`;
+    const id = `coc${suffix}`;
+    const clientOrderId = await runningWithRestingOrder(id, account);
+    const resting = exchange.resting.get(clientOrderId)!.request;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-7788",
+        price: resting.price,
+        quantity: resting.quantity,
+        feeAmount: 0n,
+        feeAsset: "USDT",
+        executedAt: clock + 1000,
+      },
+    ]);
+
+    const res = await api("POST", `/api/bots/${id}/check-open-orders`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result.status).toBe("running");
+    expect(res.body.data.result.applied).toEqual([
+      {
+        clientOrderId,
+        fillId: "gemini-tid-7788",
+        quantity: toDecimalString(resting.quantity),
+        price: toDecimalString(resting.price),
+      },
+    ]);
+    expect(res.body.data.result.skipped).toEqual([]);
+    expect(res.body.data.result.closed).toEqual([]);
+    // The field three empty arrays cannot otherwise be distinguished from.
+    expect(res.body.data.result.deferred).toBe(false);
+    expect(res.body.data.bot).toMatchObject({ id, status: "running" });
+
+    // The books really moved, through the ordinary live path.
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("filled");
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(1);
+
+    // A real person, not "system" -- the whole reason this is Access-gated
+    // rather than only an alarm.
+    const audit = await db.auditLog.findMany({ where: { action: "bot.open_orders_checked" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(HUMAN);
+  });
+
+  it("is allowed on a HALTED bot and places nothing", async () => {
+    // Step 19: observing a halted bot is safe and useful, because a halt whose
+    // cancellation failed leaves live orders on the exchange while a human is
+    // deciding about exactly those books.
+    const account = `acct-${suffix}`;
+    const id = `coch${suffix}`;
+    await runningWithRestingOrder(id, account);
+    exchange.cancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "reconciliation found drift", HUMAN));
+    exchange.cancelFailure = null;
+    const placedBefore = exchange.placed.length;
+
+    const res = await api("POST", `/api/bots/${id}/check-open-orders`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result.status).toBe("halted");
+    expect(exchange.placed).toHaveLength(placedBefore);
+  });
+
+  it("refuses a STOPPED bot with invalid_status (409)", async () => {
+    // Its capital is released, so a pass would be work whose result nothing may
+    // use. This is the refusal the dashboard mirrors before sending.
+    const account = `acct-${suffix}`;
+    const id = `cocs${suffix}`;
+    await runningWithRestingOrder(id, account);
+    await inBotId(id, (bot) => bot.close(HUMAN));
+
+    const res = await api("POST", `/api/bots/${id}/check-open-orders`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+  });
+
+  it("reports an unreadable order in `skipped` as a 200 -- a success is not a clean bill of health", async () => {
+    const account = `acct-${suffix}`;
+    const id = `cocu${suffix}`;
+    await runningWithRestingOrder(id, account);
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+
+    const res = await api("POST", `/api/bots/${id}/check-open-orders`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result.applied).toEqual([]);
+    expect(res.body.data.result.skipped.join(" ")).toContain("connection reset");
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(0);
+  });
+
+  it("surfaces the tick-staleness alert a pass raised, on the bot the operator is looking at", async () => {
+    // The end-to-end shape of step 22: the alert is bot-scoped (unlike the
+    // feed's own `price_feed_blind`, which carries a null bot id by design), so
+    // it reaches the bot's detail payload and the control that answers it.
+    const account = `acct-${suffix}`;
+    const id = `cocp${suffix}`;
+    await runningWithRestingOrder(id, account);
+    clock += 600_000;
+    exchange.now = clock;
+
+    const res = await api("POST", `/api/bots/${id}/check-open-orders`);
+    expect(res.status).toBe(200);
+
+    const detail = await api("GET", `/api/bots/${id}`);
+    const stale = detail.body.data.alerts.filter(
+      (alert: { alertType: string }) => alert.alertType === "price_updates_stale",
+    );
+    expect(stale).toHaveLength(1);
+    expect(stale[0].resolved).toBe(false);
+    expect(stale[0].severity).toBe("warning");
+  });
+
+  it("405s on GET, so the wrong method is not a missing endpoint", async () => {
+    const res = await api("GET", `/api/bots/whatever/check-open-orders`);
+    expect(res.status).toBe(405);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Alerts (endpoint 5)
 // ---------------------------------------------------------------------------
 

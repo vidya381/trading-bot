@@ -29,6 +29,7 @@
 import { Link } from "react-router-dom";
 import type { Alert, AlertCategory, AlertSeverity } from "../api/types";
 import { APPLY_MISSED_FILLS_ANCHOR, isOpenDriftAlert } from "../driftAlerts";
+import { CHECK_OPEN_ORDERS_ANCHOR, isOpenPollAlert } from "../pollAlerts";
 import { formatTime } from "../format";
 
 const SEVERITY_ACCENT: Record<AlertSeverity, string> = {
@@ -62,6 +63,23 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
    * confirmation a link can open is not a confirmation.
    */
   const repairable = linked && isOpenDriftAlert(alert);
+  /**
+   * The same arrangement for POLL-HEALTH alerts (step 22): a `poll_blind`,
+   * `poll_blind_escalated` or `price_updates_stale` row in the cross-bot feed
+   * links to the manual observation control rather than to the top of the bot
+   * page. Those alerts all mean the bot's automatic 30-second pass has stopped
+   * working, and running it by hand is the operator's first move -- so the feed
+   * should point at it, exactly as it already points drift at the repair.
+   *
+   * `repairable` wins where both somehow apply: a bot with an open drift finding
+   * has a decision waiting on it, and that outranks re-observing.
+   */
+  const observable = linked && !repairable && isOpenPollAlert(alert);
+  const anchor = repairable
+    ? `#${APPLY_MISSED_FILLS_ANCHOR}`
+    : observable
+      ? `#${CHECK_OPEN_ORDERS_ANCHOR}`
+      : "";
 
   const body = (
     <>
@@ -97,6 +115,11 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
           Apply missed fills →
         </span>
       )}
+      {observable && (
+        <span className="mt-1.5 inline-flex items-center gap-1 rounded border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[11px] font-medium text-sky-200">
+          Check open orders →
+        </span>
+      )}
     </>
   );
 
@@ -109,7 +132,7 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
   if (linked) {
     return (
       <Link
-        to={`/bots/${encodeURIComponent(alert.botInstanceId!)}${repairable ? `#${APPLY_MISSED_FILLS_ANCHOR}` : ""}`}
+        to={`/bots/${encodeURIComponent(alert.botInstanceId!)}${anchor}`}
         className={`group block transition-colors hover:bg-zinc-900 ${className}`}
       >
         {body}

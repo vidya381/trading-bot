@@ -24,6 +24,7 @@ import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
 import { botInstanceRow, freshDatabase } from "../db/test-helpers";
 import type { BotInstance, CreateDcaBotRequest } from "../durable-objects/bot-instance";
+import { POLL_STANDING_ALERT_TYPES } from "../durable-objects/bot-instance";
 import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
 import { inBot, noopFeed, rateLimiterStub } from "../durable-objects/test-helpers";
 import { reconcileAccount, type ReconciliationPorts } from "../reconciliation/reconcile";
@@ -450,11 +451,19 @@ describe("no second, parallel implementation", () => {
   });
 
   it("raises every re-detected condition through the standing path, never `#alert`", () => {
-    // The realistic regression: someone adds a fourth poll alert next to the
-    // existing three and reaches for `#alert`, which is right for a discrete
+    // The realistic regression: someone adds another poll alert next to the
+    // existing ones and reaches for `#alert`, which is right for a discrete
     // event and catastrophic for a condition re-derived every 30 seconds.
+    //
+    // THE SET IS IMPORTED, NOT RETYPED (step 22). The first version listed the
+    // three types by hand, which meant a fourth was covered only if whoever
+    // added it also remembered to extend this guard -- and the whole point of
+    // the guard is that they did not remember. `price_updates_stale` was
+    // exactly that fourth type. Reading the real set makes the coverage
+    // automatic, and `POLL_STANDING_ALERT_TYPES` is exported for this.
     const source = SOURCES["/src/durable-objects/bot-instance.ts"]!.default.split("\n");
-    const standingTypes = ["unattributable_fill", "poll_blind", "poll_blind_escalated"];
+    const standingTypes = [...POLL_STANDING_ALERT_TYPES];
+    expect(standingTypes.length).toBeGreaterThan(3);
 
     const offenders: string[] = [];
     for (const [index, line] of source.entries()) {

@@ -1612,6 +1612,296 @@ describe("checkOpenOrders (the resting-order observation gap)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The audit gate: a pass that REFUSED is a pass worth recording (step 22)
+// ---------------------------------------------------------------------------
+
+describe("bot.open_orders_checked (what a pass records)", () => {
+  async function runningWithRestingOrder(): Promise<string> {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    return exchange.placed[0]!.clientOrderId;
+  }
+
+  async function auditRows() {
+    return await db.auditLog.findMany({ where: { action: "bot.open_orders_checked" } });
+  }
+
+  it("audits the terminal-fold REFUSAL -- the bot-44400a condition -- which wrote nothing before", async () => {
+    // The gap step 22 closes, in its most important shape. An order that ended
+    // terminal on the exchange with MORE filled than this bot recorded is left
+    // open and reported, because closing it would make the understatement
+    // permanent. That is the single most consequential decision this pass can
+    // take, and under `applied || closed` it left no durable trace whatsoever.
+    const clientOrderId = await runningWithRestingOrder();
+    const resting = exchange.resting.get(clientOrderId)!;
+    resting.cancelled = true;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-overfill",
+        price: m("100"),
+        quantity: m("5"), // the order is for 1: cannot be applied
+        feeAsset: "USDT",
+        feeAmount: ZERO,
+        executedAt: T0 + 1000,
+      },
+    ]);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    // Nothing moved -- which is exactly why the old gate wrote nothing.
+    expect(result.applied).toEqual([]);
+    expect(result.closed).toEqual([]);
+
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.actor).toBe(ACTOR);
+    // And it records the REASON, not just that a pass happened.
+    expect(JSON.stringify(rows[0]!.details_json)).toMatch(/never accept the missing fill/);
+  });
+
+  it("audits an unattributable fill, which is read-and-refused rather than unread", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.resting.get(clientOrderId)!.filledQuantity = m("1");
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(JSON.stringify(rows[0]!.details_json)).toMatch(/no real fill id/);
+  });
+
+  it("writes NOTHING for an unreadable pass, however many times it repeats", async () => {
+    // The reason `refused` is its own list rather than the gate reading
+    // `skipped`. An unreachable venue at 30s would be ~2,880 rows per bot per
+    // day saying the same thing, and that condition already has a lifecycle:
+    // the backoff and one standing `poll_blind`.
+    await runningWithRestingOrder();
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+
+    for (let i = 0; i < 5; i++) await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    // It IS reported to the caller -- it is simply not an audit event.
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect(result.skipped.join(" ")).toMatch(/connection reset/);
+    expect(await auditRows()).toHaveLength(0);
+  });
+
+  it("still writes nothing for a clean pass that found nothing", async () => {
+    await runningWithRestingOrder();
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect(await auditRows()).toHaveLength(0);
+  });
+
+  // The MIXED pass -- one order unreadable and another refused, which is what
+  // actually separates `refused` from `skipped` -- needs two simultaneously open
+  // orders. DCA cannot express that (`decide` holds while `hasOpenOrder`), so it
+  // lives with the ladder, in grid-bot-instance.test.ts.
+});
+
+// ---------------------------------------------------------------------------
+// Tick staleness: what makes "wait for the next tick" sound (step 22)
+// ---------------------------------------------------------------------------
+
+describe("price_updates_stale (the first real read of lastPriceAt)", () => {
+  /** Ten minutes: 4.6x the measured 130s worst-case gap between closed candles. */
+  const STALE_MS = 600_000;
+
+  async function runningWithRestingOrder(): Promise<string> {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    return exchange.placed[0]!.clientOrderId;
+  }
+
+  async function staleAlerts() {
+    return await db.alerts.findMany({ where: { alert_type: "price_updates_stale" } });
+  }
+
+  it("raises nothing across the WORST measured gap between two closed candles", async () => {
+    // THE TEST THAT PINS THE THRESHOLD AGAINST THE MEASUREMENT, and it has to
+    // poll BETWEEN the ticks rather than alongside them -- an earlier version
+    // advanced the clock and delivered a tick before each pass, so the age was
+    // zero every time and it would have passed at any threshold at all.
+    //
+    // The real shape: the poll fires every 30s, the feed forwards a closed
+    // candle far less often. Step 14's probe measured candle frames arriving
+    // only on activity, 35-70s apart, and a forward needs a frame carrying a
+    // newer openTime -- so the worst case is ~60s to the boundary plus up to
+    // ~70s of quiet, the same ~130s arithmetic that sized the deployed live
+    // check's 120s window. A threshold that fired anywhere in here would fire
+    // on a perfectly healthy feed.
+    await runningWithRestingOrder();
+
+    for (let elapsed = 30_000; elapsed <= 130_000; elapsed += 30_000) {
+      clock = T0 + elapsed;
+      exchange.now = clock;
+      await run((bot) => bot.checkOpenOrders(ACTOR));
+      expect(await staleAlerts()).toHaveLength(0);
+    }
+
+    // And the tick that finally arrives at the far end of that gap is normal.
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(await staleAlerts()).toHaveLength(0);
+  });
+
+  it("raises nothing one second short of the threshold", async () => {
+    await runningWithRestingOrder();
+    clock += STALE_MS - 1000;
+    exchange.now = clock;
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await staleAlerts()).toHaveLength(0);
+  });
+
+  it("raises a standing warning once the bot has gone silent for the threshold", async () => {
+    // The condition step 21 left as a hope: a poll-observed fill waits for the
+    // next tick, and nothing verified a next tick was coming.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await staleAlerts();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.severity).toBe("warning");
+    expect(rows[0]!.category).toBe("system");
+    expect(rows[0]!.bot_instance_id).toBe(BOT_ID);
+    expect(rows[0]!.message).toMatch(/no live price/);
+  });
+
+  it("writes ONE row however many passes re-detect it", async () => {
+    // At 30 seconds an unconditional insert is ~2,880 rows per bot per day.
+    // This goes through the same standing mechanism reconciliation uses.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+
+    for (let i = 0; i < 10; i++) await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await staleAlerts()).toHaveLength(1);
+  });
+
+  it("resolves the moment a real tick arrives", async () => {
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect((await staleAlerts())[0]!.resolved).toBe(false);
+
+    clock += 1000;
+    exchange.now = clock;
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await staleAlerts();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.resolved).toBe(true);
+  });
+
+  it("never raises on a HALTED bot, whose price clock is frozen by design", async () => {
+    // `#onPriceUpdatePass` returns `ignored` before writing `lastPriceAt` for
+    // any status but running. Checking a halted bot would alert on every one of
+    // them, forever, for behaving exactly as specified.
+    await runningWithRestingOrder();
+    await run((bot) => bot.halt("manual", "operator halted it", ACTOR));
+    clock += STALE_MS * 3;
+    exchange.now = clock;
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await staleAlerts()).toHaveLength(0);
+  });
+
+  it("resolves an open row when the bot halts, because the condition stops being a fault", async () => {
+    // The cancel is made to fail on purpose, and that is not incidental: it is
+    // what leaves an order in `openOrderIds`, and the resolve half is gated on
+    // `reads > 0`. A halt that cancels cleanly disarms the poll and the row
+    // stays open until the bot polls again -- the same limitation step 20
+    // recorded for `poll_blind` (its open question 2), and it applies here for
+    // the same reason: only a pass that actually looked may close a row.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect((await staleAlerts())[0]!.resolved).toBe(false);
+
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.halt("manual", "operator halted it", ACTOR));
+    exchange.cancelFailure = null;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect((await staleAlerts())[0]!.resolved).toBe(true);
+  });
+
+  it("does not resolve it on a pass that could not read the venue", async () => {
+    // The staleness itself is derived from local state, but the resolve half is
+    // one call covering every type this object owns, and section 5.6 gates it on
+    // the pass having actually observed. The safe direction.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    clock += 1000;
+    exchange.now = clock;
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect((await staleAlerts())[0]!.resolved).toBe(false);
+  });
+
+  it("raises nothing for a running bot that has never seen a tick", async () => {
+    // `lastPriceAt` null: an age is not computable, there is no `startedAt` to
+    // measure against, and the scheduled path cannot reach this state anyway
+    // (an order is only ever placed from inside `onPriceUpdate`, which writes
+    // the timestamp first, and a bot with no order arms no alarm).
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    clock += STALE_MS * 5;
+    exchange.now = clock;
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(await staleAlerts()).toHaveLength(0);
+  });
+
+  it("is raised by the ALARM too, not only by a human calling in", async () => {
+    // The path that matters in production: nobody is watching, and the poll is
+    // the only thing awake.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+
+    await run((bot) => bot.alarm());
+
+    expect(await staleAlerts()).toHaveLength(1);
+  });
+
+  it("does not count a stale tick as a failed READ, so the poll keeps its 30s cadence", async () => {
+    // The two conditions are independent: the venue is perfectly reachable and
+    // this pass read every order. Folding staleness into `unreadable` would back
+    // a healthy bot off to the five-minute floor and eventually claim
+    // `poll_blind` on a venue that never stopped answering.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+
+    await run((bot) => bot.alarm());
+
+    const schedule = await inBot(objectName, async (_bot, state) => {
+      return (await state.storage.get("poll-schedule")) as { failures: number };
+    });
+    expect(schedule.failures).toBe(0);
+    expect(await db.alerts.count({ alert_type: "poll_blind" })).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The alarm: the poll, on a timer (step 20)
 // ---------------------------------------------------------------------------
 

@@ -486,4 +486,40 @@ describe("checkOpenOrders on a grid ladder", () => {
     expect(snapshot.state.openOrderIds).not.toContain(buyAt95);
     expect(snapshot.state.ladder!.slots.filter((s) => s !== null)).toHaveLength(1);
   });
+
+  it("separates a REFUSAL from an OUTAGE on a mixed pass, and audits only the refusal (step 22)", async () => {
+    // THE TEST THE AUDIT GATE ACTUALLY TURNS ON, and it needs two open orders
+    // at once -- which is why it lives here rather than with the DCA passes:
+    // `decide` holds while a DCA bot has any open order, so that strategy
+    // cannot produce this state at all. The ladder produces it on start.
+    //
+    // `skipped` holds both lines, because it is the honest full account of what
+    // this pass could not do. `refused` holds only the one the pass READ and
+    // then declined, and only that one justifies an audit row: gating on
+    // `skipped` would write a row on every pass of an outage, ~2,880 a day per
+    // bot at the 30-second cadence.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    const buyAt90 = placedAtPrice("90");
+
+    // Read fine, then refused: filled beyond what this bot recorded, with no
+    // per-fill detail behind it, so there is no real fill id to apply.
+    exchange.resting.get(buyAt95)!.filledQuantity = m("1");
+    // Never read at all: the venue would not answer for this one.
+    exchange.orderStatusFailureFor.add(buyAt90);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toEqual([]);
+    expect(result.closed).toEqual([]);
+    expect(result.skipped).toHaveLength(2);
+
+    const rows = await db.auditLog.findMany({ where: { action: "bot.open_orders_checked" } });
+    expect(rows).toHaveLength(1);
+    const details = rows[0]!.details_json as { refused: string[]; skipped: string[] };
+    expect(details.skipped).toHaveLength(2);
+    expect(details.refused).toHaveLength(1);
+    expect(details.refused[0]).toMatch(/no real fill id/);
+    expect(details.refused.join(" ")).not.toMatch(/unreadable/);
+  });
 });

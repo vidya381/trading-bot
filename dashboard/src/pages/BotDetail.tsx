@@ -28,6 +28,7 @@ import type { BotDetail as BotDetailData } from "../api/types";
 import { BotSummary } from "../components/BotSummary";
 import { StartAction } from "../components/StartAction";
 import { ApplyMissedFillsAction } from "../components/ApplyMissedFillsAction";
+import { CheckOpenOrdersAction } from "../components/CheckOpenOrdersAction";
 import { ResumeAction } from "../components/ResumeAction";
 import { LiquidateAction } from "../components/LiquidateAction";
 import { StrategyState } from "../components/StrategyState";
@@ -153,6 +154,23 @@ function BotDetailView({ id }: { id: string }) {
            * than offering a button that could only 409).
            */}
           <ApplyMissedFillsAction bot={bot} onApplied={poll.refetch} />
+          {/*
+           * The manual observation pass (step 22), directly beside the repair
+           * because the two answer adjacent questions and an operator needs to
+           * see the difference: the one above corrects books that are known to
+           * be wrong; this one finds out whether they are. It sits BELOW it
+           * deliberately — a bot with an open drift finding has a decision
+           * waiting, and that should be read first.
+           *
+           * Its gate is capability rather than a finding: it renders whenever
+           * the bot is not stopped and has something resting. That is not
+           * laxness. It is needed precisely when no finding exists to gate on —
+           * a poll that has gone blind raises `poll_blind`, not drift, and
+           * gating the recovery control on the machinery that is broken is the
+           * silent gap this codebase refuses everywhere else. The component
+           * highlights itself when such an alert is open.
+           */}
+          <CheckOpenOrdersAction bot={bot} onChecked={poll.refetch} />
           {/*
            * The resume control renders only for a halted bot, and never for any
            * other status. It sits ABOVE liquidate deliberately: both apply to a

@@ -101,3 +101,44 @@ export const ORDER_STATE_DRIFT_ALERT_TYPES: ReadonlySet<string> = new Set<string
     ALERTING_TIERS.map((tier) => reconciliationAlertType(tier, kind)),
   ),
 ]);
+
+/**
+ * The bot object's own POLL-HEALTH alert types: "this bot's observation of
+ * itself has stopped working", as distinct from "this bot found something
+ * wrong".
+ *
+ * WHY THESE LIVE HERE, in the one file both toolchains compile. Step 22 adds a
+ * dashboard control (`CheckOpenOrdersAction`) whose whole reason to be prominent
+ * is an OPEN alert of one of these kinds -- the operator seeing `poll_blind` and
+ * reaching for the manual pass. Deciding that in the dashboard means a second,
+ * hand-copied list of these strings, which is precisely the failure this module
+ * was created to end: a rename would produce no error, no failing request and no
+ * 404, just a control that quietly stops surfacing on a bot whose automatic
+ * observation has died. That is the same silent-gap-on-a-correction-surface
+ * problem `ORDER_STATE_DRIFT_ALERT_TYPES` above exists to prevent, and it gets
+ * the same treatment.
+ *
+ * `unattributable_fill` is deliberately NOT here. It is also raised through the
+ * bot's standing path, but it is a FINDING about the books rather than a fault
+ * in the observation itself, and a manual re-check is not the response to it
+ * (`applyMissedFills` is, and it has its own set above). The full standing set
+ * the Durable Object owns is built from this one in `bot-instance.ts`.
+ *
+ * WHAT EACH ONE MEANS:
+ *  - `poll_blind` / `poll_blind_escalated` (step 20) -- consecutive passes could
+ *    not READ this bot's open orders. The venue is unreachable from here.
+ *  - `price_updates_stale` (step 22) -- the opposite direction: this bot has not
+ *    RECEIVED a live price for longer than the feed's measured cadence can
+ *    explain. See `PRICE_STALENESS_MS` in `bot-instance.ts` for the number and
+ *    where it comes from.
+ */
+export const POLL_HEALTH_ALERT_TYPES = [
+  "poll_blind",
+  "poll_blind_escalated",
+  "price_updates_stale",
+] as const;
+
+/** True for an alert meaning this bot's own observation machinery is faulty. */
+export function isPollHealthAlertType(alertType: string): boolean {
+  return (POLL_HEALTH_ALERT_TYPES as readonly string[]).includes(alertType);
+}

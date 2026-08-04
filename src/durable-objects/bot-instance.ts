@@ -90,6 +90,7 @@ import type {
   Timestamp,
 } from "../shared/exchange-client";
 import { isUsable } from "../shared/downtime";
+import { POLL_HEALTH_ALERT_TYPES } from "../shared/alert-types";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import type { PriceFeedConfig, PriceFeedPort } from "./price-feed";
 import type { RequestPriority } from "../shared/rate-limiter";
@@ -459,6 +460,69 @@ const MAX_POLL_FAILURES = 5;
 /** A blind poll gets louder after this long, mirroring the price feed's policy. */
 const POLL_BLIND_ESCALATION_MS = 30 * 60_000;
 
+/**
+ * How long a RUNNING bot may go without a live price before the poll says so.
+ *
+ * WHY THIS EXISTS AT ALL, AND WHY IT IS THE POLL'S JOB. Step 21 decided that a
+ * poll-observed fill does not drive a decision: it waits for the next price
+ * tick, because the poll has no price and every action either strategy can take
+ * needs one. That is only SOUND if a next tick is actually coming, and until
+ * this constant nothing anywhere verified that -- `lastPriceAt` was written by
+ * `#onPriceUpdatePass` and read by nothing. "Wait for the next tick" was a hope.
+ * The poll is the right place to check because it is the only thing that already
+ * wakes up on a schedule while a bot has resting orders, which is exactly the
+ * state in which a missing tick is dangerous.
+ *
+ * WHAT THE FEED'S OWN ALERTS STRUCTURALLY CANNOT SEE, which is why this is not a
+ * duplicate of `price_feed_blind`:
+ *
+ *  - `PriceFeed`'s staleness clock advances on ANY inbound frame, and it treats
+ *    a `heartbeat` as liveness (`#lastMessageAt` moves). A socket that
+ *    heartbeats healthily every ~5s while delivering no candles is therefore
+ *    permanently FRESH to the feed. That shape is not hypothetical: step 14's
+ *    deployed live check has a verdict for precisely it (`connectionOpened`
+ *    true, `candlesUpdateReceived` false).
+ *  - Fan-out failure is invisible from there too: a subscriber whose RPC returns
+ *    `"ignored"` is a SUCCESSFUL RPC, so a bot that has silently stopped
+ *    consuming looks fine to the feed.
+ *  - A bot missing from the subscriber registry gets nothing while the feed is
+ *    entirely healthy.
+ *  - And `price_feed_blind` carries `bot_instance_id: null` by design (it is a
+ *    feed concern, and the column is a foreign key), so it can never appear on
+ *    a bot's page at all.
+ *
+ * Every existing check is per-socket and account-level. This is the only
+ * end-to-end, per-bot one: did THIS bot receive a price.
+ *
+ * THE NUMBER, from step 14's live probe (Q1/Q2) rather than a guess:
+ *
+ *  - Heartbeats arrive every ~5.0s (min 4.8 / max 5.2 over 71 samples) and
+ *    carry no price.
+ *  - Candle frames arrive ONLY ON ACTIVITY, 35-70s apart.
+ *  - Q1 was unanimous 6/6 CURRENT-ONLY: a closed candle is forwarded only when
+ *    a frame carrying a NEWER `openTime` arrives.
+ *
+ * So `lastPriceAt` advances once per forwarded closed candle, and the worst-case
+ * gap between two forwards is the same arithmetic step 14 used to size its
+ * deployed 120s live-check window: up to ~60s to the next minute boundary, plus
+ * up to ~70s of quiet before a frame carries the new `openTime`, so ~130s.
+ * Typical is 30-70s.
+ *
+ * Ten minutes is 4.6x that worst case -- the same headroom discipline
+ * `PriceFeed`'s own `STALENESS_MS` uses (20s = ~4 missed 5s heartbeats) -- and
+ * about ten consecutive one-minute boundaries with no forward. It also sits
+ * deliberately ABOVE the feed's own recovery envelope: a dead socket is detected
+ * at 20s and five reconnects run over ~31s, so a RECOVERABLE outage never
+ * reaches this threshold and this alert fires only on something the feed's
+ * machinery did not fix.
+ *
+ * Generous on purpose, because the costs are asymmetric. A late alert costs
+ * minutes on a condition reconciliation is still backstopping; a false one on a
+ * genuinely quiet pair costs the alert fatigue step 18 measured at 186 identical
+ * criticals in four hours.
+ */
+const PRICE_STALENESS_MS = 600_000;
+
 /** `audit_log.actor` for a pass the alarm drove rather than a human. */
 const POLL_ACTOR = "system";
 
@@ -480,11 +544,24 @@ const BOT_ALERT_SOURCE = "bot-instance";
  * and three of them are ingested and resolved by reconciliation's own loop
  * (`INGESTED_ALERT_TYPES`) -- taking them over here would give one row two
  * owners.
+ *
+ * BUILT FROM THE SHARED LIST, not spelled out again. The three poll-health types
+ * are declared in `shared/alert-types.ts` because the dashboard needs them too
+ * (step 22's manual-recheck control surfaces on exactly those), and a second
+ * copy here would be the duplicated-format bug that module exists to end.
+ * `unattributable_fill` is added locally because it is a finding about the books
+ * rather than a fault in the observation, and nothing outside this object keys
+ * off it.
+ *
+ * EXPORTED so `alerts/standing.test.ts`'s source-level guard checks the real set
+ * rather than a hand-copied one. That guard's whole job is to catch a FOURTH
+ * type being added next to these and raised through `#alert`; a list it had to
+ * be told about separately would silently stop covering the new one, which is
+ * the same class of rot it exists to prevent.
  */
-const POLL_STANDING_ALERT_TYPES: ReadonlySet<string> = new Set([
+export const POLL_STANDING_ALERT_TYPES: ReadonlySet<string> = new Set<string>([
   "unattributable_fill",
-  "poll_blind",
-  "poll_blind_escalated",
+  ...POLL_HEALTH_ALERT_TYPES,
 ]);
 
 /**
@@ -527,6 +604,24 @@ interface PollPass {
   readonly applied: AppliedFill[];
   readonly skipped: string[];
   readonly closed: string[];
+  /**
+   * The subset of `skipped` this pass READ successfully and then REFUSED to act
+   * on: the `#foldTerminalState` quantity gate, an unattributable fill, an
+   * `OrderStateError`, a missing local record.
+   *
+   * THE SAME DISTINCTION STEP 20 DREW BETWEEN `skipped` AND `unreadable`, kept
+   * structurally rather than by arithmetic. `skipped` deliberately holds both
+   * kinds, so "the refusals" was previously only derivable as
+   * `skipped.length - unreadable` -- true today purely because every unreadable
+   * read happens to push exactly one line, which is an invariant nothing states
+   * and nothing enforces. Every refusal now pushes through `refuse()`, which
+   * writes both lists, so the two can never disagree.
+   *
+   * It exists because it is what step 22's audit gate turns on: a pass that
+   * correctly identified a real problem and declined to act is the single most
+   * important thing this object can record, and it used to write nothing at all.
+   */
+  readonly refused: string[];
   /** Open orders this pass attempted to read. */
   readonly reads: number;
   /** How many of those reads failed. Section 5.6: an unreachable venue is not data. */
@@ -1496,13 +1591,23 @@ export class BotInstance extends DurableObject<Env> {
    * deliberately never auto-corrects. This is the path that actually keeps a
    * running bot's books current.
    *
-   * NOT SCHEDULED YET. This step builds the observation primitive only; arming
-   * it on an alarm is the next one. Every caller today is explicit, so this
-   * cannot yet interleave with `onPriceUpdate` -- and making that interleaving
-   * safe is its own step, deliberately not rushed here.
+   * THE THREE CALLERS, as of step 22: the 30-second alarm (step 20), a test,
+   * and a human through `POST /api/bots/:id/check-open-orders`. The endpoint is
+   * the operator's first move on a `poll_blind` or `price_updates_stale` alert,
+   * which both mean the scheduled path has stopped working -- so the manual one
+   * has to exist, or the response to "your bot stopped observing itself" is to
+   * wait and hope. Interleaving with `onPriceUpdate` is real on all three paths
+   * and is step 21's subject: this pass yields to any non-poll pass, before its
+   * loop and again after each read.
    *
    * `routine` priority: keeping the books current is ordinary work. It must not
    * draw on the slice section 5.4 reserves for getting OUT of a position.
+   *
+   * IT IS NOT READ-ONLY, and a caller must not present it as such. On a RUNNING
+   * grid bot a folded buy places its paired replacement sell, exactly as a live
+   * fill would (`placeReplacement` is derived from `fresh.status === "running"`,
+   * step 19). That is the grid working rather than a repair trading behind the
+   * operator's back -- but it does mean this can put an order on the exchange.
    */
   async checkOpenOrders(actor: string): Promise<OrderCheckResult> {
     const config = await this.#config();
@@ -1543,17 +1648,43 @@ export class BotInstance extends DurableObject<Env> {
   ): Promise<PollPass> {
     const pass = await this.#pollOpenOrders(config, state);
 
-    // Audited only when something actually MOVED. Now that this runs on a timer
-    // the no-op pass is the overwhelmingly common one, and a row per pass would
-    // measure how long the bot has been running rather than what happened to
-    // it -- the same reasoning that made reconciliation's standing alerts one
-    // row per incident instead of one per detection.
-    if (pass.applied.length > 0 || pass.closed.length > 0) {
+    // Audited when something MOVED -- or when this pass identified a real
+    // problem and refused to act on it.
+    //
+    // The `refused` half is step 22's correction to step 19's rule, and the gap
+    // it closes is not theoretical. `applied || closed` alone means a pass that
+    // hit `#foldTerminalState`'s quantity gate -- the exact bot-44400a
+    // condition, an order that ended terminal on the exchange with more filled
+    // than this bot recorded -- wrote NOTHING durable. Neither did an
+    // `OrderStateError`, nor an unattributable fill. Those are the passes whose
+    // reasoning an operator most needs to reconstruct afterwards, and the poll
+    // was recording only the passes where everything went fine.
+    //
+    // UNREADABLE PASSES ARE STILL DELIBERATELY EXCLUDED, which is why `refused`
+    // exists as its own list rather than the gate reading `skipped`. `skipped`
+    // holds both, and gating on it would put a row on every pass of an outage --
+    // at 30 seconds, ~2,880 a day per bot saying "the venue is still down". That
+    // condition already has a lifecycle built for it: the backoff, and one
+    // standing `poll_blind`. Step 20 separated these two for this class of
+    // reason and the separation earns its keep again here.
+    //
+    // The no-op pass still writes nothing at all. On a timer it is the
+    // overwhelmingly common one, and a row per pass would measure how long the
+    // bot has been running rather than what happened to it.
+    if (pass.applied.length > 0 || pass.closed.length > 0 || pass.refused.length > 0) {
       await this.#audit(
         config,
         "bot.open_orders_checked",
         actor,
-        { applied: pass.applied, skipped: pass.skipped, closed: pass.closed },
+        {
+          applied: pass.applied,
+          skipped: pass.skipped,
+          closed: pass.closed,
+          // The subset of `skipped` that made this row exist, named separately
+          // so the row says WHY it was written. `skipped` stays whole because it
+          // is the honest full account of what this pass could not do.
+          refused: pass.refused,
+        },
         this.#now(),
       );
     }
@@ -1613,12 +1744,32 @@ export class BotInstance extends DurableObject<Env> {
     const applied: AppliedFill[] = [];
     const skipped: string[] = [];
     const closed: string[] = [];
+    const refused: string[] = [];
     const standing = new Set<string>();
     let reads = 0;
     let unreadable = 0;
 
+    /**
+     * Record something this pass READ and then declined to act on.
+     *
+     * Both lists, always, through one call -- see `PollPass.refused`. The
+     * unreadable branch below deliberately does NOT come through here: it did
+     * not read anything, and conflating the two is what step 20 spent a section
+     * refusing to do.
+     */
+    const refuse = (reason: string): void => {
+      skipped.push(reason);
+      refused.push(reason);
+    };
+
+    // FIRST, and before every early return below, because it is derived from
+    // this object's own state and clock and needs no exchange call at all. A
+    // pass that stands aside for another, or finds nothing to read, has still
+    // observed the tick clock perfectly well.
+    await this.#checkPriceFreshness(config, state, standing);
+
     if (state.openOrderIds.length === 0) {
-      return { applied, skipped, closed, standing, reads, unreadable, deferred: false };
+      return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: false };
     }
 
     // Yield before starting. Another pass is already inside this object, and
@@ -1626,7 +1777,7 @@ export class BotInstance extends DurableObject<Env> {
     // changing. See `#outsidePoll`: the poll is the one writer that can always
     // afford to come back later.
     if (this.#passesInFlight > 0) {
-      return { applied, skipped, closed, standing, reads, unreadable, deferred: true };
+      return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: true };
     }
 
     const exchange = this.#exchange(config, "routine");
@@ -1657,7 +1808,7 @@ export class BotInstance extends DurableObject<Env> {
       // failed a test survived instead. What a deferred pass did not do is
       // FINISH, and `deferred` is what says so.
       if (this.#passesInFlight > 0) {
-        return { applied, skipped, closed, standing, reads, unreadable, deferred: true };
+        return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: true };
       }
 
       if (!isUsable(outcome)) {
@@ -1672,7 +1823,7 @@ export class BotInstance extends DurableObject<Env> {
       if (remote.fills === undefined) {
         const local = await this.#order(clientOrderId);
         if (local !== undefined && remote.filledQuantity > local.filledQuantity) {
-          skipped.push(
+          refuse(
             `${clientOrderId}: the exchange reports ${toDecimalString(remote.filledQuantity)} ` +
               `filled against ${toDecimalString(local.filledQuantity)} recorded, but sent no ` +
               `per-fill detail, so there is no real fill id to apply.`,
@@ -1711,7 +1862,7 @@ export class BotInstance extends DurableObject<Env> {
         // grid replacement placement mutated the state.
         const order = await this.#order(clientOrderId);
         if (order === undefined) {
-          skipped.push(`${clientOrderId}: no local record of this order`);
+          refuse(`${clientOrderId}: no local record of this order`);
           break;
         }
         if (order.fills.some((existing) => existing.fillId === fill.fillId)) {
@@ -1740,7 +1891,7 @@ export class BotInstance extends DurableObject<Env> {
         } catch (error) {
           // An `OrderStateError` means the local record and the exchange
           // genuinely disagree in a way this pass must not paper over.
-          skipped.push(
+          refuse(
             `${clientOrderId} fill ${fill.fillId}: ` +
               `${error instanceof Error ? error.message : String(error)}`,
           );
@@ -1748,12 +1899,75 @@ export class BotInstance extends DurableObject<Env> {
         }
       }
 
-      if (await this.#foldTerminalState(config, clientOrderId, remote, skipped)) {
+      if (await this.#foldTerminalState(config, clientOrderId, remote, refuse)) {
         closed.push(clientOrderId);
       }
     }
 
-    return { applied, skipped, closed, standing, reads, unreadable, deferred: false };
+    return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: false };
+  }
+
+  /**
+   * Raise or clear the "this bot has stopped receiving prices" condition.
+   *
+   * WHAT MAKES STEP 21's "WAIT FOR THE NEXT TICK" SOUND. A poll-observed fill
+   * deliberately does not act: the poll has no price, and every action either
+   * strategy can take needs one. That is a correct decision and an unverified
+   * assumption at the same time, until something checks that a next tick is
+   * actually coming. This is that check, and it is the first read of
+   * `lastPriceAt` anywhere in the codebase.
+   *
+   * RUNNING ONLY, and that is not a convenience. `#onPriceUpdatePass` returns
+   * `ignored` before it writes `lastPriceAt` for any other status, so a halted
+   * bot's clock is frozen BY DESIGN -- checking one would alert on every halted
+   * bot with a resting order, permanently, for doing exactly what it is supposed
+   * to. The useful half falls out for free: a bot that halts while this
+   * condition stands stops re-finding it, so its next pass resolves the row
+   * through the ordinary lifecycle. A halted bot receiving no prices is not a
+   * fault and the alert correctly stops claiming it is.
+   *
+   * That resolution needs a NEXT PASS, though, and a halt that cancels cleanly
+   * empties `openOrderIds` and disarms the poll -- so the row can outlive the
+   * condition, exactly as step 20's open question 2 records for `poll_blind`.
+   * The rule is the same one and it is the safe direction: only a pass that
+   * actually looked may close a row.
+   *
+   * A NULL `lastPriceAt` raises nothing, deliberately. It means "running, but no
+   * tick has ever arrived", and there is no `startedAt` in this object's state
+   * to measure that against -- an age is not computable, and inventing one from
+   * the poll's own first sighting would restart on every eviction. It is also
+   * unreachable from the SCHEDULED path, which is what makes leaving it
+   * acceptable rather than a gap: every order-placing site sits inside
+   * `#onPriceUpdatePass`, which writes `lastPriceAt` before it decides anything,
+   * so a running bot with a resting order has provably seen at least one tick,
+   * and a bot with no resting order arms no alarm. Only a manual
+   * `checkOpenOrders` can reach it. See the step 22 log's open questions.
+   */
+  async #checkPriceFreshness(
+    config: BotConfig,
+    state: BotRuntimeState,
+    standing: Set<string>,
+  ): Promise<void> {
+    if (state.status !== "running" || state.lastPriceAt === null) return;
+
+    const age = this.#now() - state.lastPriceAt;
+    if (age < PRICE_STALENESS_MS) return;
+
+    standing.add(standingAlertKey("price_updates_stale", config.botInstanceId));
+    await this.#raiseStanding(config, {
+      severity: "warning",
+      category: "system",
+      alertType: "price_updates_stale",
+      message:
+        `bot ${config.botInstanceId} has received no live price for ` +
+        `${Math.round(age / 60_000)} minutes (last at ${new Date(state.lastPriceAt).toISOString()}), ` +
+        `against a measured feed cadence of one closed candle every 35-70s. It is RUNNING, so its ` +
+        `stop-loss and take-profit are evaluated on price updates that are not arriving, and any ` +
+        `fill this poll observes waits for a tick that may never come. The feed's own ` +
+        `price_feed_blind alert cannot cover this: its staleness clock is advanced by heartbeats, ` +
+        `so a socket that heartbeats while delivering no candles looks healthy from there. Check ` +
+        `whether this bot is still subscribed to its price feed.`,
+    });
   }
 
   /**
@@ -1778,7 +1992,13 @@ export class BotInstance extends DurableObject<Env> {
     config: BotConfig,
     clientOrderId: string,
     remote: OrderStatus,
-    skipped: string[],
+    /**
+     * Takes the REFUSAL path, not a raw `skipped` array (step 22). The gate
+     * below is the archetypal refusal -- read successfully, understood exactly,
+     * and declined -- and it is the specific one that used to leave no durable
+     * record at all.
+     */
+    refuse: (reason: string) => void,
   ): Promise<boolean> {
     if (remote.state !== "cancelled" && remote.state !== "expired" && remote.state !== "rejected") {
       return false;
@@ -1788,7 +2008,7 @@ export class BotInstance extends DurableObject<Env> {
     if (order === undefined || isTerminal(order.state)) return false;
 
     if (order.filledQuantity < remote.filledQuantity) {
-      skipped.push(
+      refuse(
         `${clientOrderId}: ended ${remote.state} on the exchange with ` +
           `${toDecimalString(remote.filledQuantity)} filled against ` +
           `${toDecimalString(order.filledQuantity)} recorded. Left open rather than closed: a ` +

@@ -21,6 +21,7 @@ import type {
   ApplyMissedFillsResponse,
   Bot,
   BotDetail,
+  CheckOpenOrdersResponse,
   CreateBotRequest,
   KillSwitchStatus,
   LiquidateResponse,
@@ -232,6 +233,42 @@ export function resumeBot(id: string, signal?: AbortSignal): Promise<ResumeRespo
 export function applyMissedFills(id: string, signal?: AbortSignal): Promise<ApplyMissedFillsResponse> {
   return requestJson<ApplyMissedFillsResponse>(
     `/api/bots/${encodeURIComponent(id)}/apply-missed-fills`,
+    "POST",
+    { signal },
+  );
+}
+
+/**
+ * Observe this bot's resting orders right now
+ * (`POST /api/bots/:id/check-open-orders`, step 22).
+ *
+ * The same pass the 30-second alarm runs, triggered by a person. That is the
+ * point rather than a caveat: the conditions it answers -- `poll_blind` (the
+ * venue has been unreadable for five consecutive passes, now retrying at the
+ * five-minute floor) and `price_updates_stale` (no live price for over ten
+ * minutes on a running bot) -- both mean the SCHEDULED path has stopped
+ * working, and without this the operator's only move is to wait for a
+ * backed-off timer.
+ *
+ * TWO THINGS THE CALLER MUST NOT MISSTATE:
+ *   - A 200 is not a clean bill of health. `skipped` carries every order this
+ *     pass could not read or could not apply; `deferred` says it stood aside
+ *     for a concurrent pass and looked at nothing, which three empty arrays
+ *     cannot be distinguished from.
+ *   - It is not read-only. On a RUNNING GRID bot a folded buy places its paired
+ *     replacement sell, exactly as a live fill would.
+ *
+ * Its refusals, from the bot object:
+ *   - `invalid_status` (409) -- the bot is `stopped`; its capital is released.
+ *     A `halted` bot is explicitly fine and is a useful case.
+ *   - `not_attached`   (503) -- no exchange client could be built here.
+ *   - `not_created`    (404) -- the object holds no config for this id.
+ *
+ * Safe to retry: applied fills deduplicate on the exchange's own ids.
+ */
+export function checkOpenOrders(id: string, signal?: AbortSignal): Promise<CheckOpenOrdersResponse> {
+  return requestJson<CheckOpenOrdersResponse>(
+    `/api/bots/${encodeURIComponent(id)}/check-open-orders`,
     "POST",
     { signal },
   );

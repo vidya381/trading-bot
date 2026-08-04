@@ -87,6 +87,16 @@ export class FakeExchange implements RestExchangeClient {
   /** Set to force `getOrderStatus` to fail. Stays set until cleared. */
   orderStatusFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /**
+   * clientOrderIds whose `getOrderStatus` fails while the rest succeed.
+   *
+   * The MIXED pass, which the all-or-nothing flag above cannot express and which
+   * is the case several real distinctions turn on: step 20's backoff (a pass
+   * that reads some orders and fails on others still writes state, so it must
+   * still back off) and step 22's audit gate (`skipped` holds both an outage and
+   * a refusal; only the refusal justifies a row).
+   */
+  readonly orderStatusFailureFor = new Set<string>();
+  /**
    * Per-fill detail `getOrderStatus` reports for an order, keyed by
    * clientOrderId -- the `trades` array a real venue returns for
    * `include_trades`. An ABSENT entry means the venue reported no detail at all,
@@ -245,6 +255,9 @@ export class FakeExchange implements RestExchangeClient {
   async getOrderStatus(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>> {
     if (this.orderStatusFailure !== null) {
       return failure(this.orderStatusFailure.message, this.orderStatusFailure.kind, this.now);
+    }
+    if (this.orderStatusFailureFor.has(clientOrderId)) {
+      return failure(`${clientOrderId} is unreadable`, "transport", this.now);
     }
     const order = this.resting.get(clientOrderId);
     if (order === undefined) {

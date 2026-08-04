@@ -437,6 +437,63 @@ export async function applyMissedFills(ctx: ApiContext): Promise<Response> {
 }
 
 /**
+ * POST /api/bots/:id/check-open-orders -- observe this bot's resting orders NOW.
+ *
+ * Calls `BotInstance.checkOpenOrders(actor)`, built at step 19 and until now
+ * reachable only from the alarm and the test suite. Thin, the same shape as
+ * `startBot`, `resumeBot`, `applyMissedFills` and `liquidateBot`: the DO owns
+ * every rule.
+ *
+ * WHY A HUMAN NEEDS THIS WHEN A TIMER ALREADY RUNS IT. Precisely because the
+ * timer might not be. The conditions this endpoint answers are `poll_blind`
+ * (five consecutive passes could not read the venue, now retrying at the
+ * five-minute floor) and `price_updates_stale` (step 22 -- no live price for
+ * over ten minutes on a running bot). Both mean the SCHEDULED observation has
+ * stopped working, and without a manual trigger the operator's only move on
+ * either is to wait for a backed-off timer and hope. It is also the honest first
+ * move for the whole class: it costs one `getOrderStatus` per open order at
+ * routine priority and reports exactly what it found.
+ *
+ * HOW IT DIFFERS FROM `apply-missed-fills`, since the two are adjacent on the
+ * bot page and confusing them matters:
+ *   - This one runs on a RUNNING bot (that is its normal case); the repair
+ *     refuses anything but `halted`.
+ *   - This one is not gated on a finding. It re-derives whatever is true right
+ *     now, and it is the same pass the alarm has been running every 30 seconds
+ *     anyway -- so a human pressing it introduces no operation the system was
+ *     not already performing unattended.
+ *   - It CAN place an order. On a running grid bot a folded buy places its
+ *     paired replacement sell (step 19's `placeReplacement: fresh.status ===
+ *     "running"`), where the repair path passes `false` unconditionally. That is
+ *     the grid working normally, but it means this is not a books-only action
+ *     and the dashboard must not describe it as one.
+ *
+ * Failure surface, all from the DO (read from source, not assumed):
+ *   - `not_created` (404)    -- the object holds no config.
+ *   - `invalid_status` (409) -- the bot is `stopped`. Its capital is released,
+ *     so a pass would be work whose result nothing may use.
+ *   - `not_attached` (503)   -- no exchange client could be built here.
+ * A `halted` bot is explicitly NOT an error: observing costs nothing and a halt
+ * whose cancellation failed leaves live orders on the exchange while a human is
+ * deciding about exactly those books (step 19).
+ *
+ * A 200 does NOT mean the books are clean. `skipped` carries every order this
+ * pass could not read or could not apply, `closed` what it folded to a terminal
+ * state, and `deferred` says the pass stood aside for another rather than
+ * completing -- which three empty arrays alone cannot distinguish from a clean
+ * result, and "I did not look" is a very different answer from "nothing moved".
+ */
+export async function checkOpenOrders(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const result = await botStub(ctx, id).checkOpenOrders(ctx.actor);
+  const [row, snapshot] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+}
+
+/**
  * POST /api/bots/:id/liquidate -- the unified human close-out (endpoint 4).
  *
  * Calls `liquidatePosition(actor)` from step 10.3 verbatim. It is valid only on

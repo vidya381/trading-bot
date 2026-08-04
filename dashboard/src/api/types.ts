@@ -521,6 +521,65 @@ export interface ApplyMissedFillsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Check open orders (`POST /api/bots/:id/check-open-orders`, step 22)
+//
+// The observation pass, run on demand. Mirrored from the DO's `OrderCheckResult`.
+//
+// HOW IT DIFFERS FROM apply-missed-fills, which is directly above it on the bot
+// page and which the UI must not blur into it:
+//   - It runs on a RUNNING bot; that is its normal case. The repair refuses
+//     anything but `halted`.
+//   - It is not gated on a finding. It is the SAME pass the alarm has run every
+//     30 seconds since step 20, so a human triggering it introduces no operation
+//     the system was not already performing unattended. What a human adds is
+//     running it NOW -- which is the whole point when the scheduled path has
+//     backed off or gone blind.
+//   - IT CAN PLACE AN ORDER. On a running grid bot a folded buy places its
+//     paired replacement sell, exactly as a live fill would. The repair path
+//     passes `placeReplacement: false` unconditionally; this one derives it from
+//     `status === "running"`. So this is NOT a books-only action and must never
+//     be described as one.
+//
+// `status` is whatever the bot holds after the pass -- this never changes it.
+// ---------------------------------------------------------------------------
+
+/** The `OrderCheckResult` one observation pass returns. */
+export interface OrderCheckResult {
+  /** The status the bot holds after the pass. This operation never changes it. */
+  readonly status: BotStatus;
+  /** Executions newly folded in, each with the exchange's own fill id. */
+  readonly applied: readonly AppliedFill[];
+  /**
+   * Orders this pass could not fully account for, each with its reason, worded
+   * by the backend. Non-empty means the books are still behind the exchange.
+   * Rendered verbatim, for the same reason as the repair's: the distinction
+   * between "could not read" and "read, and refused to act" lives in the prose,
+   * and re-deriving it here by string matching would be a weaker second copy of
+   * a judgement already made.
+   */
+  readonly skipped: readonly string[];
+  /** Orders whose local record was closed to match a terminal exchange state. */
+  readonly closed: readonly string[];
+  /**
+   * True when the pass STOOD ASIDE for a concurrent pass rather than completing
+   * (step 21: the poll yields one-way, since everything it does is re-derivable).
+   *
+   * The UI must surface this rather than treating it as success. Three empty
+   * arrays are otherwise indistinguishable from a clean pass, and "your books
+   * are up to date" is a very different claim from "I did not look". Trying
+   * again is the correct response and is always safe.
+   */
+  readonly deferred: boolean;
+}
+
+/** The body of a successful `POST /api/bots/:id/check-open-orders`. */
+export interface CheckOpenOrdersResponse {
+  readonly result: OrderCheckResult;
+  /** The refreshed summary, or null if the bot's row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
 // Global kill switch (spec section 7.4; `killSwitchView` in serialize.ts,
 // `GET /api/kill-switch`, `POST /api/kill-switch/{trigger,reset}`).
 //
