@@ -42,6 +42,123 @@ export function roundDecimal(value: string, places: number): string {
   return negative && /[1-9]/.test(rounded) ? `-${rounded}` : rounded;
 }
 
+// ---------------------------------------------------------------------------
+// DISPLAY ROUNDING
+//
+// `trimDecimal` alone is not a rounding rule: it drops trailing zeros, so a
+// value that HAS eight significant decimals keeps all eight. A real price came
+// out as "66116.13259921" on the detail view, which is not a number anyone
+// reads at a glance. The three helpers below are the display-rounding rules,
+// named for what the value MEANS rather than for a digit count, so a call site
+// picks the rule by saying what it is showing.
+//
+// None of this touches a stored value. Money remains an exact decimal string
+// end to end (`src/shared/money.ts`, SCALE 8); these functions produce TEXT and
+// their output never feeds arithmetic. No float is constructed anywhere.
+// ---------------------------------------------------------------------------
+
+/** Quote-asset money -- prices, costs, allocations, P&L. Cents, as USD is read. */
+const MONEY_PLACES = 2;
+
+/**
+ * Base-asset quantities. 8 is the stored scale (`SCALE` in money.ts), so this
+ * rounds nothing that the API can actually send; trailing zeros are then
+ * trimmed, which is where the readability comes from -- "1.50000000" is "1.5"
+ * and "0.00123400" is "0.001234". Deliberately NOT a tighter fixed width: a
+ * held quantity is the thing the bot would sell, and truncating its last digits
+ * on screen invites an operator to reconcile against a number the exchange does
+ * not have.
+ */
+const QUANTITY_PLACES = 8;
+
+/** Percentages. Two places, then trimmed, so "20.00000000" reads "20%". */
+const PERCENT_PLACES = 2;
+
+/** True when a decimal string carries no significant digit ("0", "-0.0000"). */
+function isZero(value: string): boolean {
+  return !/[1-9]/.test(value);
+}
+
+/**
+ * Pad a decimal string out to exactly `places` decimals ("500" -> "500.00").
+ * Only ever called with an already-rounded value, so it never truncates; the
+ * sign travels with the integer part and needs no special handling.
+ */
+function padFraction(value: string, places: number): string {
+  const [whole, fraction = ""] = value.split(".");
+  return `${whole}.${fraction.padEnd(places, "0")}`;
+}
+
+/**
+ * Would rounding to `places` erase a real value?
+ *
+ * Two decimals is right for a USD price and wrong for an asset that trades
+ * below a cent: at 2 places a SHIB/USD price of "0.00002341" renders "0.00",
+ * which is not a rounded number but a false one -- and worse than the
+ * over-precision this whole module exists to fix, because it reads as zero.
+ * Every helper below widens to the exact figure rather than show that. A number
+ * on this dashboard is allowed to be long; it is not allowed to be wrong.
+ *
+ * Only a NON-zero input can trigger this. A genuine zero still renders as zero.
+ */
+function roundsAwayToZero(value: string, rounded: string): boolean {
+  return isZero(rounded) && !isZero(value);
+}
+
+/**
+ * Quote-asset money for display: two decimals, zero-padded so a column of them
+ * lines up under `tabular` ("500" -> "500.00", "66116.13259921" -> "66116.13").
+ *
+ * Padding is what `trimDecimal` deliberately does not do, and both are correct
+ * for their own case: an exact-value readout wants "500", a money column wants
+ * "500.00" beside "12.34". This is the money column.
+ */
+export function formatMoney(value: string): string {
+  const rounded = roundDecimal(value, MONEY_PLACES);
+  // The widened form is exact and longer than two places; padding it would be
+  // meaningless, so it returns as it is.
+  if (roundsAwayToZero(value, rounded)) return trimDecimal(value);
+  return padFraction(rounded, MONEY_PLACES);
+}
+
+/**
+ * A base-asset quantity for display: exact to the stored scale, with trailing
+ * zeros trimmed. Not padded -- unlike a money column, quantities across
+ * different assets have no shared width to line up to.
+ */
+export function formatQuantity(value: string): string {
+  const rounded = roundDecimal(value, QUANTITY_PLACES);
+  if (roundsAwayToZero(value, rounded)) return trimDecimal(value);
+  return trimDecimal(rounded);
+}
+
+/**
+ * A percentage for display, WITH its "%" sign attached, because a bare number
+ * that means a percentage is exactly the kind of unlabelled figure this module
+ * is meant to stop producing.
+ */
+export function formatPercent(value: string): string {
+  const rounded = roundDecimal(value, PERCENT_PLACES);
+  const shown = roundsAwayToZero(value, rounded) ? value : rounded;
+  return `${trimDecimal(shown)}%`;
+}
+
+/**
+ * The base asset of a pair, given its quote (capital) asset. Binance symbols are
+ * concatenated base+quote ("BTCUSDT"), so the base is the pair with the quote
+ * suffix stripped. Falls back to the raw pair if it does not end in the quote.
+ *
+ * Here rather than in a component because three call sites now need it to LABEL
+ * a quantity -- the previous two private copies in StartAction and LiquidateAction
+ * were already one duplication too many.
+ */
+export function baseAssetOf(pair: string, quoteAsset: string): string {
+  if (quoteAsset !== "" && pair.length > quoteAsset.length && pair.endsWith(quoteAsset)) {
+    return pair.slice(0, pair.length - quoteAsset.length);
+  }
+  return pair;
+}
+
 /** A signed decimal string's sign, for colouring gains/losses. */
 export function signOf(value: string): "positive" | "negative" | "zero" {
   if (value.startsWith("-")) return "negative";

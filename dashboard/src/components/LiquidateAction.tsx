@@ -41,7 +41,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, liquidateBot } from "../api/client";
 import type { BotDetail } from "../api/types";
-import { signOf, trimDecimal } from "../format";
+import { baseAssetOf, formatQuantity, signOf } from "../format";
 
 type OutcomeTone = "success" | "warning" | "info" | "error";
 
@@ -57,18 +57,6 @@ const OUTCOME_CLASS: Record<OutcomeTone, string> = {
   info: "border-zinc-700 bg-zinc-900/40 text-zinc-300",
   error: "border-red-500/30 bg-red-500/5 text-red-200",
 };
-
-/**
- * The base asset of a pair, given its quote (capital) asset. Binance symbols are
- * concatenated base+quote ("BTCUSDT"), so the base is the pair with the quote
- * suffix stripped. Falls back to the raw pair if it does not end in the quote.
- */
-function baseAsset(pair: string, quoteAsset: string): string {
-  if (quoteAsset !== "" && pair.length > quoteAsset.length && pair.endsWith(quoteAsset)) {
-    return pair.slice(0, pair.length - quoteAsset.length);
-  }
-  return pair;
-}
 
 /** Map a successful `{ result }` to its distinct, honest message. */
 function outcomeForResult(action: string, amount: string, asset: string): Outcome {
@@ -277,8 +265,10 @@ export function LiquidateAction({
 
   const held = bot.position?.heldQuantity ?? "0";
   const canLiquidate = signOf(held) === "positive";
-  const asset = baseAsset(bot.pair, bot.capitalAsset);
-  const amount = trimDecimal(held);
+  const asset = baseAssetOf(bot.pair, bot.capitalAsset);
+  // A quantity, not money: this is the base-asset amount that would be SOLD, so
+  // it keeps its exact (trimmed) precision rather than being rounded to cents.
+  const amount = formatQuantity(held);
 
   async function confirm() {
     if (submitting) return; // double-click guard (brief item 5)

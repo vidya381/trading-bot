@@ -9,11 +9,13 @@
  * label and never borrows the other's wording.
  *
  * Every value arrives as an exact decimal string from `derive.ts`; this file
- * only colours and trims it (`format.ts` discipline -- no float, ever).
+ * only colours and rounds it for display (`format.ts` discipline -- no float,
+ * ever, and the stored value keeps its full precision).
  */
 
 import type { UnrealizedPnl } from "../derive";
-import { roundDecimal, signOf, trimDecimal } from "../format";
+import { formatMoney, formatPercent, signOf } from "../format";
+import { Separator, Unit } from "./Unit";
 
 const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   positive: "text-emerald-300",
@@ -48,12 +50,21 @@ export function UnrealizedValue({
 }) {
   if (pnl === null) return <span className="text-zinc-600">—</span>;
 
+  /*
+   * Three separate facts -- an amount, the asset it is denominated in, and the
+   * percentage it represents -- so all three are separated by real text, not by
+   * margins alone. This rendered as "-0.05783555USD-0.12%" when the spacing was
+   * left to CSS. See Unit.tsx.
+   */
   return (
     <span className={SIGN_CLASS[signOf(pnl.amount)]}>
-      {signed(trimDecimal(pnl.amount))}
-      <span className="ml-1 text-xs font-normal text-zinc-500">{capitalAsset}</span>
+      <span className="tabular">{signed(formatMoney(pnl.amount))}</span>
+      <Unit>{capitalAsset}</Unit>
       {pnl.pct !== null && (
-        <span className="ml-2 text-sm font-medium">{signed(roundDecimal(pnl.pct, 2))}%</span>
+        <>
+          <Separator />
+          <span className="tabular text-sm font-medium">{signed(formatPercent(pnl.pct))}</span>
+        </>
       )}
     </span>
   );

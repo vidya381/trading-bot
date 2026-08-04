@@ -16,9 +16,10 @@
  */
 
 import { Link } from "react-router-dom";
-import type { Bot, Position } from "../api/types";
+import type { Bot } from "../api/types";
 import { StatusBadge } from "./StatusBadge";
-import { signOf, trimDecimal } from "../format";
+import { Unit } from "./Unit";
+import { baseAssetOf, formatMoney, formatQuantity, signOf } from "../format";
 
 const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   positive: "text-emerald-300",
@@ -26,28 +27,47 @@ const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   zero: "text-zinc-400",
 };
 
-/** Realized-gross figure with sign colouring, or "—" for an orphaned bot. */
-function Pnl({ position }: { position: Position | null }) {
-  if (position === null) return <span className="text-zinc-600">—</span>;
-  const value = position.realizedGross;
-  return <span className={`tabular ${SIGN_CLASS[signOf(value)]}`}>{trimDecimal(value)}</span>;
+/**
+ * Realized-gross figure with sign colouring, or "—" for an orphaned bot.
+ *
+ * Carries its capital asset: this column stacks bots from different accounts and
+ * pairs, so an unlabelled number here is a column of amounts in assets that need
+ * not be the same one.
+ */
+function Pnl({ bot }: { bot: Bot }) {
+  if (bot.position === null) return <span className="text-zinc-600">—</span>;
+  const value = bot.position.realizedGross;
+  return (
+    <span className={`tabular ${SIGN_CLASS[signOf(value)]}`}>
+      {formatMoney(value)}
+      <Unit>{bot.capitalAsset}</Unit>
+    </span>
+  );
 }
 
-/** Held quantity, with DCA's average entry as secondary context. */
-function PositionCell({ position }: { position: Position | null }) {
+/** Held quantity in the base asset, with DCA's average entry as secondary context. */
+function PositionCell({ bot }: { bot: Bot }) {
+  const position = bot.position;
   if (position === null) return <span className="text-zinc-600">—</span>;
-  const held = trimDecimal(position.heldQuantity);
-  if (position.strategy === "dca") {
+  const held = formatQuantity(position.heldQuantity);
+  const asset = baseAssetOf(bot.pair, bot.capitalAsset);
+  if (position.strategy === "dca" && position.averageEntryPrice !== "0.00000000") {
     return (
       <span className="tabular">
         {held}
-        {position.averageEntryPrice !== "0.00000000" && (
-          <span className="ml-1 text-xs text-zinc-500">@ {trimDecimal(position.averageEntryPrice)}</span>
-        )}
+        <Unit>{asset}</Unit>
+        {/* The "@" is a real separator between the two numbers, spaced on both
+            sides -- a quantity and a price abutting would read as one figure. */}
+        <Unit>@ {formatMoney(position.averageEntryPrice)} {bot.capitalAsset}</Unit>
       </span>
     );
   }
-  return <span className="tabular">{held}</span>;
+  return (
+    <span className="tabular">
+      {held}
+      <Unit>{asset}</Unit>
+    </span>
+  );
 }
 
 function OrphanTag({ bot }: { bot: Bot }) {
@@ -100,14 +120,14 @@ function BotTable({ bots }: { bots: Bot[] }) {
               <td className="px-4 py-3 uppercase text-zinc-300">{bot.strategy}</td>
               <td className="px-4 py-3 text-zinc-300">{bot.pair}</td>
               <td className="px-4 py-3 text-right">
-                <PositionCell position={bot.position} />
+                <PositionCell bot={bot} />
               </td>
               <td className="px-4 py-3 text-right">
-                <Pnl position={bot.position} />
+                <Pnl bot={bot} />
               </td>
               <td className="tabular px-4 py-3 text-right text-zinc-300">
-                {trimDecimal(bot.allocatedCapital)}{" "}
-                <span className="text-xs text-zinc-500">{bot.capitalAsset}</span>
+                {formatMoney(bot.allocatedCapital)}
+                <Unit>{bot.capitalAsset}</Unit>
               </td>
             </tr>
           ))}
@@ -149,20 +169,20 @@ function BotCard({ bot }: { bot: Bot }) {
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Position</dt>
           <dd>
-            <PositionCell position={bot.position} />
+            <PositionCell bot={bot} />
           </dd>
         </div>
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Realized (gross)</dt>
           <dd>
-            <Pnl position={bot.position} />
+            <Pnl bot={bot} />
           </dd>
         </div>
         <div className="col-span-2">
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Allocated</dt>
           <dd className="tabular text-zinc-300">
-            {trimDecimal(bot.allocatedCapital)}{" "}
-            <span className="text-xs text-zinc-500">{bot.capitalAsset}</span>
+            {formatMoney(bot.allocatedCapital)}
+            <Unit>{bot.capitalAsset}</Unit>
           </dd>
         </div>
       </dl>

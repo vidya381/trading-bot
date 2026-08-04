@@ -86,7 +86,7 @@ import { useLocation } from "react-router-dom";
 import { ApiError, applyMissedFills } from "../api/client";
 import type { Alert, BotDetail, MissedFillsResult } from "../api/types";
 import { APPLY_MISSED_FILLS_ANCHOR, openDriftAlerts } from "../driftAlerts";
-import { formatTime, trimDecimal } from "../format";
+import { formatMoney, formatQuantity, formatTime } from "../format";
 
 type OutcomeTone = "success" | "warning" | "info" | "error";
 
@@ -231,10 +231,10 @@ function AppliedTable({ applied }: { applied: MissedFillsResult["applied"] }) {
               <td className="tabular px-2 py-1.5 break-all text-zinc-300">{fill.clientOrderId}</td>
               <td className="tabular px-2 py-1.5 break-all text-zinc-300">{fill.fillId}</td>
               <td className="tabular px-2 py-1.5 text-right text-zinc-200">
-                {trimDecimal(fill.quantity)}
+                {formatQuantity(fill.quantity)}
               </td>
               <td className="tabular px-2 py-1.5 text-right text-zinc-200">
-                {trimDecimal(fill.price)}
+                {formatMoney(fill.price)}
               </td>
             </tr>
           ))}

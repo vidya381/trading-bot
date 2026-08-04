@@ -7,20 +7,28 @@
 
 import type { Trade } from "../api/types";
 import { HistoryTable, type Column } from "./HistoryTable";
-import { formatTime, trimDecimal } from "../format";
+import { formatMoney, formatQuantity, formatTime } from "../format";
+import { Unit } from "./Unit";
 
+/**
+ * The fee, in whatever asset the venue charged it in -- which is the reason it
+ * is formatted as a QUANTITY and not as money: `feeAsset` is frequently the
+ * exchange's own token or the base asset, not the capital asset, so the
+ * two-decimal money rule would be the wrong rule and (for a small crypto fee)
+ * would round the whole charge away.
+ */
 function Fee({ trade }: { trade: Trade }) {
   return (
     <span className="tabular text-zinc-400">
-      {trimDecimal(trade.feeAmount)}{" "}
-      <span className="text-xs text-zinc-500">{trade.feeAsset}</span>
+      {formatQuantity(trade.feeAmount)}
+      <Unit>{trade.feeAsset}</Unit>
     </span>
   );
 }
 
 const COLUMNS: readonly Column<Trade>[] = [
-  { key: "price", header: "Price", align: "right", render: (t) => <span className="tabular">{trimDecimal(t.price)}</span> },
-  { key: "quantity", header: "Quantity", align: "right", render: (t) => <span className="tabular">{trimDecimal(t.quantity)}</span> },
+  { key: "price", header: "Price", align: "right", render: (t) => <span className="tabular">{formatMoney(t.price)}</span> },
+  { key: "quantity", header: "Quantity", align: "right", render: (t) => <span className="tabular">{formatQuantity(t.quantity)}</span> },
   { key: "fee", header: "Fee", align: "right", render: (t) => <Fee trade={t} /> },
   {
     key: "executed",

@@ -11,11 +11,16 @@
  */
 
 import type { BotDetail } from "../api/types";
+import { baseAssetOf } from "../format";
 import { GridLadderView } from "./GridLadderView";
 import { DcaPositionView } from "./DcaPositionView";
 
 export function StrategyState({ bot }: { bot: BotDetail }) {
   const { config, state } = bot;
+  // Quantities below are held in the BASE asset while every money figure beside
+  // them is in the capital (quote) asset. Both views label their figures, so
+  // both need this; derived once here rather than twice from the same pair.
+  const baseAsset = baseAssetOf(bot.pair, bot.capitalAsset);
 
   // Orphaned: a bot_instances row whose Durable Object holds no state.
   if (config === null || state === null) {
@@ -41,6 +46,7 @@ export function StrategyState({ bot }: { bot: BotDetail }) {
         currentPrice={state.lastPrice}
         params={config.params}
         capitalAsset={bot.capitalAsset}
+        baseAsset={baseAsset}
       />
     );
   }
@@ -54,6 +60,7 @@ export function StrategyState({ bot }: { bot: BotDetail }) {
       params={config.params}
       currentPrice={state.lastPrice}
       capitalAsset={bot.capitalAsset}
+      baseAsset={baseAsset}
     />
   );
 }

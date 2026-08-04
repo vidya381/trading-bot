@@ -14,11 +14,17 @@
 
 import type { ReactNode } from "react";
 import type { DcaParams, DcaPosition } from "../api/types";
-import { formatTime, trimDecimal } from "../format";
+import { formatMoney, formatQuantity, formatTime, trimDecimal } from "../format";
 import { takeProfitPriceOf, unrealizedPnl } from "../derive";
 import { ConfigItem, ConfigSection, enabled, percent } from "./ConfigSection";
+import { Unit } from "./Unit";
 import { UnrealizedValue, unrealizedHint } from "./UnrealizedValue";
 
+/**
+ * One filled entry. The columns carry their own headers, so the figures are
+ * unlabelled here on purpose -- price and cost are quote-asset money, quantity
+ * is base-asset, and each is rounded by the rule for what it is.
+ */
 function EntryRow({
   label,
   price,
@@ -35,9 +41,9 @@ function EntryRow({
   return (
     <div className="grid grid-cols-2 gap-x-4 gap-y-1 px-4 py-2 text-sm sm:grid-cols-5">
       <span className="font-medium text-zinc-300">{label}</span>
-      <span className="tabular text-zinc-200 sm:text-right">{trimDecimal(price)}</span>
-      <span className="tabular text-zinc-400 sm:text-right">{trimDecimal(quantity)}</span>
-      <span className="tabular text-zinc-400 sm:text-right">{trimDecimal(cost)}</span>
+      <span className="tabular text-zinc-200 sm:text-right">{formatMoney(price)}</span>
+      <span className="tabular text-zinc-400 sm:text-right">{formatQuantity(quantity)}</span>
+      <span className="tabular text-zinc-400 sm:text-right">{formatMoney(cost)}</span>
       <span className="text-xs text-zinc-500 sm:text-right">{formatTime(at)}</span>
     </div>
   );
@@ -59,12 +65,15 @@ export function DcaPositionView({
   params,
   currentPrice,
   capitalAsset,
+  baseAsset,
 }: {
   position: DcaPosition;
   params: DcaParams;
   /** `state.lastPrice` -- the same live price the summary above shows. */
   currentPrice: string | null;
   capitalAsset: string;
+  /** The asset the position is HELD in, for labelling quantities. */
+  baseAsset: string;
 }) {
   const remaining = params.maxAdditionalBuys - position.additionalBuysUsed;
   const hasEntries = position.entries.length > 0;
@@ -84,7 +93,10 @@ export function DcaPositionView({
           {position.averageEntryPrice === "0.00000000" ? (
             <span className="text-zinc-600">—</span>
           ) : (
-            trimDecimal(position.averageEntryPrice)
+            <>
+              {formatMoney(position.averageEntryPrice)}
+              <Unit>{capitalAsset}</Unit>
+            </>
           )}
         </Card>
         {/*
@@ -101,12 +113,19 @@ export function DcaPositionView({
           {takeProfitAt === null ? (
             <span className="text-zinc-600">—</span>
           ) : (
-            <span className="text-emerald-300">{trimDecimal(takeProfitAt)}</span>
+            <span className="text-emerald-300">
+              {formatMoney(takeProfitAt)}
+              <Unit>{capitalAsset}</Unit>
+            </span>
           )}
         </Card>
-        <Card label="Held quantity">{trimDecimal(position.quantity)}</Card>
-        <Card label="Total cost" hint={capitalAsset}>
-          {trimDecimal(position.cost)}
+        <Card label="Held quantity">
+          {formatQuantity(position.quantity)}
+          <Unit>{baseAsset}</Unit>
+        </Card>
+        <Card label="Total cost">
+          {formatMoney(position.cost)}
+          <Unit>{capitalAsset}</Unit>
         </Card>
         {/*
          * Unrealized, and labelled "(gross)" for the same reason the summary's
@@ -123,9 +142,7 @@ export function DcaPositionView({
         </Card>
         <Card label="Buys remaining">
           {remaining}
-          <span className="ml-1 text-xs font-normal text-zinc-500">
-            of {params.maxAdditionalBuys} additional
-          </span>
+          <Unit>of {params.maxAdditionalBuys} additional</Unit>
         </Card>
       </div>
 
@@ -161,15 +178,23 @@ export function DcaPositionView({
        * has been acting on them since -- see ConfigSection's note.
        */}
       <ConfigSection>
-        <ConfigItem label="Base order size" hint={capitalAsset}>
-          {trimDecimal(params.baseOrderSize)}
+        <ConfigItem label="Base order size">
+          {formatMoney(params.baseOrderSize)}
+          <Unit>{capitalAsset}</Unit>
         </ConfigItem>
-        <ConfigItem label="Additional order size" hint={capitalAsset}>
-          {trimDecimal(params.additionalOrderSize)}
+        <ConfigItem label="Additional order size">
+          {formatMoney(params.additionalOrderSize)}
+          <Unit>{capitalAsset}</Unit>
         </ConfigItem>
-        {/* Each additional buy is the previous one x this, floored per step. */}
+        {/*
+         * Each additional buy is the previous one x this, floored per step.
+         * A ratio, not money and not a percentage, so it keeps its exact trimmed
+         * form -- rounding a multiplier to two places would misstate the
+         * configuration the bot is actually running.
+         */}
         <ConfigItem label="Step multiplier" hint="compounds each additional buy">
-          {trimDecimal(params.stepMultiplier)}×
+          {trimDecimal(params.stepMultiplier)}
+          <Unit>×</Unit>
         </ConfigItem>
         {/*
          * Measured from the LAST ENTRY, not the average -- `nextBuyTriggerPrice`

@@ -6,7 +6,7 @@
 import type { Order } from "../api/types";
 import { HistoryTable, type Column } from "./HistoryTable";
 import { SideBadge } from "./SideBadge";
-import { formatTime, trimDecimal } from "../format";
+import { formatMoney, formatQuantity, formatTime } from "../format";
 
 const STATUS_CLASS: Record<string, string> = {
   pending: "text-sky-300",
@@ -25,13 +25,13 @@ function OrderStatus({ status }: { status: string }) {
 
 const COLUMNS: readonly Column<Order>[] = [
   { key: "side", header: "Side", render: (o) => <SideBadge side={o.side} /> },
-  { key: "price", header: "Price", align: "right", render: (o) => <span className="tabular">{trimDecimal(o.price)}</span> },
-  { key: "quantity", header: "Quantity", align: "right", render: (o) => <span className="tabular">{trimDecimal(o.quantity)}</span> },
+  { key: "price", header: "Price", align: "right", render: (o) => <span className="tabular">{formatMoney(o.price)}</span> },
+  { key: "quantity", header: "Quantity", align: "right", render: (o) => <span className="tabular">{formatQuantity(o.quantity)}</span> },
   {
     key: "filled",
     header: "Filled",
     align: "right",
-    render: (o) => <span className="tabular text-zinc-400">{trimDecimal(o.filledQuantity)}</span>,
+    render: (o) => <span className="tabular text-zinc-400">{formatQuantity(o.filledQuantity)}</span>,
   },
   { key: "status", header: "Status", render: (o) => <OrderStatus status={o.status} /> },
   {

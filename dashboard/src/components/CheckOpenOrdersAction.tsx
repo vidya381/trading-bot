@@ -71,7 +71,7 @@ import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { ApiError, checkOpenOrders } from "../api/client";
 import type { Alert, BotDetail, OrderCheckResult } from "../api/types";
-import { formatTime, trimDecimal } from "../format";
+import { formatMoney, formatQuantity, formatTime } from "../format";
 import { CHECK_OPEN_ORDERS_ANCHOR, openPollAlerts } from "../pollAlerts";
 
 type OutcomeTone = "success" | "warning" | "info" | "error";
@@ -233,10 +233,10 @@ function AppliedTable({ applied }: { applied: OrderCheckResult["applied"] }) {
               <td className="tabular px-2 py-1.5 break-all text-zinc-300">{fill.clientOrderId}</td>
               <td className="tabular px-2 py-1.5 break-all text-zinc-300">{fill.fillId}</td>
               <td className="tabular px-2 py-1.5 text-right text-zinc-200">
-                {trimDecimal(fill.quantity)}
+                {formatQuantity(fill.quantity)}
               </td>
               <td className="tabular px-2 py-1.5 text-right text-zinc-200">
-                {trimDecimal(fill.price)}
+                {formatMoney(fill.price)}
               </td>
             </tr>
           ))}

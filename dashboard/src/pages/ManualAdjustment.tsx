@@ -43,7 +43,7 @@ import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, fetchBots, logManualAdjustment } from "../api/client";
 import type { Bot, ManualAdjustment as ManualAdjustmentRow } from "../api/types";
-import { formatDateTime, trimDecimal } from "../format";
+import { formatDateTime, formatQuantity } from "../format";
 
 // ---------------------------------------------------------------------------
 // Validation -- pure string checks, no float ever constructed. The decimal
@@ -415,7 +415,7 @@ export function ManualAdjustment() {
                 Will log:{" "}
                 <span className="tabular font-semibold">
                   {direction === "withdrawal" ? "−" : "+"}
-                  {trimDecimal(magnitude.trim())} {asset.trim() || "…"}
+                  {formatQuantity(magnitude.trim())} {asset.trim() || "…"}
                 </span>{" "}
                 — {direction === "withdrawal" ? "withdrawal (funds leaving the account)" : "deposit (funds entering the account)"}
               </>
@@ -478,7 +478,15 @@ export function ManualAdjustment() {
  *  exactly what was written, not just "done". */
 function confirmation(saved: ManualAdjustmentRow): Outcome {
   const withdrawal = saved.amount.startsWith("-");
-  const shown = withdrawal ? `−${trimDecimal(saved.amount.slice(1))}` : `+${trimDecimal(saved.amount)}`;
+  /*
+   * A QUANTITY rather than money, because `asset` here is free-typed by the
+   * operator and may be any asset on the account -- rounding an 0.004 BTC
+   * withdrawal to two places would echo back a receipt for something they did
+   * not log. The exact figure they submitted is the point of this confirmation.
+   */
+  const shown = withdrawal
+    ? `−${formatQuantity(saved.amount.slice(1))}`
+    : `+${formatQuantity(saved.amount)}`;
   return {
     tone: "success",
     title: "Adjustment logged",

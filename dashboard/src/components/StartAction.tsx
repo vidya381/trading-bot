@@ -50,7 +50,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, startBot } from "../api/client";
 import type { BotDetail } from "../api/types";
-import { trimDecimal } from "../format";
+import { baseAssetOf, formatMoney } from "../format";
 
 type OutcomeTone = "success" | "warning" | "info" | "error";
 
@@ -68,19 +68,6 @@ const OUTCOME_CLASS: Record<OutcomeTone, string> = {
 };
 
 /**
- * The base asset of a pair, given its quote (capital) asset. Binance symbols are
- * concatenated base+quote ("BTCUSDT"), so the base is the pair with the quote
- * suffix stripped. Falls back to the raw pair if it does not end in the quote.
- * (Same derivation as LiquidateAction -- kept local rather than shared for now.)
- */
-function baseAsset(pair: string, quoteAsset: string): string {
-  if (quoteAsset !== "" && pair.length > quoteAsset.length && pair.endsWith(quoteAsset)) {
-    return pair.slice(0, pair.length - quoteAsset.length);
-  }
-  return pair;
-}
-
-/**
  * What the bot's REAL config will place once running, in one line, built from
  * the bot's own config values (brief item 4) -- never generic wording. Returns
  * null when the object holds no config (an orphaned created row), so the dialog
@@ -90,16 +77,16 @@ function plannedOrderSummary(bot: BotDetail): string | null {
   const config = bot.config;
   if (config === null) return null;
   if (config.strategy === "dca") {
-    const asset = baseAsset(bot.pair, bot.capitalAsset);
+    const asset = baseAssetOf(bot.pair, bot.capitalAsset);
     return (
-      `a real buy worth ${trimDecimal(config.params.baseOrderSize)} ${bot.capitalAsset} ` +
+      `a real buy worth ${formatMoney(config.params.baseOrderSize)} ${bot.capitalAsset} ` +
       `of ${asset} (the base order)`
     );
   }
   const { gridLines, lowerBound, upperBound } = config.params;
   return (
     `its full ladder — ${gridLines} orders across ` +
-    `${trimDecimal(lowerBound)}–${trimDecimal(upperBound)} ${bot.capitalAsset}`
+    `${formatMoney(lowerBound)} – ${formatMoney(upperBound)} ${bot.capitalAsset}`
   );
 }
 

@@ -16,10 +16,11 @@
  */
 
 import type { GridLadder, GridParams } from "../api/types";
-import { compareDecimal, trimDecimal } from "../format";
+import { compareDecimal, formatMoney, formatQuantity } from "../format";
 import { unrealizedPnl } from "../derive";
 import { SideBadge } from "./SideBadge";
 import { ConfigItem, ConfigSection, enabled, percent } from "./ConfigSection";
+import { Unit } from "./Unit";
 import { UnrealizedValue, unrealizedHint } from "./UnrealizedValue";
 
 interface Rung {
@@ -32,13 +33,15 @@ function LadderRow({ rung, zone }: { rung: Rung; zone: "sell" | "buy" | null }) 
     zone === "sell" ? "bg-amber-500/[0.04]" : zone === "buy" ? "bg-emerald-500/[0.04]" : "";
   return (
     <div className={`flex items-center justify-between gap-4 px-4 py-2 ${zoneTint}`}>
-      <span className="tabular text-sm text-zinc-200">{trimDecimal(rung.price)}</span>
+      <span className="tabular text-sm text-zinc-200">{formatMoney(rung.price)}</span>
       {rung.slot === null ? (
         <span className="text-xs text-zinc-600">no order</span>
       ) : (
         <span className="flex items-center gap-2">
           <SideBadge side={rung.slot.side} />
-          <span className="tabular text-xs text-zinc-500">{trimDecimal(rung.slot.quantity)}</span>
+          <span className="tabular text-xs text-zinc-500">
+            {formatQuantity(rung.slot.quantity)}
+          </span>
         </span>
       )}
     </div>
@@ -49,7 +52,7 @@ function CurrentPriceDivider({ price }: { price: string }) {
   return (
     <div className="flex items-center gap-3 bg-sky-500/10 px-4 py-1.5">
       <span className="h-px flex-1 bg-sky-500/40" aria-hidden />
-      <span className="tabular text-xs font-medium text-sky-300">current {trimDecimal(price)}</span>
+      <span className="tabular text-xs font-medium text-sky-300">current {formatMoney(price)}</span>
       <span className="h-px flex-1 bg-sky-500/40" aria-hidden />
     </div>
   );
@@ -60,11 +63,14 @@ export function GridLadderView({
   currentPrice,
   params,
   capitalAsset,
+  baseAsset,
 }: {
   ladder: GridLadder;
   currentPrice: string | null;
   params: GridParams;
   capitalAsset: string;
+  /** The asset the ladder's held quantity is denominated in, for labelling. */
+  baseAsset: string;
 }) {
   /*
    * Mark-to-market on the base the ladder is holding. `heldCost` is a true cost
@@ -98,15 +104,19 @@ export function GridLadderView({
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-400">Grid ladder</h2>
         <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-500">
-          <span>
-            {trimDecimal(params.lowerBound)}–{trimDecimal(params.upperBound)}
+          {/* An en dash between two prices, spaced -- "10000.00–12000.00" reads
+              as one number, which is the same defect as an unspaced unit. */}
+          <span className="tabular">
+            {formatMoney(params.lowerBound)} – {formatMoney(params.upperBound)} {capitalAsset}
           </span>
           <span className="text-zinc-600">·</span>
           <span>{params.gridLines} lines</span>
           <span className="text-zinc-600">·</span>
           <span>{params.spacing}</span>
           <span className="text-zinc-600">·</span>
-          <span>size {trimDecimal(params.orderSize)}</span>
+          <span className="tabular">
+            size {formatMoney(params.orderSize)} {capitalAsset}
+          </span>
         </div>
       </div>
 
@@ -140,16 +150,25 @@ export function GridLadderView({
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Held quantity</dt>
-          <dd className="tabular text-sm text-zinc-200">{trimDecimal(ladder.heldQuantity)}</dd>
+          <dd className="tabular text-sm text-zinc-200">
+            {formatQuantity(ladder.heldQuantity)}
+            <Unit>{baseAsset}</Unit>
+          </dd>
         </div>
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Held cost</dt>
-          <dd className="tabular text-sm text-zinc-200">{trimDecimal(ladder.heldCost)}</dd>
+          <dd className="tabular text-sm text-zinc-200">
+            {formatMoney(ladder.heldCost)}
+            <Unit>{capitalAsset}</Unit>
+          </dd>
         </div>
         {/* Closed round-trips only -- the open position is the card beside it. */}
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Realized (gross)</dt>
-          <dd className="tabular text-sm text-zinc-200">{trimDecimal(ladder.realizedGross)}</dd>
+          <dd className="tabular text-sm text-zinc-200">
+            {formatMoney(ladder.realizedGross)}
+            <Unit>{capitalAsset}</Unit>
+          </dd>
         </div>
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Unrealized (gross)</dt>
@@ -171,15 +190,22 @@ export function GridLadderView({
        * is the complete record beside it.
        */}
       <ConfigSection>
-        <ConfigItem label="Lower bound">{trimDecimal(params.lowerBound)}</ConfigItem>
-        <ConfigItem label="Upper bound">{trimDecimal(params.upperBound)}</ConfigItem>
+        <ConfigItem label="Lower bound">
+          {formatMoney(params.lowerBound)}
+          <Unit>{capitalAsset}</Unit>
+        </ConfigItem>
+        <ConfigItem label="Upper bound">
+          {formatMoney(params.upperBound)}
+          <Unit>{capitalAsset}</Unit>
+        </ConfigItem>
         <ConfigItem label="Grid lines" hint="including both bounds">
           {params.gridLines}
         </ConfigItem>
         <ConfigItem label="Spacing">{params.spacing}</ConfigItem>
         {/* Quote spent per buy line, and recovered plus profit per sell line. */}
-        <ConfigItem label="Order size per line" hint={capitalAsset}>
-          {trimDecimal(params.orderSize)}
+        <ConfigItem label="Order size per line">
+          {formatMoney(params.orderSize)}
+          <Unit>{capitalAsset}</Unit>
         </ConfigItem>
         <ConfigItem label="Stop-loss">{percent(params.stopLossPct)}</ConfigItem>
         {/*
@@ -189,12 +215,15 @@ export function GridLadderView({
          */}
         <ConfigItem
           label="Take-profit amount"
-          hint={params.takeProfitAmount === null ? "not set" : `accumulated realized, ${capitalAsset}`}
+          hint={params.takeProfitAmount === null ? "not set" : "accumulated realized"}
         >
           {params.takeProfitAmount === null ? (
             <span className="text-zinc-600">Not set</span>
           ) : (
-            trimDecimal(params.takeProfitAmount)
+            <>
+              {formatMoney(params.takeProfitAmount)}
+              <Unit>{capitalAsset}</Unit>
+            </>
           )}
         </ConfigItem>
         <ConfigItem label="Breakout take-profit" hint="cash out on an upside breakout">

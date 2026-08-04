@@ -20,7 +20,7 @@
  */
 
 import type { ReactNode } from "react";
-import { trimDecimal } from "../format";
+import { formatPercent } from "../format";
 
 export function ConfigItem({
   label,
@@ -51,9 +51,16 @@ export function ConfigSection({ children }: { children: ReactNode }) {
   );
 }
 
-/** A percentage parameter. Percentages arrive as plain decimal strings ("20" = 20%). */
+/**
+ * A percentage parameter. Percentages arrive as plain decimal strings, at the
+ * money scale ("20.00000000" = 20%), so this rounds for display rather than
+ * showing eight decimals of a figure that carries at most two.
+ *
+ * Kept as this module's export so the strategy views' call sites are unchanged;
+ * the rule itself lives in `format.ts` with the other two.
+ */
 export function percent(value: string): string {
-  return `${trimDecimal(value)}%`;
+  return formatPercent(value);
 }
 
 /** A configured on/off flag, worded as what it does rather than as `true`. */
