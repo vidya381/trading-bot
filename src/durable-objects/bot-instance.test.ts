@@ -1918,3 +1918,225 @@ describe("alarm (the scheduled open-order poll)", () => {
     expect(await db.alerts.count({ alert_type: "unattributable_fill" })).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Step 21: interleaving safety
+// ---------------------------------------------------------------------------
+
+/**
+ * Every test here forces a real interleaving rather than hoping for one, in the
+ * shape `rate-limiter.test.ts` established at step 8: a seam the object really
+ * uses is wrapped, and the competing pass is driven from inside it. That is the
+ * only way to make a race reproducible, and step 21's section 0 probe
+ * (`concurrency-model.test.ts`) is what establishes these interleavings are
+ * ones the runtime genuinely produces -- an RPC and an alarm are both delivered
+ * while this object sits suspended inside an exchange call.
+ */
+describe("interleaving safety (step 21)", () => {
+  async function pollSchedule(): Promise<{
+    nextPollAt: number | null;
+    failures: number;
+    blindSince: number | null;
+    escalated: boolean;
+  }> {
+    return await inBot(objectName, async (_bot, state) => {
+      return (await state.storage.get("poll-schedule")) as never;
+    });
+  }
+
+  async function openOrderIds(): Promise<readonly string[]> {
+    return await inBot(objectName, async (bot) => (await bot.snapshot()).state.openOrderIds);
+  }
+
+  /** A RUNNING bot with one resting, unfilled base order. */
+  async function runningWithRestingOrder(): Promise<string> {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    return exchange.placed[0]!.clientOrderId;
+  }
+
+  /** Report one full execution for `clientOrderId`, with real per-fill detail. */
+  function reportFill(clientOrderId: string): void {
+    const order = exchange.resting.get(clientOrderId)!;
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: `gemini-tid-${clientOrderId}`,
+        price: order.request.price,
+        quantity: order.request.quantity,
+        feeAmount: ZERO,
+        feeAsset: "USDT",
+        executedAt: T0 + 1000,
+      },
+    ]);
+  }
+
+  // --- #mutateState: writes that used to revert each other -----------------
+
+  it("keeps an order whose cancellation failed when the take-profit sell is placed", async () => {
+    // Deterministic, and it needs no concurrency at all -- one failed cancel is
+    // enough. `#placeTakeProfitSell` used to write `openOrderIds: [exitId]`,
+    // discarding whatever `#cancelOpenOrders` had just been unable to cancel.
+    // That order is still live on the exchange, and dropping it here meant it
+    // was never polled and never cancelled again, on the one path where the bot
+    // is trying to get flat.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const restingBuy = exchange.placed[1]!.clientOrderId;
+    expect(await openOrderIds()).toContain(restingBuy);
+
+    exchange.cancelFailure = { kind: "transport", message: "gateway timeout" };
+    await run((bot) => bot.onPriceUpdate(priceAt("120"))); // above the take-profit target
+
+    const ids = await openOrderIds();
+    const exitId = await inBot(objectName, async (bot) => (await bot.snapshot()).state.exitOrderId);
+
+    expect(exitId).not.toBeNull();
+    expect(ids).toContain(exitId!); // the exit is tracked
+    expect(ids).toContain(restingBuy); // and so is the order that would not cancel
+  });
+
+  it("does not drop an order a concurrent pass added while a halt was cancelling", async () => {
+    // Scenario B. The halt sweep cancels across the network, order by order,
+    // and used to finish by ASSIGNING the list it believed in when it started.
+    // A poll folding a fill mid-sweep places a grid replacement, and that id was
+    // silently erased -- a live order on the exchange, untracked, unpolled, and
+    // never cancelled.
+    //
+    // Driven here on DCA for simplicity: the competing pass adds an id through
+    // the ordinary placement path while the sweep is suspended on its cancel.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const restingBuy = exchange.placed[1]!.clientOrderId;
+
+    let addedDuringSweep: string | null = null;
+    const realCancel = exchange.cancelOrder.bind(exchange);
+    exchange.cancelOrder = async (pair, clientOrderId) => {
+      if (addedDuringSweep === null) {
+        // A second order starts resting while the sweep is in flight.
+        addedDuringSweep = "concurrent-order";
+        await inBot(objectName, async (_bot, state) => {
+          const stored = (await state.storage.get("state")) as { openOrderIds: string[] };
+          await state.storage.put("state", {
+            ...stored,
+            openOrderIds: [...stored.openOrderIds, addedDuringSweep],
+          });
+        });
+      }
+      return await realCancel(pair, clientOrderId);
+    };
+
+    await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    const ids = await openOrderIds();
+    expect(ids).not.toContain(restingBuy); // cancelled, so it leaves
+    expect(ids).toContain("concurrent-order"); // added meanwhile, so it stays
+  });
+
+  // --- the point of no return ----------------------------------------------
+
+  it("abandons a buy rather than sending it to a bot that halted mid-preparation", async () => {
+    // Scenario D's shape. The decision to buy is taken while running, but the
+    // send happens several awaits later -- `#ensureFilters` reaches the network
+    // on a bot with no cached filters. A halt landing in that window used to
+    // put a live order on the exchange from a halted bot, which is precisely
+    // the invariant steps 18 and 19 worked to protect.
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    const realFilters = exchange.getSymbolFilters.bind(exchange);
+    let halted = false;
+    exchange.getSymbolFilters = async (pair) => {
+      if (!halted) {
+        halted = true;
+        await run((bot) => bot.halt("manual", "halted mid-placement", ACTOR));
+      }
+      return await realFilters(pair);
+    };
+
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(result.action).toBe("aborted");
+    expect(result.status).toBe("halted");
+    // The whole point: nothing reached the exchange.
+    expect(exchange.placed).toHaveLength(0);
+  });
+
+  // --- the poll's yield-and-defer -------------------------------------------
+
+  it("defers a poll that would overlap another pass, and applies nothing", async () => {
+    const clientOrderId = await runningWithRestingOrder();
+    reportFill(clientOrderId);
+
+    // The competing pass is a halt, which reaches the network to cancel. The
+    // poll is driven from inside that cancel, so it starts while the halt is
+    // genuinely in flight.
+    let observed: Awaited<ReturnType<BotInstance["checkOpenOrders"]>> | null = null;
+    const realCancel = exchange.cancelOrder.bind(exchange);
+    exchange.cancelOrder = async (pair, id) => {
+      observed ??= await run((bot) => bot.checkOpenOrders("competing-poll"));
+      return await realCancel(pair, id);
+    };
+
+    await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    expect(observed).not.toBeNull();
+    expect(observed!.deferred).toBe(true);
+    expect(observed!.applied).toHaveLength(0);
+
+    // And the fill really was left for a later pass rather than lost: nothing
+    // reached the position.
+    const position = await inBot(objectName, async (bot) => (await bot.snapshot()).state.position);
+    expect(position.quantity).toBe(ZERO);
+  });
+
+  it("does not count a deferred pass as a failure", async () => {
+    // A deferred pass is not a blind one. Counting it would back a busy bot off
+    // toward the five-minute floor and eventually raise `poll_blind` against a
+    // venue that was answering the whole time.
+    const clientOrderId = await runningWithRestingOrder();
+    reportFill(clientOrderId);
+
+    const realCancel = exchange.cancelOrder.bind(exchange);
+    let done = false;
+    exchange.cancelOrder = async (pair, id) => {
+      if (!done) {
+        done = true;
+        await run((bot) => bot.alarm());
+      }
+      return await realCancel(pair, id);
+    };
+
+    clock = T0 + 30_000;
+    await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    expect((await pollSchedule()).failures).toBe(0);
+  });
+
+  it("does not let a deferred pass resolve a standing alert it never looked for", async () => {
+    // The other half of the lifecycle, and the reason `deferred` is a third
+    // outcome rather than folded into a clean pass. A deferred pass found no
+    // unattributable fill because it looked at nothing.
+    const clientOrderId = await runningWithRestingOrder();
+
+    // Raise a real `unattributable_fill`: filled on the venue, no per-fill
+    // detail, so there is no id to apply.
+    exchange.resting.get(clientOrderId)!.filledQuantity = exchange.placed[0]!.quantity;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect(await db.alerts.count({ alert_type: "unattributable_fill", resolved: false })).toBe(1);
+
+    // Now a deferred pass runs while another is in flight. It must not close it.
+    const realCancel = exchange.cancelOrder.bind(exchange);
+    let done = false;
+    exchange.cancelOrder = async (pair, id) => {
+      if (!done) {
+        done = true;
+        await run((bot) => bot.checkOpenOrders("competing-poll"));
+      }
+      return await realCancel(pair, id);
+    };
+    await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "unattributable_fill", resolved: false })).toBe(1);
+  });
+});

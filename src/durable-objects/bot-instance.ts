@@ -414,6 +414,15 @@ export interface OrderCheckResult {
   readonly skipped: readonly string[];
   /** Orders whose local record was closed to match a terminal exchange state. */
   readonly closed: readonly string[];
+  /**
+   * True when this pass stood aside for another rather than completing.
+   *
+   * Reported rather than hidden, because the three empty arrays above are
+   * otherwise indistinguishable from a clean pass that found nothing -- and
+   * "your books are up to date" is a very different answer from "I did not
+   * look". A caller that cares should try again.
+   */
+  readonly deferred: boolean;
 }
 
 /** What happened on one pass of the event pipeline, for tests and the dashboard. */
@@ -524,11 +533,37 @@ interface PollPass {
   readonly unreadable: number;
   /** Standing incident keys this pass FOUND, for the resolve half. */
   readonly standing: Set<string>;
+  /**
+   * THE THIRD OUTCOME (step 21), and it is neither of the other two.
+   *
+   * A deferred pass stood aside for another pass rather than failing. It is not
+   * `unreadable`: the venue answered, or was never asked. It is not `skipped`
+   * either: nothing was read and refused. Folding it into either would break
+   * one of the two lifecycles step 20 built --
+   *
+   *   - counted as a FAILURE, a busy bot would back off to the five-minute
+   *     floor and eventually raise `poll_blind`, reporting an outage while the
+   *     exchange was reachable the whole time;
+   *   - counted as a SUCCESS, it would resolve standing alerts it never looked
+   *     for, closing a live `unattributable_fill` on the strength of a pass
+   *     that deliberately looked at nothing.
+   *
+   * So it is its own thing, exactly as step 20 kept `skipped` and `unreadable`
+   * apart for the same class of reason.
+   */
+  deferred: boolean;
 }
 
-/** True when a pass is entitled to close a standing alert it did not re-find. */
+/**
+ * True when a pass is entitled to close a standing alert it did not re-find.
+ *
+ * A DEFERRED pass never is. It stopped early by design, so the alerts it did
+ * not re-find are alerts it did not look for -- section 5.6 applied to the
+ * alert lifecycle, which is the same rule that already excludes a pass that
+ * could not reach the venue.
+ */
 function observedEverything(pass: PollPass): boolean {
-  return pass.reads > 0 && pass.unreadable === 0;
+  return pass.reads > 0 && pass.unreadable === 0 && !pass.deferred;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +579,13 @@ export class BotInstance extends DurableObject<Env> {
    * each re-sync the clock (section 4.2) at their own expense.
    */
   #gated: { routine: RestExchangeClient; riskExit: RestExchangeClient } | undefined;
+
+  /**
+   * How many non-poll passes are inside this object right now.
+   *
+   * The poll yields whenever this is above zero. See `#outsidePoll`.
+   */
+  #passesInFlight = 0;
 
   /**
    * Supply or override this object's dependencies.
@@ -802,6 +844,161 @@ export class BotInstance extends DurableObject<Env> {
     await this.#syncAlarm(state);
   }
 
+  /**
+   * Read this object's state and write a function of it, as one step.
+   *
+   * THE SINGLE-WRITER DISCIPLINE (step 21). Every write that spans an exchange
+   * call, a D1 write, or a feed RPC must go through here rather than through
+   * `#putState` with a snapshot taken before that await, because step 21's
+   * section 0 probe MEASURED that this object is re-entered across exactly
+   * those awaits: an `onPriceUpdate` RPC and a scheduled `alarm` were both
+   * delivered while a poll sat parked inside an exchange read, with two
+   * `getOrderStatus` calls outstanding at once.
+   *
+   * So `{ ...snapshotTakenEarlier, oneField: newValue }` is not a field update.
+   * It is a whole-state overwrite that silently reverts every OTHER field a
+   * concurrent pass wrote in the meantime -- a position, a ladder, an
+   * `openOrderIds` entry, or a `status`. That last one is the worst of them: a
+   * poll holding a pre-halt snapshot can write `running` back over a bot that
+   * was halted while it was reading, or `close()`'s `stopped` can be undone by
+   * a pass that started before it.
+   *
+   * `mutate` receives state read HERE, after the await rather than before it,
+   * and must express its change as a delta on that value. It runs synchronously
+   * and must stay pure: an await inside it would reopen the very window this
+   * closes. Everything between this read and the write is storage-only, which
+   * the same probe found to be atomic in practice (a two-pass race on one
+   * `fillId` applied it exactly once, with the identity check isolated as the
+   * only guard). That result is weak evidence rather than a guarantee, which is
+   * why this re-reads regardless: it costs one storage read and is correct
+   * under either model.
+   */
+  async #mutateState(
+    mutate: (current: BotRuntimeState) => BotRuntimeState,
+  ): Promise<BotRuntimeState> {
+    const next = mutate(await this.#state());
+    await this.#putState(next);
+    return next;
+  }
+
+  /**
+   * The same discipline for the poll's schedule, which has the same exposure.
+   *
+   * `#recordPollFailure` reads the schedule, raises a standing alert -- a D1
+   * write, and therefore a re-entry point -- and only then writes back. Without
+   * this, that write reverts any `nextPollAt` or cleared failure count a
+   * concurrent pass set while the alert was in flight.
+   */
+  async #mutatePollSchedule(
+    mutate: (current: PollSchedule) => PollSchedule,
+  ): Promise<PollSchedule> {
+    const next = mutate(await this.#pollSchedule());
+    await this.#putPollSchedule(next);
+    return next;
+  }
+
+  /**
+   * Take the next order sequence, and advance it, in one step.
+   *
+   * The sequence IS the `clientOrderId` (`IdempotencyGuard.clientOrderIdFor`),
+   * so two passes reading the same value mint the same id for two different
+   * orders. Read-then-write on a snapshot allowed exactly that: the poll
+   * placing a grid replacement while a price tick placed a rung would take the
+   * same number twice.
+   *
+   * `beginAttempt` already caught it -- the second caller finds the attempt
+   * recorded and answers `recover` rather than sending -- and step 21's probe
+   * measured that defence to be sufficient, which is why it is untouched. But
+   * being caught by the idempotency guard means the second order is SKIPPED,
+   * not placed, so a rung silently goes missing and only reappears on the next
+   * price update. Allocating atomically means the collision does not happen in
+   * the first place, and `beginAttempt` stays the backstop it was built to be.
+   *
+   * Persisted BEFORE the attempt is recorded, as before: a crash here burns a
+   * sequence number, which costs nothing, while the reverse ordering would let
+   * a crash re-use a sequence whose attempt already existed.
+   */
+  /**
+   * Run one non-poll pass, counted so the poll can see it is in flight.
+   *
+   * THE POLL IS THE DESIGNATED LOSER (step 21), and the asymmetry that makes
+   * this the right shape is a property step 19 established rather than a
+   * general principle: everything the poll does is RE-DERIVABLE. It invents
+   * nothing, it dedupes on the exchange's own `fillId`, and abandoning a pass
+   * costs thirty seconds and a re-read. Nothing else in this object has that
+   * property -- a price tick that skipped its stop-loss check has simply not
+   * checked it.
+   *
+   * So the rule is one-way. Every writer here proceeds exactly as before and is
+   * never delayed by the poll; the poll yields to all of them. A symmetric lock
+   * would have reintroduced, at the scheduling layer, precisely the
+   * head-of-line blocking that section 5.4's reserved rate-limit slice exists
+   * to prevent -- a stop-loss queued behind a routine status read is the one
+   * outcome this system is built to avoid.
+   *
+   * IN MEMORY, DELIBERATELY. A Durable Object's alarm and its RPCs run in the
+   * same instance, so a counter on the instance sees them all; and if the
+   * object is evicted, the in-flight pass is gone with it, so there is nothing
+   * to persist. It is a `finally` rather than a `try`/`catch` because a pass
+   * that threw is still a pass that finished.
+   *
+   * Poll-vs-poll is NOT covered, and that is deliberate: step 21's section 0
+   * probe raced two passes onto the same `fillId` and exactly one applied it,
+   * so the idempotency already holds there. What it would cost is a duplicate
+   * read, not a duplicate fill.
+   */
+  async #outsidePoll<T>(body: () => Promise<T>): Promise<T> {
+    this.#passesInFlight += 1;
+    try {
+      return await body();
+    } finally {
+      this.#passesInFlight -= 1;
+    }
+  }
+
+  /**
+   * The status this object holds right now, if it is no longer what a decision
+   * assumed. `null` means the decision still stands.
+   *
+   * THE POINT OF NO RETURN (step 21). A placement is decided from state read
+   * before `#ensureFilters`, `beginAttempt` and the validation pass, and at
+   * least one of those reaches the network -- so by the time the order is about
+   * to be SENT, the status it was decided under may be several awaits old.
+   * Step 21's section 0 probe measured that window to be genuinely re-entrant:
+   * an RPC and an alarm were both delivered while this object sat inside an
+   * exchange call.
+   *
+   * `#mutateState` cannot help here. That fixes writes that revert each other;
+   * this is a decision taken against state that has since changed, and once the
+   * order is on the exchange no amount of careful writing takes it back. The
+   * only defence is to look again immediately before sending.
+   *
+   * This is what makes step 19's `placeReplacement: fresh.status === "running"`
+   * mean what it says. That gate reads the status and then crosses two D1
+   * writes (`#mirrorOrderUpdate`, `#mirrorTrade`) and a possible filter refresh
+   * before `#placeGridOrder` sends -- so a halt landing in that window left the
+   * derived-not-hardcoded gate deciding on a status that was no longer true,
+   * and a halted bot put a live order on the exchange anyway. Steps 18 and 19
+   * both worked hard for that invariant; this is the check that actually holds
+   * it.
+   *
+   * Cancellation is deliberately NOT gated this way: cancelling an order is
+   * safe under every status, and refusing to cancel because the bot changed
+   * state is how orders get left live on the exchange.
+   */
+  async #statusChangedFrom(expected: BotStatus): Promise<BotStatus | null> {
+    const current = (await this.#state()).status;
+    return current === expected ? null : current;
+  }
+
+  async #allocateSequence(): Promise<number> {
+    const advanced = await this.#mutateState((current) => ({
+      ...current,
+      nextSequence: current.nextSequence + 1,
+    }));
+    return advanced.nextSequence - 1;
+  }
+
   async #order(clientOrderId: string): Promise<TrackedOrder | undefined> {
     return await this.ctx.storage.get<TrackedOrder>(orderKey(clientOrderId));
   }
@@ -1010,6 +1207,10 @@ export class BotInstance extends DurableObject<Env> {
    * places the order the moment a price actually arrives.
    */
   async start(actor: string): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#startPass(actor));
+  }
+
+  async #startPass(actor: string): Promise<PipelineResult> {
     const config = await this.#config();
     const state = await this.#state();
     if (state.status !== "created") {
@@ -1026,7 +1227,7 @@ export class BotInstance extends DurableObject<Env> {
     await this.#subscribeToFeed(config);
 
     const now = this.#now();
-    await this.#putState({ ...state, status: "running" });
+    await this.#mutateState((current) => ({ ...current, status: "running" }));
     await this.#mirrorStatus(config, "running", null, null, now);
     await this.#audit(config, "bot.started", actor, { cycle: state.cycleCount + 1 }, now);
 
@@ -1042,6 +1243,10 @@ export class BotInstance extends DurableObject<Env> {
    * than failing silently or retrying into an unknown state.
    */
   async onPriceUpdate(price: Price): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#onPriceUpdatePass(price));
+  }
+
+  async #onPriceUpdatePass(price: Price): Promise<PipelineResult> {
     const config = await this.#config();
     let state = await this.#state();
 
@@ -1049,8 +1254,11 @@ export class BotInstance extends DurableObject<Env> {
       return { status: state.status, action: "ignored", detail: `status is ${state.status}` };
     }
 
-    state = { ...state, lastPrice: price.price, lastPriceAt: price.at };
-    await this.#putState(state);
+    state = await this.#mutateState((current) => ({
+      ...current,
+      lastPrice: price.price,
+      lastPriceAt: price.at,
+    }));
 
     try {
       if (config.strategy === "grid") {
@@ -1105,6 +1313,10 @@ export class BotInstance extends DurableObject<Env> {
    * fill, so this is per-fill rather than per-order.
    */
   async onFill(clientOrderId: string, fill: Fill): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#onFillPass(clientOrderId, fill));
+  }
+
+  async #onFillPass(clientOrderId: string, fill: Fill): Promise<PipelineResult> {
     const config = await this.#config();
     const state = await this.#state();
 
@@ -1179,6 +1391,10 @@ export class BotInstance extends DurableObject<Env> {
    * A failed read is skipped and reported, never guessed at (section 5.6).
    */
   async applyMissedFills(actor: string): Promise<MissedFillsResult> {
+    return await this.#outsidePoll(() => this.#applyMissedFillsPass(actor));
+  }
+
+  async #applyMissedFillsPass(actor: string): Promise<MissedFillsResult> {
     const config = await this.#config();
     const state = await this.#state();
 
@@ -1306,6 +1522,7 @@ export class BotInstance extends DurableObject<Env> {
       applied: pass.applied,
       skipped: pass.skipped,
       closed: pass.closed,
+      deferred: pass.deferred,
     };
   }
 
@@ -1354,12 +1571,12 @@ export class BotInstance extends DurableObject<Env> {
       // resolution, `poll_blind` could never be raised again.
       const schedule = await this.#pollSchedule();
       if (schedule.failures !== 0 || schedule.blindSince !== null || schedule.escalated) {
-        await this.#putPollSchedule({
-          ...schedule,
+        await this.#mutatePollSchedule((current) => ({
+          ...current,
           failures: 0,
           blindSince: null,
           escalated: false,
-        });
+        }));
       }
 
       await resolveClearedStandingAlerts(this.#db(), {
@@ -1401,13 +1618,48 @@ export class BotInstance extends DurableObject<Env> {
     let unreadable = 0;
 
     if (state.openOrderIds.length === 0) {
-      return { applied, skipped, closed, standing, reads, unreadable };
+      return { applied, skipped, closed, standing, reads, unreadable, deferred: false };
     }
+
+    // Yield before starting. Another pass is already inside this object, and
+    // anything read now would be applied against state it is in the middle of
+    // changing. See `#outsidePoll`: the poll is the one writer that can always
+    // afford to come back later.
+    if (this.#passesInFlight > 0) {
+      return { applied, skipped, closed, standing, reads, unreadable, deferred: true };
+    }
+
     const exchange = this.#exchange(config, "routine");
 
     for (const clientOrderId of [...state.openOrderIds]) {
       reads += 1;
       const outcome = await exchange.getOrderStatus(config.pair, clientOrderId);
+
+      // AND YIELD AGAIN HERE, which is the check that actually matters. The
+      // read above suspends this object on the network, and step 21's section 0
+      // probe measured that a price tick or an alarm is delivered into exactly
+      // that window. So the pass may have been alone when it started and not be
+      // alone now -- and the fill just read would be folded into a position
+      // another pass is mid-way through acting on.
+      //
+      // Abandoning costs nothing: the fill is the exchange's own record, it is
+      // still there on the next pass, and `applyFill` dedupes on its id. Not
+      // applying something re-readable is always cheaper than applying it at
+      // the wrong moment.
+      //
+      // `reads` deliberately KEEPS this read. It happened and it succeeded --
+      // the venue answered. An earlier version decremented it here on the
+      // reasoning that the result was discarded, and that quietly disabled both
+      // of the guards `deferred` exists to feed: `observedEverything` starts
+      // with `reads > 0`, and `#runScheduledPoll` treats `reads === 0` as
+      // "nothing to read". Forcing the count to zero made a deferred pass
+      // indistinguishable from an empty one, so two mutants that should have
+      // failed a test survived instead. What a deferred pass did not do is
+      // FINISH, and `deferred` is what says so.
+      if (this.#passesInFlight > 0) {
+        return { applied, skipped, closed, standing, reads, unreadable, deferred: true };
+      }
+
       if (!isUsable(outcome)) {
         // Section 5.6: an unreachable exchange is not data. The order keeps its
         // local state and stays open, to be read again on the next pass.
@@ -1501,7 +1753,7 @@ export class BotInstance extends DurableObject<Env> {
       }
     }
 
-    return { applied, skipped, closed, standing, reads, unreadable };
+    return { applied, skipped, closed, standing, reads, unreadable, deferred: false };
   }
 
   /**
@@ -1555,16 +1807,20 @@ export class BotInstance extends DurableObject<Env> {
       // removal; filtering the array directly would be undone by the next fill.
       const levelIndex = levelOf(state.ladder, clientOrderId);
       if (levelIndex >= 0) {
-        const slots = state.ladder.slots.map((slot, index) => (index === levelIndex ? null : slot));
-        const ladder: GridLadder = { ...state.ladder, slots };
-        await this.#putState({ ...state, ladder, openOrderIds: ladderOpenOrderIds(ladder) });
+        await this.#mutateState((current) => {
+          const slots = current.ladder!.slots.map((slot, index) =>
+            index === levelIndex ? null : slot,
+          );
+          const ladder: GridLadder = { ...current.ladder!, slots };
+          return { ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) };
+        });
         return true;
       }
     }
-    await this.#putState({
-      ...state,
-      openOrderIds: state.openOrderIds.filter((id) => id !== clientOrderId),
-    });
+    await this.#mutateState((current) => ({
+      ...current,
+      openOrderIds: current.openOrderIds.filter((id) => id !== clientOrderId),
+    }));
     return true;
   }
 
@@ -1647,8 +1903,20 @@ export class BotInstance extends DurableObject<Env> {
     }
 
     if (pass !== null && (pass.reads === 0 || pass.unreadable === 0)) {
-      // Either there was nothing to read, or everything was read.
-      // `#observeOpenOrders` has already cleared the failure state.
+      // Either there was nothing to read, or everything that was read came
+      // back. `#observeOpenOrders` has already cleared the failure state.
+      //
+      // A DEFERRED PASS NEEDS NO BRANCH OF ITS OWN HERE, which is worth saying
+      // because it had one and a surviving mutant proved it dead. Standing
+      // aside is not a failure, and a pass that stood aside without any
+      // unreadable order satisfies `unreadable === 0` already.
+      //
+      // The case that made the explicit branch actively WRONG is the mixed
+      // one: a pass that failed to read order A, then deferred on order B.
+      // That failure is real evidence the venue is unreachable, and returning
+      // early on `deferred` would have thrown it away -- suppressing the
+      // backoff and `poll_blind` for exactly the bot that needed them. Falling
+      // through to record it is correct, and this condition does that.
       return;
     }
 
@@ -1681,43 +1949,58 @@ export class BotInstance extends DurableObject<Env> {
   async #recordPollFailure(config: BotConfig, detail: string): Promise<void> {
     const schedule = await this.#pollSchedule();
     const now = this.#now();
+    const failures = schedule.failures + 1;
+
+    // DECIDED FIRST, RAISED SECOND, WRITTEN LAST, and the split exists because
+    // the middle step is a D1 write and therefore a point at which this object
+    // is re-entered. The old form built the whole next schedule up front and
+    // wrote it after the alert, reverting anything a concurrent pass had
+    // written meanwhile -- including a successful pass's cleared failure count.
+    const goesBlind = failures >= MAX_POLL_FAILURES && schedule.blindSince === null;
+    const escalates =
+      failures >= MAX_POLL_FAILURES &&
+      !goesBlind &&
+      !schedule.escalated &&
+      schedule.blindSince !== null &&
+      now - schedule.blindSince >= POLL_BLIND_ESCALATION_MS;
+
+    if (goesBlind) {
+      await this.#raiseStanding(config, {
+        severity: "warning",
+        category: "system",
+        alertType: "poll_blind",
+        message:
+          `bot ${config.botInstanceId} has failed to read its own open orders on ` +
+          `${failures} consecutive passes (${detail}). Retrying every ` +
+          `${POLL_BACKOFF_CAP_MS / 1000}s. Until it succeeds, a fill on a resting order ` +
+          `reaches this bot's position through nothing at all, and reconciliation is the ` +
+          `only thing that would notice.`,
+      });
+    } else if (escalates) {
+      await this.#raiseStanding(config, {
+        severity: "critical",
+        category: "system",
+        alertType: "poll_blind_escalated",
+        message:
+          `bot ${config.botInstanceId} has been unable to read its own open orders for over ` +
+          `${Math.round(POLL_BLIND_ESCALATION_MS / 60_000)} minutes (${detail}). Its books ` +
+          `have been unverified for that entire period, so its position, its take-profit ` +
+          `target and its stop-loss may all be computed from a quantity that is no longer true.`,
+      });
+    }
+
     // `nextPollAt` is cleared as well as the count incremented, so the
     // re-arming that follows recomputes the delay from the NEW failure count.
     // A pass that read some orders and failed on others writes state, and that
     // write re-arms at the healthy 30s through `#putState` -- without this, the
     // backoff would silently not apply to exactly the mixed case.
-    let next: PollSchedule = { ...schedule, nextPollAt: null, failures: schedule.failures + 1 };
-
-    if (next.failures >= MAX_POLL_FAILURES) {
-      if (next.blindSince === null) {
-        next = { ...next, blindSince: now };
-        await this.#raiseStanding(config, {
-          severity: "warning",
-          category: "system",
-          alertType: "poll_blind",
-          message:
-            `bot ${config.botInstanceId} has failed to read its own open orders on ` +
-            `${next.failures} consecutive passes (${detail}). Retrying every ` +
-            `${POLL_BACKOFF_CAP_MS / 1000}s. Until it succeeds, a fill on a resting order ` +
-            `reaches this bot's position through nothing at all, and reconciliation is the ` +
-            `only thing that would notice.`,
-        });
-      } else if (!next.escalated && now - next.blindSince >= POLL_BLIND_ESCALATION_MS) {
-        next = { ...next, escalated: true };
-        await this.#raiseStanding(config, {
-          severity: "critical",
-          category: "system",
-          alertType: "poll_blind_escalated",
-          message:
-            `bot ${config.botInstanceId} has been unable to read its own open orders for over ` +
-            `${Math.round(POLL_BLIND_ESCALATION_MS / 60_000)} minutes (${detail}). Its books ` +
-            `have been unverified for that entire period, so its position, its take-profit ` +
-            `target and its stop-loss may all be computed from a quantity that is no longer true.`,
-        });
-      }
-    }
-
-    await this.#putPollSchedule(next);
+    await this.#mutatePollSchedule((current) => ({
+      ...current,
+      nextPollAt: null,
+      failures: current.failures + 1,
+      blindSince: goesBlind ? now : current.blindSince,
+      escalated: escalates ? true : current.escalated,
+    }));
   }
 
   /**
@@ -1811,6 +2094,10 @@ export class BotInstance extends DurableObject<Env> {
    * (the account circuit breaker of 7.3, the global kill switch of 7.4).
    */
   async halt(reason: HaltReason, detail: string, actor: string): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#haltPass(reason, detail, actor));
+  }
+
+  async #haltPass(reason: HaltReason, detail: string, actor: string): Promise<PipelineResult> {
     const config = await this.#config();
     return await this.#halt(config, reason, detail, actor);
   }
@@ -1820,6 +2107,10 @@ export class BotInstance extends DurableObject<Env> {
    * review. This is that action, and it is the only path out of `halted`.
    */
   async resume(actor: string): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#resumePass(actor));
+  }
+
+  async #resumePass(actor: string): Promise<PipelineResult> {
     const config = await this.#config();
     const state = await this.#state();
     if (state.status !== "halted") {
@@ -1861,7 +2152,12 @@ export class BotInstance extends DurableObject<Env> {
     // a bot stopped belongs -- an append-only log, not a mutable status column
     // that the next halt would overwrite anyway. `start` has always cleared
     // both (see above); resume was the inconsistent one.
-    await this.#putState({ ...state, status: "running", haltReason: null, haltedAt: null });
+    await this.#mutateState((current) => ({
+      ...current,
+      status: "running",
+      haltReason: null,
+      haltedAt: null,
+    }));
     await this.#mirrorStatus(config, "running", null, null, now);
     await this.#audit(
       config,
@@ -1905,6 +2201,10 @@ export class BotInstance extends DurableObject<Env> {
    *     dashboard shows the click landed and found nothing to do.
    */
   async liquidatePosition(actor: string): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#liquidatePositionPass(actor));
+  }
+
+  async #liquidatePositionPass(actor: string): Promise<PipelineResult> {
     const config = await this.#config();
     let state = await this.#state();
 
@@ -1943,7 +2243,7 @@ export class BotInstance extends DurableObject<Env> {
     state = await this.#state();
     if (config.strategy === "grid") {
       const cleared: GridLadder = { ...state.ladder!, slots: state.ladder!.slots.map(() => null) };
-      await this.#putState({ ...state, ladder: cleared });
+      await this.#mutateState((current) => ({ ...current, ladder: cleared }));
     }
 
     // "At current price" (section 4.5's marketable limit) needs a price, and a
@@ -1998,6 +2298,10 @@ export class BotInstance extends DurableObject<Env> {
    * whose capital has been returned must not still have live orders against it.
    */
   async close(actor: string): Promise<PipelineResult> {
+    return await this.#outsidePoll(() => this.#closePass(actor));
+  }
+
+  async #closePass(actor: string): Promise<PipelineResult> {
     const config = await this.#config();
     const state = await this.#state();
     const now = this.#now();
@@ -2011,7 +2315,7 @@ export class BotInstance extends DurableObject<Env> {
     await releaseBotCapital(this.#db(), config.botInstanceId, { actor, now });
 
     const latest = await this.#state();
-    await this.#putState({ ...latest, status: "stopped", openOrderIds: [] });
+    await this.#mutateState((current) => ({ ...current, status: "stopped", openOrderIds: [] }));
     await this.#audit(config, "bot.closed", actor, { cycles_completed: latest.cycleCount }, now);
 
     // Closing can go running -> stopped directly (bypassing #halt), so this is a
@@ -2111,7 +2415,7 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
 
-    await this.#putState({ ...(await this.#state()), filters: outcome.value });
+    await this.#mutateState((current) => ({ ...current, filters: outcome.value }));
     return outcome.value;
   }
 
@@ -2163,9 +2467,7 @@ export class BotInstance extends DurableObject<Env> {
     // burns a sequence number, which costs nothing. The reverse ordering would
     // let a crash re-use a sequence whose attempt already existed, and
     // `beginAttempt` would answer `recover` for an order that was never placed.
-    const sequence = state.nextSequence;
-    state = { ...state, nextSequence: sequence + 1 };
-    await this.#putState(state);
+    const sequence = await this.#allocateSequence();
 
     const guard = this.#guard(config.botInstanceId);
     const decision = await guard.beginAttempt(sequence, now);
@@ -2184,6 +2486,22 @@ export class BotInstance extends DurableObject<Env> {
     if (!verified.valid) {
       await guard.markFailed(decision.clientOrderId, `failed the pre-send check: ${verified.reason}`, now);
       return await this.#halt(config, "order_rejected", `pre-send validation failed: ${verified.reason}`, "system");
+    }
+
+    // The point of no return. See `#statusChangedFrom`: everything above this
+    // line decided that a buy should exist; below it, one does.
+    const abandoned = await this.#statusChangedFrom("running");
+    if (abandoned !== null) {
+      await guard.markFailed(
+        decision.clientOrderId,
+        `the bot became ${abandoned} before the ${label} buy was sent`,
+        now,
+      );
+      return {
+        status: abandoned,
+        action: "aborted",
+        detail: `${label} buy abandoned: the bot became ${abandoned} while it was being prepared`,
+      };
     }
 
     const outcome = await this.#exchange(config, "routine").placeOrder({
@@ -2247,10 +2565,18 @@ export class BotInstance extends DurableObject<Env> {
       at: result.acceptedAt,
     });
     await this.#putOrder(order);
-    await this.#putState({
-      ...(await this.#state()),
-      openOrderIds: [...state.openOrderIds, decision.clientOrderId],
-    });
+    // APPENDED TO THE CURRENT LIST, not to the one read before `placeOrder`.
+    // The old form re-read state for every other field but built `openOrderIds`
+    // from the pre-send snapshot, so a poll that removed a filled order while
+    // this was in flight had that removal undone -- and a `filled` order put
+    // back into `openOrderIds` is unrecoverable: `#foldTerminalState` refuses a
+    // terminal order, so it is re-read on every pass forever, the alarm never
+    // disarms, and `hasOpenOrder` stays true so `decide` can never return
+    // `open_base` or `additional_buy` again. A permanently wedged bot.
+    await this.#mutateState((current) => ({
+      ...current,
+      openOrderIds: [...current.openOrderIds, decision.clientOrderId],
+    }));
     await this.#mirrorOrderInsert(config, order, result.exchangeOrderId);
 
     // A limit order can come back with executions already attached.
@@ -2301,13 +2627,29 @@ export class BotInstance extends DurableObject<Env> {
       );
     }
 
-    const sequence = state.nextSequence;
-    await this.#putState({ ...state, nextSequence: sequence + 1 });
+    const sequence = await this.#allocateSequence();
 
     const guard = this.#guard(config.botInstanceId);
     const decision = await guard.beginAttempt(sequence, now);
     if (decision.action === "recover") {
       return { status: "running", action: "recover", detail: decision.reason };
+    }
+
+    // The point of no return. A take-profit exit is still a decision taken
+    // while running: if the bot halted meanwhile, the halt has already
+    // cancelled and a liquidation is the human's call, not this path's.
+    const abandoned = await this.#statusChangedFrom("running");
+    if (abandoned !== null) {
+      await guard.markFailed(
+        decision.clientOrderId,
+        `the bot became ${abandoned} before the take-profit sell was sent`,
+        now,
+      );
+      return {
+        status: abandoned,
+        action: "aborted",
+        detail: `take-profit sell abandoned: the bot became ${abandoned} while it was being prepared`,
+      };
     }
 
     const outcome = await this.#exchange(config, "risk-exit").placeOrder({
@@ -2358,12 +2700,18 @@ export class BotInstance extends DurableObject<Env> {
       at: outcome.value.acceptedAt,
     });
     await this.#putOrder(order);
-    await this.#putState({
-      ...(await this.#state()),
-      openOrderIds: [decision.clientOrderId],
+    // APPENDED rather than assigned. `openOrderIds: [exitId]` discarded
+    // anything `#cancelOpenOrders` had just left open -- an order whose
+    // cancellation could not be confirmed is still live on the exchange, and
+    // dropping it here stopped it being polled or cancelled ever again, on the
+    // one path where the bot is trying to get flat. That was reachable without
+    // any concurrency at all: one failed cancel was enough.
+    await this.#mutateState((current) => ({
+      ...current,
+      openOrderIds: [...current.openOrderIds, decision.clientOrderId],
       exitOrderId: decision.clientOrderId,
       exitKind: "take_profit",
-    });
+    }));
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
 
     for (const fill of outcome.value.fills) {
@@ -2387,34 +2735,45 @@ export class BotInstance extends DurableObject<Env> {
     await this.#putOrder(effect.order);
 
     const isExit = state.exitOrderId === order.clientOrderId;
-    let next: BotRuntimeState = { ...state };
 
-    if (!isExit) {
-      // Section 6.3 step 3: recalculate the average entry on every entry. The
-      // cost is what was actually executed (price x quantity of this fill),
-      // not what was requested.
-      const cost = -effect.quoteDelta;
-      next = {
-        ...next,
-        position: applyEntry(
-          next.position,
-          {
-            clientOrderId: order.clientOrderId,
-            price: fill.price,
-            quantity: fill.quantity,
-            cost,
-            at: fill.executedAt,
-          },
-          next.position.quantity > ZERO,
-        ),
-      };
-    }
+    // Both changes are DELTAS ON CURRENT STATE, not fields of a rebuilt
+    // snapshot. `{ ...state, position }` would write back every other field as
+    // this caller saw it, and the callers reach here holding a `state` read
+    // before an exchange call -- so a poll folding a fill could revert a halt
+    // that landed while it was reading, or `close()`'s `stopped`.
+    const next = await this.#mutateState((current) => {
+      let updated = current;
 
-    if (effect.fullyFilled) {
-      next = { ...next, openOrderIds: next.openOrderIds.filter((id) => id !== order.clientOrderId) };
-    }
+      if (!isExit) {
+        // Section 6.3 step 3: recalculate the average entry on every entry. The
+        // cost is what was actually executed (price x quantity of this fill),
+        // not what was requested.
+        const cost = -effect.quoteDelta;
+        updated = {
+          ...updated,
+          position: applyEntry(
+            updated.position,
+            {
+              clientOrderId: order.clientOrderId,
+              price: fill.price,
+              quantity: fill.quantity,
+              cost,
+              at: fill.executedAt,
+            },
+            updated.position.quantity > ZERO,
+          ),
+        };
+      }
 
-    await this.#putState(next);
+      if (effect.fullyFilled) {
+        updated = {
+          ...updated,
+          openOrderIds: updated.openOrderIds.filter((id) => id !== order.clientOrderId),
+        };
+      }
+
+      return updated;
+    });
 
     // Mirror the order's new state and the trade, in the same pass.
     await this.#mirrorOrderUpdate(effect.order);
@@ -2465,16 +2824,15 @@ export class BotInstance extends DurableObject<Env> {
     const proceeds = mul(exit.filledQuantity, exit.price, "half-even");
     const gross = proceeds - state.position.cost;
 
-    const completed: BotRuntimeState = {
-      ...state,
-      cycleCount: state.cycleCount + 1,
+    const completed = await this.#mutateState((current) => ({
+      ...current,
+      cycleCount: current.cycleCount + 1,
       position: EMPTY_POSITION,
       openOrderIds: [],
       exitOrderId: null,
       exitKind: undefined,
-      realizedGross: state.realizedGross + gross,
-    };
-    await this.#putState(completed);
+      realizedGross: current.realizedGross + gross,
+    }));
     await this.#audit(
       config,
       "bot.cycle_completed",
@@ -2525,15 +2883,14 @@ export class BotInstance extends DurableObject<Env> {
     const proceeds = mul(exit.filledQuantity, exit.price, "half-even");
     const gross = proceeds - state.position.cost;
 
-    const completed: BotRuntimeState = {
-      ...state,
+    const completed = await this.#mutateState((current) => ({
+      ...current,
       position: EMPTY_POSITION,
-      openOrderIds: state.openOrderIds.filter((id) => id !== exit.clientOrderId),
+      openOrderIds: current.openOrderIds.filter((id) => id !== exit.clientOrderId),
       exitOrderId: null,
       exitKind: undefined,
-      realizedGross: state.realizedGross + gross,
-    };
-    await this.#putState(completed);
+      realizedGross: current.realizedGross + gross,
+    }));
     await this.#audit(
       config,
       "bot.liquidation_filled",
@@ -2642,7 +2999,10 @@ export class BotInstance extends DurableObject<Env> {
 
     if (!throttled) {
       const current = await this.#state();
-      await this.#putState({ ...current, ladder: { ...current.ladder!, placed: true } });
+      await this.#mutateState((latest) => ({
+        ...latest,
+        ladder: { ...latest.ladder!, placed: true },
+      }));
     }
     return {
       status: "running",
@@ -2694,9 +3054,7 @@ export class BotInstance extends DurableObject<Env> {
       return { status: "running", action: "skipped", detail: adjusted.code };
     }
 
-    const sequence = state.nextSequence;
-    state = { ...state, nextSequence: sequence + 1 };
-    await this.#putState(state);
+    const sequence = await this.#allocateSequence();
 
     const guard = this.#guard(config.botInstanceId);
     const decision = await guard.beginAttempt(sequence, now);
@@ -2712,6 +3070,26 @@ export class BotInstance extends DurableObject<Env> {
     if (!verified.valid) {
       await guard.markFailed(decision.clientOrderId, `failed the pre-send check: ${verified.reason}`, now);
       return await this.#halt(config, "order_rejected", `pre-send validation failed: ${verified.reason}`, "system");
+    }
+
+    // The point of no return, and the check that makes step 19's
+    // `placeReplacement: fresh.status === "running"` true at the moment it
+    // matters rather than several awaits earlier. See `#statusChangedFrom`.
+    const abandoned = await this.#statusChangedFrom("running");
+    if (abandoned !== null) {
+      await guard.markFailed(
+        decision.clientOrderId,
+        `the bot became ${abandoned} before the ${intent.side} at level ` +
+          `${intent.levelIndex} was sent`,
+        now,
+      );
+      return {
+        status: abandoned,
+        action: "aborted",
+        detail:
+          `${intent.side} at grid level ${intent.levelIndex} abandoned: the bot became ` +
+          `${abandoned} while it was being prepared`,
+      };
     }
 
     const outcome = await this.#exchange(config, priority).placeOrder({
@@ -2754,15 +3132,16 @@ export class BotInstance extends DurableObject<Env> {
     });
     await this.#putOrder(order);
 
-    const current = await this.#state();
     const slot: GridSlot = {
       side: intent.side,
       clientOrderId: decision.clientOrderId,
       costBasis: intent.costBasis,
       quantity: adjusted.quantity,
     };
-    const ladder = withSlot(current.ladder!, intent.levelIndex, slot);
-    await this.#putState({ ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) });
+    await this.#mutateState((current) => {
+      const ladder = withSlot(current.ladder!, intent.levelIndex, slot);
+      return { ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) };
+    });
     await this.#mirrorOrderInsert(config, order, result.exchangeOrderId);
 
     for (const fill of result.fills) {
@@ -2799,9 +3178,7 @@ export class BotInstance extends DurableObject<Env> {
       return await this.#applyGridExitFill(config, state, effect.order, effect.fullyFilled, fill);
     }
 
-    const ladder = state.ladder!;
-    const levelIndex = levelOf(ladder, order.clientOrderId);
-    if (levelIndex < 0) {
+    if (levelOf(state.ladder!, order.clientOrderId) < 0) {
       // The order is not on the ladder any more (its slot was cleared, e.g. by a
       // halt). Record the fill; there is no level to replace.
       await this.#mirrorOrderUpdate(effect.order);
@@ -2809,16 +3186,44 @@ export class BotInstance extends DurableObject<Env> {
       return { status: state.status, action: "fill_off_ladder", detail: order.clientOrderId };
     }
 
-    const plan = planFill(ladder, config.params, levelIndex, fill.price, fill.quantity, effect.fullyFilled);
-    const next: BotRuntimeState = {
-      ...state,
-      ladder: plan.ladder,
-      realizedGross: plan.ladder.realizedGross,
-      openOrderIds: ladderOpenOrderIds(plan.ladder),
-    };
-    await this.#putState(next);
+    // PLANNED AGAINST THE CURRENT LADDER, inside the mutation. `planFill` is
+    // pure, so running it here rather than against the caller's snapshot costs
+    // nothing and means a rung another pass placed, cleared, or replaced while
+    // this fill was being read is present in the ladder this plan is built
+    // from. Planning outside and writing `{ ...state, ladder: plan.ladder }`
+    // would have reverted that rung along with everything else on the snapshot.
+    //
+    // The level is re-derived for the same reason: the filled order's rung is
+    // found in the current ladder, not the one read before the exchange call.
+    let plan: ReturnType<typeof planFill> | undefined;
+    const next = await this.#mutateState((current) => {
+      const currentLevel = levelOf(current.ladder!, order.clientOrderId);
+      if (currentLevel < 0) return current;
+      plan = planFill(
+        current.ladder!,
+        config.params,
+        currentLevel,
+        fill.price,
+        fill.quantity,
+        effect.fullyFilled,
+      );
+      return {
+        ...current,
+        ladder: plan.ladder,
+        realizedGross: plan.ladder.realizedGross,
+        openOrderIds: ladderOpenOrderIds(plan.ladder),
+      };
+    });
+
     await this.#mirrorOrderUpdate(effect.order);
     await this.#mirrorTrade(config, effect.order, fill);
+
+    if (plan === undefined) {
+      // The rung went away between the read above and the write: another pass
+      // cleared it (a halt sweep, or a terminal fold). The fill is recorded on
+      // the order and mirrored; there is no level left to replace.
+      return { status: next.status, action: "fill_off_ladder", detail: order.clientOrderId };
+    }
 
     if (plan.replacement !== null && placeReplacement) {
       // Place the replacement at the level's own price (a resting limit), routine
@@ -2851,30 +3256,41 @@ export class BotInstance extends DurableObject<Env> {
     fullyFilled: boolean,
     fill: Fill,
   ): Promise<PipelineResult> {
-    const ladder = state.ladder!;
     const proceeds = mul(fill.price, fill.quantity, "half-even");
-    const costPortion =
-      ladder.heldQuantity > ZERO
-        ? divideRounded(ladder.heldCost * fill.quantity, ladder.heldQuantity, "half-even")
-        : ZERO;
-    const realized = proceeds - costPortion;
 
-    const nextLadder: GridLadder = {
-      ...ladder,
-      heldQuantity: ladder.heldQuantity - fill.quantity,
-      heldCost: ladder.heldCost - costPortion,
-      realizedGross: ladder.realizedGross + realized,
-    };
-    let next: BotRuntimeState = { ...state, ladder: nextLadder, realizedGross: nextLadder.realizedGross };
-    if (fullyFilled) {
-      next = {
-        ...next,
-        exitOrderId: null,
-        exitKind: undefined,
-        openOrderIds: next.openOrderIds.filter((id) => id !== order.clientOrderId),
+    // Prorated against the CURRENT held position, inside the mutation. The
+    // cost portion is a fraction of what the ladder holds, so computing it from
+    // a snapshot taken before an exchange call would prorate against a held
+    // quantity that has since moved -- and then write that stale ladder back
+    // over the one that moved it.
+    const next = await this.#mutateState((current) => {
+      const ladder = current.ladder!;
+      const costPortion =
+        ladder.heldQuantity > ZERO
+          ? divideRounded(ladder.heldCost * fill.quantity, ladder.heldQuantity, "half-even")
+          : ZERO;
+      const nextLadder: GridLadder = {
+        ...ladder,
+        heldQuantity: ladder.heldQuantity - fill.quantity,
+        heldCost: ladder.heldCost - costPortion,
+        realizedGross: ladder.realizedGross + (proceeds - costPortion),
       };
-    }
-    await this.#putState(next);
+      let updated: BotRuntimeState = {
+        ...current,
+        ladder: nextLadder,
+        realizedGross: nextLadder.realizedGross,
+      };
+      if (fullyFilled) {
+        updated = {
+          ...updated,
+          exitOrderId: null,
+          exitKind: undefined,
+          openOrderIds: updated.openOrderIds.filter((id) => id !== order.clientOrderId),
+        };
+      }
+      return updated;
+    });
+
     await this.#mirrorOrderUpdate(order);
     await this.#mirrorTrade(config, order, fill);
 
@@ -2910,7 +3326,7 @@ export class BotInstance extends DurableObject<Env> {
     // and is what the liquidation sell now disposes of.
     const state = await this.#state();
     const clearedLadder: GridLadder = { ...state.ladder!, slots: state.ladder!.slots.map(() => null) };
-    await this.#putState({ ...state, ladder: clearedLadder });
+    await this.#mutateState((current) => ({ ...current, ladder: clearedLadder }));
 
     if (clearedLadder.heldQuantity > ZERO) {
       await this.#placeLiquidationSell(config, clearedLadder.heldQuantity, price);
@@ -2965,12 +3381,35 @@ export class BotInstance extends DurableObject<Env> {
       return;
     }
 
-    const sequence = state.nextSequence;
-    await this.#putState({ ...state, nextSequence: sequence + 1 });
+    const sequence = await this.#allocateSequence();
 
     const guard = this.#guard(config.botInstanceId);
     const decision = await guard.beginAttempt(sequence, now);
     if (decision.action === "recover") return;
+
+    // The point of no return, and the expected status here is HALTED rather
+    // than running: a liquidation is the halt's own action. If the bot is no
+    // longer halted -- resumed by a human, or closed -- selling the position
+    // out from under it is precisely what `liquidatePosition` refuses to do
+    // when it is asked directly.
+    const abandoned = await this.#statusChangedFrom("halted");
+    if (abandoned !== null) {
+      await guard.markFailed(
+        decision.clientOrderId,
+        `the bot became ${abandoned} before the liquidation sell was sent`,
+        now,
+      );
+      await this.#alert(config, {
+        severity: "critical",
+        category: "trading",
+        alertType: "liquidation_abandoned",
+        message:
+          `the liquidation of ${toDecimalString(quantity)} was abandoned: the bot became ` +
+          `${abandoned} while the sell was being prepared, so it was never sent. The position ` +
+          `is still held.`,
+      });
+      return;
+    }
 
     const outcome = await this.#exchange(config, "risk-exit").placeOrder({
       pair: config.pair,
@@ -3026,13 +3465,12 @@ export class BotInstance extends DurableObject<Env> {
       at: outcome.value.acceptedAt,
     });
     await this.#putOrder(order);
-    const current = await this.#state();
-    await this.#putState({
+    await this.#mutateState((current) => ({
       ...current,
       exitOrderId: decision.clientOrderId,
       exitKind: "liquidation",
       openOrderIds: [...current.openOrderIds, decision.clientOrderId],
-    });
+    }));
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
 
     for (const fill of outcome.value.fills) {
@@ -3075,7 +3513,12 @@ export class BotInstance extends DurableObject<Env> {
     }
 
     const recorded = `${reason}: ${detail}`;
-    await this.#putState({ ...state, status: "halted", haltReason: recorded, haltedAt: now });
+    await this.#mutateState((current) => ({
+      ...current,
+      status: "halted",
+      haltReason: recorded,
+      haltedAt: now,
+    }));
 
     // 1. Cancel every open order.
     await this.#cancelOpenOrders(config, state);
@@ -3154,7 +3597,22 @@ export class BotInstance extends DurableObject<Env> {
       await this.#recordCancellation(config, order, outcome.value, now);
     }
 
-    await this.#putState({ ...(await this.#state()), openOrderIds: stillOpen });
+    // REMOVE WHAT THIS SWEEP RESOLVED, rather than assigning the list it
+    // believed in when it started. `openOrderIds: stillOpen` was written after
+    // N network cancellations -- a long window on a grid ladder, which is
+    // throttled deliberately -- and it silently dropped any id added while the
+    // sweep ran. The poll adding a grid replacement mid-halt was exactly that:
+    // a live order on the exchange, no longer tracked, no longer polled, and
+    // never cancelled, on a bot that had just been halted.
+    //
+    // "Resolved" is every id this sweep started with that is not still open:
+    // the ones it cancelled, plus the ones already terminal or unknown, which
+    // the loop skips and which must still leave the list.
+    const resolved = new Set(state.openOrderIds.filter((id) => !stillOpen.includes(id)));
+    await this.#mutateState((current) => ({
+      ...current,
+      openOrderIds: current.openOrderIds.filter((id) => !resolved.has(id)),
+    }));
   }
 
   /**

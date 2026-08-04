@@ -402,9 +402,23 @@ describe("two acquires interleaving", () => {
     // pass the check while the first was suspended and both be granted -- the
     // same shape as the lost update step 5's compare-and-swap defeats.
     //
-    // A Durable Object serialises nothing across an await, so this is a real
-    // interleaving and not a hypothetical one. Forcing it is the only way to
-    // make it reproducible.
+    // A Durable Object serialises nothing across a NETWORK await, so this is a
+    // real interleaving and not a hypothetical one. Forcing it is the only way
+    // to make it reproducible.
+    //
+    // That sentence was carried here from step 8 as an assumption, and step 21
+    // finally measured it: `concurrency-model.test.ts` shows an RPC and an
+    // alarm both being delivered while a Durable Object sits suspended inside
+    // an exchange call. The conclusion was right. The wording was not, and the
+    // difference matters -- the same probe found a storage-only
+    // read-modify-write surviving a two-pass race, so "nothing" overstated it.
+    // What is unserialised is the await that leaves the object: a fetch, a
+    // cross-object RPC, a D1 write.
+    //
+    // Note also what this test does NOT establish, since it reads like it
+    // might: the competitor below is a direct in-process method call, not a
+    // call through the stub, so it exercises the lost-update arithmetic rather
+    // than the runtime's delivery. The probe is what covers delivery.
     await withLimiter({ limit: 120 }, async ({ limiter, state }) => {
       const events: string[] = [];
       const original = state.storage.put.bind(state.storage);
