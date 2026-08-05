@@ -498,6 +498,7 @@ async function reconcileOrders(
     const d1Orders = await db.orders.findMany({ where: { bot_instance_id: bot.id } });
 
     pending.push(...mirrorFindings(db, bot, snapshot, d1Orders));
+    pending.push(...uncoveredInventoryFindings(bot, snapshot));
 
     if (remoteOpen !== null) {
       pending.push(...(await liveOrderFindings(ports, bot, snapshot, remoteOpen, at, thresholds)));
@@ -509,6 +510,73 @@ async function reconcileOrders(
   pending.push(...unknownOrderFindings(openOrdersByPair, bots, snapshots));
 
   return pending;
+}
+
+/**
+ * A grid bot holding base with no sell resting against any of it.
+ *
+ * WHAT THIS CATCHES, and why nothing else did. Section 6.2 step 3 is the only
+ * thing that ever puts a sell on a grid ladder: a buy fills, and its
+ * replacement sell goes one rung up. If that replacement is never placed, the
+ * base the buy acquired stays held with no order that would ever sell it, and
+ * `decide` will not repair it -- it places a ladder only while `placed` is
+ * false, so an incomplete ladder stays incomplete for the life of the bot.
+ *
+ * Every number remains correct while this is true, which is exactly why it
+ * needed its own detector. The position is right, the cost basis is right, the
+ * realized profit is right, D1 agrees with the object, and the exchange agrees
+ * with both. Every existing check compares two records that DO match. What is
+ * wrong is not a disagreement at all -- it is an absence, and only the ladder's
+ * own shape reveals it.
+ *
+ * TWO WAYS TO REACH IT, which is why this is not filed as one bug's regression
+ * test. The slot collision fixed in `claimSlot` is one. `applyMissedFills` is
+ * the other, and that one is BY DESIGN: it folds fills on a halted bot with
+ * `placeReplacement: false` and honestly leaves the rungs empty. A bot resumed
+ * after such a repair carries uncovered inventory and nothing says so.
+ *
+ * Deliberately silent on a HALTED bot: its ladder has been swept on purpose and
+ * a human is already the one holding it. Silent too when a liquidation is live
+ * (`exitOrderId`), because that sell is precisely the cover this looks for.
+ */
+function uncoveredInventoryFindings(
+  bot: BotInstanceRow,
+  snapshot: BotSnapshot,
+): PendingFinding[] {
+  const ladder = snapshot.state.ladder;
+  if (ladder === undefined) return []; // Not a grid bot.
+  if (snapshot.state.status !== "running") return [];
+  if (snapshot.state.exitOrderId !== null) return [];
+  if (ladder.heldQuantity <= ZERO) return [];
+
+  const restingSell = ladder.slots.reduce(
+    (total, slot) => (slot !== null && slot.side === "sell" ? total + slot.quantity : total),
+    ZERO,
+  );
+  if (restingSell >= ladder.heldQuantity) return [];
+
+  const uncovered = ladder.heldQuantity - restingSell;
+  const queued = snapshot.state.pendingReplacements ?? [];
+  return [
+    {
+      finding: {
+        kind: "uncovered_held_inventory",
+        scope: "bot",
+        botInstanceId: bot.id,
+        asset: null,
+        detail:
+          `grid bot ${bot.id} holds ${toDecimalString(ladder.heldQuantity)} base on ${bot.pair} ` +
+          `with only ${toDecimalString(restingSell)} covered by resting sells -- ` +
+          `${toDecimalString(uncovered)} has no sell against it. Section 6.2's replace-on-fill is ` +
+          `the only thing that places a grid sell, and it does not re-run for a rung already ` +
+          `missed, so this will not correct itself. ` +
+          (queued.length > 0
+            ? `${queued.length} replacement(s) are queued waiting for their level to free up, so ` +
+              `this may clear on its own within a poll or two.`
+            : `Nothing is queued to place one.`),
+      },
+    },
+  ];
 }
 
 /**

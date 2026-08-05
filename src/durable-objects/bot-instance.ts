@@ -123,6 +123,7 @@ import {
   type DcaPosition,
 } from "../strategies/dca";
 import {
+  claimSlot,
   decide as gridDecide,
   emptyLadder,
   encodeGridParams,
@@ -345,6 +346,27 @@ export interface BotRuntimeState {
    * this is belt-and-braces.
    */
   readonly exitKind?: "take_profit" | "liquidation";
+  /**
+   * GRID ONLY: replacement orders that could not be placed yet because their
+   * target level was still occupied by a live order.
+   *
+   * Section 6.2 step 3 replaces a filled buy with a sell one level up (and a
+   * filled sell with a buy one level down). When several ladder orders fill in
+   * the same instant, the poll folds them one at a time, and the replacement
+   * for the first can target a level whose own order has filled but has not
+   * been folded yet. `claimSlot` refuses to overwrite it -- and the intent has
+   * to go SOMEWHERE, or the ladder quietly loses a rung and the base that buy
+   * acquired sits held with nothing resting against it.
+   *
+   * So it queues here and is drained once the level frees up: at the top of
+   * each poll pass, and after each grid fill is folded. FIFO, and holding at
+   * most one intent per level (a second intent for the same level would mean
+   * the ladder had two live orders there, which is the state this prevents).
+   *
+   * Optional and defaulted to empty on read, so state written before this
+   * field existed stays valid.
+   */
+  readonly pendingReplacements?: readonly GridOrderIntent[];
 }
 
 export interface CreateDcaBotRequest {
@@ -561,6 +583,12 @@ const BOT_ALERT_SOURCE = "bot-instance";
  */
 export const POLL_STANDING_ALERT_TYPES: ReadonlySet<string> = new Set<string>([
   "unattributable_fill",
+  // Also a finding about the books rather than a poll fault, and standing for
+  // the same reason: `#drainReplacements` re-evaluates the queue on every pass,
+  // so an unconditional insert would write one row per pass for as long as a
+  // level stays occupied. It resolves through the same machinery -- a pass that
+  // drains the queue does not re-raise it, and the open alert closes.
+  "grid_replacement_queued",
   ...POLL_HEALTH_ALERT_TYPES,
 ]);
 
@@ -1767,6 +1795,16 @@ export class BotInstance extends DurableObject<Env> {
     // pass that stands aside for another, or finds nothing to read, has still
     // observed the tick clock perfectly well.
     await this.#checkPriceFreshness(config, state, standing);
+
+    // BEFORE the empty-book early return, not after. A ladder can have every
+    // rung filled and no open order left while replacements are still queued
+    // waiting for those very levels -- which is the exact shape of the incident
+    // this queue exists for. Returning early there would leave the queue
+    // undrained for as long as the book stayed empty, i.e. forever.
+    if (config.strategy === "grid" && state.status === "running") {
+      await this.#drainReplacements(config, standing);
+      state = await this.#state();
+    }
 
     if (state.openOrderIds.length === 0) {
       return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: false };
@@ -3247,6 +3285,12 @@ export class BotInstance extends DurableObject<Env> {
    * The order's LEVEL determines its slot. The pure layer never mints an id, so
    * a placement that fails simply leaves the level empty -- correct, and the next
    * price update or reconciliation handles it.
+   *
+   * THE LEVEL IS CHECKED BEFORE ANYTHING IS SENT. A replacement can target a
+   * level whose own order is still live (see `pendingReplacements`), and the
+   * cheapest correct answer is to notice that before an order exists on the
+   * exchange rather than after. `slot_occupied` is returned so the caller can
+   * queue the intent; nothing has been sent and no id has been burned.
    */
   async #placeGridOrder(
     config: GridConfig,
@@ -3256,6 +3300,22 @@ export class BotInstance extends DurableObject<Env> {
   ): Promise<PipelineResult> {
     let state = await this.#state();
     const now = this.#now();
+
+    // BEFORE the filter read and before the exchange call. A level occupied by
+    // a live order is not a transient condition this pass can wait out -- the
+    // occupant clears it when its own fill is folded -- so there is no reason
+    // to spend a network round trip discovering it.
+    const occupant = state.ladder?.slots[intent.levelIndex] ?? null;
+    if (occupant !== null) {
+      return {
+        status: state.status,
+        action: "slot_occupied",
+        detail:
+          `${intent.side} at grid level ${intent.levelIndex} not sent: the level still holds ` +
+          `${occupant.side} ${occupant.clientOrderId}`,
+      };
+    }
+
     const filters = await this.#ensureFilters(config, state, now, priority);
     state = await this.#state();
 
@@ -3349,6 +3409,11 @@ export class BotInstance extends DurableObject<Env> {
       price: adjusted.price,
       quantity: adjusted.quantity,
       at: result.acceptedAt,
+      // The order's own copy of where it belongs on the ladder, so a fill
+      // against it stays attributable even if its slot is taken. See
+      // `TrackedOrder.levelIndex` for why this is not derived from the slots.
+      levelIndex: intent.levelIndex,
+      costBasis: intent.costBasis,
     });
     await this.#putOrder(order);
 
@@ -3358,10 +3423,43 @@ export class BotInstance extends DurableObject<Env> {
       costBasis: intent.costBasis,
       quantity: adjusted.quantity,
     };
+    // THE RACE THE PRE-SEND CHECK CANNOT CLOSE. Everything between that check
+    // and here is awaited -- the filter read, the attempt record, the exchange
+    // call -- and this object accepts a price tick, an alarm or a second
+    // `onFill` into exactly those windows (see `#outsidePoll`). So the level
+    // may have been taken while this order was in flight.
+    //
+    // The order is REAL by now: it is resting on the exchange. There is no
+    // version of this where refusing the slot is safe, because for a grid
+    // `openOrderIds` is derived from the slots -- an order with no slot is
+    // never polled and never cancelled, which is how it would leak. So the
+    // write wins, and the eviction is made LOUD instead of silent. The evicted
+    // order carries its own `levelIndex` and `costBasis`, so its fill is still
+    // attributable when it arrives.
+    let evicted: GridSlot | null = null;
     await this.#mutateState((current) => {
-      const ladder = withSlot(current.ladder!, intent.levelIndex, slot);
+      const claim = claimSlot(current.ladder!, intent.levelIndex, slot);
+      const ladder =
+        claim.kind === "claimed"
+          ? claim.ladder
+          : ((evicted = claim.by), withSlot(current.ladder!, intent.levelIndex, slot));
       return { ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) };
     });
+    if (evicted !== null) {
+      const lost = evicted as GridSlot;
+      await this.#alert(config, {
+        severity: "critical",
+        category: "trading",
+        alertType: "grid_slot_collision",
+        message:
+          `${intent.side} ${decision.clientOrderId} was placed for grid level ` +
+          `${intent.levelIndex}, but ${lost.side} ${lost.clientOrderId} took that level while ` +
+          `it was in flight. The new order holds the slot; the displaced order keeps its own ` +
+          `recorded level and cost basis, so a fill against it is still applied, but it is no ` +
+          `longer in openOrderIds and will not be polled or cancelled from the ladder. ` +
+          `Check it on the exchange.`,
+      });
+    }
     await this.#mirrorOrderInsert(config, order, result.exchangeOrderId);
 
     for (const fill of result.fills) {
@@ -3398,9 +3496,22 @@ export class BotInstance extends DurableObject<Env> {
       return await this.#applyGridExitFill(config, state, effect.order, effect.fullyFilled, fill);
     }
 
-    if (levelOf(state.ladder!, order.clientOrderId) < 0) {
-      // The order is not on the ladder any more (its slot was cleared, e.g. by a
-      // halt). Record the fill; there is no level to replace.
+    // WHERE THIS ORDER BELONGS, and whether it still holds that level.
+    //
+    // These used to be one question answered by `levelOf`, which searches the
+    // live slots for the order's id. That conflated "this order has no level"
+    // with "this order's level was taken from it", and answered the second as
+    // if it were the first: the fill was recorded, no replacement was placed,
+    // and nothing was raised. Two of bot-4xcq8p's rungs were lost that way.
+    //
+    // `order.levelIndex` answers the first question from the order's own
+    // record; the slot at that level answers the second. Orders written before
+    // that field existed fall back to the old search, which is exactly as good
+    // as it ever was for them.
+    const level = this.#gridLevelOf(state.ladder!, order);
+    if (level === null) {
+      // Genuinely off the ladder: no recorded level, and no slot claims it.
+      // A halt sweep cleared it, or an exit folded it. Record and stop.
       await this.#mirrorOrderUpdate(effect.order);
       await this.#mirrorTrade(config, effect.order, fill);
       return { status: state.status, action: "fill_off_ladder", detail: order.clientOrderId };
@@ -3416,16 +3527,24 @@ export class BotInstance extends DurableObject<Env> {
     // The level is re-derived for the same reason: the filled order's rung is
     // found in the current ladder, not the one read before the exchange call.
     let plan: ReturnType<typeof planFill> | undefined;
+    let displaced = false;
     const next = await this.#mutateState((current) => {
-      const currentLevel = levelOf(current.ladder!, order.clientOrderId);
-      if (currentLevel < 0) return current;
+      const currentLevel = this.#gridLevelOf(current.ladder!, order);
+      if (currentLevel === null) return current;
+      const occupant = current.ladder!.slots[currentLevel.index] ?? null;
+      // Displaced: the level is real and recorded on the order, but a different
+      // order holds it now. Fold the fill against the order's OWN slot, and
+      // leave the level alone -- clearing it would evict the current holder,
+      // which is the same silent loss in the opposite direction.
+      displaced = occupant === null || occupant.clientOrderId !== order.clientOrderId;
       plan = planFill(
         current.ladder!,
         config.params,
-        currentLevel,
+        currentLevel.index,
         fill.price,
         fill.quantity,
         effect.fullyFilled,
+        displaced ? { slot: currentLevel.slot, ownsSlot: false } : {},
       );
       return {
         ...current,
@@ -3449,15 +3568,164 @@ export class BotInstance extends DurableObject<Env> {
       // Place the replacement at the level's own price (a resting limit), routine
       // priority: rebuilding the ladder is ordinary work, not a risk exit.
       const placed = await this.#placeGridOrder(config, plan.replacement, plan.replacement.price, "routine");
-      return placed.status === "halted"
-        ? placed
-        : { status: "running", action: `replaced-${plan.replacement.side}`, detail: order.clientOrderId };
+      if (placed.status === "halted") return placed;
+      if (placed.action === "slot_occupied") {
+        // The target level still holds a live order -- typically one that has
+        // filled in this same instant and has not been folded yet. QUEUED, not
+        // dropped: the level frees up as soon as that fill is folded, and the
+        // drain places it then. Dropping it is what left bot-4xcq8p holding
+        // base with no sell resting against it.
+        await this.#queueReplacement(config, plan.replacement);
+        return {
+          status: next.status,
+          action: `queued-${plan.replacement.side}`,
+          detail: `${order.clientOrderId}: ${placed.detail}`,
+        };
+      }
+      // A fold may have freed a level that an earlier intent was waiting on.
+      await this.#drainReplacements(config);
+      return { status: "running", action: `replaced-${plan.replacement.side}`, detail: order.clientOrderId };
     }
+    if (placeReplacement) await this.#drainReplacements(config);
     return {
       status: next.status,
-      action: effect.fullyFilled ? "filled" : "partially_filled",
+      action: displaced
+        ? "filled_displaced"
+        : effect.fullyFilled
+          ? "filled"
+          : "partially_filled",
       detail: order.clientOrderId,
     };
+  }
+
+  /**
+   * The ladder level an order belongs to, and the slot describing it.
+   *
+   * PREFERS THE ORDER'S OWN RECORD (`levelIndex`, written at placement) over
+   * searching the ladder, because searching answers a subtly different
+   * question: `levelOf` finds where the order is HELD, and returns -1 both when
+   * the order never had a level and when its level was taken from it. Those
+   * need different handling, and telling them apart is the point of this.
+   *
+   * The returned `slot` is the order's own -- reconstructed from the order
+   * record when the ladder no longer holds it -- so a displaced sell keeps the
+   * cost basis its round trip must be measured against.
+   *
+   * Falls back to the ladder search for orders placed before `levelIndex`
+   * existed. Null means genuinely no level: nothing recorded, nothing holding.
+   */
+  #gridLevelOf(
+    ladder: GridLadder,
+    order: TrackedOrder,
+  ): { readonly index: number; readonly slot: GridSlot } | null {
+    const recorded = order.levelIndex;
+    if (recorded !== undefined && recorded >= 0 && recorded < ladder.slots.length) {
+      const held = ladder.slots[recorded] ?? null;
+      if (held !== null && held.clientOrderId === order.clientOrderId) {
+        return { index: recorded, slot: held };
+      }
+      return {
+        index: recorded,
+        slot: {
+          side: order.side,
+          clientOrderId: order.clientOrderId,
+          costBasis: order.costBasis ?? null,
+          quantity: order.quantity,
+        },
+      };
+    }
+
+    const found = levelOf(ladder, order.clientOrderId);
+    if (found < 0) return null;
+    return { index: found, slot: ladder.slots[found]! };
+  }
+
+  /**
+   * Hold a replacement whose level was not free, for the drain to place later.
+   *
+   * At most one intent per level. A second intent for the same level would mean
+   * two live orders were wanted at one rung, which is the state the ladder does
+   * not have and `claimSlot` exists to keep it from reaching -- so the newer
+   * intent is dropped rather than queued, and said so out loud.
+   */
+  async #queueReplacement(config: GridConfig, intent: GridOrderIntent): Promise<void> {
+    let duplicate = false;
+    await this.#mutateState((current) => {
+      const queue = current.pendingReplacements ?? [];
+      if (queue.some((pending) => pending.levelIndex === intent.levelIndex)) {
+        duplicate = true;
+        return current;
+      }
+      return { ...current, pendingReplacements: [...queue, intent] };
+    });
+    if (duplicate) {
+      await this.#alert(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "grid_replacement_duplicate",
+        message:
+          `a ${intent.side} replacement for grid level ${intent.levelIndex} was already queued; ` +
+          `the second one is dropped. Two replacements wanting one rung means the ladder's ` +
+          `held position and its slots disagree -- check the ladder against the exchange.`,
+      });
+    }
+  }
+
+  /**
+   * Place every queued replacement whose level has since freed up.
+   *
+   * Called at the top of each poll pass and after each grid fill is folded --
+   * the two moments a level can become free. An intent whose level is still
+   * occupied stays queued; one that places is removed. Nothing here halts on a
+   * placement failure that `#placeGridOrder` already handled its own way.
+   *
+   * A HALTED BOT DRAINS NOTHING. The queue is emptied instead: a halt cancels
+   * the ladder and sweeps its slots, so every queued intent refers to a rung
+   * that no longer exists, and placing one would put a live order on the
+   * exchange from a bot a human has stopped.
+   */
+  async #drainReplacements(config: GridConfig, standing?: Set<string>): Promise<void> {
+    let state = await this.#state();
+    if ((state.pendingReplacements ?? []).length === 0) return;
+
+    if (state.status !== "running") {
+      await this.#mutateState((current) => ({ ...current, pendingReplacements: [] }));
+      return;
+    }
+
+    for (const intent of [...(state.pendingReplacements ?? [])]) {
+      const current = await this.#state();
+      if (current.status !== "running") break;
+      if ((current.ladder?.slots[intent.levelIndex] ?? null) !== null) continue;
+
+      const placed = await this.#placeGridOrder(config, intent, intent.price, "routine");
+      if (placed.action === "slot_occupied") continue; // Lost a race; try again later.
+      // Placed, skipped, throttled or halted -- in every one of those the intent
+      // has had its turn and must not be replayed. A transport failure is the
+      // one case `#placeGridOrder` leaves genuinely unresolved, and recovery
+      // owns that through the idempotency guard, not this queue.
+      await this.#mutateState((cur) => ({
+        ...cur,
+        pendingReplacements: (cur.pendingReplacements ?? []).filter(
+          (pending) => pending.levelIndex !== intent.levelIndex,
+        ),
+      }));
+      if (placed.status === "halted") break;
+    }
+
+    state = await this.#state();
+    if ((state.pendingReplacements ?? []).length > 0) {
+      standing?.add(standingAlertKey("grid_replacement_queued", config.botInstanceId));
+      await this.#raiseStanding(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "grid_replacement_queued",
+        message:
+          `${state.pendingReplacements!.length} grid replacement order(s) are waiting for their ` +
+          `level to free up: ${state.pendingReplacements!.map((p) => `${p.side}@${p.levelIndex}`).join(", ")}. ` +
+          `Base acquired by the filled buy is held with nothing resting against it until they place.`,
+      });
+    }
   }
 
   /**

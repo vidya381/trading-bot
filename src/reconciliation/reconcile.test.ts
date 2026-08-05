@@ -40,6 +40,7 @@ import { inBot } from "../durable-objects/test-helpers";
 import { fromDecimalString as m, ZERO } from "../shared/money";
 import type { TrackedOrder } from "../shared/order-state";
 import { DCA_SCHEMA_VERSION, EMPTY_POSITION, type DcaParams } from "../strategies/dca";
+import type { GridLadder, GridSlot } from "../strategies/grid";
 
 const T0 = 1_910_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const ACCOUNT = "main";
@@ -1330,5 +1331,144 @@ describe("a persistent finding does not re-alert on every pass", () => {
     const drift = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
     expect(drift).toHaveLength(2);
     expect(drift.filter((row) => !row.resolved)).toHaveLength(1);
+  });
+});
+
+// ===========================================================================
+// Uncovered held inventory (the 2026-08-05 slot collision, detected)
+// ===========================================================================
+
+describe("a grid bot holding base with no sell against it", () => {
+  /** A placed ladder over levels 90/95/100/105/110. */
+  function ladderWith(overrides: Partial<GridLadder> = {}): GridLadder {
+    return {
+      levels: [m("90"), m("95"), m("100"), m("105"), m("110")],
+      slots: [null, null, null, null, null],
+      heldQuantity: ZERO,
+      heldCost: ZERO,
+      realizedGross: ZERO,
+      placed: true,
+      ...overrides,
+    };
+  }
+
+  function sellSlot(clientOrderId: string, quantity: string, costBasis: string): GridSlot {
+    return { side: "sell", clientOrderId, costBasis: m(costBasis), quantity: m(quantity) };
+  }
+
+  beforeEach(async () => {
+    await seedBot("grid-btc-1");
+    await seedLedger("400");
+    await seedBaseline("USDT", "5000");
+    exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
+  });
+
+  it("is found even though every number in the books is correct", async () => {
+    // This is the point of the detector. The position, cost, realized profit,
+    // D1 mirror and exchange all agree -- there is no disagreement anywhere for
+    // the other checks to find. What is wrong is an ABSENCE: base was bought
+    // and the sell that would close the round trip was never placed.
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], { ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }) }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const finding = result.findings.find((f) => f.kind === "uncovered_held_inventory");
+    expect(finding).toBeDefined();
+    expect(finding!.tier).toBe("meaningful");
+    expect(finding!.botInstanceId).toBe("grid-btc-1");
+    expect(finding!.detail).toContain("1.05000000");
+    expect(finding!.detail).toContain("Nothing is queued");
+  });
+
+  it("counts partial cover rather than treating any sell as enough", async () => {
+    // Half the position has a sell against it; the other half does not. The
+    // bot-4xcq8p shape exactly: some rungs replaced, some silently lost.
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        ladder: ladderWith({
+          heldQuantity: m("1.05"),
+          heldCost: m("99.75"),
+          slots: [null, null, sellSlot("sell-1", "0.5", "95"), null, null],
+        }),
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const finding = result.findings.find((f) => f.kind === "uncovered_held_inventory");
+    expect(finding).toBeDefined();
+    // 1.05 held, 0.5 covered -> 0.55 exposed.
+    expect(finding!.detail).toContain("0.55000000");
+  });
+
+  it("says so when replacements are queued, because that clears on its own", async () => {
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+        pendingReplacements: [
+          { levelIndex: 2, side: "sell", price: m("100"), quantity: m("1.05"), costBasis: m("95") },
+        ],
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const finding = result.findings.find((f) => f.kind === "uncovered_held_inventory");
+    expect(finding!.detail).toContain("1 replacement(s) are queued");
+  });
+
+  it("stays silent when every held unit is covered", async () => {
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        ladder: ladderWith({
+          heldQuantity: m("1.05"),
+          heldCost: m("99.75"),
+          slots: [null, null, sellSlot("sell-1", "1.05", "95"), null, null],
+        }),
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
+  });
+
+  it("stays silent on a halted bot, whose ladder was swept on purpose", async () => {
+    // A human already holds this one, and the halt cleared the slots itself.
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        status: "halted",
+        haltReason: "manual",
+        ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
+  });
+
+  it("stays silent while a liquidation sell is live, which IS the cover", async () => {
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        exitOrderId: "v1-grid-btc-1-9",
+        ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
+  });
+
+  it("stays silent for a DCA bot, which has no ladder at all", async () => {
+    snapshots.set("grid-btc-1", snapshotFor("grid-btc-1"));
+    const result = await reconcileAccount(ports(), ACCOUNT);
+    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
   });
 });

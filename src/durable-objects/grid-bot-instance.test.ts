@@ -453,6 +453,112 @@ describe("checkOpenOrders on a grid ladder", () => {
     expect(sells[0]!.price).toBe(m("100"));
   });
 
+  it("gives BOTH adjacent buys their sell when they fill in the same pass", async () => {
+    /*
+     * THE 2026-08-05 REGRESSION, in its original shape.
+     *
+     * Levels 90 and 95 both rest as buys and both fill in one instant. The poll
+     * folds them one at a time, in ascending level order, and folding the fill
+     * at level 0 wants its replacement sell at level 1 -- the level the buy at
+     * 95 still occupies, because its own fill has not been folded yet.
+     *
+     * The old code overwrote that slot. The buy at 95 then had no slot, so
+     * `levelOf` returned -1 when its fill was read, and it took the "not on the
+     * ladder any more" branch: recorded, no replacement, no alert. One sell
+     * existed where there should have been two, and the base that buy acquired
+     * was held with nothing resting against it. On bot-4xcq8p that happened
+     * twice in one pass and stranded 0.00037572 BTC.
+     */
+    await startAt("100");
+    const buyAt90 = placedAtPrice("90");
+    const buyAt95 = placedAtPrice("95");
+    exchange.fillsByOrder.set(buyAt90, [exchange.fillFor(buyAt90, { fillId: "tid-same-1" })]);
+    exchange.fillsByOrder.set(buyAt95, [exchange.fillFor(buyAt95, { fillId: "tid-same-2" })]);
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.applied).toHaveLength(2);
+
+    // TWO sells, one per filled buy, at the rung above each.
+    const sells = exchange.placed.filter((o) => o.side === "sell");
+    expect(sells.map((o) => o.price).sort()).toEqual([m("100"), m("95")].sort());
+
+    // And the ladder agrees: every unit of base held is covered by a resting
+    // sell. This is the assertion that would have caught the original bug --
+    // the position was never wrong, only uncovered.
+    const snapshot = await run((bot) => bot.snapshot());
+    const ladder = snapshot.state.ladder!;
+    const covered = ladder.slots.reduce(
+      (total, slot) => (slot !== null && slot.side === "sell" ? total + slot.quantity : total),
+      ZERO,
+    );
+    expect(ladder.heldQuantity).toBeGreaterThan(ZERO);
+    expect(covered).toBe(ladder.heldQuantity);
+    expect(snapshot.state.pendingReplacements ?? []).toHaveLength(0);
+  });
+
+  it("queues a replacement whose level still holds a live resting order, evicting nothing", async () => {
+    // The buy at 90 fills alone. Its sell belongs at level 1 (price 95), where
+    // a buy is still resting and entirely healthy. The old code would have
+    // overwritten that slot -- and for a grid `openOrderIds` is derived from
+    // the slots, so the buy at 95 would have stopped being polled and stopped
+    // being cancellable while staying live on the exchange.
+    await startAt("100");
+    const buyAt90 = placedAtPrice("90");
+    const buyAt95 = placedAtPrice("95");
+    exchange.fillsByOrder.set(buyAt90, [exchange.fillFor(buyAt90, { fillId: "tid-queue-1" })]);
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    // Nothing was sold into an occupied rung.
+    expect(exchange.placed.filter((o) => o.side === "sell")).toHaveLength(0);
+    const snapshot = await run((bot) => bot.snapshot());
+    // The occupant is untouched and still tracked.
+    expect(snapshot.state.ladder!.slots[1]?.clientOrderId).toBe(buyAt95);
+    expect(snapshot.state.openOrderIds).toContain(buyAt95);
+    expect(exchange.cancelled).not.toContain(buyAt95);
+    // The intent is held, not lost.
+    expect(snapshot.state.pendingReplacements).toMatchObject([{ levelIndex: 1, side: "sell" }]);
+  });
+
+  it("drains a queued replacement once its level frees up", async () => {
+    await startAt("100");
+    const buyAt90 = placedAtPrice("90");
+    const buyAt95 = placedAtPrice("95");
+    exchange.fillsByOrder.set(buyAt90, [exchange.fillFor(buyAt90, { fillId: "tid-drain-1" })]);
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect((await run((bot) => bot.snapshot())).state.pendingReplacements).toHaveLength(1);
+
+    // Now the buy at 95 fills too, clearing level 1.
+    exchange.fillsByOrder.set(buyAt95, [exchange.fillFor(buyAt95, { fillId: "tid-drain-2" })]);
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.pendingReplacements ?? []).toHaveLength(0);
+    const sells = exchange.placed.filter((o) => o.side === "sell");
+    expect(sells.map((o) => o.price).sort()).toEqual([m("100"), m("95")].sort());
+  });
+
+  it("records the ladder level and cost basis on the order itself", async () => {
+    // The order's own copy of where it belongs. Without it, an order's level is
+    // recoverable only by searching the live slots, so an order loses its
+    // identity the moment anything takes its slot.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.fillsByOrder.set(buyAt95, [exchange.fillFor(buyAt95, { fillId: "tid-ident-1" })]);
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const buy = snapshot.orders.find((o) => o.clientOrderId === buyAt95)!;
+    expect(buy.levelIndex).toBe(1);
+    expect(buy.costBasis ?? null).toBeNull();
+
+    const sell = snapshot.orders.find((o) => o.side === "sell")!;
+    expect(sell.levelIndex).toBe(2);
+    // The buy price it replaced -- what makes the round trip's profit exact.
+    expect(sell.costBasis).toBe(m("95"));
+  });
+
   it("places NOTHING when the bot is halted, even though the fill is applied", async () => {
     // A halted bot must not put a live order on the exchange. This is the
     // invariant the repair path's `false` protects, and it has to survive a

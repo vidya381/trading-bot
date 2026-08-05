@@ -101,6 +101,35 @@ export interface TrackedOrder {
   fills: readonly Fill[];
   createdAt: Timestamp;
   updatedAt: Timestamp;
+  /**
+   * GRID ONLY: the ladder level this order was placed for. Absent on DCA
+   * orders, and on grid orders written before this field existed.
+   *
+   * WHY IT LIVES ON THE ORDER. The ladder used to be the only record of which
+   * level an order belonged to, and `levelOf` recovered it by SEARCHING the
+   * live slots for the order's id. That makes an order's own level a property
+   * of someone else's data structure: the moment anything overwrites its slot,
+   * the order can no longer say where it came from, and a fill against it
+   * becomes unattributable. That is exactly how bot-4xcq8p lost two
+   * replacement sells (see `claimSlot` in `strategies/grid.ts`).
+   *
+   * Written once at placement and never changed. `claimSlot` prevents the
+   * eviction that made this necessary; this field is what makes a fill still
+   * correct if one happens anyway, which matters because the slot write and
+   * the exchange call cannot be made atomic.
+   */
+  levelIndex?: number;
+  /**
+   * GRID SELLS ONLY: the price of the buy this sell replaced, carried so the
+   * round trip's realized profit is exact. Null on a buy, absent on DCA.
+   *
+   * Duplicated from `GridSlot.costBasis` for the same reason as `levelIndex`,
+   * and it is the more dangerous of the two to lose: `planFill` falls back to
+   * ZERO for a missing cost basis, so a displaced sell folded against the
+   * wrong slot would report its entire proceeds as profit rather than the
+   * one-grid-step margin it actually earned.
+   */
+  costBasis?: Money | null;
 }
 
 /**
@@ -173,6 +202,10 @@ export function createOrder(params: {
   price: Money;
   quantity: Money;
   at: Timestamp;
+  /** Grid only: the ladder level this order is for. See `TrackedOrder`. */
+  levelIndex?: number;
+  /** Grid sells only: the buy price being replaced. See `TrackedOrder`. */
+  costBasis?: Money | null;
 }): TrackedOrder {
   if (params.quantity <= ZERO) {
     throw new OrderStateError(
@@ -198,6 +231,10 @@ export function createOrder(params: {
     fills: [],
     createdAt: params.at,
     updatedAt: params.at,
+    // Spread-in rather than assigned, so a DCA order keeps the exact shape it
+    // had before these fields existed instead of gaining two `undefined` keys.
+    ...(params.levelIndex === undefined ? {} : { levelIndex: params.levelIndex }),
+    ...(params.costBasis === undefined ? {} : { costBasis: params.costBasis }),
   };
 }
 

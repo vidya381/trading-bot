@@ -3,6 +3,7 @@ import { fromDecimalString as m, ZERO } from "../shared/money";
 import {
   breakoutPrice,
   buildLevels,
+  claimSlot,
   decide,
   decodeGridParams,
   emptyLadder,
@@ -331,6 +332,76 @@ describe("replace-on-fill (section 6.2 step 3)", () => {
 
   it("refuses a fill against a level with no live order", () => {
     expect(() => planFill(placedLadder(), params, 2, m("100"), m("1"), true)).toThrow(/no live order/);
+  });
+});
+
+describe("claimSlot (the 2026-08-05 slot collision)", () => {
+  it("claims a level that is empty", () => {
+    const claim = claimSlot(placedLadder(), 1, buySlot("buy-1", "1.05"));
+    expect(claim.kind).toBe("claimed");
+    expect(claim.kind === "claimed" && claim.ladder.slots[1]?.clientOrderId).toBe("buy-1");
+  });
+
+  it("is idempotent when an order re-writes its own slot", () => {
+    // A retry must not be mistaken for a collision with itself.
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1.05"));
+    const claim = claimSlot(ladder, 1, buySlot("buy-1", "1.05"));
+    expect(claim.kind).toBe("claimed");
+  });
+
+  it("refuses a level held by a different order, and names the occupant", () => {
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1.05"));
+    const claim = claimSlot(ladder, 1, sellSlot("sell-9", "1.05", "90"));
+    expect(claim.kind).toBe("occupied");
+    expect(claim.kind === "occupied" && claim.by.clientOrderId).toBe("buy-1");
+    // And critically: the occupant is still there. `withSlot` would have
+    // replaced it, taking the ladder's only record that buy-1 is live with it.
+    expect(ladder.slots[1]?.clientOrderId).toBe("buy-1");
+  });
+});
+
+describe("folding a fill whose slot was taken", () => {
+  it("realizes profit against the ORDER's cost basis, not the current occupant's", () => {
+    // The displaced sell was placed at level 2 carrying cost basis 95. Some
+    // other order holds level 2 now, and it carries a different basis.
+    const ladder = withSlot(
+      placedLadder({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+      2,
+      sellSlot("someone-else", "1.05", "50"),
+    );
+    const displaced = sellSlot("displaced-sell", "1.05", "95");
+
+    const plan = planFill(ladder, params, 2, m("100"), m("1.05"), true, {
+      slot: displaced,
+      ownsSlot: false,
+    });
+
+    // 95 -> 100 on 1.05 base = 5.25. Reading the occupant's basis of 50 would
+    // have reported 52.50 -- ten times the real profit, from a sell that never
+    // had that basis.
+    expect(plan.realized).toBe(m("5.25"));
+    expect(plan.ladder.heldQuantity).toBe(ZERO);
+  });
+
+  it("leaves the level alone rather than clearing the order that now holds it", () => {
+    const ladder = withSlot(placedLadder(), 1, buySlot("current-holder", "1.05"));
+    const plan = planFill(ladder, params, 1, m("95"), m("1.05"), true, {
+      slot: buySlot("displaced-buy", "1.05"),
+      ownsSlot: false,
+    });
+
+    // Clearing here would evict `current-holder` -- the same silent loss in the
+    // other direction. The fill still moves the position and still plans its
+    // replacement one rung up.
+    expect(plan.ladder.slots[1]?.clientOrderId).toBe("current-holder");
+    expect(plan.ladder.heldQuantity).toBe(m("1.05"));
+    expect(plan.replacement).toMatchObject({ levelIndex: 2, side: "sell", costBasis: m("95") });
+  });
+
+  it("still clears its own level in the ordinary case", () => {
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1.05"));
+    const plan = planFill(ladder, params, 1, m("95"), m("1.05"), true);
+    expect(plan.ladder.slots[1]).toBeNull();
   });
 });
 

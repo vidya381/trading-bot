@@ -284,6 +284,40 @@ export interface GridFillPlan {
   readonly realized: Money;
 }
 
+/**
+ * Overrides for folding a fill whose slot is no longer the ladder's own record.
+ *
+ * Both fields exist for ONE case: an order that filled after being displaced
+ * from its level (see `claimSlot`). Such a fill still has to move the held
+ * position and realize its profit -- the execution happened -- but the slot at
+ * its level now belongs to a different order, so neither reading nor clearing
+ * that slot is correct.
+ *
+ * The caller supplies the displaced order's OWN side and cost basis (which the
+ * Durable Object carries on the order record precisely so this is possible) and
+ * says it no longer owns the level. Left unset, `planFill` behaves exactly as
+ * it always has: slot read from the ladder, slot cleared on a full fill.
+ */
+export interface PlanFillOptions {
+  /**
+   * The filled order's own slot, when the ladder no longer holds it.
+   *
+   * Supplying this is what keeps realized profit honest on a displaced sell:
+   * `costBasis` falls back to ZERO when it is missing, and against a ladder
+   * slot belonging to some other order that fallback would report the sell's
+   * entire proceeds as profit.
+   */
+  readonly slot?: GridSlot;
+  /**
+   * Whether the filled order still owns the slot at its level. Default true.
+   *
+   * False suppresses the slot-clearing a full fill normally does -- clearing it
+   * would evict whichever order legitimately holds the level now, which is the
+   * same class of silent loss `claimSlot` exists to prevent.
+   */
+  readonly ownsSlot?: boolean;
+}
+
 /** Everything the price-update planner looks at, gathered so it stays pure. */
 export interface GridDecisionInput {
   readonly config: GridConfig;
@@ -537,7 +571,14 @@ export function emptyLadder(params: GridParams): GridLadder {
   };
 }
 
-/** Replace one slot, returning a new ladder. `slot` may be `null` to clear it. */
+/**
+ * Replace one slot, returning a new ladder. `slot` may be `null` to clear it.
+ *
+ * UNCONDITIONAL, and that is why `claimSlot` below exists. Use this only where
+ * the caller has already established that overwriting whatever is at the level
+ * is correct -- clearing a filled rung, or a halt sweep clearing everything.
+ * For PLACING an order at a level, go through `claimSlot`.
+ */
 export function withSlot(ladder: GridLadder, levelIndex: number, slot: GridSlot | null): GridLadder {
   if (levelIndex < 0 || levelIndex >= ladder.slots.length) {
     throw new GridError("invalid_parameter", `level index ${levelIndex} is out of range`);
@@ -545,6 +586,50 @@ export function withSlot(ladder: GridLadder, levelIndex: number, slot: GridSlot 
   const slots = ladder.slots.slice();
   slots[levelIndex] = slot;
   return { ...ladder, slots };
+}
+
+/**
+ * The result of trying to put an order's slot at a level.
+ *
+ * `occupied` carries the slot that is in the way, so the caller can name it in
+ * the alert rather than reporting an anonymous collision.
+ */
+export type SlotClaim =
+  | { readonly kind: "claimed"; readonly ladder: GridLadder }
+  | { readonly kind: "occupied"; readonly by: GridSlot };
+
+/**
+ * Take a level for an order, but ONLY if the level is free.
+ *
+ * WHY THIS EXISTS. `withSlot` writes unconditionally, and on 2026-08-05 that
+ * silently lost two replacement sells on bot-4xcq8p. Four ladder buys filled in
+ * the same instant; the poll folds them one at a time, and folding the fill at
+ * level 0 placed its replacement sell into level 1 -- the level still holding
+ * the buy that the very next iteration was about to fold. That buy's slot was
+ * gone by the time its own fill was read, `levelOf` returned -1, and the fill
+ * took the "not on the ladder any more" branch: recorded, but with no
+ * replacement placed and no alert raised. 0.00037572 BTC ended up held with no
+ * sell resting against it, on a bot that went on reporting itself healthy.
+ *
+ * A slot may be claimed when the level is EMPTY, or when it already holds this
+ * same order (a retry re-writing its own slot must stay idempotent). Anything
+ * else is a collision, and the caller decides what to do about it -- queue the
+ * order, or alert. What it must not do is overwrite, because the slot that
+ * would be lost is the ladder's only record that its order is live: for a grid,
+ * `openOrderIds` is DERIVED from the slots, so an evicted order stops being
+ * polled and stops being cancellable. A resting order evicted this way leaks
+ * onto the exchange entirely unmanaged, which is strictly worse than the filled
+ * case that exposed the bug.
+ */
+export function claimSlot(ladder: GridLadder, levelIndex: number, slot: GridSlot): SlotClaim {
+  if (levelIndex < 0 || levelIndex >= ladder.slots.length) {
+    throw new GridError("invalid_parameter", `level index ${levelIndex} is out of range`);
+  }
+  const occupant = ladder.slots[levelIndex] ?? null;
+  if (occupant !== null && occupant.clientOrderId !== slot.clientOrderId) {
+    return { kind: "occupied", by: occupant };
+  }
+  return { kind: "claimed", ladder: withSlot(ladder, levelIndex, slot) };
 }
 
 /** The level index whose slot holds this order, or -1 if none does. */
@@ -700,10 +785,15 @@ export function planFill(
   fillPrice: Money,
   fillQuantity: Money,
   fullyFilled: boolean,
+  options: PlanFillOptions = {},
 ): GridFillPlan {
-  const slot = ladder.slots[levelIndex];
+  const slot = options.slot ?? ladder.slots[levelIndex];
+  const ownsSlot = options.ownsSlot ?? true;
   if (slot === undefined || slot === null) {
     throw new GridError("invalid_parameter", `no live order at level ${levelIndex} to fill`);
+  }
+  if (levelIndex < 0 || levelIndex >= ladder.levels.length) {
+    throw new GridError("invalid_parameter", `level index ${levelIndex} is out of range`);
   }
   if (fillQuantity <= ZERO) {
     throw new GridError("invalid_parameter", `fill quantity must be positive, got ${fillQuantity}`);
@@ -724,7 +814,9 @@ export function planFill(
       return { ladder: next, replacement: null, realized: ZERO };
     }
 
-    next = withSlot(next, levelIndex, null);
+    // Only clear a level this order still owns. A displaced order's level now
+    // belongs to someone else, and clearing it would repeat the eviction.
+    if (ownsSlot) next = withSlot(next, levelIndex, null);
     const sellIndex = levelIndex + 1;
     if (sellIndex >= ladder.levels.length) {
       // The top level filled: there is no rung above to sell into. The breakout
@@ -763,7 +855,7 @@ export function planFill(
     return { ladder: next, replacement: null, realized };
   }
 
-  next = withSlot(next, levelIndex, null);
+  if (ownsSlot) next = withSlot(next, levelIndex, null);
   const buyIndex = levelIndex - 1;
   if (buyIndex < 0) {
     // The bottom level's sell filled: no rung below to buy back into.

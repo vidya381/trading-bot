@@ -76,7 +76,9 @@ export type FindingKind =
   /** A balance change this system cannot explain from its own records. */
   | "balance_drift"
   /** sum(bot allocations) disagrees with capital_ledger.total_allocated. */
-  | "ledger_allocation_drift";
+  | "ledger_allocation_drift"
+  /** A grid bot holds base with no sell resting against any of it. */
+  | "uncovered_held_inventory";
 
 /**
  * The two links that tie `shared/alert-types.ts` -- which the DASHBOARD also
@@ -163,6 +165,23 @@ export const TIER_FLOOR: Readonly<Record<FindingKind, DriftClassification>> = {
   // only detector of a leaked reservation". It is an internal bookkeeping
   // disagreement, not an exchange one, so it never reaches severe by kind.
   ledger_allocation_drift: "meaningful",
+
+  // A grid bot that has bought base and has no sell resting against any of it.
+  // Nothing is MISCOUNTED here -- the position, the cost and the realized
+  // profit are all correct -- which is why this is not a position-drift kind.
+  // What is wrong is that the strategy has stopped managing what it bought: the
+  // rung that was supposed to close that round trip is not on the exchange, and
+  // section 6.2's replace-on-fill is the only thing that would ever put it
+  // there. It cannot self-heal, because `decide` only places a ladder when
+  // `placed` is false, so this state persists until a human acts.
+  //
+  // Meaningful rather than severe: the bot's stop-loss and breakout exits still
+  // read `heldQuantity` directly and still cover the position, so this is a bot
+  // needing attention rather than an account to latch. Reachable both from the
+  // slot-collision bug this was written for AND from `applyMissedFills`, which
+  // deliberately leaves rungs empty -- so it is a standing condition worth
+  // detecting on its own, not a proxy for one defect.
+  uncovered_held_inventory: "meaningful",
 };
 
 /**
@@ -208,6 +227,11 @@ export const TIER_CEILING: Readonly<Record<FindingKind, DriftClassification>> = 
   // is real and needs a human, but halting every bot on the account over it
   // would be a worse outcome than the mismatch.
   ledger_allocation_drift: "meaningful",
+  // Bot-scoped, and its natural magnitude ("how much base is uncovered") is a
+  // fraction of one bot's own position -- the denominator `TIER_CEILING` exists
+  // to keep out of the escalation path. A bot holding all of its inventory
+  // uncovered is 100% of a small thing, not an account-scale event.
+  uncovered_held_inventory: "meaningful",
   // The one kind where magnitude means what the severe tier is about.
   balance_drift: "severe",
   // Already severe by kind; the ceiling is only ever reached from below.
