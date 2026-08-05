@@ -95,10 +95,29 @@ discrepancy                 = exchange_reported_balance
 So `discrepancy` is the *unexplained* part of the change, which matches
 migration 0001's note that it "is NOT a plain difference of these two columns".
 
+"Since" means **since that asset's own baseline**, and step 24 had to make it
+true: `recordedActivity` was windowing from the account's oldest snapshot and
+handing every asset one lifetime sum, which the caller added to a five-minute-old
+baseline that already contained it. The discrepancy it produced was the account's
+lifetime trading, negated, on every pass. Contributions now carry their
+timestamps and are summed per asset by `activitySince`; the `attributed` flag is
+per contribution for the same reason, so one unattributable trade no longer
+blinds an asset permanently.
+
 The first run for an (account, asset) has no baseline. It **adopts** the
 exchange's balance and raises nothing: with no prior observation there is no
 change to explain, and treating the whole balance as unexplained would trip the
 breaker on the first run of every account, forever.
+
+An exchange that answers successfully with **no holdings at all** is a third
+case, and step 24 separated it from the second. It used to share the
+`assets.size === 0` early return with "this account has nothing to check", which
+made a venue mid-transition look like a clean pass — no snapshot, no `skipped`
+entry, no alert, and (worse) an observation entitled to resolve live standing
+alerts. `auditEmptyBalanceSet` now raises `reconciliation_empty_balance_set` and
+records the set as **unread**, so the baseline survives. The discriminator is
+whether this account has ever been observed holding anything; it deliberately is
+not `capital_ledger` expectations, which an empty union already proves absent.
 
 Base and quote assets come from the exchange's own symbol filters, never from
 slicing the pair string — step 5's decision 1 rejected that, and being wrong

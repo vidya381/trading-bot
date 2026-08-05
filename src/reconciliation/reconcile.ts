@@ -906,7 +906,13 @@ async function reconcileBalances(
     ...ledgerRows.map((row) => row.asset),
     ...balances.filter((balance) => balance.free + balance.locked > ZERO).map((b) => b.asset),
   ]);
-  if (assets.size === 0) return [];
+
+  // An exchange reporting NOTHING is not the same as an account with nothing
+  // to check, and until step 24 those two cases shared one silent early return.
+  // See `auditEmptyBalanceSet` for the incident that distinguished them.
+  const empty = assets.size === 0;
+  await auditEmptyBalanceSet(ports, accountLabel, empty, at, skipped);
+  if (empty) return [];
 
   const activity = await recordedActivity(ports, accountLabel, bots, skipped);
   const pending: PendingFinding[] = [];
@@ -937,7 +943,10 @@ async function reconcileBalances(
       discrepancy = ZERO;
       classification = "minor";
     } else {
-      const delta = activity.get(asset) ?? { amount: ZERO, attributed: true };
+      // From THIS asset's own baseline, not from the account's first snapshot.
+      // The baseline below already contains everything that settled before it,
+      // so anything earlier would be counted twice (step 24).
+      const delta = activitySince(activity, asset, baseline.checked_at);
       if (!delta.attributed) {
         // Some trade in the window could not be attributed to an asset, so the
         // expected change is not knowable and any residual would be noise
@@ -1022,6 +1031,161 @@ async function reconcileBalances(
   return pending;
 }
 
+/** `alert_type` for an exchange that reported no holdings at all. */
+export const EMPTY_BALANCE_SET_ALERT = "reconciliation_empty_balance_set";
+
+/**
+ * Raise (or clear) the standing "the exchange reported no holdings" alert.
+ *
+ * THE GAP THIS CLOSES, and it is a real one that hid a real incident. On
+ * 2026-08-05 the Binance testnet re-provisioned account `main`. For four
+ * consecutive passes between the outage and the re-provision the exchange
+ * answered `getAccountBalances` SUCCESSFULLY with a set containing no non-zero
+ * balance. The union below was therefore empty, `reconcileBalances` returned on
+ * `assets.size === 0`, and the run recorded `skipped: []` -- a clean pass, by
+ * every signal the system emits. It wrote no snapshot, raised nothing, and
+ * counted as an observation for the purpose of RESOLVING standing alerts.
+ *
+ * That silence is the whole problem. "The exchange says you hold nothing" and
+ * "there is nothing here to check" arrived down the same code path, and only
+ * one of them is benign.
+ *
+ * WHY THE DISCRIMINATOR IS PRIOR OBSERVATION AND NOT THE LEDGER. The obvious
+ * guard -- alert when the account has `capital_ledger` expectations -- cannot
+ * ever fire. `assets` is the union of ledger assets and non-zero balances, so
+ * an empty union already proves there are no ledger rows; the condition would
+ * be dead code, and it would have missed this incident exactly, because `main`
+ * has no ledger rows at all. What DOES separate the two cases is whether this
+ * account has ever been seen holding anything. An account observed with 445
+ * assets seven hours ago and zero now has undergone a state change; an account
+ * never observed holding anything has not.
+ *
+ * WHY IT ALSO PUSHES ONTO `skipped`. Section 5.6, in the direction that costs
+ * money. An empty response treated as data means the next pass measures its
+ * delta from a fiction of zero, and -- worse -- `resolveClearedAlerts` is
+ * gated on `skipped.length === 0`, so those four passes were entitled to CLOSE
+ * live standing alerts on the strength of having seen nothing. Recording the
+ * empty set as unread rather than as read-and-empty fixes both.
+ *
+ * One row per incident, resolved when holdings are visible again, in the shape
+ * `auditBlindness` already uses for its sibling condition. The two are
+ * deliberately different alert types: blindness means the pass could not read,
+ * this means it read and was told nothing is there, and an operator needs to
+ * know which.
+ */
+async function auditEmptyBalanceSet(
+  ports: ReconciliationPorts,
+  accountLabel: string,
+  empty: boolean,
+  at: Timestamp,
+  skipped: string[],
+): Promise<void> {
+  const { db, newId } = ports;
+  // Account-scoped, like `auditBlindness`'s rows rather than like a finding's.
+  // `owns` below keeps this lifecycle off that one despite the shared source.
+  const source = `${RECONCILIATION_SOURCE}:${accountLabel}`;
+
+  if (!empty) {
+    await resolveClearedStandingAlerts(db, {
+      source,
+      owns: (alertType) => alertType === EMPTY_BALANCE_SET_ALERT,
+      stillOpen: new Set(),
+      // This branch only runs when the exchange returned holdings, which is
+      // the observation that clears the incident.
+      observed: true,
+      inScope: () => true,
+    });
+    return;
+  }
+
+  const seen = await db.balanceSnapshots.findMany({
+    where: { account_label: accountLabel },
+    orderBy: [{ column: "checked_at", direction: "desc" }],
+    limit: 1,
+  });
+  const lastObservation = seen[0];
+
+  // Never seen holding anything, so there is genuinely nothing to check and
+  // nothing has changed. This is the case the original early return was right
+  // about, and it stays silent.
+  if (lastObservation === undefined) return;
+
+  const since = at - lastObservation.checked_at;
+  const when =
+    `${new Date(lastObservation.checked_at).toISOString()} ` +
+    `(${Math.floor(since / 60000)} minute(s) ago)`;
+
+  skipped.push(
+    `account balances: the exchange answered successfully but reported NO holdings at ` +
+      `all, and this account was last observed holding assets at ${when}. Treated as ` +
+      `unread rather than as a balance of zero, so no snapshots were written this run ` +
+      `and the next run still measures from the last real observation.`,
+  );
+
+  await raiseStandingAlert(db, newId, {
+    alertType: EMPTY_BALANCE_SET_ALERT,
+    botInstanceId: null,
+    severity: "critical",
+    category: "system",
+    source,
+    message:
+      `reconciliation read account ${accountLabel} successfully and the exchange ` +
+      `reported NO holdings at all. It was last observed holding assets at ${when}. ` +
+      `Nothing has been recorded as having drained to zero: the empty set is treated ` +
+      `as unread, so the baseline survives and section 9's drift detection is NOT ` +
+      `protecting this account until holdings are visible again. Either the venue is ` +
+      `mid-transition (a testnet faucet re-provision does exactly this) or this client ` +
+      `is authenticated against an account that is not the one holding the assets.`,
+    at,
+  });
+}
+
+/**
+ * One trade's effect on one asset, kept WITH the time it settled.
+ *
+ * The timestamp is what makes a per-asset window possible at all: without it
+ * there is only a lifetime scalar, and a lifetime scalar can only be added to a
+ * lifetime baseline -- which is not the baseline this pass has.
+ */
+interface AssetContribution {
+  readonly executedAt: Timestamp;
+  readonly amount: Money;
+  /** False when the trade could not be attributed to base/quote at all. */
+  readonly attributed: boolean;
+}
+
+/** Every contribution per asset, unsummed. Sum it with `activitySince`. */
+type RecordedActivity = ReadonlyMap<string, readonly AssetContribution[]>;
+
+/**
+ * What this system's own activity did to one asset AFTER a given instant.
+ *
+ * `since` is exclusive and is the asset's own baseline `checked_at`: that
+ * snapshot's `exchange_reported_balance` already contains everything that
+ * settled at or before it.
+ *
+ * `attributed` is false when any trade INSIDE the window could not be
+ * attributed. Outside the window it does not matter -- the baseline absorbed
+ * that trade whether this code could read it or not.
+ */
+function activitySince(
+  activity: RecordedActivity,
+  asset: string,
+  since: Timestamp,
+): { amount: Money; attributed: boolean } {
+  const contributions = activity.get(asset);
+  if (contributions === undefined) return { amount: ZERO, attributed: true };
+
+  let amount = ZERO;
+  let attributed = true;
+  for (const entry of contributions) {
+    if (entry.executedAt <= since) continue;
+    amount += entry.amount;
+    if (!entry.attributed) attributed = false;
+  }
+  return { amount, attributed };
+}
+
 /**
  * How much this system's OWN recorded activity should have moved each asset.
  *
@@ -1036,20 +1200,36 @@ async function reconcileBalances(
  * table, and being wrong moves money between the wrong ledger rows. Here the
  * exchange is asked instead.
  *
- * The window start is per asset (each asset's own last snapshot), so this
- * computes from the OLDEST baseline across the assets involved and lets each
- * asset take the slice it needs. Trades before an asset's own baseline are
- * excluded by the caller's arithmetic, because that baseline already contains
- * them.
+ * ---------------------------------------------------------------------------
+ * THE WINDOW IS PER ASSET, AND THAT IS LOAD-BEARING (step 24)
+ * ---------------------------------------------------------------------------
+ * Each asset's window opens at ITS OWN baseline -- the snapshot
+ * `reconcileBalances` is about to subtract from -- because that baseline's
+ * `exchange_reported_balance` already contains every trade that settled before
+ * it. Adding those trades again double-counts them.
+ *
+ * This docblock claimed that behaviour before step 24 and the code did not
+ * implement it: `since` was the account's OLDEST snapshot, one scalar sum was
+ * computed from it, and every asset took that whole lifetime sum onto a
+ * five-minute-old baseline. The discrepancy it produced was therefore exactly
+ * the account's lifetime net activity, negated, on every pass -- measured on
+ * `gemini-main` at 0.00149818 BTC and 96.24 USD against thresholds of 0.1% and
+ * 2%, so it was a ratchet climbing toward the meaningful tier as the bots
+ * traded. See `docs/decision-log/24.md`.
+ *
+ * So contributions are kept WITH their timestamps and summed per asset by
+ * `activitySince`. One trades query still serves every asset: no asset's window
+ * can open earlier than the account's oldest snapshot, so that remains the
+ * correct fetch bound -- it is only the wrong SUM bound.
  */
 async function recordedActivity(
   ports: ReconciliationPorts,
   accountLabel: string,
   bots: readonly BotInstanceRow[],
   skipped: string[],
-): Promise<Map<string, { amount: Money; attributed: boolean }>> {
+): Promise<RecordedActivity> {
   const { db, exchange } = ports;
-  const result = new Map<string, { amount: Money; attributed: boolean }>();
+  const result = new Map<string, AssetContribution[]>();
   const botIds = bots.map((bot) => bot.id);
   if (botIds.length === 0) return result;
 
@@ -1070,13 +1250,19 @@ async function recordedActivity(
   const botById = new Map(bots.map((bot) => [bot.id, bot]));
 
   const filtersByPair = new Map<Pair, SymbolFilters | null>();
-  const add = (asset: string, amount: Money): void => {
-    const current = result.get(asset) ?? { amount: ZERO, attributed: true };
-    result.set(asset, { amount: current.amount + amount, attributed: current.attributed });
+  const contribute = (asset: string, entry: AssetContribution): void => {
+    const existing = result.get(asset);
+    if (existing === undefined) result.set(asset, [entry]);
+    else existing.push(entry);
   };
-  const markUnattributed = (asset: string): void => {
-    const current = result.get(asset) ?? { amount: ZERO, attributed: true };
-    result.set(asset, { amount: current.amount, attributed: false });
+  const add = (asset: string, amount: Money, executedAt: Timestamp): void => {
+    contribute(asset, { executedAt, amount, attributed: true });
+  };
+  // An unattributable trade poisons only the windows that CONTAIN it. Before
+  // step 24 the flag was per asset with no timestamp, so one unattributable
+  // trade suppressed that asset's finding for the rest of the account's life.
+  const markUnattributed = (asset: string, executedAt: Timestamp): void => {
+    contribute(asset, { executedAt, amount: ZERO, attributed: false });
   };
 
   for (const trade of trades) {
@@ -1105,8 +1291,8 @@ async function recordedActivity(
       // Cannot attribute this trade. Mark every asset it might have touched,
       // so the caller declines to draw a conclusion rather than drawing a
       // wrong one from a partial sum.
-      markUnattributed(bot.capital_asset);
-      markUnattributed(trade.fee_asset);
+      markUnattributed(bot.capital_asset, trade.executed_at);
+      markUnattributed(trade.fee_asset, trade.executed_at);
       continue;
     }
 
@@ -1118,15 +1304,15 @@ async function recordedActivity(
     const notional = mul(trade.price, trade.quantity, "half-even");
 
     if (order.side === "buy") {
-      add(filters.baseAsset, trade.quantity);
-      add(filters.quoteAsset, -notional);
+      add(filters.baseAsset, trade.quantity, trade.executed_at);
+      add(filters.quoteAsset, -notional, trade.executed_at);
     } else {
-      add(filters.baseAsset, -trade.quantity);
-      add(filters.quoteAsset, notional);
+      add(filters.baseAsset, -trade.quantity, trade.executed_at);
+      add(filters.quoteAsset, notional, trade.executed_at);
     }
 
     // The fee leaves the account in whatever asset it was charged in.
-    add(trade.fee_asset, -trade.fee_amount);
+    add(trade.fee_asset, -trade.fee_amount, trade.executed_at);
   }
 
   return result;

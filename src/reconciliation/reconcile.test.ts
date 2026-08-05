@@ -18,7 +18,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { readCircuitBreaker } from "./circuit-breaker";
-import { reconcileAccount, type ReconciliationPorts } from "./reconcile";
+import {
+  EMPTY_BALANCE_SET_ALERT,
+  reconcileAccount,
+  type ReconciliationPorts,
+} from "./reconcile";
 import { alertView } from "../api/serialize";
 // The dashboard's own gate for the "Apply missed fills" control, executed here
 // against what this module really writes. See src/shared/alert-types.test.ts.
@@ -1470,5 +1474,286 @@ describe("a grid bot holding base with no sell against it", () => {
     snapshots.set("grid-btc-1", snapshotFor("grid-btc-1"));
     const result = await reconcileAccount(ports(), ACCOUNT);
     expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
+  });
+});
+
+// ===========================================================================
+// The empty balance set (the 2026-08-05 faucet re-provision, made observable)
+// ===========================================================================
+
+/**
+ * Replays the real recorded sequence for account `main` on 2026-08-05, at the
+ * shape that matters rather than at its full 504-asset width.
+ *
+ * From `audit_log` and `balance_snapshots` on the testnet database:
+ *
+ *   11:45:38Z  clean pass, 445 assets, 0G at 1302
+ *   11:50:38Z  HTTP 502 -- 85 consecutive passes skip their balance reads
+ *   18:55:38Z  reads recover, but the exchange reports NO holdings: four
+ *              passes wrote no snapshot and recorded `skipped: []`
+ *   19:15:38Z  504 assets, 0G at 3569, compared against the 11:45 baseline
+ *              -> 268 drifts, 256 severe -> breaker tripped
+ *
+ * The bug is the third step. The fourth is CORRECT behaviour given a stale
+ * baseline and is asserted here so the fix cannot quietly suppress it.
+ */
+describe("when the exchange reports an empty balance set", () => {
+  /** 0G, at the two balances the faucet actually had it at. */
+  const BEFORE = "1302";
+  const AFTER = "3569";
+
+  beforeEach(async () => {
+    await seedBot("dca-btc-1");
+    snapshots.set("dca-btc-1", snapshotFor("dca-btc-1"));
+  });
+
+  it("records it as unread, not as a balance of zero, once the account has been seen", async () => {
+    await seedBaseline("0G", BEFORE);
+    exchange.balances = [];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.skipped.some((entry) => entry.includes("NO holdings"))).toBe(true);
+    // The baseline survives: nothing is recorded as having drained to zero, so
+    // the next real read still measures its delta from the last true one.
+    const written = await db.balanceSnapshots.findMany({
+      where: { reconciliation_run_id: result.runId },
+    });
+    expect(written).toEqual([]);
+  });
+
+  it("raises one standing alert, distinct from blindness", async () => {
+    await seedBaseline("0G", BEFORE);
+    exchange.balances = [];
+
+    await reconcileAccount(ports(), ACCOUNT);
+    clock += 300_000;
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const raised = await alerts({ alert_type: EMPTY_BALANCE_SET_ALERT });
+    expect(raised).toHaveLength(1); // one per incident, not one per pass
+    expect(raised[0]!.resolved).toBe(false);
+    expect(raised[0]!.severity).toBe("critical");
+    // The pass READ successfully -- it was told nothing is there. An operator
+    // needs that distinguished from "could not read at all".
+    expect(raised[0]!.alert_type).not.toBe("reconciliation_blind");
+  });
+
+  it("stays silent for an account never observed holding anything", async () => {
+    // No baseline seeded: the case the original early return was right about.
+    exchange.balances = [];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.skipped.some((entry) => entry.includes("NO holdings"))).toBe(false);
+    expect(await alerts({ alert_type: EMPTY_BALANCE_SET_ALERT })).toEqual([]);
+  });
+
+  it("does not let the empty pass resolve a live standing alert", async () => {
+    // Section 5.6 applied to the alert lifecycle. This is what those four real
+    // passes were entitled to do: they reported `skipped: []`, so they counted
+    // as an observation and could have closed a live incident having seen
+    // nothing at all.
+    await seedBaseline("0G", BEFORE);
+    await db.alerts.insert(
+      alertRow({
+        id: "standing-1",
+        alert_type: "reconciliation_meaningful_order_state_drift",
+        bot_instance_id: "dca-btc-1",
+        source: "reconciliation",
+        resolved: false,
+      }),
+    );
+    exchange.balances = [];
+
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const [standing] = await alerts({ id: "standing-1" });
+    expect(standing!.resolved).toBe(false);
+  });
+
+  it("clears the incident when holdings are visible again", async () => {
+    await seedBaseline("0G", BEFORE);
+    exchange.balances = [];
+    await reconcileAccount(ports(), ACCOUNT);
+
+    clock += 300_000;
+    exchange.balances = [{ asset: "0G", free: m(AFTER), locked: ZERO }];
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const raised = await alerts({ alert_type: EMPTY_BALANCE_SET_ALERT });
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.resolved).toBe(true);
+  });
+
+  it("still trips the breaker on the re-provisioned balances, against the surviving baseline", async () => {
+    // The fix must not suppress the real finding. 3569 - 1302 = 2267
+    // unexplained, exactly what run 12ec9351 recorded.
+    await seedBaseline("0G", BEFORE);
+    exchange.balances = [];
+    await reconcileAccount(ports(), ACCOUNT);
+
+    clock += 300_000;
+    exchange.balances = [{ asset: "0G", free: m(AFTER), locked: ZERO }];
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const drift = result.findings.find((finding) => finding.asset === "0G");
+    expect(drift?.kind).toBe("balance_drift");
+    expect(drift?.tier).toBe("severe");
+    expect(drift?.detail).toContain("2267.00000000 remains unexplained");
+    expect(result.circuitBreakerTripped).toBe(true);
+    expect((await readCircuitBreaker(db, ACCOUNT))?.state).toBe("tripped");
+  });
+});
+
+// ===========================================================================
+// The per-asset activity window (the double-counted lifetime activity, step 24)
+// ===========================================================================
+
+/**
+ * `recordedActivity` used to window its trade query from the account's OLDEST
+ * snapshot and hand every asset that one lifetime sum, which the caller then
+ * added to a five-minute-old baseline that already contained it.
+ *
+ * Measured live on `gemini-main` before the fix: the reported discrepancy was
+ * exactly the account's lifetime net activity, negated, on every pass --
+ * +0.00149818 BTC and 96.24 USD, the latter at 0.0965% of balance against a
+ * 0.1% meaningful threshold, climbing with every fill.
+ *
+ * These use the real shape: an OLDER snapshot, a trade after it, then the
+ * baseline that already reflects that trade. With one snapshot only, oldest and
+ * baseline are the same row and the bug is invisible -- which is why every
+ * existing test in this file passed both before and after the fix.
+ */
+describe("the activity window is each asset's own baseline", () => {
+  const OLDEST = T0 - 900_000;
+  const BASELINE = T0 - 300_000;
+
+  beforeEach(async () => {
+    await seedBot("dca-btc-1");
+    snapshots.set("dca-btc-1", snapshotFor("dca-btc-1"));
+    await db.orders.insert(
+      orderRow({ id: "ord-1", bot_instance_id: "dca-btc-1", side: "buy", status: "filled" }),
+    );
+  });
+
+  /** A snapshot pair with a trade settled BETWEEN them. */
+  async function tradeBeforeBaseline(): Promise<void> {
+    await seedBaseline("USDT", "5000", OLDEST);
+    await seedBaseline("BTC", "0", OLDEST);
+    await db.trades.insert(
+      tradeRow({
+        id: "trd-old",
+        order_id: "ord-1",
+        bot_instance_id: "dca-btc-1",
+        price: m("65000"),
+        quantity: m("0.01"),
+        fee_amount: ZERO,
+        fee_asset: "USDT",
+        fee_reporting_amount: null,
+        fee_reporting_asset: null,
+        fee_conversion_rate: null,
+        executed_at: OLDEST + 120_000,
+      }),
+    );
+    // The baseline the pass will subtract from ALREADY reflects that buy:
+    // 5000 - 650 = 4350 USDT, and 0.01 BTC in.
+    await seedBaseline("USDT", "4350", BASELINE);
+    await seedBaseline("BTC", "0.01", BASELINE);
+  }
+
+  it("does not count a trade the baseline already contains", async () => {
+    await tradeBeforeBaseline();
+    // Nothing has happened since the baseline, so nothing is unexplained.
+    exchange.balances = [
+      { asset: "USDT", free: m("4350"), locked: ZERO },
+      { asset: "BTC", free: m("0.01"), locked: ZERO },
+    ];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.findings).toEqual([]);
+    expect(result.tier).toBeNull();
+    expect(result.circuitBreakerTripped).toBe(false);
+    const rows = await db.balanceSnapshots.findMany({
+      where: { reconciliation_run_id: result.runId },
+    });
+    // The predicted balance is the baseline itself, unmoved.
+    expect(rows.find((row) => row.asset === "USDT")!.internal_calculated_balance).toBe(m("4350"));
+    expect(rows.every((row) => row.discrepancy === ZERO)).toBe(true);
+  });
+
+  it("still counts a trade that settled after the baseline", async () => {
+    // The window must exclude the past without excluding the present.
+    await tradeBeforeBaseline();
+    await db.trades.insert(
+      tradeRow({
+        id: "trd-new",
+        order_id: "ord-1",
+        exchange_trade_id: "556678",
+        bot_instance_id: "dca-btc-1",
+        price: m("65000"),
+        quantity: m("0.01"),
+        fee_amount: ZERO,
+        fee_asset: "USDT",
+        fee_reporting_amount: null,
+        fee_reporting_asset: null,
+        fee_conversion_rate: null,
+        executed_at: BASELINE + 60_000,
+      }),
+    );
+    exchange.balances = [
+      { asset: "USDT", free: m("3700"), locked: ZERO }, // 4350 - 650
+      { asset: "BTC", free: m("0.02"), locked: ZERO }, // 0.01 + 0.01
+    ];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.findings).toEqual([]);
+    const rows = await db.balanceSnapshots.findMany({
+      where: { reconciliation_run_id: result.runId },
+    });
+    expect(rows.find((row) => row.asset === "USDT")!.internal_calculated_balance).toBe(m("3700"));
+    expect(rows.find((row) => row.asset === "BTC")!.internal_calculated_balance).toBe(m("0.02"));
+  });
+
+  it("reports real drift against the baseline, not against lifetime activity", async () => {
+    await tradeBeforeBaseline();
+    // 1000 USDT left that nothing explains. The finding must be that 1000 --
+    // not 1000 plus the 650 the baseline already absorbed.
+    exchange.balances = [
+      { asset: "USDT", free: m("3350"), locked: ZERO },
+      { asset: "BTC", free: m("0.01"), locked: ZERO },
+    ];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const rows = await db.balanceSnapshots.findMany({
+      where: { reconciliation_run_id: result.runId },
+    });
+    expect(rows.find((row) => row.asset === "USDT")!.discrepancy).toBe(m("-1000"));
+  });
+
+  it("lets an old unattributable trade go, instead of blinding the asset forever", async () => {
+    // The `attributed` flag used to be per asset with no timestamp, so a single
+    // unattributable trade suppressed that asset's findings for the rest of the
+    // account's life. Outside the window the baseline absorbed it regardless.
+    await tradeBeforeBaseline();
+    exchange.filtersFailure = { kind: "transport", message: "timeout" };
+    exchange.balances = [
+      { asset: "USDT", free: m("3350"), locked: ZERO },
+      { asset: "BTC", free: m("0.01"), locked: ZERO },
+    ];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    // The filters read really did fail, so `recordedActivity` still reports
+    // that. What must NOT appear is the per-asset refusal to conclude anything,
+    // because no trade inside USDT's window needed those filters.
+    expect(result.skipped.some((entry) => entry.includes("symbol filters"))).toBe(true);
+    expect(
+      result.skipped.some((entry) => entry.includes("balance reconciliation for USDT")),
+    ).toBe(false);
+    expect(result.findings.some((entry) => entry.asset === "USDT")).toBe(true);
   });
 });
