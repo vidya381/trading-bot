@@ -111,7 +111,7 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Bot is no longer halted",
         text:
-          "Missed fills can only be applied to a halted bot, and this one is not halted anymore — it " +
+          "Missed fills can only be applied to a halted bot, and this one is not halted anymore. It " +
           "was probably resumed since this page loaded. Nothing was written. Repairing the books " +
           "underneath a live pipeline would race the bot's own order handling, which is why the " +
           "backend refuses it. Halt the bot again if you still want to repair it.",
@@ -143,7 +143,7 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Session expired",
         text:
-          "Your Cloudflare Access session has expired — reload to sign in again. Nothing was written.",
+          "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was written.",
       };
     }
     if (error.code === "network_error" || error.code === "bad_response") {
@@ -152,7 +152,7 @@ function outcomeForError(error: unknown): Outcome {
       return {
         kind: "message",
         tone: "warning",
-        title: "Outcome unknown — couldn’t confirm",
+        title: "Outcome unknown, couldn’t confirm",
         text:
           `${error.message}. The request may or may not have reached the bot, so some fills may ` +
           "already have been recorded. Running this again is SAFE: the repair deduplicates on the " +
@@ -192,14 +192,14 @@ function summarise(result: MissedFillsResult): { tone: OutcomeTone; title: strin
   if (applied > 0) {
     return {
       tone: "warning",
-      title: `Recorded ${fills} — ${orders} could not be applied`,
+      title: `Recorded ${fills}, ${orders} could not be applied`,
       lead: "This repair is INCOMPLETE. What was applied is listed below; so is what was not, with the backend's own reason for each.",
     };
   }
   if (skipped > 0) {
     return {
       tone: "warning",
-      title: `Nothing recorded — ${orders} could not be applied`,
+      title: `Nothing recorded, ${orders} could not be applied`,
       lead: "No execution was applied. Every order is listed below with the reason it could not be read or could not be repaired.",
     };
   }
@@ -208,8 +208,8 @@ function summarise(result: MissedFillsResult): { tone: OutcomeTone; title: strin
     title: "Nothing to apply",
     lead:
       "Every order the bot still believes open was read successfully, and the exchange reported no " +
-      "execution that is not already recorded. Either the drift was already repaired (this operation " +
-      "is idempotent, so a second run applies nothing) or the orders really are still resting.",
+      "execution that is not already recorded. Either the drift was already repaired (a second run " +
+      "applies nothing) or the orders really are still resting.",
   };
 }
 
@@ -267,7 +267,7 @@ function SkippedList({ skipped }: { skipped: readonly string[] }) {
        */}
       <p className="mt-1.5 text-[0.75rem] leading-snug text-amber-200/70">
         A line here means the drift on that order is still open. An order that could not be read, or
-        whose response carried no per-fill detail, is reported as <em>unread</em> — that is not the
+        whose response carried no per-fill detail, is reported as <em>unread</em>. That is not the
         same as “it did not fill”, and it is not safe to treat it as one. Reconciliation will keep
         raising the finding until it is genuinely resolved.
       </p>
@@ -291,7 +291,7 @@ function ResultBanner({ result, isGrid }: { result: MissedFillsResult; isGrid: b
       {repairedGridRungs && (
         <p className="mt-3 rounded border border-amber-500/25 bg-amber-500/5 px-2 py-1.5 text-[0.8125rem] leading-snug text-amber-100/90">
           <span className="font-medium">The ladder is now short those rungs.</span> No paired
-          replacement sell was placed for any of the fills above, and none will be placed later —
+          replacement sell was placed for any of the fills above, and none will be placed later;
           resuming this bot does not re-place them. Check the ladder below: each repaired level now
           shows the acquired base and its cost with an empty rung, which is the truth. Re-placing
           those levels is a separate, manual decision.
@@ -299,7 +299,7 @@ function ResultBanner({ result, isGrid }: { result: MissedFillsResult; isGrid: b
       )}
 
       <p className="mt-3 text-[0.8125rem] leading-snug opacity-90">
-        The bot is still <span className="font-medium">{result.status}</span> — this never changes a
+        The bot is still <span className="font-medium">{result.status}</span>. This never changes a
         bot's status. Resuming stays a separate action. The repair is recorded in the audit log
         against your Access identity.
       </p>
@@ -392,7 +392,7 @@ function ConfirmDialog({
                 <p className="mt-0.5 text-zinc-400">
                   Each missed fill is recorded as a real trade, its grid level is marked filled, and
                   the ladder's held quantity and cost move by exactly what the exchange says
-                  executed — through the same code the live fill path uses, with no separate
+                  executed, through the same code the live fill path uses, with no separate
                   arithmetic.
                 </p>
               </div>
@@ -403,7 +403,7 @@ function ConfirmDialog({
                 </div>
                 <p className="mt-1 leading-snug">
                   When a grid buy level fills normally, the bot immediately places a sell one rung
-                  above it — that is how a grid recycles. This repair suppresses that placement.
+                  above it. That is how a grid recycles, and this repair suppresses that placement.
                   Every level repaired here comes back with the buy recorded and{" "}
                   <span className="font-semibold">its rung empty</span>, and nothing will fill that
                   gap later: the initial ladder is only ever placed once, so resuming this bot does
@@ -415,7 +415,7 @@ function ConfirmDialog({
                   oversight.</span>{" "}
                   Placing a live order from inside a correction endpoint, on a bot that may still be
                   halted, would put real orders on the exchange without the consent you withheld by
-                  leaving it halted — resuming trading through the back door. A repair writes books;
+                  leaving it halted. That is resuming trading through the back door. A repair writes books;
                   it does not trade.
                 </p>
                 <p className="mt-2 leading-snug text-amber-200/80">
@@ -432,7 +432,7 @@ function ConfirmDialog({
                 Each missed fill is recorded as a real trade and applied as an entry in this DCA
                 cycle, so the held quantity, the cost, and the{" "}
                 <span className="text-zinc-200">average entry price</span> are recalculated to
-                include it — through the same code the live fill path uses, with no separate
+                include it, through the same code the live fill path uses, with no separate
                 arithmetic. The take-profit target this cycle is measured against moves with that
                 average.
               </p>
@@ -566,7 +566,7 @@ export function ApplyMissedFillsAction({
           <p className="mt-0.5 text-xs text-zinc-500">
             This bot has {driftAlerts.length === 1 ? "an open" : `${driftAlerts.length} open`}{" "}
             order-state-drift {driftAlerts.length === 1 ? "finding" : "findings"}: the exchange and
-            this system disagree about an order. Reconciliation never corrects that on its own — it
+            this system disagree about an order. Reconciliation never corrects that on its own; it
             halts and waits for a person.
           </p>
         </div>
@@ -599,8 +599,8 @@ export function ApplyMissedFillsAction({
             Missed fills can only be applied to a <span className="text-zinc-200">halted</span> bot,
             and the backend refuses anything else. A repair writes trades and moves the position
             while the bot's own pipeline may be doing the same thing on the next candle; the two
-            would race, and the books are exactly what is already in doubt. Halt this bot — or let
-            reconciliation halt it — and the action will appear here.
+            would race, and the books are exactly what is already in doubt. Halt this bot, or let
+            reconciliation halt it, and the action will appear here.
           </p>
         </div>
       )}

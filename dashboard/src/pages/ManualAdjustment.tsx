@@ -81,7 +81,7 @@ function validate(
   // Note is REQUIRED by the backend (requireString) and by section 8.6, so it is
   // enforced here too -- a manual adjustment with no explanation is the thing
   // reconciliation will later have to make sense of.
-  if (note.trim() === "") errors.note = "Required — say what this movement was.";
+  if (note.trim() === "") errors.note = "Required. Say what this movement was.";
   return errors;
 }
 
@@ -118,7 +118,7 @@ function describeError(error: unknown): Outcome {
       case "invalid_amount":
         return {
           tone: "error",
-          title: "A field was rejected",
+          title: "The server rejected a field",
           body: `${error.message} Nothing was logged.`,
         };
       case "no_schema":
@@ -131,7 +131,7 @@ function describeError(error: unknown): Outcome {
         return {
           tone: "error",
           title: "Session expired",
-          body: "Your Cloudflare Access session has expired — reload to sign in again. Nothing was logged.",
+          body: "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was logged.",
         };
       case "network_error":
       case "bad_response":
@@ -141,8 +141,8 @@ function describeError(error: unknown): Outcome {
         // here. Say exactly that rather than inviting a blind retry.
         return {
           tone: "warning",
-          title: "Couldn’t confirm — the adjustment may or may not have been logged",
-          body: "The request failed before a result came back, and there’s no way to check from the dashboard (this endpoint has no read/list yet). Don’t simply resubmit — logging again could create a duplicate. Reconcile against the exchange, or check with whoever manages the database, before logging the same movement a second time.",
+          title: "Couldn’t confirm: the adjustment may or may not have been logged",
+          body: "The request failed before a result came back, and there’s no way to check from the dashboard (this endpoint has no read/list yet). Don’t simply resubmit: logging again could create a duplicate. Reconcile against the exchange, or check with whoever manages the database, before logging the same movement a second time.",
         };
       default:
         return { tone: "error", title: "Couldn’t log the adjustment", body: `${error.message} Nothing was logged.` };
@@ -237,7 +237,7 @@ export function ManualAdjustment() {
     if (Object.keys(errors).length > 0) {
       setOutcome({
         tone: "error",
-        title: "Some fields need attention",
+        title: "A few fields need fixing",
         body: "Fix the highlighted fields, then log the adjustment. Nothing was submitted.",
       });
       return;
@@ -382,7 +382,7 @@ export function ManualAdjustment() {
             label="Amount"
             htmlFor="magnitude"
             error={fieldErrors.amount}
-            help="How much moved, as a positive number. The sign is set by the direction above — don’t type a minus."
+            help="How much moved, as a positive number. The sign is set by the direction above, so don’t type a minus."
           >
             <input
               id="magnitude"
@@ -416,8 +416,9 @@ export function ManualAdjustment() {
                 <span className="tabular font-semibold">
                   {direction === "withdrawal" ? "−" : "+"}
                   {formatQuantity(magnitude.trim())} {asset.trim() || "…"}
-                </span>{" "}
-                — {direction === "withdrawal" ? "withdrawal (funds leaving the account)" : "deposit (funds entering the account)"}
+                </span>
+                ,{" "}
+                {direction === "withdrawal" ? "withdrawal (funds leaving the account)" : "deposit (funds entering the account)"}
               </>
             ) : (
               "Choose a direction and enter an amount to see exactly what will be logged."

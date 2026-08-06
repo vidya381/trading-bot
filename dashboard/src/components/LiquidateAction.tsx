@@ -67,13 +67,13 @@ function outcomeForResult(action: string, amount: string, asset: string): Outcom
         title: "Liquidation order placed",
         text:
           `A limit sell of ${amount} ${asset} was placed at the current market price. The bot stays ` +
-          `halted. The order is usually marketable, but on a fast move it may rest until it fills — ` +
-          `watch this bot's order history and alerts to confirm it completed.`,
+          `halted. The order is usually marketable, but on a fast move it may rest until it fills. ` +
+          `Watch this bot's order history and alerts to confirm it completed.`,
       };
     case "no_price":
       return {
         tone: "warning",
-        title: "Nothing sold — no current price",
+        title: "Nothing sold: no current price",
         text:
           `A current price could not be read, so nothing was sold. The position (${amount} ${asset}) is ` +
           `still held on the halted bot and a critical alert was raised. Try again once the exchange is ` +
@@ -83,7 +83,7 @@ function outcomeForResult(action: string, amount: string, asset: string): Outcom
       return {
         tone: "info",
         title: "Nothing to liquidate",
-        text: "The position is already flat — there was nothing to sell.",
+        text: "The position is already flat, so there was nothing to sell.",
       };
     case "hold":
       return {
@@ -110,8 +110,8 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Bot is no longer halted",
         text:
-          "This bot is not halted anymore — it may have resumed since the page loaded. Liquidation only " +
-          "applies to a halted bot; nothing was sold. The view will refresh to its current state.",
+          "This bot is not halted anymore; it may have resumed since the page loaded. Liquidation only " +
+          "applies to a halted bot, and nothing was sold. The view will refresh to its current state.",
       };
     }
     if (error.code === "not_attached") {
@@ -127,7 +127,7 @@ function outcomeForError(error: unknown): Outcome {
       return {
         tone: "error",
         title: "Session expired",
-        text: "Your Cloudflare Access session has expired — reload to sign in again. Nothing was sold.",
+        text: "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was sold.",
       };
     }
     return {
@@ -203,7 +203,7 @@ function ConfirmDialog({
           <p>
             This sells the entire held position as a <span className="font-medium">limit order at the
             current market price</span>. The bot <span className="font-medium">stays halted</span>{" "}
-            afterwards — liquidating does not resume it or release its capital.
+            afterwards. Liquidating does not resume it or release its capital.
           </p>
           <p className="text-red-300">
             This is a real, irreversible order once live funds are involved.

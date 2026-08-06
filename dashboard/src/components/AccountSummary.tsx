@@ -121,7 +121,7 @@ function AssetStrip({ totals, showHeading }: { totals: AssetTotals; showHeading:
         </Tile>
         <Tile
           label="Fees paid"
-          hint={totals.gaps.unpricedFills > 0 ? "at least — some unpriced" : undefined}
+          hint={totals.gaps.unpricedFills > 0 ? "a floor; some fees unpriced" : undefined}
         >
           <Money value={totals.feesReported} asset={asset} />
         </Tile>

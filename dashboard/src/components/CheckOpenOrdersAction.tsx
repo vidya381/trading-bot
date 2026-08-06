@@ -97,9 +97,9 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "This bot has been stopped",
         text:
-          "A stopped bot has no open orders to check — its capital has already been released back " +
-          "to the ledger, so a pass would be work whose result nothing may use. Nothing was " +
-          "written. This most likely means the bot was closed since this page loaded.",
+          "A stopped bot has no open orders to check. Its capital has already been released back to " +
+          "the ledger, so a pass would produce a result nothing can use. Nothing was written. " +
+          "This most likely means the bot was closed since this page loaded.",
       };
     }
     if (error.code === "not_attached") {
@@ -128,14 +128,14 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Session expired",
         text:
-          "Your Cloudflare Access session has expired — reload to sign in again. Nothing was written.",
+          "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was written.",
       };
     }
     if (error.code === "network_error" || error.code === "bad_response") {
       return {
         kind: "message",
         tone: "warning",
-        title: "Outcome unknown — couldn’t confirm",
+        title: "Outcome unknown, couldn’t confirm",
         text:
           `${error.message}. The request may or may not have reached the bot, so a fill may already ` +
           "have been recorded. Running this again is SAFE: applied fills deduplicate on the " +
@@ -163,7 +163,7 @@ function summarise(result: OrderCheckResult): { tone: OutcomeTone; title: string
   if (result.deferred) {
     return {
       tone: "info",
-      title: "Didn’t look — another pass was already running",
+      title: "Didn’t look: another pass was already running",
       lead:
         "This pass stood aside rather than reading the books underneath something that was already " +
         "changing them (a price update, a halt, or a fill arriving). Nothing was read and nothing " +
@@ -180,7 +180,7 @@ function summarise(result: OrderCheckResult): { tone: OutcomeTone; title: string
   if (skipped > 0 && applied === 0 && closed === 0) {
     return {
       tone: "warning",
-      title: `Nothing recorded — ${orders} could not be accounted for`,
+      title: `Nothing recorded, ${orders} could not be accounted for`,
       lead:
         "The books are still behind the exchange. Each order is listed below with the backend's own " +
         "reason: either it could not be read at all, or it was read and this pass deliberately " +
@@ -190,7 +190,7 @@ function summarise(result: OrderCheckResult): { tone: OutcomeTone; title: string
   if (skipped > 0) {
     return {
       tone: "warning",
-      title: `Recorded ${fills} — ${orders} could not be accounted for`,
+      title: `Recorded ${fills}, ${orders} could not be accounted for`,
       lead: "This pass is INCOMPLETE. What moved is listed below; so is what did not, with the reason for each.",
     };
   }
@@ -272,9 +272,9 @@ function ResultBanner({ result, isGrid }: { result: OrderCheckResult; isGrid: bo
           </ul>
           <p className="mt-1.5 text-[0.75rem] leading-snug text-zinc-400">
             These ended cancelled, expired or rejected on the exchange and this system still believed
-            them open. An order is only ever closed here when the filled quantities agree — one that
+            them open. An order is only ever closed here when the filled quantities agree. One that
             ended with more filled than was recorded is left open and reported below instead, because
-            a terminal order can never accept the missing fill afterwards.
+            an order that has already finished can never accept the missing fill afterwards.
           </p>
         </div>
       )}
@@ -297,7 +297,7 @@ function ResultBanner({ result, isGrid }: { result: OrderCheckResult; isGrid: bo
           <p className="mt-1.5 text-[0.75rem] leading-snug text-amber-200/70">
             Two different things live in this list and the backend words them differently on purpose:
             an order it could not READ (an unreachable venue is never treated as “nothing filled”),
-            and an order it read and then deliberately REFUSED to act on — a fill with no real
+            and an order it read and then deliberately REFUSED to act on: a fill with no real
             exchange id behind it, or one the order state machine would not accept. The second kind
             is now recorded in the audit log as well.
           </p>
@@ -308,13 +308,13 @@ function ResultBanner({ result, isGrid }: { result: OrderCheckResult; isGrid: bo
         <p className="mt-3 rounded border border-sky-500/25 bg-sky-500/5 px-2 py-1.5 text-[0.8125rem] leading-snug text-sky-100/90">
           <span className="font-medium">Paired replacement sells were placed.</span> This bot is a
           running grid, so each buy folded in above recycled its rung exactly as it would have on a
-          live fill. That is the grid working normally — but it does mean real orders went to the
+          live fill. That is the grid working normally, but it does mean real orders went to the
           exchange from this action. Check the ladder and order history below.
         </p>
       )}
 
       <p className="mt-3 text-[0.8125rem] leading-snug opacity-90">
-        The bot is <span className="font-medium">{result.status}</span> — this never changes a bot's
+        The bot is <span className="font-medium">{result.status}</span>. This never changes a bot's
         status. The pass is recorded in the audit log against your Access identity whenever it moved
         or refused something.
       </p>
@@ -394,8 +394,8 @@ function ConfirmDialog({
               {openOrders} {openOrders === 1 ? "order" : "orders"}
             </span>{" "}
             this bot believes are still resting, and folds in any execution this system has not seen.
-            It is the same pass that normally runs by itself every 30 seconds — running it now is
-            what helps when that automatic pass has backed off or gone blind.
+            It is the same pass that normally runs by itself every 30 seconds. Running it now is what
+            helps when that automatic pass has backed off or gone blind.
           </p>
 
           {willPlaceReplacements ? (
@@ -406,7 +406,7 @@ function ConfirmDialog({
               <p className="mt-1 leading-snug">
                 This bot is a <span className="font-semibold">running grid</span>. If a buy level
                 turns out to have filled while resting, the bot will place the paired sell one rung
-                above it, exactly as it would have the moment the fill arrived — that is how a grid
+                above it, exactly as it would have the moment the fill arrived. That is how a grid
                 recycles, and suppressing it here would leave the ladder silently short a rung.
               </p>
               <p className="mt-2 leading-snug text-amber-200/80">

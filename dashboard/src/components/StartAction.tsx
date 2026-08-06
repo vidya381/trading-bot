@@ -85,7 +85,7 @@ function plannedOrderSummary(bot: BotDetail): string | null {
   }
   const { gridLines, lowerBound, upperBound } = config.params;
   return (
-    `its full ladder — ${gridLines} orders across ` +
+    `its full ladder of ${gridLines} orders across ` +
     `${formatMoney(lowerBound)} – ${formatMoney(upperBound)} ${bot.capitalAsset}`
   );
 }
@@ -98,8 +98,9 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Bot is no longer in the created state",
         text:
-          "This bot is not newly created anymore — it may have been started already since the page " +
-          "loaded. Only a created bot can be started (a halted one is resumed instead); nothing changed. " +
+          "This bot is not newly created anymore; it may have been started already since the page " +
+          "loaded. Only a created bot can be started (a halted one is resumed instead), and nothing " +
+          "changed. " +
           "The view will refresh to its current state.",
       };
     }
@@ -107,7 +108,7 @@ function outcomeForError(error: unknown): Outcome {
       return {
         tone: "error",
         title: "Session expired",
-        text: "Your Cloudflare Access session has expired — reload to sign in again. Nothing was started.",
+        text: "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was started.",
       };
     }
     return {
@@ -190,7 +191,7 @@ function ConfirmDialog({
           </p>
           <div className="rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[0.8125rem] text-amber-200/90">
             This commits real capital. Starting subscribes the bot to the live price feed, and the
-            next closed 1-minute candle — normally within a minute — drives a real order on the real
+            next closed 1-minute candle, normally within a minute, drives a real order on the real
             exchange. There is no dry run and no further prompt after this one.
           </div>
         </div>
@@ -260,10 +261,10 @@ export function StartAction({
       if (!mounted.current) return;
       setOutcome({
         tone: "success",
-        title: "Bot started — now running",
+        title: "Bot started, now running",
         text:
           "The status moved to running and the bot is subscribed to the live price feed. Its first " +
-          "order goes to the exchange on the next closed 1-minute candle — watch the orders and " +
+          "order goes to the exchange on the next closed 1-minute candle. Watch the orders and " +
           "alerts below.",
       });
       setDialogOpen(false);

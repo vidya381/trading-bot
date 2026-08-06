@@ -88,7 +88,7 @@ function LoadError({ id, error }: { id: string; error: Error | null }) {
   if (code === "no_schema") {
     return (
       <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-10 text-center text-sm text-zinc-400">
-        This environment has no database schema yet — migrations are deferred to go-live, so there is
+        This environment has no database schema yet. Migrations are deferred to go-live, so there is
         no bot data to show.
       </div>
     );
@@ -97,7 +97,7 @@ function LoadError({ id, error }: { id: string; error: Error | null }) {
   if (code === "unauthenticated") {
     return (
       <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-10 text-center text-sm text-red-300">
-        Your Cloudflare Access session has expired — reload to sign in again.
+        Your Cloudflare Access session has expired. Reload to sign in again.
       </div>
     );
   }
@@ -106,7 +106,7 @@ function LoadError({ id, error }: { id: string; error: Error | null }) {
     <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-10 text-center text-sm text-red-300">
       Couldn’t load this bot: {error?.message ?? "unknown error"}
       <div className="mt-1 text-xs text-red-400/70">
-        If this persists, your Cloudflare Access session may have expired — reload to sign in again.
+        If this persists, your Cloudflare Access session may have expired. Reload to sign in again.
       </div>
     </div>
   );

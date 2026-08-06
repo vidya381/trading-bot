@@ -122,7 +122,7 @@ export function GridLadderView({
 
       {!ladder.placed && (
         <div className="rounded-lg border border-dashed border-zinc-800 px-4 py-3 text-sm text-zinc-500">
-          The initial ladder has not been placed yet (the bot has not started, section 6.2 step 2).
+          The initial ladder hasn’t been placed yet, because the bot hasn’t started.
         </div>
       )}
 

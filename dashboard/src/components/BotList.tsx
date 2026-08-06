@@ -194,7 +194,7 @@ export function BotList({ bots }: { bots: Bot[] }) {
   if (bots.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">
-        No bots yet. Once bots are created they will appear here, across every account.
+        No bots yet. Any bot you create will show up here, across every account.
       </div>
     );
   }

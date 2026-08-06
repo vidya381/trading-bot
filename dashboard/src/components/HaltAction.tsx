@@ -119,11 +119,11 @@ function outcomeForResult(result: HaltResult, openOrders: number): Outcome {
   if (result.action === "already_halted") {
     return {
       tone: "info",
-      title: "Already halted — nothing changed",
+      title: "Already halted, nothing changed",
       text:
         "This bot was halted before this request arrived (something else stopped it, or an earlier " +
-        "click did). Halting an already-halted bot is a deliberate no-op, so no order was cancelled " +
-        "and — the part worth knowing — the reason you just typed was NOT recorded. The bot keeps the " +
+        "click did). Halting an already-halted bot does nothing, on purpose, so no order was " +
+        "cancelled. The part worth knowing: the reason you just typed was NOT recorded. The bot keeps the " +
         `reason from the halt that actually stopped it${result.detail ? `: ${result.detail}` : "."}`,
     };
   }
@@ -138,7 +138,7 @@ function outcomeForResult(result: HaltResult, openOrders: number): Outcome {
       `The bot is stopped and will place no further orders. ${orders} Check the alerts below before ` +
       "assuming the exchange is clear: an order whose cancellation could not be confirmed is left " +
       "open with a cancel_failed alert rather than being assumed cancelled, and this response " +
-      "succeeds either way. The position it was holding is untouched — halting never sells.",
+      "succeeds either way. The position it was holding is untouched. Halting never sells.",
   };
 }
 
@@ -148,7 +148,7 @@ function outcomeForError(error: unknown): Outcome {
     if (error.code === "invalid_status") {
       return {
         tone: "error",
-        title: "Bot is stopped — there is nothing to halt",
+        title: "Bot is stopped, so there is nothing to halt",
         text:
           "This bot is no longer running; it has been stopped since this page loaded, and a stopped " +
           "bot's capital is already released. Nothing was changed. The view will refresh to its " +
@@ -160,7 +160,7 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "A reason is required",
         text:
-          "The halt needs a real explanation — it becomes this bot's recorded halt reason and is what " +
+          "The halt needs a real explanation. It becomes this bot's recorded halt reason and is what " +
           "the next person sees before resuming it. Nothing was changed.",
       };
     }
@@ -178,7 +178,7 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Session expired",
         text:
-          "Your Cloudflare Access session has expired — reload to sign in again. The bot is still " +
+          "Your Cloudflare Access session has expired. Reload to sign in again. The bot is still " +
           "running.",
       };
     }
@@ -188,7 +188,7 @@ function outcomeForError(error: unknown): Outcome {
       // bot without reporting back.
       return {
         tone: "warning",
-        title: "Outcome unknown — couldn’t confirm",
+        title: "Outcome unknown, couldn’t confirm",
         text:
           `${error.message}. The request may or may not have reached the bot, so it may already be ` +
           "halted. Halting again is SAFE: a second halt on an already-halted bot changes nothing. " +
@@ -272,7 +272,7 @@ function ConfirmDialog({
           <p>
             This stops the bot immediately. Its status moves{" "}
             <span className="font-medium">running → halted</span>, it places no further orders, and it
-            is unsubscribed from the live price feed — so the next closed candle drives nothing.
+            is unsubscribed from the live price feed, so the next closed candle drives nothing.
           </p>
 
           <div className="rounded-md border border-red-500/30 bg-red-500/[0.07] px-3 py-2 text-[0.8125rem]">
@@ -287,7 +287,7 @@ function ConfirmDialog({
                   "Halting still stops it from placing anything new."
                 : `Halting cancels every order this ${strategyLabel} bot has resting on the exchange. ` +
                   "That is not reversible by resuming: resuming re-enters the execution path and " +
-                  "decides afresh from the position the bot holds then — it does not put the " +
+                  "decides afresh from the position the bot holds then. It does not put the " +
                   "cancelled orders back."}
             </p>
             {openOrders > 0 && (
@@ -308,12 +308,12 @@ function ConfirmDialog({
             <div className="font-medium text-zinc-200">The position is NOT sold</div>
             <p className="mt-0.5 leading-snug text-zinc-400">
               {holdsPosition
-                ? "This bot is holding a position, and it keeps it — halting stops trading, it does " +
+                ? "This bot is holding a position, and it keeps it. Halting stops trading, it does " +
                   "not exit. The position stays exposed to the market with no bot managing it, and " +
                   "its capital stays reserved. Selling out is a separate action (Liquidate), which " +
                   "becomes available once the bot is halted."
                 : "Halting stops trading; it never sells. This bot is flat right now, so there is " +
-                  "nothing to exit — but its allocated capital stays reserved either way. Releasing " +
+                  "nothing to exit, but its allocated capital stays reserved either way. Releasing " +
                   "it is a close, a different action again."}
             </p>
           </div>
@@ -321,7 +321,7 @@ function ConfirmDialog({
           <div className="rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[0.8125rem] text-amber-200/90">
             <span className="font-medium">Coming back is a separate, deliberate action.</span> A halt
             never auto-resumes. Resuming is its own decision, taken after review, and it commits real
-            capital again — it re-subscribes the bot to the feed and re-enters the same live execution
+            capital again: it re-subscribes the bot to the feed and re-enters the same live execution
             path. It also asserts both risk latches, so it is blocked entirely while the global kill
             switch is pulled or this account's circuit breaker is tripped. Halting is not.
           </div>
@@ -371,7 +371,7 @@ function ConfirmDialog({
           </div>
           {!canSubmit && !submitting && (
             <p className="text-right text-xs text-zinc-600">
-              Enter a reason to enable. The backend refuses an empty one.
+              Enter a reason to enable. An empty one won’t be accepted.
             </p>
           )}
         </form>

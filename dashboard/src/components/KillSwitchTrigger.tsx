@@ -60,15 +60,15 @@ function outcomeForResult(result: GlobalTripResult): Outcome {
   const halted = result.haltedBotIds.length;
   const failed = result.failures.length;
   const title = result.newlyTripped
-    ? `Kill switch pulled — ${halted} bot${halted === 1 ? "" : "s"} halted`
-    : `Already tripped — re-swept, ${halted} bot${halted === 1 ? "" : "s"} halted`;
+    ? `Kill switch pulled, ${halted} bot${halted === 1 ? "" : "s"} halted`
+    : `Already tripped, re-swept: ${halted} bot${halted === 1 ? "" : "s"} halted`;
   return {
     tone: failed > 0 ? "warning" : "success",
     title,
     text:
       failed > 0
-        ? `${failed} bot${failed === 1 ? "" : "s"} could NOT be reached and may still be trading — ` +
-          `see the list below. Pulling again re-sweeps them (it is safe and idempotent). No bot on any ` +
+        ? `${failed} bot${failed === 1 ? "" : "s"} could NOT be reached and may still be trading. ` +
+          `See the list below. Pulling again re-sweeps them, and pulling twice is safe. No bot on any ` +
           `account can be created or resumed until the switch is reset.`
         : `Every active bot on every account was halted. No bot can be created or resumed until the ` +
           `switch is reset.`,
@@ -84,11 +84,11 @@ function outcomeForError(error: unknown): Outcome {
     if (error.code === "network_error" || error.code === "bad_response") {
       return {
         tone: "warning",
-        title: "Outcome unknown — could not confirm",
+        title: "Outcome unknown, could not confirm",
         text:
           "The request failed before a result came back. The switch may already be tripped and some " +
-          "bots may already be halted, or nothing may have happened. Pulling again is safe (the action " +
-          "is idempotent); the status above will refresh to show the true state.",
+          "bots may already be halted, or nothing may have happened. Pulling again is safe, and the " +
+          "status above will refresh to show the true state.",
       };
     }
     if (error.code === "no_schema" || error.code === "kill_switch_unavailable") {
@@ -96,8 +96,8 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Nothing to halt in this environment",
         text:
-          "This environment has no bots to halt yet — its database schema (and exchange) are not " +
-          "provisioned until go-live. Nothing was changed.",
+          "This environment has no bots to halt yet. Its database schema (and exchange) are not set " +
+          "up until go-live. Nothing was changed.",
       };
     }
     if (error.code === "missing_field" || error.code === "requires_reason") {
@@ -120,7 +120,7 @@ function outcomeForError(error: unknown): Outcome {
       return {
         tone: "error",
         title: "Session expired",
-        text: "Your Cloudflare Access session has expired — reload to sign in again. Nothing was changed.",
+        text: "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was changed.",
       };
     }
     return { tone: "error", title: "Pull failed", text: `${error.message} Nothing was changed.` };
@@ -174,7 +174,7 @@ function OutcomeView({ outcome }: { outcome: Outcome }) {
                       <span aria-hidden>✗ </span>
                       {failure.botInstanceId}
                     </span>
-                    <span className="text-red-200/70"> — {failure.message}</span>
+                    <span className="text-red-200/70">: {failure.message}</span>
                   </li>
                 ))}
               </ul>
@@ -246,7 +246,7 @@ export function KillSwitchTrigger({
               Reason <span className="text-red-400">*</span>
             </label>
             <p className="mt-0.5 text-xs text-zinc-500">
-              Recorded permanently — this is the record of why the switch was pulled.
+              Recorded permanently. This is the record of why the switch was pulled.
             </p>
             <textarea
               id="ks-reason"
@@ -296,7 +296,7 @@ export function KillSwitchTrigger({
                 aria-hidden
               />
             )}
-            {submitting ? "Halting every bot…" : "Trip kill switch — halt every bot"}
+            {submitting ? "Halting every bot…" : "Trip kill switch and halt every bot"}
           </button>
           {!canSubmit && !submitting && (
             <p className="text-xs text-zinc-600">

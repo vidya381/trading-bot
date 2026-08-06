@@ -25,17 +25,17 @@ interface BannerStyle {
 
 const STYLES: Record<Environment, BannerStyle> = {
   testnet: {
-    label: "TESTNET — NOT REAL MONEY",
+    label: "TESTNET: NOT REAL MONEY",
     className: "bg-amber-400 text-amber-950",
     prominent: true,
   },
   development: {
-    label: "LOCAL DEVELOPMENT — NOT A DEPLOYED ENVIRONMENT",
+    label: "LOCAL DEVELOPMENT: NOT A DEPLOYED ENVIRONMENT",
     className: "bg-violet-500 text-violet-50",
     prominent: true,
   },
   production: {
-    label: "PRODUCTION — LIVE FUNDS",
+    label: "PRODUCTION: LIVE FUNDS",
     className: "bg-zinc-800 text-zinc-300 border-b border-zinc-700",
     prominent: false,
   },

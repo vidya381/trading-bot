@@ -90,7 +90,7 @@ export function Dashboard() {
         <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-10 text-center text-sm text-red-300">
           Couldn’t load bots: {botsPoll.error?.message}
           <div className="mt-1 text-xs text-red-400/70">
-            If this persists, your Cloudflare Access session may have expired — reload to sign in again.
+            If this persists, your Cloudflare Access session may have expired. Reload to sign in again.
           </div>
         </div>
       ) : (

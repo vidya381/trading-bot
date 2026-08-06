@@ -88,7 +88,7 @@ function StatusCard({ status }: { status: KillSwitchStatus }) {
       </div>
       <p className="mt-2 text-sm text-zinc-300">
         Normal operation. All bots run under their own controls. Trip the switch below only in a genuine
-        emergency — it halts everything, everywhere, at once.
+        emergency. It halts everything, everywhere, at once.
       </p>
       {status.resetAt !== null && (
         <p className="mt-2 text-xs text-zinc-500">
@@ -105,7 +105,7 @@ function LoadState({ error }: { error: Error }) {
   if (code === "no_schema" || code === "kill_switch_unavailable") {
     return (
       <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-8 text-center text-sm text-zinc-400">
-        This environment is not provisioned yet — its database schema is deferred to go-live, so there is
+        This environment is not set up yet. Its database schema is deferred to go-live, so there is
         no kill-switch state to show. This is expected on a fresh production deploy.
       </div>
     );
@@ -113,7 +113,7 @@ function LoadState({ error }: { error: Error }) {
   if (code === "unauthenticated") {
     return (
       <div className="rounded-xl border border-red-500/30 bg-red-500/5 px-4 py-8 text-center text-sm text-red-300">
-        Your Cloudflare Access session has expired — reload to sign in again.
+        Your Cloudflare Access session has expired. Reload to sign in again.
       </div>
     );
   }
@@ -121,7 +121,7 @@ function LoadState({ error }: { error: Error }) {
     <div className="rounded-xl border border-red-500/30 bg-red-500/5 px-4 py-8 text-center text-sm text-red-300">
       Couldn’t load the kill switch: {error.message}
       <div className="mt-1 text-xs text-red-400/70">
-        If this persists, your Cloudflare Access session may have expired — reload to sign in again.
+        If this persists, your Cloudflare Access session may have expired. Reload to sign in again.
       </div>
     </div>
   );

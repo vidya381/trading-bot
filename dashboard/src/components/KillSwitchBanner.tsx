@@ -44,7 +44,7 @@ export function KillSwitchBanner() {
         <span className="min-w-0 flex-1 text-sm text-red-100">
           {status.reason ?? "no reason recorded"}
           <span className="text-red-200/80">
-            {" — by "}
+            {". Pulled by "}
             {status.trippedBy ?? "unknown"} at {formatDateTime(status.trippedAt)}. Every bot is halted;
             none can create or resume until reset.
           </span>

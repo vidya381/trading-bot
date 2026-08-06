@@ -177,7 +177,7 @@ function describeError(error: unknown, id: string, account: string, asset: strin
         return {
           tone: "error",
           title: "Not enough available capital",
-          text: `${error.message} No bot was created — lower the allocated amount or free up capital on this account.`,
+          text: `${error.message} No bot was created. Lower the allocated amount, or free up capital on this account.`,
         };
       case "exceeds_allocated_capital":
         // A DIFFERENT refusal from insufficient_capital: the config would out-spend
@@ -234,7 +234,7 @@ function describeError(error: unknown, id: string, account: string, asset: strin
       case "invalid_parameter":
         return {
           tone: "error",
-          title: "A parameter was rejected",
+          title: "The server rejected a parameter",
           text: `${error.message} No bot was created.`,
         };
       case "invalid_amount":
@@ -243,7 +243,7 @@ function describeError(error: unknown, id: string, account: string, asset: strin
       case "invalid_strategy":
         return {
           tone: "error",
-          title: "A field was rejected",
+          title: "The server rejected a field",
           text: `${error.message} No bot was created.`,
         };
       case "network_error":
@@ -253,14 +253,14 @@ function describeError(error: unknown, id: string, account: string, asset: strin
         // as duplicate_bot_instance rather than making a second bot.
         return {
           tone: "warning",
-          title: "Couldn’t confirm — the bot may or may not have been created",
-          text: `The request failed before a result came back. Check the bot list: if "${id}" is there, it was created. Submitting again with the same ID is safe — a duplicate would be reported rather than making a second bot.`,
+          title: "Couldn’t confirm: the bot may or may not have been created",
+          text: `The request failed before a result came back. Check the bot list: if "${id}" is there, it was created. Submitting again with the same ID is safe: a duplicate would be reported rather than making a second bot.`,
         };
       case "unauthenticated":
         return {
           tone: "error",
           title: "Session expired",
-          text: "Your Cloudflare Access session has expired — reload to sign in again. No bot was created.",
+          text: "Your Cloudflare Access session has expired. Reload to sign in again. No bot was created.",
         };
       default:
         return { tone: "error", title: "Creation failed", text: `${error.message} No bot was created.` };
@@ -423,7 +423,7 @@ function describeSymbolsError(error: unknown, accountLabel: string): Outcome {
         return {
           tone: "warning",
           title: "This exchange couldn’t be reached",
-          text: `We couldn’t load the tradable pairs for “${accountLabel}” — this is most likely a connectivity issue on our end reaching the exchange, not anything you did. Try again, or pick a different account.`,
+          text: `We couldn’t load the tradable pairs for “${accountLabel}”. This is most likely a connection problem on our end reaching the exchange, not anything you did. Try again, or pick a different account.`,
         };
       case "unknown_account":
         return {
@@ -435,7 +435,7 @@ function describeSymbolsError(error: unknown, accountLabel: string): Outcome {
         return {
           tone: "error",
           title: "Session expired",
-          text: "Your Cloudflare Access session has expired — reload to sign in again.",
+          text: "Your Cloudflare Access session has expired. Reload to sign in again.",
         };
       default:
         return {
@@ -500,7 +500,7 @@ function AccountSelect({
       label="Account"
       htmlFor="accountLabel"
       required
-      help="Which registered exchange account this bot trades on — its exchange and capital ledger come with it."
+      help="Which registered exchange account this bot trades on. Its exchange and capital ledger come with it."
       error={fieldError}
     >
       {loading ? (
@@ -518,7 +518,8 @@ function AccountSelect({
         </div>
       ) : accounts.length === 0 ? (
         <div className="mt-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
-          No accounts are registered yet. Register one (see docs/d1-provisioning.md) before creating a bot.
+          No accounts are registered yet, and a bot has to be created on one. Registering an account
+          happens outside this dashboard, so ask whoever looks after this system to add one.
         </div>
       ) : (
         <select
@@ -552,7 +553,7 @@ function ExchangeDisplay({ exchange }: { exchange: string }) {
   return (
     <div>
       <div className="text-sm font-medium text-zinc-300">Exchange</div>
-      <p className="mt-0.5 text-xs text-zinc-500">Set by the account you pick — shown to confirm the venue, not chosen.</p>
+      <p className="mt-0.5 text-xs text-zinc-500">Set by the account you pick. Shown to confirm the venue, not chosen.</p>
       <div className={[INPUT_BASE, "flex items-center border-zinc-800 bg-zinc-950/60"].join(" ")}>
         {exchange === "" ? (
           <span className="text-zinc-600">Select an account first</span>
@@ -728,7 +729,7 @@ function PairCombobox({
           })}
           {matches.length > shown.length && (
             <li className="px-3 py-1.5 text-xs text-zinc-500">
-              {(matches.length - shown.length).toLocaleString()} more — keep typing to narrow the list.
+              {(matches.length - shown.length).toLocaleString()} more. Keep typing to narrow the list.
             </li>
           )}
         </ul>
@@ -827,7 +828,7 @@ export function CreateBot() {
         setAccountsError(
           error instanceof ApiError
             ? `Couldn’t load accounts: ${error.message}`
-            : "Couldn’t load accounts — check your connection and try again.",
+            : "Couldn’t load accounts. Check your connection and try again.",
         );
         setAccountsLoading(false);
       });
@@ -1001,7 +1002,7 @@ export function CreateBot() {
     if (Object.keys(errors).length > 0) {
       setOutcome({
         tone: "error",
-        title: "Some fields need attention",
+        title: "A few fields need fixing",
         text: "Fix the highlighted fields, then create the bot. Nothing was submitted.",
       });
       return;
@@ -1018,7 +1019,7 @@ export function CreateBot() {
       setOutcome(describeError(error, botInstanceId.trim(), accountLabel.trim(), capitalAsset.trim()));
       // A taken id is worth pinning to its field as well as the banner.
       if (error instanceof ApiError && (error.code === "duplicate_bot_instance" || error.code === "already_created")) {
-        setFieldErrors((prev) => ({ ...prev, botInstanceId: "Already taken — choose another." }));
+        setFieldErrors((prev) => ({ ...prev, botInstanceId: "Already taken. Choose another." }));
       }
       setSubmitting(false); // stay on the form to correct and retry
     }
@@ -1037,8 +1038,8 @@ export function CreateBot() {
       <div>
         <h1 className="text-xl font-semibold text-zinc-100">Create a bot</h1>
         <p className="mt-1 text-sm text-zinc-400">
-          Configuration is saved and capital is reserved on submit; no orders are placed until the bot is
-          started. Capital is checked against this account’s live ledger by the server.
+          Submitting saves the configuration and reserves the capital. No orders are placed until you start
+          the bot, and the server checks the capital against this account’s live ledger.
         </p>
       </div>
 
@@ -1083,7 +1084,7 @@ export function CreateBot() {
               required
               help={
                 accountLabel === ""
-                  ? "Pick an account first — its tradable pairs load here."
+                  ? "Pick an account first. Its tradable pairs load here."
                   : pairs.length > 0
                     ? `Search ${pairs.length.toLocaleString()} tradable pairs on this account.`
                     : "The account’s live tradable pairs."
@@ -1137,7 +1138,7 @@ export function CreateBot() {
               onChange={setCapitalAsset}
               required
               error={fieldErrors.capitalAsset}
-              help="The quote asset your capital is held in — usually the pair’s quote (USDT)."
+              help="The quote asset your capital is held in, usually the pair’s quote (USDT)."
               list={assetList}
               disabled={submitting}
             />
@@ -1247,7 +1248,7 @@ export function CreateBot() {
                 label="Auto-restart a fresh cycle after take-profit"
                 checked={autoRestart}
                 onChange={setAutoRestart}
-                help="When off, the bot stays stopped after a take-profit exit for human review (spec 6.3)."
+                help="When off, the bot stays stopped after a take-profit exit so a person can review it."
                 disabled={submitting}
               />
             </div>
@@ -1262,7 +1263,7 @@ export function CreateBot() {
                   required
                   numeric
                   error={fieldErrors.lowerBound}
-                  help="Bottom of the grid — the lowest buy line."
+                  help="Bottom of the grid: the lowest buy line."
                   disabled={submitting}
                 />
                 <TextInput
@@ -1273,7 +1274,7 @@ export function CreateBot() {
                   required
                   numeric
                   error={fieldErrors.upperBound}
-                  help="Top of the grid — the highest sell line."
+                  help="Top of the grid: the highest sell line."
                   disabled={submitting}
                 />
               </div>
@@ -1342,7 +1343,7 @@ export function CreateBot() {
                 required
                 numeric
                 error={fieldErrors.dcaTakeProfitPct}
-                help="Rise above average entry that closes the position. Mandatory for DCA — it defines the cycle’s exit."
+                help="Rise above average entry that closes the position. Mandatory for DCA: it defines the cycle’s exit."
                 disabled={submitting}
               />
             </>
@@ -1356,7 +1357,7 @@ export function CreateBot() {
                 required
                 numeric
                 error={fieldErrors.gridStopLossPct}
-                help="Break below the lowest grid line by this % halts the bot. Mandatory."
+                help="Falling this far below the lowest grid line halts the bot. Mandatory."
                 disabled={submitting}
               />
               <TextInput
@@ -1366,7 +1367,7 @@ export function CreateBot() {
                 onChange={setTakeProfitAmount}
                 numeric
                 error={fieldErrors.takeProfitAmount}
-                help="Optional for grid — halts once realized profit reaches this amount (a profit amount, not a percentage). Leave blank to rely on the stop-loss and the breakout exit below."
+                help="Optional for grid. Halts once realized profit reaches this amount (a profit amount, not a percentage). Leave blank to rely on the stop-loss and the breakout exit below."
                 disabled={submitting}
               />
               <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
@@ -1375,7 +1376,7 @@ export function CreateBot() {
                   label="Cash out on an upside breakout"
                   checked={breakoutTakeProfit}
                   onChange={setBreakoutTakeProfit}
-                  help="Recommended (spec default): if price runs above the grid, treat it as a take-profit rather than leaving the bot idle."
+                  help="Recommended, and on by default: if price runs above the grid, treat it as a take-profit rather than leaving the bot idle."
                   disabled={submitting}
                 />
                 {breakoutTakeProfit && (
@@ -1387,7 +1388,7 @@ export function CreateBot() {
                       onChange={setBreakoutThresholdPct}
                       numeric
                       error={fieldErrors.breakoutThresholdPct}
-                      help="Optional — how far above the top line counts as a breakout. Blank uses the backend default."
+                      help="Optional. How far above the top line counts as a breakout; leave blank to use the default."
                       disabled={submitting}
                     />
                   </div>

@@ -103,8 +103,8 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Bot is no longer halted",
         text:
-          "This bot is not halted anymore — it may have been resumed already since the page loaded. " +
-          "Only a halted bot can be resumed; nothing changed. The view will refresh to its current state.",
+          "This bot is not halted anymore; it may have been resumed already since the page loaded. " +
+          "Only a halted bot can be resumed, and nothing changed. The view will refresh to its current state.",
       };
     }
     if (error.code === "globally_tripped") {
@@ -113,8 +113,8 @@ function outcomeForError(error: unknown): Outcome {
         title: "Global kill switch is pulled",
         text:
           `${error.message} The bot is still halted. Resuming stays blocked until someone re-arms the ` +
-          "kill switch on the kill-switch page — and re-arming resumes nothing on its own, so you " +
-          "would come back here afterwards.",
+          "kill switch on the kill-switch page. Re-arming resumes nothing on its own, so you would " +
+          "come back here afterwards.",
       };
     }
     if (error.code === "account_tripped") {
@@ -131,7 +131,7 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "No price feed in this environment",
         text:
-          `${error.message} The subscribe runs before the status flip, so nothing changed — the bot ` +
+          `${error.message} The subscribe runs before the status flip, so nothing changed and the bot ` +
           "is still halted.",
       };
     }
@@ -140,7 +140,7 @@ function outcomeForError(error: unknown): Outcome {
         tone: "error",
         title: "Session expired",
         text:
-          "Your Cloudflare Access session has expired — reload to sign in again. The bot is still halted.",
+          "Your Cloudflare Access session has expired. Reload to sign in again. The bot is still halted.",
       };
     }
     return {
@@ -232,7 +232,7 @@ function ConfirmDialog({
           <div className="rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[0.8125rem] text-amber-200/90">
             This commits real capital. Resuming re-subscribes the bot to the live price feed and
             re-enters the same execution path starting does, so for this {strategyLabel} bot the next
-            real closed 1-minute candle — normally within a minute — drives a real order attempt on
+            real closed 1-minute candle, normally within a minute, drives a real order attempt on
             the real exchange. There is no dry run and no further prompt after this one.
           </div>
           {/*
@@ -243,7 +243,7 @@ function ConfirmDialog({
           <p className="text-[0.8125rem] text-zinc-400">
             Exactly which order that is depends on the position this bot is holding now, not on a
             fresh cycle. If the condition that halted it has not actually been fixed, it will halt
-            again — a stop-loss halt with the price still below the stop halts on that first candle.
+            again. A stop-loss halt with the price still below the stop halts on that first candle.
           </p>
         </div>
 
@@ -311,10 +311,10 @@ export function ResumeAction({
       if (!mounted.current) return;
       setOutcome({
         tone: "success",
-        title: "Bot resumed — now running",
+        title: "Bot resumed, now running",
         text:
           "The status moved back to running and the bot is re-subscribed to the live price feed. Its " +
-          "next order attempt goes to the exchange on the next closed 1-minute candle — watch the " +
+          "next order attempt goes to the exchange on the next closed 1-minute candle. Watch the " +
           "orders and alerts below. If nothing appears within a few minutes, check the alerts for " +
           "price_feed_blind: an unreachable feed does not fail this action, it reconnects in the " +
           "background.",

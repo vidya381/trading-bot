@@ -168,7 +168,7 @@ export function DcaPositionView({
         </div>
       ) : (
         <div className="rounded-lg border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">
-          No entries yet — the base order fires when the bot starts (section 6.3 step 2).
+          No entries yet. The base order goes in when the bot starts.
         </div>
       )}
 

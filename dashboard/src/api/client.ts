@@ -80,7 +80,7 @@ async function requestJson<T>(path: string, method: string, options: RequestOpti
     body = (await response.json()) as ApiEnvelope<T>;
   } catch {
     if (response.status === 401 || response.status === 403) {
-      throw new ApiError("unauthenticated", "your session has expired -- reload to sign in again", response.status);
+      throw new ApiError("unauthenticated", "your session has expired, reload to sign in again", response.status);
     }
     throw new ApiError("bad_response", `unexpected non-JSON response (${response.status})`, response.status);
   }

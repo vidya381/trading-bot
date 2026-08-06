@@ -45,7 +45,7 @@ function outcomeForError(error: unknown): Outcome {
     if (error.code === "network_error" || error.code === "bad_response") {
       return {
         tone: "warning",
-        title: "Outcome unknown — could not confirm",
+        title: "Outcome unknown, could not confirm",
         text:
           "The request failed before a result came back. The switch may or may not have re-armed; the " +
           "status above will refresh to show the true state. Resetting again is safe.",
@@ -85,7 +85,7 @@ function outcomeForError(error: unknown): Outcome {
       return {
         tone: "error",
         title: "Session expired",
-        text: "Your Cloudflare Access session has expired — reload to sign in again. Nothing was changed.",
+        text: "Your Cloudflare Access session has expired. Reload to sign in again. Nothing was changed.",
       };
     }
     return { tone: "error", title: "Reset failed", text: `${error.message} Nothing was changed.` };
@@ -140,7 +140,7 @@ export function KillSwitchReset({
     <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
       <h2 className="text-base font-semibold text-zinc-100">Reset (re-arm) the kill switch</h2>
       <p className="mt-1 text-sm text-zinc-400">
-        A separate action from triggering. Re-arming lets bots be created and resumed again — it does not
+        A separate action from triggering. Re-arming lets bots be created and resumed again. It does not
         resume any halted bot on its own.
       </p>
 
@@ -157,7 +157,7 @@ export function KillSwitchReset({
               Note <span className="text-red-400">*</span>
             </label>
             <p className="mt-0.5 text-xs text-zinc-500">
-              Recorded permanently — what was resolved and why it is safe to re-arm.
+              Recorded permanently: what was resolved and why it is safe to re-arm.
             </p>
             <textarea
               id="ks-note"
@@ -189,7 +189,7 @@ export function KillSwitchReset({
         </form>
       ) : (
         <p className="mt-4 rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-sm text-zinc-400">
-          The switch is armed — there is nothing to reset.
+          The switch is armed, so there is nothing to reset.
         </p>
       )}
 
