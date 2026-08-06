@@ -61,8 +61,13 @@ function applyPercent(base: Money, pct: Money, rounding: Rounding): Money {
  * broken, a throw here would happen during render and take the WHOLE detail page
  * down, replacing a working page with a blank one. These figures are additive
  * context, so they degrade to "—" instead and leave everything else standing.
+ *
+ * EXPORTED as of step 25, for `accountTotals.ts`. The alternative was a second
+ * copy of these four lines, and the module note above is entirely about why this
+ * file does not keep a second decimal parser -- a rule that would be strange to
+ * honour against the backend and break against the module next door.
  */
-function parse(value: string): Money | null {
+export function parse(value: string): Money | null {
   try {
     return fromDecimalString(value);
   } catch {

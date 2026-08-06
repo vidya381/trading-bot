@@ -59,8 +59,8 @@ rather than trusting the header alone.
 
 | Method & path | Wraps |
 | --- | --- |
-| `GET /api/bots` | D1 rows + each bot's DO snapshot (position, PnL) |
-| `GET /api/bots/:id` | DO snapshot + D1 order/trade/alert history |
+| `GET /api/bots` | D1 rows + each bot's DO snapshot (position, PnL) + per-bot fee totals from `trades` (step 25) |
+| `GET /api/bots/:id` | DO snapshot + D1 order/trade/alert history + the same fee totals |
 | `POST /api/bots` | `BotInstance.create`/`createGrid` (ledger check + SL/TP reused); exchange derived from the `accounts` registry (step 11) |
 | `POST /api/bots/:id/start` | `BotInstance.start` (step 6); `created -> running` only, its `invalid_status` refusal surfaced as 409 |
 | `POST /api/bots/:id/halt` | `BotInstance.halt("manual", …)` (section 7.2) for ONE bot, with a required free-text `reason` and the verified human as actor. Idempotent (`already_halted`); asserts neither latch, since a halt reduces risk |
@@ -78,3 +78,30 @@ rather than trusting the header alone.
 | `POST /api/kill-switch/reset` | `resetGlobalKillSwitchFromEnv` |
 | `GET /api/reconciliation` | `audit_log` `reconciliation.run` entries |
 | `GET /api/health` (+ `/health`) | version/environment probe, unauthenticated |
+
+## The bot summary's fee figure (`fees`, step 25)
+
+Every bot summary carries `fees: { reported, unpricedCount }`, denominated in
+**that bot's own `capitalAsset`**.
+
+`reported` is a **floor, not a total**. It sums `trades.fee_reporting_amount` —
+the fee converted to the capital asset at fill time by `#mirrorTrade` — and that
+column is NULL for every fill whose fee could not be priced. Section 5.5 rule 1:
+a venue charges in whatever asset it likes (Binance commonly charges in BNB),
+and when no rate is available all three reporting columns are left NULL rather
+than guessed (step 2 decision 9; migration 0001's `fee_conversion_all_or_nothing`
+CHECK). SQLite's `SUM` skips those rows silently, so **`unpricedCount` is what
+makes the omission visible** and is not optional context.
+
+A non-zero `unpricedCount` means any net figure derived from `reported`
+understates cost and therefore **overstates profit**. `realizedPnl` in
+`shared/fees.ts` answers this by withholding its `net` entirely (`complete:
+false`), and the dashboard's account rollup does the same rather than showing a
+caveated number.
+
+Three more summary fields exist for the same rollup: `position.cost` (now on the
+grid arm too, from `ladder.heldCost`), `lastPrice`, and `cycleCount`. The last
+two are **null for an orphan** — an object holding no state has not seen a price
+of zero and has not completed zero cycles; both are unknown. And `cycleCount` is
+**DCA-only**: it is incremented solely by `#completeCycle`, so a grid bot reports
+0 for its entire life.

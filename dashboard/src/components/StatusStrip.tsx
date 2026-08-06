@@ -14,11 +14,20 @@
  * control from the main page without navigating into any specific bot. The loud
  * everywhere-signal is the separate App-level banner; this is the always-present,
  * at-a-glance state next to the fleet counts.
+ *
+ * STEP 25 ADDED A SECOND ROW: the account-level money rollup (`AccountSummary`),
+ * below the counts rather than mixed into them. The two rows answer different
+ * questions -- "what is the fleet DOING" and "what is the fleet WORTH" -- and
+ * interleaving a currency figure among count tiles that share a visual
+ * treatment would invite reading one as the other. Same source array, same
+ * poll, same one-source-of-truth rule as the counts above it.
  */
 
 import { Link } from "react-router-dom";
 import { ENVIRONMENT } from "../env";
 import type { Alert, Bot, BotStatus, KillSwitchStatus } from "../api/types";
+import { accountTotals } from "../accountTotals";
+import { AccountSummary } from "./AccountSummary";
 
 function countByStatus(bots: Bot[], status: BotStatus): number {
   return bots.reduce((n, bot) => (bot.status === status ? n + 1 : n), 0);
@@ -124,21 +133,28 @@ export function StatusStrip({
   const stopped = countByStatus(bots, "stopped");
   const created = countByStatus(bots, "created");
   const unresolved = alerts.reduce((n, alert) => (alert.resolved ? n : n + 1), 0);
+  // Derived from the SAME `bots` array the count tiles above and the table
+  // below are built from -- one poll, one source of truth, so the money row
+  // can never describe a different fleet than the one on screen.
+  const totals = accountTotals(bots);
 
   return (
-    <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
-      <div className="flex flex-col justify-center rounded-lg border border-zinc-800 bg-zinc-900/60 px-4 py-3">
-        <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">Environment</span>
-        <span className="mt-1 text-lg font-semibold uppercase tracking-wide text-zinc-100">
-          {ENVIRONMENT}
-        </span>
-      </div>
-      <KillSwitchTile status={killSwitch} />
-      <Tile label="Running" value={running} tone="good" />
-      <Tile label="Halted" value={halted} tone="bad" muted />
-      <Tile label="Stopped" value={stopped} tone="neutral" muted />
-      <Tile label="Created" value={created} tone="neutral" muted />
-      <UnresolvedAlertsTile count={unresolved} />
-    </section>
+    <div className="space-y-4">
+      <section className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
+        <div className="flex flex-col justify-center rounded-lg border border-zinc-800 bg-zinc-900/60 px-4 py-3">
+          <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">Environment</span>
+          <span className="mt-1 text-lg font-semibold uppercase tracking-wide text-zinc-100">
+            {ENVIRONMENT}
+          </span>
+        </div>
+        <KillSwitchTile status={killSwitch} />
+        <Tile label="Running" value={running} tone="good" />
+        <Tile label="Halted" value={halted} tone="bad" muted />
+        <Tile label="Stopped" value={stopped} tone="neutral" muted />
+        <Tile label="Created" value={created} tone="neutral" muted />
+        <UnresolvedAlertsTile count={unresolved} />
+      </section>
+      <AccountSummary totals={totals} />
+    </div>
   );
 }

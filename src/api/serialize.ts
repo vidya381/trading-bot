@@ -215,6 +215,19 @@ export function killSwitchView(row: GlobalKillSwitchRow | null) {
  * which is the field the state actually carries (`BotRuntimeState.realizedGross`).
  * Netting fees is reconciliation's job against `total_balance`, not this
  * layer's, and calling a gross number "pnl" would overstate what it is.
+ *
+ * `cost` IS CARRIED BY BOTH STRATEGIES, and that is new as of step 25. It was
+ * DCA-only, so the grid arm of this union published a held QUANTITY with no
+ * basis to value it against -- fine for a per-bot row that only prints the
+ * quantity, and useless the moment anything wants to know what the fleet is
+ * holding. The two fields mean the same thing and are accumulated the same way:
+ * DCA's `position.cost` and grid's `ladder.heldCost` are both the bare notional
+ * (`mul(price, quantity)`) of what is STILL HELD, gross of fees -- `applyFill`
+ * carries `feeAmount` as a separate field that never enters the position
+ * (order-state.ts) and grid.ts's buy branch accumulates the same bare product.
+ * So they share one name, and the account rollup adds them without branching on
+ * strategy. Renaming grid's to match DCA's rather than the reverse keeps the
+ * field the frontend has read since step 10.7 exactly where it was.
  */
 function positionOf(snapshot: BotSnapshot | null) {
   if (snapshot === null) return null;
@@ -224,6 +237,7 @@ function positionOf(snapshot: BotSnapshot | null) {
     return {
       strategy: "grid" as const,
       heldQuantity: ladder === undefined ? "0" : money(ladder.heldQuantity),
+      cost: ladder === undefined ? "0" : money(ladder.heldCost),
       realizedGross: money(state.realizedGross),
     };
   }
@@ -237,6 +251,37 @@ function positionOf(snapshot: BotSnapshot | null) {
 }
 
 /**
+ * What one bot has paid the venue, in its OWN capital asset (step 25).
+ *
+ * WHY THIS IS NOT SIMPLY `SUM(fee_amount)`. A fee is charged in whatever asset
+ * the venue chose, and `trades.fee_asset` records that honestly -- Binance
+ * commonly charges in BNB (section 5.5 rule 1). Summing that column would add
+ * BNB to USD and call the result money. The summable column is
+ * `fee_reporting_amount`, which `#mirrorTrade` writes at fill time as the fee
+ * converted to `config.capitalAsset` at the fill's own price.
+ *
+ * AND IT IS NULLABLE ON PURPOSE. The rate lookup at fill time knows only the
+ * base asset's price, so a fee paid in the exchange's own token has no rate
+ * available and all three reporting columns are left NULL rather than guessed
+ * (step 2 decision 9; migration 0001's `fee_conversion_all_or_nothing` CHECK).
+ * SQLite's SUM skips those rows, so `reported` is the total of the fees that
+ * could be PRICED -- never the total that was PAID.
+ *
+ * `unpricedCount` is therefore load-bearing, not diagnostic. It is the count of
+ * fills carrying a real fee this figure does not include, and a non-zero value
+ * means `reported` is a floor. Any net figure derived from it must say so, or
+ * suppress itself -- which is exactly what `realizedPnl` (shared/fees.ts) has
+ * always done with its `complete: false` arm, and this mirrors that rule rather
+ * than inventing a second one.
+ */
+export interface BotFees {
+  /** Sum of the fees that CONVERTED, in the bot's capital asset. A floor. */
+  readonly reported: string;
+  /** Fills whose fee could not be priced. Non-zero means `reported` is partial. */
+  readonly unpricedCount: number;
+}
+
+/**
  * The list-view of one bot (endpoint 1): status, strategy, pair, position, PnL,
  * allocated capital, plus the identity fields a dashboard row needs.
  *
@@ -245,8 +290,25 @@ function positionOf(snapshot: BotSnapshot | null) {
  * realized profit. When the snapshot is null the bot row exists but its object
  * does not, which is surfaced with `orphaned: true` rather than shown as a flat,
  * zero-position bot.
+ *
+ * THREE FIELDS WERE ADDED IN STEP 25 so the bot LIST can be rolled up into an
+ * account-level total without a second request per bot. Two of them cost
+ * nothing: `lastPrice` and `cycleCount` were already sitting in the snapshot
+ * this function is handed and were simply not published, so a caller wanting to
+ * mark a position to market had to fetch `/api/bots/:id` for a number the list
+ * had already read. The third, `fees`, is genuinely new work and is passed IN
+ * rather than read here -- this module performs no I/O, and keeping it that way
+ * is what lets every shape in it stay a pure function of its arguments.
+ *
+ * `cycleCount` IS DCA-ONLY, and the name does not say so because the field is
+ * the DO's. It is incremented in exactly one place -- `#completeCycle(config:
+ * DcaConfig, ...)` in bot-instance.ts -- and a grid bot, which has no notion of
+ * a cycle to complete, holds the 0 it was created with forever. A caller
+ * totalling this across a mixed fleet is counting DCA cycles and must label it
+ * that way; summing it under a bare "cycles" heading silently reports grid bots
+ * as having done nothing.
  */
-export function botSummary(row: BotInstanceRow, snapshot: BotSnapshot | null) {
+export function botSummary(row: BotInstanceRow, snapshot: BotSnapshot | null, fees: BotFees) {
   return {
     id: row.id,
     accountLabel: row.account_label,
@@ -263,6 +325,16 @@ export function botSummary(row: BotInstanceRow, snapshot: BotSnapshot | null) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     position: positionOf(snapshot),
+    // The latest usable price the bot has seen, or null before its first
+    // (section 5.6: an unusable price is reported, never guessed at). Null is
+    // NOT zero and NOT "no movement" -- it means a held position's current
+    // worth is unknown, which is a different fact from a position worth
+    // nothing, and a rollup must refuse to value it rather than treat it as 0.
+    lastPrice: snapshot === null ? null : moneyOrNull(snapshot.state.lastPrice),
+    // Null for an orphan, matching `position`: an object holding no state has
+    // not completed zero cycles, it has no record of cycles at all.
+    cycleCount: snapshot === null ? null : snapshot.state.cycleCount,
+    fees,
     orphaned: snapshot === null,
   };
 }
@@ -282,9 +354,10 @@ export function botDetail(
   orders: readonly OrderRow[],
   trades: readonly TradeRow[],
   alerts: readonly AlertRow[],
+  fees: BotFees,
 ) {
   return {
-    ...botSummary(row, snapshot),
+    ...botSummary(row, snapshot, fees),
     config: snapshot === null ? null : jsonSafe(snapshot.config),
     state: snapshot === null ? null : jsonSafe(snapshot.state),
     orders: orders.map(orderView),

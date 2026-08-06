@@ -18,7 +18,7 @@ import { env, SELF } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
-import { alertRow, freshDatabase } from "../db/test-helpers";
+import { alertRow, botInstanceRow, freshDatabase, orderRow, tradeRow } from "../db/test-helpers";
 import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
 import { inBot, rateLimiterStub } from "../durable-objects/test-helpers";
 import type { BotInstance } from "../durable-objects/bot-instance";
@@ -269,6 +269,206 @@ describe("bots", () => {
       capitalAsset: "USDT",
     });
     expect(dca.position).toMatchObject({ strategy: "dca", heldQuantity: "0.00000000" });
+  });
+
+  // -------------------------------------------------------------------------
+  // The account rollup's inputs (step 25)
+  //
+  // Every test below pins one figure the main page's account summary adds up.
+  // They are backend tests for a frontend feature on purpose: the dashboard has
+  // no test runner yet (its own step), so the contract these assert is the only
+  // place the rollup's inputs can be held still.
+  // -------------------------------------------------------------------------
+
+  /** A resting order plus the fills to apply to it, through the REAL fill path. */
+  async function haltedBotWithFills(
+    id: string,
+    account: string,
+    fills: readonly { fillId: string; feeAmount: bigint; feeAsset: string; part: bigint }[],
+  ): Promise<void> {
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    const resting = exchange.resting.get(clientOrderId)!.request;
+    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "seeding fills", HUMAN));
+    exchange.fillsByOrder.set(
+      clientOrderId,
+      fills.map((fill) => ({
+        fillId: fill.fillId,
+        price: resting.price,
+        quantity: resting.quantity / fill.part,
+        feeAmount: fill.feeAmount,
+        feeAsset: fill.feeAsset,
+        executedAt: clock + 1000,
+      })),
+    );
+    await api("POST", `/api/bots/${id}/apply-missed-fills`);
+  }
+
+  it("totals each bot's fees from its trade history, and counts the fills it could not price", async () => {
+    const account = `acct-${suffix}`;
+    const id = `fee${suffix}`;
+    // Two real fills through `#mirrorTrade`, which does section 5.5's conversion
+    // at fill time. The USDT fee IS the capital asset, so it converts at a rate
+    // of ONE and needs no lookup. The BNB fee has no rate available -- the
+    // lookup knows only the base asset's price -- so all three reporting
+    // columns are left NULL rather than guessed, and that fee is real money
+    // this total cannot include.
+    await haltedBotWithFills(id, account, [
+      { fillId: "tid-usdt", feeAmount: m("0.25"), feeAsset: "USDT", part: 2n },
+      { fillId: "tid-bnb", feeAmount: m("0.075"), feeAsset: "BNB", part: 2n },
+    ]);
+
+    const res = await api("GET", "/api/bots");
+    const bot = res.body.data.find((b: any) => b.id === id);
+
+    // The priced fee only. NOT 0.325: adding a BNB amount to a USDT one would
+    // be adding two different currencies and calling the result money.
+    expect(bot.fees.reported).toBe("0.25000000");
+    // And the un-addable one is COUNTED, so the total can be shown as a floor
+    // rather than passed off as complete. This is what suppresses the net
+    // figure on the dashboard.
+    expect(bot.fees.unpricedCount).toBe(1);
+
+    // The rows really are as claimed -- the count is not a serializer artefact.
+    expect(await db.trades.count({ bot_instance_id: id, fee_reporting_amount: { isNull: true } })).toBe(1);
+  });
+
+  it("sums fees exactly past 2^53, where a float total would drift", async () => {
+    const account = `acct-${suffix}`;
+    const id = `big${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await db.orders.insert(orderRow({ id: `o-${id}`, bot_instance_id: id }));
+    // 1000000000.00000001 and 0.00000001. Their exact sum differs from the
+    // float sum: at 1e9 a float64's spacing is coarser than 1e-8, so the small
+    // fee vanishes entirely if this total is ever computed as a number.
+    await db.trades.insert(
+      tradeRow({
+        id: `t1-${id}`,
+        order_id: `o-${id}`,
+        bot_instance_id: id,
+        exchange_trade_id: "big-1",
+        fee_reporting_amount: 100_000_000_000_000_001n,
+        fee_reporting_asset: "USDT",
+      }),
+    );
+    await db.trades.insert(
+      tradeRow({
+        id: `t2-${id}`,
+        order_id: `o-${id}`,
+        bot_instance_id: id,
+        exchange_trade_id: "big-2",
+        fee_reporting_amount: 1n,
+        fee_reporting_asset: "USDT",
+      }),
+    );
+
+    const res = await api("GET", "/api/bots");
+    const bot = res.body.data.find((b: any) => b.id === id);
+    // The last digit is the whole point. `sumMoney` keeps the total on
+    // SQLite's side as a 64-bit INTEGER (money columns are INTEGER, read via
+    // CAST(... AS TEXT)), so it survives; a float would have lost the 1n.
+    expect(bot.fees.reported).toBe("1000000000.00000002");
+    expect(bot.fees.unpricedCount).toBe(0);
+  });
+
+  it("publishes a grid bot's held cost basis, which used to be DCA-only", async () => {
+    const account = `acct-${suffix}`;
+    const gridId = `gc${suffix}`;
+    await seedBalance(account);
+    await inBotId(gridId, (bot) =>
+      bot.createGrid({
+        botInstanceId: gridId,
+        accountLabel: account,
+        exchange: "binance",
+        pair: TEST_PAIR,
+        capitalAsset: "USDT",
+        allocatedCapital: m("500"),
+        params: gridParams,
+        actor: HUMAN,
+      }),
+    );
+
+    const list = await api("GET", "/api/bots");
+    const summary = list.body.data.find((b: any) => b.id === gridId);
+    // Without this the grid arm published a held QUANTITY with nothing to value
+    // it against, so an account-level "in position" total silently omitted
+    // every grid bot.
+    expect(summary.position).toMatchObject({ strategy: "grid", cost: "0.00000000" });
+
+    // Pinned to its real source rather than to a literal: the summary's `cost`
+    // is the ladder's `heldCost` from the object's own state, which the detail
+    // endpoint exposes separately.
+    const detail = await api("GET", `/api/bots/${gridId}`);
+    expect(summary.position.cost).toBe(detail.body.data.state.ladder.heldCost);
+  });
+
+  it("carries the live price and cycle count in the LIST, not only the detail", async () => {
+    const account = `acct-${suffix}`;
+    const id = `lp${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+
+    const res = await api("GET", "/api/bots");
+    const bot = res.body.data.find((b: any) => b.id === id);
+    // Marking a held position to market needs a price. Before this it meant one
+    // `/api/bots/:id` fetch per bot for a number the list had already read.
+    expect(bot.lastPrice).toBe("100.00000000");
+    expect(bot.cycleCount).toBe(0);
+  });
+
+  it("reports an orphan's position, price and cycles as null -- not zero -- but still totals its fees", async () => {
+    const id = `orph${suffix}`;
+    // A `bot_instances` row with no Durable Object behind it (the step-6
+    // orphan), plus a trade in D1. The two sources fail independently: object
+    // state is gone, trade history is not.
+    await db.botInstances.insert(botInstanceRow({ id, account_label: `acct-${suffix}` }));
+    await db.orders.insert(orderRow({ id: `o-${id}`, bot_instance_id: id }));
+    await db.trades.insert(
+      tradeRow({
+        id: `t-${id}`,
+        order_id: `o-${id}`,
+        bot_instance_id: id,
+        exchange_trade_id: "orph-1",
+        fee_reporting_amount: m("1.5"),
+        fee_reporting_asset: "USDT",
+      }),
+    );
+
+    const res = await api("GET", "/api/bots");
+    const bot = res.body.data.find((b: any) => b.id === id);
+
+    expect(bot.orphaned).toBe(true);
+    expect(bot.position).toBeNull();
+    // NULL, NOT 0. An object holding no state has not completed zero cycles and
+    // has not seen a price of zero -- both facts are unknown, and a rollup that
+    // read them as zeroes would report a confident total built on missing data.
+    expect(bot.cycleCount).toBeNull();
+    expect(bot.lastPrice).toBeNull();
+    // The fee total survives, because it never came from the object.
+    expect(bot.fees).toEqual({ reported: "1.50000000", unpricedCount: 0 });
+  });
+
+  it("gives the same fee figure on the detail endpoint as on the list", async () => {
+    const account = `acct-${suffix}`;
+    const id = `agr${suffix}`;
+    await haltedBotWithFills(id, account, [
+      { fillId: "tid-1", feeAmount: m("0.4"), feeAsset: "USDT", part: 2n },
+      { fillId: "tid-2", feeAmount: m("0.1"), feeAsset: "BNB", part: 2n },
+    ]);
+
+    const list = await api("GET", "/api/bots");
+    const detail = await api("GET", `/api/bots/${id}`);
+    // One query path, so an operator who clicks into a bot cannot be shown a
+    // different cost than the page they clicked from.
+    expect(detail.body.data.fees).toEqual(list.body.data.find((b: any) => b.id === id).fees);
+    expect(detail.body.data.fees.unpricedCount).toBe(1);
   });
 
   it("returns full detail for one bot, including config and state", async () => {

@@ -58,11 +58,18 @@ export type Strategy = "dca" | "grid";
  * state (`positionOf` in serialize.ts). `null` when the object holds no state
  * (an orphaned row). `realizedGross` is named honestly: gross realized profit
  * before fees -- the backend deliberately does not call it "pnl".
+ *
+ * `cost` IS ON BOTH ARMS as of step 25, and both arms mean the same thing by it:
+ * the bare notional paid for what is STILL HELD, gross of fees. DCA's comes from
+ * `position.cost`, grid's from `ladder.heldCost`; the backend renamed the latter
+ * to match rather than the reverse, so a caller totalling what the fleet is
+ * holding reads `position.cost` without branching on strategy.
  */
 export type Position =
   | {
       readonly strategy: "grid";
       readonly heldQuantity: string;
+      readonly cost: string;
       readonly realizedGross: string;
     }
   | {
@@ -72,6 +79,30 @@ export type Position =
       readonly cost: string;
       readonly realizedGross: string;
     };
+
+/**
+ * What one bot has paid the venue, in ITS OWN `capitalAsset` (`BotFees` in
+ * serialize.ts). Step 25.
+ *
+ * `reported` IS A FLOOR, NOT A TOTAL. It sums `trades.fee_reporting_amount`,
+ * which the backend writes at fill time as the fee converted to the capital
+ * asset -- and which is NULL whenever no rate was available, the common case
+ * being a fee charged in the exchange's own token. Those fills are real costs
+ * this number does not contain.
+ *
+ * `unpricedCount` is how many. Non-zero means any figure derived from
+ * `reported` UNDERSTATES cost and therefore OVERSTATES profit, which is the one
+ * direction a trading dashboard must never be wrong in. `shared/fees.ts`'s
+ * `realizedPnl` has always answered this by withholding its `net` entirely
+ * (`complete: false`); the account rollup does the same rather than showing a
+ * net that quietly omits a known cost.
+ */
+export interface BotFees {
+  /** Sum of the fees that could be PRICED, in `capitalAsset`. A floor. */
+  readonly reported: string;
+  /** Fills whose fee could not be priced. Non-zero means `reported` is partial. */
+  readonly unpricedCount: number;
+}
 
 /** One bot in the list view (`botSummary` in serialize.ts, `GET /api/bots`). */
 export interface Bot {
@@ -90,6 +121,30 @@ export interface Bot {
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly position: Position | null;
+  /**
+   * The latest usable price this bot has seen, or null before its first (step
+   * 25; the same `state.lastPrice` the detail view has always shown, lifted into
+   * the summary so the list can mark positions to market without a fetch per
+   * bot).
+   *
+   * NULL IS NOT ZERO. It means the current worth of anything held is UNKNOWN --
+   * section 5.6's rule that an unusable price is reported, never guessed at. A
+   * bot holding nothing and a bot holding 0.4 BTC it cannot value are different
+   * situations, and only the second one poisons a total.
+   */
+  readonly lastPrice: string | null;
+  /**
+   * Completed cycles -- **DCA ONLY**, and null for an orphan.
+   *
+   * The backend increments this in exactly one place, `#completeCycle`, which
+   * takes a `DcaConfig`. A grid bot has no cycle to complete and reports the 0
+   * it was created with for its entire life. Summing this across a mixed fleet
+   * gives a DCA cycle count, and it must be LABELLED as one; under a bare
+   * "cycles" heading it reads as though the grid bots have done nothing.
+   */
+  readonly cycleCount: number | null;
+  /** Fees paid, in this bot's capital asset. See `BotFees` -- `reported` is a floor. */
+  readonly fees: BotFees;
   readonly orphaned: boolean;
 }
 

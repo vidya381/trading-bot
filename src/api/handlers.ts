@@ -23,6 +23,7 @@ import {
   circuitBreakerView,
   killSwitchView,
   manualAdjustmentView,
+  type BotFees,
 } from "./serialize";
 import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
 import type {
@@ -66,6 +67,42 @@ function botStub(ctx: ApiContext, id: string): DurableObjectStub<BotInstance> {
 async function snapshotOf(ctx: ApiContext, id: string): Promise<BotSnapshot | null> {
   return await botStub(ctx, id).snapshotIfCreated();
 }
+
+/**
+ * What one bot has paid the venue, in its own capital asset (step 25).
+ *
+ * TWO QUERIES, NOT ONE, AND THE SECOND IS NOT OPTIONAL. `sumMoney` is exact --
+ * `CAST(SUM(col) AS TEXT)` keeps the total on SQLite's side as a 64-bit integer,
+ * so no float exists on this path -- but SQLite's SUM silently SKIPS NULLs, and
+ * `fee_reporting_amount` is NULL for every fill whose fee could not be priced
+ * (see `BotFees` in serialize.ts). So the sum alone cannot tell "this bot has
+ * paid 4.12 in fees" from "this bot has paid 4.12 PLUS an unknown amount of
+ * BNB". The count is what makes that difference visible, and without it the
+ * total would be a quietly understated cost -- the precise failure section 5.5
+ * exists to prevent.
+ *
+ * Deliberately NOT `sumMoney(..., { fee_reporting_amount: { isNotNull: true } })`:
+ * the filter would change nothing (SUM already skips them) while implying the
+ * exclusion is a choice this function makes, rather than SQLite's behaviour the
+ * count exists to compensate for.
+ */
+async function feesFor(ctx: ApiContext, id: string): Promise<BotFees> {
+  const [reported, unpricedCount] = await Promise.all([
+    ctx.db.trades.sumMoney("fee_reporting_amount", { bot_instance_id: id }),
+    ctx.db.trades.count({ bot_instance_id: id, fee_reporting_amount: { isNull: true } }),
+  ]);
+  return { reported: toDecimalString(reported), unpricedCount };
+}
+
+/**
+ * The fee figure for a bot that provably has no fills yet.
+ *
+ * Only for `createBot`, whose bot was created microseconds ago and cannot have
+ * traded. Querying for it would be two round-trips to prove an empty table, and
+ * writing the zero literal by hand in that handler would be a second place that
+ * has to know what `BotFees` looks like when nothing has happened.
+ */
+const NO_FEES: BotFees = { reported: "0.00000000", unpricedCount: 0 };
 
 async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
   let parsed: unknown;
@@ -130,13 +167,32 @@ function requireMoney(body: Record<string, unknown>, field: string): Money {
  * and realized profit come from each bot's own object. That is one Durable
  * Object read per bot, run in parallel -- the same per-bot fan-out the kill
  * switch and circuit breaker already do, and acceptable at v1's bot count.
+ *
+ * STEP 25 ADDED TWO D1 READS PER BOT (`feesFor`), and the cost is worth stating
+ * plainly because this is the endpoint the dashboard polls every 5 seconds: at
+ * v1's ten bots that is twenty extra reads per poll, joining the ten Durable
+ * Object reads already there. They are issued inside the SAME per-bot
+ * `Promise.all` fan-out rather than sequentially after it, so the added latency
+ * is one round-trip, not twenty.
+ *
+ * The alternative -- one account-wide `SUM` over the whole `trades` table, two
+ * queries total -- was considered and rejected on correctness, not cost. A
+ * single SUM blends every bot's `fee_reporting_amount` into one number, and
+ * those amounts are denominated in each bot's OWN `capital_asset`; a fleet
+ * spanning a USDT account and a USD one would produce a total in no currency at
+ * all. Per-bot keeps every figure attached to the asset it is denominated in,
+ * which is what lets the caller group by capital asset instead of guessing that
+ * they all match.
  */
 export async function listBots(ctx: ApiContext): Promise<Response> {
   const rows = await ctx.db.botInstances.findMany({
     orderBy: [{ column: "created_at", direction: "desc" }],
   });
   const summaries = await Promise.all(
-    rows.map(async (row) => botSummary(row, await snapshotOf(ctx, row.id))),
+    rows.map(async (row) => {
+      const [snapshot, fees] = await Promise.all([snapshotOf(ctx, row.id), feesFor(ctx, row.id)]);
+      return botSummary(row, snapshot, fees);
+    }),
   );
   return ok(summaries);
 }
@@ -148,7 +204,7 @@ export async function getBot(ctx: ApiContext): Promise<Response> {
   if (row === null) {
     throw notFound("unknown_bot", `no bot instance ${JSON.stringify(id)}`);
   }
-  const [snapshot, orders, trades, alerts] = await Promise.all([
+  const [snapshot, orders, trades, alerts, fees] = await Promise.all([
     snapshotOf(ctx, id),
     ctx.db.orders.findMany({
       where: { bot_instance_id: id },
@@ -162,8 +218,15 @@ export async function getBot(ctx: ApiContext): Promise<Response> {
       where: { bot_instance_id: id },
       orderBy: [{ column: "created_at", direction: "desc" }],
     }),
+    // Two more reads over `trades`, which this handler is ALREADY reading in
+    // full one line above. Recomputing the totals from that array in JS would
+    // save the round-trip -- and would be a second implementation of `feesFor`,
+    // free to disagree with the list endpoint's about what a fee total is. The
+    // number an operator sees on the detail page must be the number they saw on
+    // the list page; one query path is how that stays true.
+    feesFor(ctx, id),
   ]);
-  return ok(botDetail(row, snapshot, orders, trades, alerts));
+  return ok(botDetail(row, snapshot, orders, trades, alerts, fees));
 }
 
 /**
@@ -276,7 +339,10 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
   // Return the created bot so the frontend reflects it without a second fetch.
   const row = await ctx.db.botInstances.findOne({ id: botInstanceId });
   const snapshot = await snapshotOf(ctx, botInstanceId);
-  return ok(botDetail(row!, snapshot, [], [], []), 201);
+  // `NO_FEES` for the same reason the three histories are empty literals: a bot
+  // that came into existence in this request has no orders, no trades and no
+  // alerts, so there is nothing to query for.
+  return ok(botDetail(row!, snapshot, [], [], [], NO_FEES), 201);
 }
 
 /**
@@ -305,11 +371,12 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
 export async function startBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
   const result = await botStub(ctx, id).start(ctx.actor);
-  const [row, snapshot] = await Promise.all([
+  const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
     snapshotOf(ctx, id),
+    feesFor(ctx, id),
   ]);
-  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
 /**
@@ -353,11 +420,12 @@ export async function haltBot(ctx: ApiContext): Promise<Response> {
   const reason = requireString(body, "reason");
 
   const result = await botStub(ctx, id).halt("manual", reason, ctx.actor);
-  const [row, snapshot] = await Promise.all([
+  const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
     snapshotOf(ctx, id),
+    feesFor(ctx, id),
   ]);
-  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
 /**
@@ -396,11 +464,12 @@ export async function haltBot(ctx: ApiContext): Promise<Response> {
 export async function resumeBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
   const result = await botStub(ctx, id).resume(ctx.actor);
-  const [row, snapshot] = await Promise.all([
+  const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
     snapshotOf(ctx, id),
+    feesFor(ctx, id),
   ]);
-  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
 /**
@@ -429,11 +498,12 @@ export async function resumeBot(ctx: ApiContext): Promise<Response> {
 export async function applyMissedFills(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
   const result = await botStub(ctx, id).applyMissedFills(ctx.actor);
-  const [row, snapshot] = await Promise.all([
+  const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
     snapshotOf(ctx, id),
+    feesFor(ctx, id),
   ]);
-  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
 /**
@@ -486,11 +556,12 @@ export async function applyMissedFills(ctx: ApiContext): Promise<Response> {
 export async function checkOpenOrders(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
   const result = await botStub(ctx, id).checkOpenOrders(ctx.actor);
-  const [row, snapshot] = await Promise.all([
+  const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
     snapshotOf(ctx, id),
+    feesFor(ctx, id),
   ]);
-  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
 /**
@@ -504,11 +575,12 @@ export async function checkOpenOrders(ctx: ApiContext): Promise<Response> {
 export async function liquidateBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
   const result = await botStub(ctx, id).liquidatePosition(ctx.actor);
-  const [row, snapshot] = await Promise.all([
+  const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
     snapshotOf(ctx, id),
+    feesFor(ctx, id),
   ]);
-  return ok({ result, bot: row === null ? null : botSummary(row, snapshot) });
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
 // ---------------------------------------------------------------------------
