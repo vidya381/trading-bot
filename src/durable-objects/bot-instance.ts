@@ -72,7 +72,12 @@
 
 import { DurableObject } from "cloudflare:workers";
 
-import { raiseStandingAlert, resolveClearedStandingAlerts, standingAlertKey } from "../alerts";
+import {
+  raiseStandingAlert,
+  resolveClearedStandingAlerts,
+  resolveHaltAlerts,
+  standingAlertKey,
+} from "../alerts";
 import { createBotInstanceWithCapital, releaseBotCapital } from "../capital";
 import { databaseFrom, type Database } from "../db";
 import type { AlertRow, AuditLogRow, BotStatus, OrderRow, TradeRow } from "../db/schema";
@@ -90,7 +95,7 @@ import type {
   Timestamp,
 } from "../shared/exchange-client";
 import { isUsable } from "../shared/downtime";
-import { POLL_HEALTH_ALERT_TYPES } from "../shared/alert-types";
+import { haltAlertType, POLL_HEALTH_ALERT_TYPES } from "../shared/alert-types";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import type { PriceFeedConfig, PriceFeedPort } from "./price-feed";
 import type { RequestPriority } from "../shared/rate-limiter";
@@ -2417,11 +2422,36 @@ export class BotInstance extends DurableObject<Env> {
       haltedAt: null,
     }));
     await this.#mirrorStatus(config, "running", null, null, now);
+
+    // Step 27, and the same principle as the paragraph above applied one layer
+    // out. Clearing `halt_reason` stopped the BOT ROW advertising a failure that
+    // no longer applied; the ALERT ROW for that same halt was left standing
+    // `unresolved` forever, which is where an operator counting open criticals
+    // actually looks. Every open `halt_*` row for this bot is history the moment
+    // the status is `running` -- and only those: `cancel_failed` may still mean a
+    // live order, and the poll's standing alerts have their own owner. See
+    // `/src/alerts/halt.ts` for the full exclusion list and why this is not
+    // `resolveClearedStandingAlerts`.
+    //
+    // AFTER the status writes, deliberately. Everything above can refuse the
+    // resume -- a latched kill switch, a latched breaker, a feed that will not
+    // re-subscribe -- and a bot that stayed halted must keep its halt alert open.
+    const resolvedAlertIds = await resolveHaltAlerts(this.#db(), {
+      source: BOT_ALERT_SOURCE,
+      botInstanceId: config.botInstanceId,
+    });
+
     await this.#audit(
       config,
       "bot.resumed",
       actor,
-      { previous_halt_reason: state.haltReason, previous_halted_at: state.haltedAt },
+      {
+        previous_halt_reason: state.haltReason,
+        previous_halted_at: state.haltedAt,
+        // Which rows this resume closed, so the append-only log records the
+        // alert-table effect and not just the status change.
+        resolved_halt_alert_ids: resolvedAlertIds,
+      },
       now,
     );
 
@@ -4019,11 +4049,18 @@ export class BotInstance extends DurableObject<Env> {
     // The "good news" halts -- a DCA cycle taken to profit, a grid cashed out on
     // its breakout or profit target -- are `info`, not `critical`. Only an
     // actual loss, error, or rejection is critical.
+    //
+    // STILL AN UNCONDITIONAL INSERT, and still the right treatment: a halt is a
+    // discrete event and one row per halt is exactly what history wants. What
+    // changed at step 27 is only that the row now gets CLOSED -- `#resumePass`
+    // resolves it, through `haltAlertType`'s counterpart predicate, once the bot
+    // is running again. The two must stay together the way `standing.ts`'s two
+    // halves do; see `/src/alerts/halt.ts`.
     const positiveExit = reason === "take_profit_reached" || reason === "take_profit" || reason === "breakout_take_profit";
     await this.#alert(config, {
       severity: positiveExit ? "info" : "critical",
       category: reason === "unhandled_error" ? "system" : "trading",
-      alertType: `halt_${reason}`,
+      alertType: haltAlertType(reason),
       message: recorded,
     });
     await this.#audit(config, "bot.halted", actor, { reason, detail }, now);

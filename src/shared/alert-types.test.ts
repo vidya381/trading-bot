@@ -35,9 +35,13 @@ import {
 import {
   ALERTING_TIERS,
   ORDER_STATE_DRIFT_ALERT_TYPES,
+  POLL_HEALTH_ALERT_TYPES,
+  haltAlertType,
+  isHaltAlertType,
   isReconciliationAlertType,
   reconciliationAlertType,
 } from "./alert-types";
+import type { HaltReason } from "../durable-objects/bot-instance";
 import { DRIFT_ALERT_TYPES, isOpenDriftAlert } from "../../dashboard/src/driftAlerts";
 
 /** Every finding kind that exists, read from the classification table itself. */
@@ -70,6 +74,70 @@ describe("the reconciliation alert-type contract", () => {
     expect(isReconciliationAlertType("reconciliation_blind")).toBe(false);
     expect(isReconciliationAlertType("reconciliation_halt_failed")).toBe(false);
     expect(isReconciliationAlertType("orphaned_bot_row")).toBe(false);
+  });
+});
+
+/**
+ * Every halt reason that exists, as a value, tied to the type union.
+ *
+ * `HaltReason` is a union of string literals with no runtime list behind it, so
+ * this Record IS the list -- and it is exhaustive by TYPECHECK: a reason added to
+ * `DcaHaltReason` or `GridHaltReason` and not added here fails to compile, and a
+ * key here that is not a real reason fails too. That is what makes the loop below
+ * cover a new reason without anyone remembering this file exists, which is the
+ * same property `EVERY_KIND` gives the tests above.
+ */
+const EVERY_HALT_REASON: Record<HaltReason, true> = {
+  stop_loss: true,
+  unhandled_error: true,
+  order_rejected: true,
+  take_profit_reached: true,
+  take_profit: true,
+  breakout_take_profit: true,
+  manual: true,
+};
+
+describe("the halt alert-type contract", () => {
+  it("recognises the alert type for EVERY halt reason either strategy can raise", () => {
+    // The silent failure this closes: a new halt reason whose alert row
+    // `resolveHaltAlerts` does not recognise is never closed on resume, and
+    // nothing anywhere says so -- it just accumulates as an open critical, which
+    // is the bug step 27 fixed in the first place.
+    const reasons = Object.keys(EVERY_HALT_REASON) as HaltReason[];
+    expect(reasons.length).toBeGreaterThan(0);
+    for (const reason of reasons) {
+      expect(isHaltAlertType(haltAlertType(reason))).toBe(true);
+    }
+  });
+
+  it("recognises NOTHING else, which is what keeps a resume narrowly scoped", () => {
+    // The over-broad half. Every one of these belongs to another lifecycle, and
+    // closing any of them on resume would either hide a live problem
+    // (`cancel_failed`: an order may still be on the exchange) or give one row
+    // two owners (the poll's standing alerts, reconciliation's ingested ones).
+    const notHalts = [
+      "cancel_failed",
+      "cancel_fill_discrepancy",
+      "order_state_drift",
+      "unknown_order_fill",
+      "unattributable_fill",
+      "grid_replacement_queued",
+      "price_feed_fanout_failed",
+      "liquidation_failed",
+      // Reconciliation's own, which is the one string in the system that
+      // contains "halt_" without being a halt alert. It does not START with it.
+      "reconciliation_halt_failed",
+      ...POLL_HEALTH_ALERT_TYPES,
+    ];
+    for (const alertType of notHalts) {
+      expect(isHaltAlertType(alertType)).toBe(false);
+    }
+
+    for (const kind of EVERY_KIND) {
+      for (const tier of ALERTING_TIERS) {
+        expect(isHaltAlertType(reconciliationAlertType(tier, kind))).toBe(false);
+      }
+    }
   });
 });
 

@@ -68,6 +68,39 @@ export function isReconciliationAlertType(alertType: string): boolean {
 }
 
 /**
+ * The one place `halt_{reason}` is spelled, and the predicate that reads it back.
+ *
+ * WHY IT MOVED HERE (step 27). The format had exactly one construction site --
+ * `#halt` in `bot-instance.ts` -- and one is not a duplication problem, so it
+ * stayed inline. Resolving these rows on a successful resume adds a SECOND place
+ * that has to agree about what a halt alert looks like, which is the moment the
+ * `reconciliationAlertType` treatment starts paying for itself: a rename now
+ * moves both sides at once instead of leaving a resolver quietly matching
+ * nothing. The failure it prevents is the silent one -- no error, no failing
+ * request, just halt alerts that stop being closed.
+ *
+ * `reason` is a `HaltReason` (the union of `DcaHaltReason` and `GridHaltReason`)
+ * at every real call site; it is `string` here so this file stays import-free for
+ * the dashboard's toolchain, exactly as `reconciliationAlertType`'s `kind` is.
+ * `alert-types.test.ts` pins the two together against the real union.
+ *
+ * PREFIX MATCHING IS SAFE HERE and is checked rather than assumed. No other
+ * alert type in the system begins `halt_`: reconciliation's own
+ * `reconciliation_halt_failed` begins `reconciliation_`, and the test above
+ * asserts that specific non-match. A future alert type that is ABOUT halting
+ * without BEING a halt must not be named `halt_*`, or `resolveHaltAlerts` would
+ * close it on the next resume.
+ */
+export function haltAlertType(reason: string): string {
+  return `halt_${reason}`;
+}
+
+/** True for an alert row that records a bot entering `halted`. */
+export function isHaltAlertType(alertType: string): boolean {
+  return alertType.startsWith("halt_");
+}
+
+/**
  * The finding kinds that mean "an order this system believes open may actually
  * have executed" -- the drift `applyMissedFills` repairs.
  *

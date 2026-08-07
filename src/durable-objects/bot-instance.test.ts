@@ -15,7 +15,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
-import { freshDatabase } from "../db/test-helpers";
+import { alertRow, freshDatabase } from "../db/test-helpers";
+import { GlobalKillSwitchError, tripGlobalKillSwitch } from "../reconciliation/kill-switch";
 import { fromDecimalString as m, ZERO } from "../shared/money";
 import type { Price } from "../shared/exchange-client";
 import type { DcaParams } from "../strategies/dca";
@@ -101,8 +102,16 @@ function priceAt(value: string): Price {
 async function run<T>(
   body: (bot: BotInstance) => Promise<T>,
   feed: PriceFeedPort = noopFeed,
+  /**
+   * Which Durable Object to run in. Defaults to this test's own, which is what
+   * every test but one wants. The exception is step 27's per-bot alert scoping,
+   * which has to drive a SECOND bot against the same database to prove that
+   * resuming one does not touch the other's rows -- a property no single-object
+   * test can observe.
+   */
+  name: string = objectName,
 ): Promise<T> {
-  return await inBot(objectName, async (instance) => {
+  return await inBot(name, async (instance) => {
     instance.attach({
       db,
       exchange,
@@ -786,6 +795,117 @@ describe("resume (section 7.2 step 5)", () => {
   it("refuses to resume a bot that is not halted", async () => {
     await openPosition("100");
     await expect(run((bot) => bot.resume(ACTOR))).rejects.toThrow(/only a halted bot/);
+  });
+
+  // -------------------------------------------------------------------------
+  // Resolving the halt ALERT, step 27
+  // -------------------------------------------------------------------------
+  //
+  // The row-level half of step 16's bug 3. That fixed `halt_reason`, the
+  // current-state column a running bot kept advertising a fixed failure in; the
+  // `halt_*` alert row for the same halt was left `unresolved` forever, which is
+  // where an operator counting open criticals actually looks.
+
+  it("resolves the halt alert when the bot successfully resumes", async () => {
+    await openPosition("100");
+    await run((bot) => bot.halt("order_rejected", "MissingAccounts", ACTOR));
+
+    // Open while the bot is halted: the condition genuinely applies.
+    expect(await db.alerts.count({ alert_type: "halt_order_rejected", resolved: false })).toBe(1);
+
+    await run((bot) => bot.resume(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "halt_order_rejected", resolved: false })).toBe(0);
+    // Resolved, NOT deleted. The halt happened and the history says so.
+    expect(await db.alerts.count({ alert_type: "halt_order_rejected", resolved: true })).toBe(1);
+
+    // And the resume's own audit entry records which rows it closed.
+    const audit = await db.auditLog.findMany({ where: { action: "bot.resumed" } });
+    const details = audit[0]!.details_json as unknown as Record<string, unknown>;
+    expect(details["resolved_halt_alert_ids"]).toHaveLength(1);
+  });
+
+  it("resolves nothing when the resume is REFUSED and the bot stays halted", async () => {
+    // The other side of "on a SUCCESSFUL resume", and the reason the resolve
+    // call sits after the status writes rather than at the top of `#resumePass`.
+    // A latched global kill switch refuses the resume; the bot is still halted,
+    // so its critical must still be open. Closing it here would take the alert
+    // away from an operator whose bot did not actually come back.
+    await openPosition("100");
+    await run((bot) => bot.halt("stop_loss", "drawdown breached", ACTOR));
+    await tripGlobalKillSwitch(db, {
+      reason: "venue outage",
+      actor: ACTOR,
+      now: clock,
+      haltBot: async () => {}, // the bot under test is already halted
+      newId: () => `kill-${(idCounter += 1)}`,
+    });
+
+    await expect(run((bot) => bot.resume(ACTOR))).rejects.toBeInstanceOf(GlobalKillSwitchError);
+
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.status).toBe("halted");
+    expect(await db.alerts.count({ alert_type: "halt_stop_loss", resolved: false })).toBe(1);
+  });
+
+  it("does NOT resolve this bot's other alerts, which a resume does not address", async () => {
+    // The scope question, and `cancel_failed` is the one that matters: it is
+    // raised BY the halt path, so it looks like part of the same incident. It is
+    // not. It means an order may still be live on the exchange, which resuming
+    // does not cancel -- and reconciliation owns that row through
+    // INGESTED_ALERT_TYPES, so closing it here would give one row two owners.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const untouched = [
+      // Same source, same bot, raised during the halt itself.
+      { alert_type: "cancel_failed", source: "bot-instance" },
+      // Same source, same bot, owned by the poll's own resolve half.
+      { alert_type: "poll_blind", source: "bot-instance" },
+      { alert_type: "unattributable_fill", source: "bot-instance" },
+      // Reconciliation's, ingested.
+      { alert_type: "order_state_drift", source: "bot-instance" },
+      // A DIFFERENT writer's row about this bot, excluded twice over.
+      { alert_type: "price_feed_fanout_failed", source: "price-feed" },
+    ];
+    for (const [index, alert] of untouched.entries()) {
+      await db.alerts.insert(
+        alertRow({ id: `unrelated-${index}`, bot_instance_id: BOT_ID, ...alert }),
+      );
+    }
+
+    await run((bot) => bot.resume(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(0);
+    for (const alert of untouched) {
+      expect(await db.alerts.count({ alert_type: alert.alert_type, resolved: false })).toBe(1);
+    }
+  });
+
+  it("resolves per bot: resuming one leaves another bot's halt alert open", async () => {
+    // Two halted bots, one resumed. The other is still halted and its critical
+    // must still say so -- a resolve scoped only by `source` and alert type would
+    // close both, and on an account halted by the circuit breaker that is every
+    // bot on it going quiet at once because one was reviewed.
+    const OTHER_ID = "dca-btc-2";
+    const otherObject = `${objectName}-other`;
+    const inOther = <T>(body: (bot: BotInstance) => Promise<T>) => run(body, noopFeed, otherObject);
+
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    await inOther((bot) => bot.create(creation({ botInstanceId: OTHER_ID })));
+    await inOther((bot) => bot.halt("manual", "the other operator review", ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(2);
+
+    await run((bot) => bot.resume(ACTOR));
+
+    const open = await db.alerts.findMany({
+      where: { alert_type: "halt_manual", resolved: false },
+    });
+    expect(open).toHaveLength(1);
+    expect(open[0]!.bot_instance_id).toBe(OTHER_ID);
   });
 });
 
