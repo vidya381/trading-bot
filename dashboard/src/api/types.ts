@@ -118,6 +118,19 @@ export interface Bot {
   readonly takeProfitPct: string | null;
   readonly haltReason: string | null;
   readonly haltedAt: number | null;
+  /**
+   * Hidden from the bot list's DEFAULT view (step 26). NOT a status and not a
+   * deletion: an archived bot's row, object state, orders, trades and alerts are
+   * all untouched, its detail page renders identically, and it still holds its
+   * capital allocation.
+   *
+   * It is orthogonal to `status` and must not be derived from it -- an archived
+   * bot is halted or stopped, but a halted bot is not archived by implication.
+   * The backend never filters on it; hiding is this dashboard's job, and it
+   * hides only the TABLE. Archived bots keep counting toward the account-level
+   * totals, because their allocation and position are still real.
+   */
+  readonly archived: boolean;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly position: Position | null;
@@ -554,6 +567,33 @@ export interface ResumeResult {
 export interface ResumeResponse {
   readonly result: ResumeResult;
   /** The refreshed summary (now `running`), or null if the row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
+// Archive / unarchive (`POST /api/bots/:id/archive` and `/unarchive`, step 26)
+//
+// The `{ result, bot }` shape every other action uses. Both are idempotent and
+// report which of the two things happened rather than failing on a repeat, so a
+// double-click is harmless: `already_archived` and `not_archived` are SUCCESSES,
+// not errors, and both come back 200 with the current bot.
+//
+// Archiving refuses a `running` or `created` bot with `invalid_status` (409).
+// Unarchiving refuses nothing -- it is the reversing half, and a gate on it
+// could only ever strand a bot in the hidden state.
+// ---------------------------------------------------------------------------
+
+export type ArchiveAction = "archived" | "already_archived";
+export type UnarchiveAction = "unarchived" | "not_archived";
+
+export interface ArchiveResponse {
+  readonly result: { readonly action: ArchiveAction };
+  /** The refreshed summary, or null if the row vanished mid-call. */
+  readonly bot: Bot | null;
+}
+
+export interface UnarchiveResponse {
+  readonly result: { readonly action: UnarchiveAction };
   readonly bot: Bot | null;
 }
 

@@ -79,6 +79,14 @@ export const botInstances = defineTable("bot_instances", {
   // capital_ledger row (account_label, asset) its allocation lives in. Not the
   // pair's quote asset by definition, though in practice it will be.
   capital_asset: text(),
+  // Added by migration 0007, and last for the same ALTER TABLE reason as
+  // `capital_asset` above.
+  //
+  // Whether this bot is hidden from the bot list's DEFAULT view. NOT a delete
+  // and not a status: it is orthogonal to `status`, written only by the
+  // archive/unarchive endpoints, and read only by the dashboard's view filter.
+  // Nothing in the trading path consults it. See the migration header.
+  archived: boolean(),
 });
 
 /**

@@ -19,6 +19,7 @@ import type {
   AlertCategory,
   AlertSeverity,
   ApplyMissedFillsResponse,
+  ArchiveResponse,
   Bot,
   BotDetail,
   CheckOpenOrdersResponse,
@@ -31,6 +32,7 @@ import type {
   ResumeResponse,
   StartResponse,
   TriggerKillSwitchResponse,
+  UnarchiveResponse,
 } from "./types";
 
 /** An API failure, carrying the backend's typed error code. */
@@ -238,6 +240,33 @@ export function haltBot(id: string, reason: string, signal?: AbortSignal): Promi
  */
 export function resumeBot(id: string, signal?: AbortSignal): Promise<ResumeResponse> {
   return requestJson<ResumeResponse>(`/api/bots/${encodeURIComponent(id)}/resume`, "POST", { signal });
+}
+
+/**
+ * Hide a finished bot from the bot list's default view
+ * (`POST /api/bots/:id/archive`). No request body.
+ *
+ * NOT A DELETE. It writes one boolean on the bot's row; the bot's own state,
+ * order and trade history, alerts and capital allocation are untouched, and its
+ * detail page is unchanged. Nothing in this system can delete a bot's data --
+ * the backend's storage layer has no delete method at all.
+ *
+ * A repeat is a SUCCESS, not an error: `result.action` is `already_archived`.
+ * The one refusal is `invalid_status` (409) on a `running` or `created` bot.
+ */
+export function archiveBot(id: string, signal?: AbortSignal): Promise<ArchiveResponse> {
+  return requestJson<ArchiveResponse>(`/api/bots/${encodeURIComponent(id)}/archive`, "POST", { signal });
+}
+
+/**
+ * Put an archived bot back in the default view (`POST /api/bots/:id/unarchive`).
+ *
+ * Refuses nothing, by design -- a gate here could only strand a bot in the
+ * hidden state. It resumes nothing either: a halted bot comes back halted.
+ * A repeat reports `not_archived` and is still a 200.
+ */
+export function unarchiveBot(id: string, signal?: AbortSignal): Promise<UnarchiveResponse> {
+  return requestJson<UnarchiveResponse>(`/api/bots/${encodeURIComponent(id)}/unarchive`, "POST", { signal });
 }
 
 /**

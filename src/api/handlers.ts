@@ -29,6 +29,8 @@ import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
 import type {
   AlertCategory,
   AlertSeverity,
+  BotInstanceRow,
+  BotStatus,
   ExchangeId,
   ManualAdjustmentRow,
 } from "../db/schema";
@@ -103,6 +105,48 @@ async function feesFor(ctx: ApiContext, id: string): Promise<BotFees> {
  * has to know what `BotFees` looks like when nothing has happened.
  */
 const NO_FEES: BotFees = { reported: "0.00000000", unpricedCount: 0 };
+
+/** The `bot_instances` row, or 404. The D1 row, not the object's own state. */
+async function requireBotRow(ctx: ApiContext, id: string): Promise<BotInstanceRow> {
+  const row = await ctx.db.botInstances.findOne({ id });
+  if (row === null) {
+    throw notFound("unknown_bot", `no bot instance ${JSON.stringify(id)}`);
+  }
+  return row;
+}
+
+/**
+ * Refuse an action that would put an ARCHIVED bot back into trading (step 26).
+ *
+ * Archiving is only allowed from `halted` or `stopped`, which leaves one way
+ * for an archived bot to become live again: `start` or `resume`. Without this,
+ * a resumed archived bot would be RUNNING and hidden from the bot list's
+ * default view -- a live bot placing real orders that an operator has to
+ * remember to go looking for. Refusing here keeps the invariant that nothing
+ * hidden by default is capable of trading, and says which action to take first
+ * rather than silently unarchiving on the operator's behalf.
+ *
+ * A CHECK, NOT A LATCH, and the difference is worth stating. Both this and
+ * `archiveBot` read state and then act, so two operators acting on one bot at
+ * the same instant can interleave. One direction is closed properly: the
+ * archive write is a conditional UPDATE on the status still being archivable,
+ * so an archive that races a resume which has already flipped the status
+ * changes nothing and reports why. The other direction -- an archive
+ * committing in the window between this check and the object's status flip --
+ * is open, and its worst outcome is one running bot hidden from the default
+ * view. That is recoverable from the UI (the toggle shows it, unarchive is one
+ * click), which is why it is documented rather than serialised behind a lock
+ * this flag does not otherwise need.
+ */
+function assertNotArchived(row: BotInstanceRow, action: string): void {
+  if (!row.archived) return;
+  throw new ApiError(
+    409,
+    "bot_archived",
+    `bot instance ${JSON.stringify(row.id)} is archived; unarchive it before ${action}. ` +
+      `An archived bot is hidden from the bot list's default view, and a running bot must not be.`,
+  );
+}
 
 async function readJsonObject(request: Request): Promise<Record<string, unknown>> {
   let parsed: unknown;
@@ -365,11 +409,19 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
  * price-unusable, unreachable-exchange, or order-filter error, but its failures
  * are no longer only `invalid_status` -- a fail-closed feed subscribe can also
  * reject (e.g. `not_attached` with no PRICE_FEED binding), leaving the bot
- * untouched. Returns the pipeline result and the refreshed bot so the new status
- * shows immediately.
+ * untouched. Step 26 adds one more, raised here rather than by the object:
+ * `bot_archived` (409), refused before `start` is called at all. Returns the
+ * pipeline result and the refreshed bot so the new status shows immediately.
  */
 export async function startBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
+  // Step 26's one addition to this handler. Read WITHOUT requiring the row:
+  // a missing row is not this endpoint's error to raise (the `bot: null` branch
+  // below has always covered an object with no row), and a bot with no row has
+  // no archived flag to honour. `start` still owns every other rule.
+  const existing = await ctx.db.botInstances.findOne({ id });
+  if (existing !== null) assertNotArchived(existing, "starting it");
+
   const result = await botStub(ctx, id).start(ctx.actor);
   const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
@@ -440,6 +492,10 @@ export async function haltBot(ctx: ApiContext): Promise<Response> {
  * ITS FAILURE SURFACE IS WIDER THAN `start`'s (confirmed from source, not
  * assumed by analogy). In order, all BEFORE the status flip, so every one of
  * them leaves the bot halted and untouched:
+ *   - `bot_archived` (409)     -- step 26, and the only one raised HERE rather
+ *                                 than by the object: an archived bot must be
+ *                                 unarchived before it can trade again. See
+ *                                 `assertNotArchived`.
  *   - `not_created` (404)      -- the object holds no config.
  *   - `invalid_status` (409)   -- the bot is not `halted`. `start`'s mirror.
  *   - `globally_tripped` (409) -- section 7.4's kill switch is pulled. NOT a
@@ -463,6 +519,12 @@ export async function haltBot(ctx: ApiContext): Promise<Response> {
  */
 export async function resumeBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
+  // Step 26, and the same shape as `startBot`'s: refused BEFORE the object is
+  // called, so a refusal leaves the bot exactly as halted as it was -- which is
+  // the property every one of `resume`'s own refusals already has.
+  const existing = await ctx.db.botInstances.findOne({ id });
+  if (existing !== null) assertNotArchived(existing, "resuming it");
+
   const result = await botStub(ctx, id).resume(ctx.actor);
   const [row, snapshot, fees] = await Promise.all([
     ctx.db.botInstances.findOne({ id }),
@@ -581,6 +643,168 @@ export async function liquidateBot(ctx: ApiContext): Promise<Response> {
     feesFor(ctx, id),
   ]);
   return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
+}
+
+// ---------------------------------------------------------------------------
+// Archiving (step 26)
+// ---------------------------------------------------------------------------
+
+/**
+ * The statuses a bot may be archived FROM.
+ *
+ * `running` is excluded because archiving a live bot hides it from the page an
+ * operator reads to see what is happening now. `created` is excluded too, and
+ * that is a deliberate scope choice rather than an oversight -- the same one
+ * step 23 made when `HaltAction` refused a `created` bot the backend would have
+ * accepted. A bot that has never started is not finished with; it is not
+ * started. Widening this later is a one-line change plus a test.
+ */
+const ARCHIVABLE_STATUSES: readonly BotStatus[] = ["halted", "stopped"];
+
+/**
+ * Write the archived flag and its audit entry. Returns whether it changed.
+ *
+ * THE CONDITIONAL UPDATE IS THE ONLY DECISION -- there is deliberately no
+ * "already archived?" branch in the callers to duplicate it. The `WHERE`
+ * carries the current value (and, when archiving, that the status is still
+ * archivable), so inspecting `changes` answers both questions at once and
+ * answers them against the database rather than against a row read a moment
+ * ago. A second archive matches no row, writes no second audit entry, and
+ * reports `already_archived`; an archive that races a `resume` which has
+ * already flipped the status likewise matches nothing, rather than hiding a bot
+ * that is now running.
+ *
+ * This is the same `update(...) -> inspect changes` idiom the capital ledger
+ * uses for its `status <> 'stopped'` claims, for the same reason: a read
+ * followed by an unconditional write is a lost update waiting for a second
+ * caller.
+ */
+async function setArchived(
+  ctx: ApiContext,
+  row: BotInstanceRow,
+  archived: boolean,
+): Promise<boolean> {
+  const now = ctx.now();
+  const where =
+    archived === true
+      ? { id: row.id, archived: false, status: { in: [...ARCHIVABLE_STATUSES] } }
+      : { id: row.id, archived: true };
+  const changed = await ctx.db.botInstances.update(where, { archived, updated_at: now });
+  if (changed !== 1) return false;
+
+  await ctx.db.auditLog.insert({
+    id: ctx.newId(),
+    actor: ctx.actor,
+    action: archived ? "bot.archived" : "bot.unarchived",
+    target_bot_instance_id: row.id,
+    // The status is recorded because it is the thing the gate was checked
+    // against, and it is not otherwise recoverable from this entry later.
+    details_json: { status: row.status, account_label: row.account_label },
+    created_at: now,
+  });
+  return true;
+}
+
+/** The bot as the caller should now see it, with its fees and live position. */
+async function refreshedBot(ctx: ApiContext, id: string) {
+  const [row, snapshot, fees] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+    feesFor(ctx, id),
+  ]);
+  return row === null ? null : botSummary(row, snapshot, fees);
+}
+
+/**
+ * POST /api/bots/:id/archive -- hide a finished bot from the default list view.
+ *
+ * WHAT THIS IS NOT. It is not a delete, and that is structural rather than a
+ * promise made in a comment: `Repository` exposes no `delete` method at all
+ * (/src/db/table.ts's header explains why -- section 8.7 retains everything),
+ * and `no-raw-d1.test.ts` fails the build if any file outside /src/db reaches
+ * for the raw binding to route around it. There is no code path from this
+ * endpoint to a removed row, because there is no code path from ANY endpoint to
+ * one.
+ *
+ * What it writes is one boolean and `updated_at`, on the `bot_instances` row.
+ * It does not touch the Durable Object -- the object is never asked to mutate
+ * anything here, only read for the response -- so the bot's configuration,
+ * position, ladder or DCA entries, order history and idempotency records are
+ * exactly as they were. It does not touch `orders`, `trades`, `alerts` or
+ * `capital_ledger` either: an archived bot still holds its allocation (only the
+ * `stopped` transition releases capital, via `releaseBotCapital`), still counts
+ * toward the account-level totals on the dashboard, and its detail page renders
+ * identically before and after.
+ *
+ * GATED ON `halted` OR `stopped`, mirroring the status-gating every other
+ * action here uses, and read from the D1 ROW rather than the object's snapshot.
+ * That is deliberate: archived is a property of the row, and an ORPHANED bot --
+ * a row whose object holds no state, which `botSummary` already surfaces as
+ * `orphaned: true` -- must still be archivable. A snapshot-authoritative gate
+ * could not answer for one, since there is no snapshot to ask.
+ *
+ * Failures:
+ *   - `unknown_bot` (404)    -- no such row.
+ *   - `invalid_status` (409) -- the bot is `running` or `created`.
+ * Archiving an already-archived bot is NOT an error: it reports
+ * `already_archived`, changes nothing and writes no second audit entry, which
+ * is the same idempotence `halt` gives a double-click.
+ */
+export async function archiveBot(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const row = await requireBotRow(ctx, id);
+
+  // The status refusal is the ONE thing decided here, because it is the one
+  // thing the conditional update cannot express: a `WHERE` that matches nothing
+  // cannot say WHY, and "halt it first" is the whole point of the message.
+  // Skipped for a bot that is already archived, so idempotence does not depend
+  // on the status -- an already-hidden bot is reported as such whatever it is
+  // doing, rather than being refused for a state it is already in.
+  if (!row.archived && !ARCHIVABLE_STATUSES.includes(row.status)) {
+    throw new ApiError(
+      409,
+      "invalid_status",
+      `bot instance ${JSON.stringify(id)} is ${row.status}; only a ${ARCHIVABLE_STATUSES.join(" or ")} ` +
+        `bot can be archived. Archiving removes nothing, but hiding a live bot from the default ` +
+        `view would hide orders being placed with real capital.`,
+    );
+  }
+
+  const changed = await setArchived(ctx, row, true);
+  return ok({
+    result: { action: changed ? ("archived" as const) : ("already_archived" as const) },
+    bot: await refreshedBot(ctx, id),
+  });
+}
+
+/**
+ * POST /api/bots/:id/unarchive -- put a bot back in the default list view.
+ *
+ * Deliberately NOT status-gated. Every action in this system is reversible and
+ * this is the reversing half; a gate here could only ever strand a bot in the
+ * hidden state, which is the one outcome archiving must never produce. It is
+ * also the risk-REDUCING direction (it makes a bot more visible, not less), and
+ * this codebase already keeps such actions available unconditionally -- `halt`
+ * asserts neither risk latch for the same reason.
+ *
+ * Unarchiving a bot that is not archived reports `not_archived` and changes
+ * nothing, the mirror of `archive`'s `already_archived`. It never resumes
+ * anything: a halted bot comes back halted, and resuming remains a separate,
+ * explicit action (section 7.2 step 5).
+ */
+export async function unarchiveBot(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const row = await requireBotRow(ctx, id);
+
+  // No status branch of ANY kind, deliberately -- not even the one archiving
+  // uses. A bot in a status archiving would refuse can still be unarchived, and
+  // must be: that is precisely the bot for which being stuck hidden would be
+  // unrecoverable.
+  const changed = await setArchived(ctx, row, false);
+  return ok({
+    result: { action: changed ? ("unarchived" as const) : ("not_archived" as const) },
+    bot: await refreshedBot(ctx, id),
+  });
 }
 
 // ---------------------------------------------------------------------------

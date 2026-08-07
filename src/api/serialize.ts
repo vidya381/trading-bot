@@ -322,6 +322,11 @@ export function botSummary(row: BotInstanceRow, snapshot: BotSnapshot | null, fe
     takeProfitPct: moneyOrNull(row.take_profit_pct),
     haltReason: row.halt_reason,
     haltedAt: row.halted_at,
+    // Step 26. Orthogonal to `status`, never derived from it: an archived bot
+    // is halted or stopped, but a halted bot is not archived by implication.
+    // The frontend hides these from the list's default view and shows them
+    // behind its "Show archived" toggle; nothing here filters.
+    archived: row.archived,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     position: positionOf(snapshot),

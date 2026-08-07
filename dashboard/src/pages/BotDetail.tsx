@@ -32,6 +32,7 @@ import { CheckOpenOrdersAction } from "../components/CheckOpenOrdersAction";
 import { HaltAction } from "../components/HaltAction";
 import { ResumeAction } from "../components/ResumeAction";
 import { LiquidateAction } from "../components/LiquidateAction";
+import { ArchiveAction } from "../components/ArchiveAction";
 import { StrategyState } from "../components/StrategyState";
 import { OrderHistory } from "../components/OrderHistory";
 import { TradeHistory } from "../components/TradeHistory";
@@ -203,6 +204,19 @@ function BotDetailView({ id }: { id: string }) {
            * response refetches immediately (item 4) via `poll.refetch`.
            */}
           {bot.status === "halted" && <LiquidateAction bot={bot} onLiquidated={poll.refetch} />}
+          {/*
+           * Archive / unarchive (step 26), LAST of the controls on purpose. It
+           * is the only one here that changes nothing about the bot itself — it
+           * writes one boolean deciding whether the bot appears in the list's
+           * default view, deletes nothing, and never touches the object. So it
+           * sits below every control that does something real, where a
+           * housekeeping action belongs.
+           *
+           * It renders its own two states (archive when halted or stopped,
+           * unarchive when archived) and nothing at all otherwise, so unlike its
+           * neighbours it needs no status condition here.
+           */}
+          <ArchiveAction bot={bot} onChanged={poll.refetch} />
           <StrategyState bot={bot} />
           <OrderHistory orders={bot.orders} />
           <TradeHistory trades={bot.trades} />

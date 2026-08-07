@@ -67,6 +67,8 @@ rather than trusting the header alone.
 | `POST /api/bots/:id/apply-missed-fills` | `BotInstance.applyMissedFills` (step 18's order-state-drift repair); halted bots only |
 | `POST /api/bots/:id/resume` | `BotInstance.resume` (section 7.2 step 5); `halted -> running` only. Refuses with `invalid_status` (409), and — unlike `start` — also `globally_tripped` / `account_tripped` (409), since resume asserts both latches |
 | `POST /api/bots/:id/liquidate` | `BotInstance.liquidatePosition` (step 10.3) |
+| `POST /api/bots/:id/archive` | one boolean on the `bot_instances` row + an audit entry (step 26). `halted`/`stopped` only (`invalid_status`, 409); idempotent (`already_archived`). Touches no Durable Object, no history table and no ledger row — see below |
+| `POST /api/bots/:id/unarchive` | the same boolean, back. Never status-gated; idempotent (`not_archived`) |
 | `GET /api/accounts` | registered accounts and their exchange, from the `accounts` table (step 11) |
 | `GET /api/accounts/:label/symbols` | the account's live tradable pairs via its real client's `listTradablePairs`, KV-cached (step 11) |
 | `GET /api/alerts` | `alerts`, filtered by category/severity/resolved |
@@ -78,6 +80,33 @@ rather than trusting the header alone.
 | `POST /api/kill-switch/reset` | `resetGlobalKillSwitchFromEnv` |
 | `GET /api/reconciliation` | `audit_log` `reconciliation.run` entries |
 | `GET /api/health` (+ `/health`) | version/environment probe, unauthenticated |
+
+## Archiving (`archived`, step 26)
+
+Every bot summary carries `archived: boolean`, read straight off
+`bot_instances.archived` (migration 0007). It is **orthogonal to `status`**: an
+archived bot is halted or stopped, but a halted bot is not archived by
+implication.
+
+**Archiving is a view decision, and this layer does not act on it.** `GET
+/api/bots` returns archived bots exactly as before — no filter, no query
+parameter. The dashboard hides them from its default table and shows them behind
+a "Show archived" toggle, and it keeps counting them in the account-level totals,
+because an archived halted bot still holds its capital allocation and may still
+hold inventory. A total that changed when a view toggle flipped would be the
+silent-omission failure step 25 exists to prevent.
+
+**No data is removed at any point, and that is structural.** `Repository` has no
+`delete` method (see `/src/db/table.ts`), and `no-raw-d1.test.ts` fails the build
+if anything outside `/src/db` reaches for the raw binding to route around it.
+Archiving writes `archived` and `updated_at` on one row; it never calls a
+mutating Durable Object method, and it never touches `orders`, `trades`,
+`alerts`, `audit_log` or `capital_ledger`.
+
+The one interaction with the rest of the system: `start` and `resume` refuse an
+archived bot with `bot_archived` (409), raised in this layer before the object is
+called. Otherwise a resumed archived bot would be **running and hidden from the
+default view**.
 
 ## The bot summary's fee figure (`fees`, step 25)
 

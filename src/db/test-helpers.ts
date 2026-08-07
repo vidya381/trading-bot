@@ -98,6 +98,7 @@ export function botInstanceRow(overrides: Partial<BotInstanceRow> = {}): BotInst
     created_at: T0,
     updated_at: T0,
     capital_asset: "USDT",
+    archived: false,
     ...overrides,
   };
 }

@@ -441,6 +441,10 @@ export async function createBotInstanceWithCapital(
     created_at: options.now,
     updated_at: options.now,
     capital_asset: request.asset,
+    // A new bot is never archived (migration 0007). Written explicitly rather
+    // than leaning on the column's DEFAULT, which exists only for the rows that
+    // predate the migration.
+    archived: false,
   };
 
   // Named rather than inlined: no-raw-d1.test.ts forbids `.batch([` outside

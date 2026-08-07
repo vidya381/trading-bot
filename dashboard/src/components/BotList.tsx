@@ -13,6 +13,13 @@
  * P&L is labelled "Realized (gross)" on purpose: the backend's `realizedGross`
  * is gross of fees and it deliberately does not call the number "pnl" (see
  * serialize.ts). Showing it under an honest label keeps that promise.
+ *
+ * ARCHIVED BOTS (step 26) are filtered OUT BY THE CALLER, not here: this
+ * component renders whatever list it is handed. `hiddenCount` is how many the
+ * caller withheld, and it exists so the empty state can say "hidden" rather than
+ * "none" -- an account whose every bot is archived must not be told it has no
+ * bots. Rows that ARE archived carry an `archived` tag, since the toggle
+ * otherwise just makes the table longer with nothing marking the new rows.
  */
 
 import { Link } from "react-router-dom";
@@ -70,6 +77,25 @@ function PositionCell({ bot }: { bot: Bot }) {
   );
 }
 
+/**
+ * Marks a row that is only on screen because "Show archived" is on (step 26).
+ *
+ * Without it the toggle simply grows the table and nothing says which rows are
+ * the archived ones -- and "archived" is not visible in any other column, since
+ * it is deliberately not a status.
+ */
+function ArchivedTag({ bot }: { bot: Bot }) {
+  if (!bot.archived) return null;
+  return (
+    <span
+      title="Archived: hidden from the default view. Nothing was deleted, and this bot still counts toward the account totals."
+      className="ml-2 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-400 ring-1 ring-inset ring-zinc-600/50"
+    >
+      archived
+    </span>
+  );
+}
+
 function OrphanTag({ bot }: { bot: Bot }) {
   if (!bot.orphaned) return null;
   return (
@@ -111,6 +137,7 @@ function BotTable({ bots }: { bots: Bot[] }) {
                 >
                   {bot.id}
                 </Link>
+                <ArchivedTag bot={bot} />
                 <OrphanTag bot={bot} />
                 <div className="text-xs text-zinc-500">{bot.accountLabel}</div>
               </td>
@@ -151,6 +178,7 @@ function BotCard({ bot }: { bot: Bot }) {
         <div className="min-w-0">
           <div className="truncate font-medium text-zinc-100">
             {bot.id}
+            <ArchivedTag bot={bot} />
             <OrphanTag bot={bot} />
           </div>
           <div className="text-xs text-zinc-500">{bot.accountLabel}</div>
@@ -190,11 +218,22 @@ function BotCard({ bot }: { bot: Bot }) {
   );
 }
 
-export function BotList({ bots }: { bots: Bot[] }) {
+export function BotList({ bots, hiddenCount = 0 }: { bots: Bot[]; hiddenCount?: number }) {
   if (bots.length === 0) {
+    // The empty state has to know about the filter, or it lies. "No bots yet" on
+    // an account whose every bot is archived is worse than unhelpful -- it says
+    // the fleet is empty when it is merely hidden.
     return (
       <div className="rounded-lg border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">
-        No bots yet. Any bot you create will show up here, across every account.
+        {hiddenCount > 0 ? (
+          <>
+            Nothing to show. {hiddenCount} archived {hiddenCount === 1 ? "bot is" : "bots are"} hidden
+            — turn on <span className="font-medium text-zinc-400">Show archived</span> to see{" "}
+            {hiddenCount === 1 ? "it" : "them"}.
+          </>
+        ) : (
+          <>No bots yet. Any bot you create will show up here, across every account.</>
+        )}
       </div>
     );
   }

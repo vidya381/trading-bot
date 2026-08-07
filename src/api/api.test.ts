@@ -1350,6 +1350,327 @@ describe("check open orders", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Archiving (step 26)
+//
+// The whole feature is one boolean, so most of what is worth testing is what
+// archiving does NOT do: it must not change a status, must not remove a row,
+// must not disturb an object, and must not let a hidden bot start trading.
+// ---------------------------------------------------------------------------
+
+describe("archiving", () => {
+  /** A halted DCA bot -- the ordinary archivable case. */
+  async function haltedBot(id: string, account: string): Promise<void> {
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.halt("manual", "done experimenting", HUMAN));
+  }
+
+  it("archives a halted bot, leaving its status and everything else alone", async () => {
+    const account = `acct-${suffix}`;
+    const id = `ar${suffix}`;
+    await haltedBot(id, account);
+
+    const res = await api("POST", `/api/bots/${id}/archive`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toEqual({ action: "archived" });
+    expect(res.body.data.bot).toMatchObject({ id, archived: true, status: "halted" });
+
+    const row = await db.botInstances.findOne({ id });
+    // The flag moved and NOTHING else did. `status` in particular: archiving is
+    // orthogonal to the lifecycle, not a fifth status.
+    expect(row!.archived).toBe(true);
+    expect(row!.status).toBe("halted");
+    expect(row!.halt_reason).toContain("manual");
+    expect(row!.allocated_capital).toBe(m("500"));
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.archived" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(HUMAN);
+    expect(audit[0]!.target_bot_instance_id).toBe(id);
+    expect(audit[0]!.details_json).toMatchObject({ status: "halted", account_label: account });
+  });
+
+  it("archives a stopped bot", async () => {
+    const account = `acct-${suffix}`;
+    const id = `as${suffix}`;
+    await haltedBot(id, account);
+    await inBotId(id, (bot) => bot.close(HUMAN));
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("stopped");
+
+    const res = await api("POST", `/api/bots/${id}/archive`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toEqual({ action: "archived" });
+    expect((await db.botInstances.findOne({ id }))!.archived).toBe(true);
+  });
+
+  it("refuses a running bot, and changes nothing at all", async () => {
+    const account = `acct-${suffix}`;
+    const id = `arun${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+
+    const res = await api("POST", `/api/bots/${id}/archive`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+    // The message has to say what IS allowed, since the operator's next move is
+    // to halt it first.
+    expect(res.body.error.message).toContain("halted or stopped");
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.archived).toBe(false);
+    expect(row!.status).toBe("running");
+    expect(await db.auditLog.count({ action: "bot.archived" })).toBe(0);
+  });
+
+  it("refuses a `created` bot, which the backend could accept but deliberately does not", async () => {
+    const account = `acct-${suffix}`;
+    const id = `acr${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+
+    const res = await api("POST", `/api/bots/${id}/archive`);
+
+    // A bot that has never started is not finished with, it is not started.
+    // Pinned so the scope choice stays legible rather than looking accidental
+    // (the same reason step 23 pinned `HaltAction` refusing `created`).
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("invalid_status");
+    expect((await db.botInstances.findOne({ id }))!.archived).toBe(false);
+  });
+
+  it("is idempotent: archiving twice writes one audit entry, not two", async () => {
+    const account = `acct-${suffix}`;
+    const id = `aid${suffix}`;
+    await haltedBot(id, account);
+
+    await api("POST", `/api/bots/${id}/archive`);
+    const second = await api("POST", `/api/bots/${id}/archive`);
+
+    // Not an error -- a double-click is harmless, as it is for halt.
+    expect(second.status).toBe(200);
+    expect(second.body.data.result).toEqual({ action: "already_archived" });
+    expect(second.body.data.bot.archived).toBe(true);
+    expect(await db.auditLog.count({ action: "bot.archived" })).toBe(1);
+  });
+
+  it("unarchives, and reports a bot that was not archived rather than failing", async () => {
+    const account = `acct-${suffix}`;
+    const id = `aun${suffix}`;
+    await haltedBot(id, account);
+    await api("POST", `/api/bots/${id}/archive`);
+
+    const res = await api("POST", `/api/bots/${id}/unarchive`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toEqual({ action: "unarchived" });
+    expect(res.body.data.bot).toMatchObject({ archived: false, status: "halted" });
+    expect((await db.botInstances.findOne({ id }))!.archived).toBe(false);
+    expect(await db.auditLog.count({ action: "bot.unarchived" })).toBe(1);
+
+    // Unarchiving resumes nothing: the bot comes back exactly as halted as it
+    // was, and starting it again stays a separate, explicit action.
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("halted");
+
+    const again = await api("POST", `/api/bots/${id}/unarchive`);
+    expect(again.status).toBe(200);
+    expect(again.body.data.result).toEqual({ action: "not_archived" });
+    expect(await db.auditLog.count({ action: "bot.unarchived" })).toBe(1);
+  });
+
+  /**
+   * The reversing half must have NO status gate, and this is the only test that
+   * can see that -- every bot reachable through the archive endpoint is halted
+   * or stopped, so a gate copied from `archive` would pass every other test in
+   * this block unnoticed.
+   *
+   * The flag is written directly to reach the case, the same way the `start`
+   * gate's test does. A bot archived in a status archiving would now refuse is
+   * exactly the one that must not be strandable: if unarchive could refuse it
+   * too, it would be hidden with no way back, which is the one outcome this
+   * feature must never produce.
+   */
+  it("unarchives from a status that archiving itself would refuse, so nothing can be stranded", async () => {
+    const account = `acct-${suffix}`;
+    const id = `astr${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("created");
+    // Archiving refuses this status, so an unarchive that reused the same gate
+    // would refuse it too -- which is the whole point of the case.
+    expect((await api("POST", `/api/bots/${id}/archive`)).status).toBe(409);
+    // So the flag is written directly to reach a state the endpoint declines to
+    // produce.
+    await db.botInstances.update({ id }, { archived: true });
+
+    // In this state the SAME archive call now succeeds as a no-op rather than
+    // refusing: idempotence must not depend on the status, or a bot could be
+    // both already hidden and refused for the state it is already in.
+    const repeat = await api("POST", `/api/bots/${id}/archive`);
+    expect(repeat.status).toBe(200);
+    expect(repeat.body.data.result).toEqual({ action: "already_archived" });
+
+    const res = await api("POST", `/api/bots/${id}/unarchive`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toEqual({ action: "unarchived" });
+    expect((await db.botInstances.findOne({ id }))!.archived).toBe(false);
+  });
+
+  it("404s an unknown bot on both endpoints, without creating anything", async () => {
+    const archive = await api("POST", `/api/bots/nope${suffix}/archive`);
+    expect(archive.status).toBe(404);
+    expect(archive.body.error.code).toBe("unknown_bot");
+
+    const unarchive = await api("POST", `/api/bots/nope${suffix}/unarchive`);
+    expect(unarchive.status).toBe(404);
+    expect(unarchive.body.error.code).toBe("unknown_bot");
+    expect(await db.botInstances.count()).toBe(0);
+  });
+
+  /**
+   * The claim this whole step rests on: archiving removes NOTHING.
+   *
+   * Built as a deep comparison of the entire detail payload across an archive
+   * rather than a list of field assertions, because a list can only check the
+   * fields whoever wrote it thought of. The payload carries the object's own
+   * config and runtime state, plus every order, trade and alert row for the
+   * bot -- so if archiving touched any of them, this fails without anyone
+   * having predicted which one.
+   *
+   * The three history assertions BEFORE the archive are not decoration. Without
+   * them this test would pass just as happily against a bot with no history at
+   * all, comparing two empty arrays and proving nothing -- the vacuous-assertion
+   * failure this suite has hit more than once.
+   */
+  it("removes nothing: the whole detail payload survives an archive intact", async () => {
+    const account = `acct-${suffix}`;
+    const id = `akeep${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    const resting = exchange.resting.get(clientOrderId)!.request;
+    // Fail the cancellation so the order stays believed-open and the halt
+    // raises an alert -- this bot needs real history, not a clean one.
+    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "finished with this experiment", HUMAN));
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: "gemini-tid-archive",
+        price: resting.price,
+        quantity: resting.quantity,
+        feeAmount: m("0.1"),
+        feeAsset: "USDT",
+        executedAt: clock + 1000,
+      },
+    ]);
+    await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    const before = (await api("GET", `/api/bots/${id}`)).body.data;
+    // There is genuinely something to lose.
+    expect(before.orders.length).toBeGreaterThan(0);
+    expect(before.trades.length).toBeGreaterThan(0);
+    expect(before.alerts.length).toBeGreaterThan(0);
+    expect(before.state).not.toBeNull();
+    expect(before.config).not.toBeNull();
+    expect(before.archived).toBe(false);
+
+    expect((await api("POST", `/api/bots/${id}/archive`)).status).toBe(200);
+
+    const after = (await api("GET", `/api/bots/${id}`)).body.data;
+    // Exactly two fields may differ: the flag itself, and the row's mtime.
+    expect(after.archived).toBe(true);
+    expect({ ...after, archived: false, updatedAt: before.updatedAt }).toStrictEqual(before);
+
+    // And the same again through the row counts, which the payload's own
+    // ordering and limits cannot hide.
+    expect(await db.orders.count({ bot_instance_id: id })).toBe(before.orders.length);
+    expect(await db.trades.count({ bot_instance_id: id })).toBe(before.trades.length);
+    expect(await db.alerts.count({ bot_instance_id: id })).toBe(before.alerts.length);
+    // The capital allocation is untouched too -- archiving is not closing.
+    const ledger = await db.capitalLedger.findOne({ account_label: account, asset: "USDT" });
+    expect(ledger!.total_allocated).toBe(m("500"));
+  });
+
+  it("keeps archived bots in GET /api/bots, because hiding them is the view's job", async () => {
+    const account = `acct-${suffix}`;
+    const kept = `alive${suffix}`;
+    const hidden = `ahid${suffix}`;
+    await seedBalance(account, "20000");
+    await createDcaBot(kept, account);
+    await haltedBot(hidden, account);
+    await api("POST", `/api/bots/${hidden}/archive`);
+
+    const res = await api("GET", "/api/bots");
+
+    // Both, always. The dashboard filters its table client-side so the
+    // account-level totals keep counting an archived bot's allocation and
+    // position -- a total that changed when a view toggle flipped would be the
+    // silent omission step 25 exists to prevent.
+    expect(res.body.data.map((b: any) => b.id).sort()).toEqual([kept, hidden].sort());
+    expect(res.body.data.find((b: any) => b.id === hidden).archived).toBe(true);
+    expect(res.body.data.find((b: any) => b.id === kept).archived).toBe(false);
+  });
+
+  it("refuses to resume an archived bot, and leaves it halted", async () => {
+    const account = `acct-${suffix}`;
+    const id = `ares${suffix}`;
+    await haltedBot(id, account);
+    await api("POST", `/api/bots/${id}/archive`);
+
+    const refused = await api("POST", `/api/bots/${id}/resume`);
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe("bot_archived");
+    // Refused BEFORE the object was called, so the bot is exactly as it was --
+    // the property every one of resume's own refusals already has.
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("halted");
+    expect(await db.auditLog.count({ action: "bot.resumed" })).toBe(0);
+
+    // And unarchiving restores the path, since nothing here is a one-way door.
+    await api("POST", `/api/bots/${id}/unarchive`);
+    const resumed = await api("POST", `/api/bots/${id}/resume`);
+    expect(resumed.status).toBe(200);
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("running");
+  });
+
+  /**
+   * `start`'s gate is unreachable through the archive endpoint TODAY -- a
+   * `created` bot cannot be archived, and `start` accepts nothing else -- so
+   * the flag is written directly here to reach it.
+   *
+   * It is not dead code: it becomes reachable the moment `created` joins
+   * `ARCHIVABLE_STATUSES`, which the constant's own comment names as a
+   * one-line change. Testing it now is what stops that change from silently
+   * opening the "running and hidden" hole the resume gate exists to close.
+   */
+  it("refuses to start an archived bot, the gate that only matters if `created` is ever archivable", async () => {
+    const account = `acct-${suffix}`;
+    const id = `astart${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await db.botInstances.update({ id }, { archived: true });
+
+    const res = await api("POST", `/api/bots/${id}/start`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("bot_archived");
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("created");
+    expect(exchange.placed).toEqual([]);
+  });
+
+  it("405s on GET, so the wrong method is not a missing endpoint", async () => {
+    expect((await api("GET", `/api/bots/whatever/archive`)).status).toBe(405);
+    expect((await api("GET", `/api/bots/whatever/unarchive`)).status).toBe(405);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Alerts (endpoint 5)
 // ---------------------------------------------------------------------------
 

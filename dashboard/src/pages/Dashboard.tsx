@@ -5,6 +5,7 @@
  * across a transient failure and surfaces the error without blanking the screen.
  */
 
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchAlerts, fetchBots, fetchKillSwitch } from "../api/client";
 import { usePolling } from "../api/usePolling";
@@ -36,6 +37,40 @@ function FreshnessIndicator({
   );
 }
 
+/**
+ * The "Show archived" toggle (step 26).
+ *
+ * A real checkbox rather than a styled div, so it is keyboard-reachable and
+ * announced as a checkbox without any ARIA of our own. It states the count it
+ * would reveal, which is what keeps archiving from hiding anything silently: the
+ * number is on screen even when the archived rows are not.
+ */
+function ShowArchivedToggle({
+  checked,
+  archivedCount,
+  onChange,
+}: {
+  checked: boolean;
+  archivedCount: number;
+  onChange: (next: boolean) => void;
+}) {
+  // Nothing archived and nothing to reveal: the control would be a no-op with a
+  // count of zero beside it.
+  if (archivedCount === 0 && !checked) return null;
+  return (
+    <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-zinc-400 hover:text-zinc-300">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-900 accent-zinc-400"
+      />
+      Show archived
+      <span className="tabular text-zinc-500">({archivedCount})</span>
+    </label>
+  );
+}
+
 export function Dashboard() {
   const botsPoll = usePolling<Bot[]>(fetchBots);
   // Unfiltered: the status strip derives its unresolved-alert count from this
@@ -45,8 +80,25 @@ export function Dashboard() {
   // keeps last-good through a blip and one endpoint failing never blanks another.
   const killSwitchPoll = usePolling<KillSwitchStatus>(fetchKillSwitch);
 
+  const [showArchived, setShowArchived] = useState(false);
+
   const bots = botsPoll.data ?? [];
   const alerts = alertsPoll.data ?? [];
+  /*
+   * The archived filter is applied HERE and to the TABLE ONLY (step 26).
+   *
+   * `StatusStrip` -- and the account-level totals inside it -- is deliberately
+   * given the FULL list. An archived bot is halted or stopped, not closed: it
+   * still holds its capital allocation, and it may still hold inventory. A
+   * total that changed when a view toggle flipped would silently under-report
+   * committed capital, which is exactly the class of quiet omission step 25 was
+   * built to avoid. Hiding is a view decision; the arithmetic is not.
+   *
+   * The backend agrees by doing nothing: `GET /api/bots` has no archived filter,
+   * so this page always has every bot in hand.
+   */
+  const archivedCount = bots.filter((bot) => bot.archived).length;
+  const visibleBots = showArchived ? bots : bots.filter((bot) => !bot.archived);
   const firstLoad = botsPoll.loading && botsPoll.data === null;
   const hardError = botsPoll.error !== null && botsPoll.data === null;
 
@@ -55,6 +107,11 @@ export function Dashboard() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-xl font-semibold text-zinc-100">Bots</h1>
         <div className="flex items-center gap-3">
+          <ShowArchivedToggle
+            checked={showArchived}
+            archivedCount={archivedCount}
+            onChange={setShowArchived}
+          />
           <FreshnessIndicator
             lastUpdated={botsPoll.lastUpdated ?? alertsPoll.lastUpdated}
             error={botsPoll.error ?? alertsPoll.error}
@@ -94,7 +151,7 @@ export function Dashboard() {
           </div>
         </div>
       ) : (
-        <BotList bots={bots} />
+        <BotList bots={visibleBots} hiddenCount={bots.length - visibleBots.length} />
       )}
     </div>
   );

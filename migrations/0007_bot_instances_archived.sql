@@ -1,0 +1,71 @@
+-- Migration 0007: `bot_instances.archived` (build step 26).
+--
+-- A bot that is finished with -- a completed experiment, a superseded
+-- parameter set, a testnet run whose conclusions are already recorded -- has
+-- nowhere to go. It stays on the bot list forever, and the list is the page an
+-- operator reads to see what is happening RIGHT NOW. Ten dead rows above two
+-- live ones is not a cosmetic problem: it is the main risk surface of this
+-- dashboard getting harder to read every week.
+--
+-- ---------------------------------------------------------------------------
+-- THIS IS NOT A DELETE, AND THE DISTINCTION IS STRUCTURAL, NOT A PROMISE
+-- ---------------------------------------------------------------------------
+-- Section 8.7 retains all trade, order and log data indefinitely, and /src/db
+-- enforces that by construction: `Repository` offers no `delete` method at all
+-- (see the header of /src/db/table.ts), and `no-raw-d1.test.ts` fails the build
+-- if any file outside /src/db reaches for `.prepare(`, `env.DB` or `D1Database`
+-- to route around it. So "archive" could not have been built as a soft delete
+-- that later becomes a hard one -- there is no hard one to become.
+--
+-- What this column changes is exactly one thing: whether a bot appears in the
+-- bot list's DEFAULT view. Its row, its Durable Object state, its orders, its
+-- trades, its alerts, its audit entries and its capital-ledger allocation are
+-- all untouched by archiving, and its detail page renders identically before
+-- and after. `api.test.ts`'s "archiving removes nothing" case asserts that by
+-- deep-comparing the whole detail payload across an archive.
+--
+-- ---------------------------------------------------------------------------
+-- WHY THE FLAG LIVES HERE AND NOT IN THE DURABLE OBJECT
+-- ---------------------------------------------------------------------------
+-- Section 8.1 makes each `BotInstance` object the source of truth for its own
+-- TRADING state: configuration, status, position, ladder or DCA entries, order
+-- history, idempotency records. Archived is none of those. No strategy branches
+-- on it, no order is placed or withheld because of it, and the object would
+-- never read it back. Putting it in stored state would mean a state-shape
+-- change and therefore a `schemaVersion` migration on every existing bot
+-- (section 16) plus a new mirror path, all for a flag whose only consumer is a
+-- list view already built from this row.
+--
+-- The `bot_instances` row is already authoritative for `status`,
+-- `strategy_type` and `allocated_capital` -- facts the dashboard reads without
+-- waking an object. This is that kind of fact.
+--
+-- ---------------------------------------------------------------------------
+-- WHY NO INDEX
+-- ---------------------------------------------------------------------------
+-- Deliberately none. Nothing queries on this column: the dashboard fetches
+-- every bot (archived bots still count toward the account-level totals, since
+-- an archived halted bot still holds its capital allocation and may still hold
+-- inventory) and hides the archived rows in the view. An index on a column no
+-- WHERE clause mentions is dead weight that reads as intent.
+--
+-- ---------------------------------------------------------------------------
+-- MECHANICS
+-- ---------------------------------------------------------------------------
+-- A separate numbered file rather than an edit to 0001, for the reason 0002
+-- and 0004 both record: 0001 is already applied to the real testnet database
+-- and `applyD1Migrations` records applied migrations by filename, so an edited
+-- 0001 would never re-run there.
+--
+-- The DEFAULT exists because SQLite requires one to add a NOT NULL column, and
+-- unlike 0002's it IS depended upon -- for existing rows only. Every row that
+-- predates this migration becomes `archived = 0`, which is the honest reading:
+-- nothing has ever been archived. New rows still supply the column explicitly
+-- (/src/db has no `.withDefault()`; every column is required at insert time),
+-- so there is no path that omits it and silently gets a value.
+--
+-- ALTER TABLE ADD COLUMN appends, so `archived` is last in the bot_instances
+-- column list, and schema.ts and schema.test.ts must match that order.
+
+ALTER TABLE bot_instances ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
+  CHECK (archived IN (0, 1));
