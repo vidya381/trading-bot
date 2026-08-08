@@ -102,6 +102,28 @@ export const accounts = defineTable("accounts", {
   updated_at: integer(),
 });
 
+/**
+ * The section 21.3 fixed watchlist (migration 0008). A deliberately small,
+ * human-chosen set of pairs for the research pipeline's general entry point to
+ * consider -- storage only; nothing reads it yet.
+ *
+ * `removed_at`/`removed_by` make removal a soft delete, because `Repository`
+ * offers no hard one (see /src/db/table.ts) -- the same shape as
+ * `bot_instances.archived`. An entry is on the live list exactly while
+ * `removed_at IS NULL`, which is also the scope of the migration's unique
+ * index. `/src/research/watchlist.ts` is the only writer.
+ */
+export const watchlist = defineTable("watchlist", {
+  id: text(),
+  account_label: text(),
+  pair: text(),
+  note: text(),
+  added_by: text(),
+  added_at: integer(),
+  removed_by: nullable(text()),
+  removed_at: nullable(integer()),
+});
+
 export const capitalLedger = defineTable("capital_ledger", {
   id: text(),
   account_label: text(),
@@ -233,6 +255,7 @@ export const alerts = defineTable("alerts", {
 // every column is present -- these are also the insert types.
 export type BotInstanceRow = Row<typeof botInstances.columns>;
 export type AccountRow = Row<typeof accounts.columns>;
+export type WatchlistRow = Row<typeof watchlist.columns>;
 export type CapitalLedgerRow = Row<typeof capitalLedger.columns>;
 export type OrderRow = Row<typeof orders.columns>;
 export type TradeRow = Row<typeof trades.columns>;
@@ -247,6 +270,7 @@ export type GlobalKillSwitchRow = Row<typeof globalKillSwitch.columns>;
 export const ALL_TABLES = {
   botInstances,
   accounts,
+  watchlist,
   capitalLedger,
   orders,
   trades,

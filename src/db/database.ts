@@ -25,6 +25,7 @@ import {
   manualAdjustments,
   orders,
   trades,
+  watchlist,
 } from "./schema";
 
 export class Database {
@@ -32,6 +33,7 @@ export class Database {
 
   readonly botInstances: Repository<typeof botInstances.columns>;
   readonly accounts: Repository<typeof accounts.columns>;
+  readonly watchlist: Repository<typeof watchlist.columns>;
   readonly capitalLedger: Repository<typeof capitalLedger.columns>;
   readonly orders: Repository<typeof orders.columns>;
   readonly trades: Repository<typeof trades.columns>;
@@ -46,6 +48,7 @@ export class Database {
     this.#d1 = d1;
     this.botInstances = new Repository(d1, botInstances);
     this.accounts = new Repository(d1, accounts);
+    this.watchlist = new Repository(d1, watchlist);
     this.capitalLedger = new Repository(d1, capitalLedger);
     this.orders = new Repository(d1, orders);
     this.trades = new Repository(d1, trades);

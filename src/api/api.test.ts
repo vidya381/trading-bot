@@ -1943,6 +1943,515 @@ describe("accounts (step 11)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Watchlist (section 21.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The HTTP surface over `/src/research/watchlist.ts`.
+ *
+ * The module's own rules -- the cap, fail-closed tradability, the audit entries,
+ * the read path -- already have their own file of tests. What is proved HERE is
+ * the endpoint layer's share and only that: request parsing, that the actor is
+ * the VERIFIED Access email rather than anything the caller sent, that each of
+ * the module's coded refusals reaches HTTP as the right status, and that the
+ * `TradablePairSource` port is wired to the real cached `listAccountSymbols`
+ * rather than to a stub that only tests see.
+ *
+ * The exchange is injected through `symbolLister`, which is the SAME seam the
+ * symbols endpoint uses -- so these tests exercise the real
+ * `listAccountSymbols` (cache included), and the only thing replaced is the
+ * network call at the far end of it.
+ */
+describe("watchlist endpoints (section 21.3)", () => {
+  const GEMINI_PAIRS = ["BTCUSD", "ETHUSD", "SOLUSD", "LINKUSD", "DOGEUSD"];
+
+  /** A lister answering with a fixed catalogue, counting how often it is asked. */
+  function catalogue(pairs: readonly string[] = GEMINI_PAIRS) {
+    const calls = { n: 0 };
+    const lister: SymbolLister = async () => {
+      calls.n += 1;
+      return { ok: true, value: [...pairs], at: T0 };
+    };
+    return { lister, calls };
+  }
+
+  /** A lister that cannot reach the venue at all. */
+  function unreachable() {
+    const calls = { n: 0 };
+    const lister: SymbolLister = async () => {
+      calls.n += 1;
+      return { ok: false, kind: "transport" as const, message: "connect ETIMEDOUT", retryable: true, at: T0 };
+    };
+    return { lister, calls };
+  }
+
+  /** A registered account, unique per test so the KV symbol cache cannot leak. */
+  async function account(prefix: string, exchange: "gemini" | "binance" = "gemini") {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange, created_at: T0, updated_at: T0 });
+    return label;
+  }
+
+  async function watchlistAudit() {
+    const rows = await db.auditLog.findMany({
+      orderBy: [{ column: "created_at", direction: "asc" }],
+    });
+    return rows.filter((row) => row.action.startsWith("watchlist."));
+  }
+
+  // -- POST /api/watchlist ---------------------------------------------------
+
+  it("POST /api/watchlist adds a pair and returns it, 201", async () => {
+    const label = await account("wl-add");
+    const { lister } = catalogue();
+
+    const res = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "deepest book on the venue" },
+    });
+
+    expect(res.status).toBe(201);
+    expect(res.body.error).toBeNull();
+    expect(res.body.data).toEqual({
+      id: expect.any(String),
+      accountLabel: label,
+      pair: "BTCUSD",
+      note: "deepest book on the venue",
+      addedBy: HUMAN,
+      addedAt: T0,
+    });
+
+    // It is really in the table, and really audited -- not just echoed back.
+    const listed = await api("GET", "/api/watchlist", { symbolLister: lister });
+    expect(listed.body.data).toEqual([res.body.data]);
+    const audit = await watchlistAudit();
+    expect(audit.map((row) => row.action)).toEqual(["watchlist.added"]);
+    expect(audit[0]!.actor).toBe(HUMAN);
+  });
+
+  it("records the VERIFIED token email as actor, not the one in the body", async () => {
+    // The whole reason this layer never reads an actor from a request. The
+    // watchlist's value is that a named human vouched for each row, so an actor
+    // the caller can choose is an audit trail that proves nothing.
+    const label = await account("wl-actor");
+    const { lister } = catalogue();
+
+    const spoofed = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      email: "real@example.com",
+      body: {
+        accountLabel: label,
+        pair: "BTCUSD",
+        note: "n",
+        actor: "someone-else@example.com",
+      },
+    });
+    expect(spoofed.status).toBe(400);
+    expect(spoofed.body.error.code).toBe("actor_not_accepted");
+    expect(await db.watchlist.count()).toBe(0);
+
+    // Without the field, the recorded actor is the token's email.
+    const res = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      email: "real@example.com",
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.data.addedBy).toBe("real@example.com");
+    expect((await watchlistAudit())[0]!.actor).toBe("real@example.com");
+  });
+
+  it("validates the pair it stores, ignoring any query-string of the same name", async () => {
+    // The property underneath fail-closed: the pair that was CHECKED must be the
+    // pair that lands in the row. A query parameter shadowing the body field
+    // would let a caller have one pair validated and a different one stored,
+    // which is a validation that validates nothing. Nothing reads the query
+    // string on this route; this pins that.
+    const label = await account("wl-qs");
+    const { lister } = catalogue();
+
+    const res = await api("POST", "/api/watchlist?pair=PEPEUSD", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.pair).toBe("BTCUSD");
+    expect((await db.watchlist.findMany()).map((r) => r.pair)).toEqual(["BTCUSD"]);
+  });
+
+  it("derives the exchange from the registry, never from the request body", async () => {
+    // Step 11's lesson applied to this table. If the caller could name the
+    // exchange, they could pick which venue their pair is validated against --
+    // send a Binance symbol, claim Binance, and have it accepted onto a Gemini
+    // account whose venue has never heard of it.
+    const label = await account("wl-venue"); // registered as gemini
+    const { lister } = catalogue(); // the gemini catalogue: no BTCUSDT in it
+
+    const spoofed = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSDT", note: "n", exchange: "binance" },
+    });
+    expect(spoofed.status).toBe(400);
+    expect(spoofed.body.error.code).toBe("pair_not_tradable");
+    expect(await db.watchlist.count()).toBe(0);
+
+    // And the registry's exchange is what the audit entry records.
+    await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n", exchange: "binance" },
+    });
+    const audit = (await watchlistAudit())[0]!;
+    expect((audit.details_json as { exchange: unknown }).exchange).toBe("gemini");
+  });
+
+  it("POST is 409 cap_exceeded once the list holds ten", async () => {
+    const label = await account("wl-cap");
+    const { lister, calls } = catalogue();
+    for (let i = 0; i < 10; i += 1) {
+      await db.watchlist.insert({
+        id: `cap-${suffix}-${i}`,
+        account_label: label,
+        pair: `pad${i}`,
+        note: "fixture",
+        added_by: HUMAN,
+        added_at: T0,
+        removed_by: null,
+        removed_at: null,
+      });
+    }
+
+    const res = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("cap_exceeded");
+    // The module refuses before reaching the venue, and the endpoint does not
+    // undo that by pre-fetching the catalogue for its own reasons.
+    expect(calls.n).toBe(0);
+    expect(await db.watchlist.count({ removed_at: null })).toBe(10);
+  });
+
+  it("POST is 400 pair_not_tradable for a pair the venue does not list", async () => {
+    const label = await account("wl-untradable");
+    const { lister } = catalogue();
+
+    const res = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "PEPEUSD", note: "seen it trending" },
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("pair_not_tradable");
+    expect(await db.watchlist.count()).toBe(0);
+    expect(await watchlistAudit()).toEqual([]);
+  });
+
+  it("POST is 409 already_watched for a duplicate", async () => {
+    const label = await account("wl-dup");
+    const { lister } = catalogue();
+    const body = { accountLabel: label, pair: "BTCUSD", note: "n" };
+
+    expect((await api("POST", "/api/watchlist", { symbolLister: lister, body })).status).toBe(201);
+    const res = await api("POST", "/api/watchlist", { symbolLister: lister, body });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("already_watched");
+    expect(await db.watchlist.count({ removed_at: null })).toBe(1);
+    expect((await watchlistAudit()).length).toBe(1);
+  });
+
+  it("POST is 503 tradable_set_unreadable when the venue cannot be asked", async () => {
+    // Fail closed, and 503 rather than the symbols endpoint's 502: this is a
+    // REFUSAL to write on unverifiable input, not a relayed read failure.
+    const label = await account("wl-down");
+    const { lister } = unreachable();
+
+    const res = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("tradable_set_unreadable");
+    expect(res.body.error.message).toContain("connect ETIMEDOUT");
+    expect(await db.watchlist.count()).toBe(0);
+  });
+
+  it("POST is 404 for an unregistered account", async () => {
+    const res = await api("POST", "/api/watchlist", {
+      symbolLister: catalogue().lister,
+      body: { accountLabel: `nope-${suffix}`, pair: "BTCUSD", note: "n" },
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_account");
+  });
+
+  it("POST is 400 for a missing or blank field", async () => {
+    const label = await account("wl-fields");
+    const { lister } = catalogue();
+    for (const body of [
+      { pair: "BTCUSD", note: "n" },
+      { accountLabel: label, note: "n" },
+      { accountLabel: label, pair: "BTCUSD" },
+      { accountLabel: label, pair: "BTCUSD", note: "   " },
+    ]) {
+      const res = await api("POST", "/api/watchlist", { symbolLister: lister, body });
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe("missing_field");
+    }
+    expect(await db.watchlist.count()).toBe(0);
+  });
+
+  it("uses the REAL cached listAccountSymbols, so two adds cost one venue call", async () => {
+    // The port wiring, asserted rather than assumed. If the endpoint reached for
+    // the exchange directly instead of going through `listAccountSymbols`, this
+    // would be two calls -- and the watchlist's idea of what is tradable could
+    // drift from the dropdown the operator reads.
+    const label = await account("wl-cache");
+    const { lister, calls } = catalogue();
+
+    await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+    await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "ETHUSD", note: "n" },
+    });
+
+    expect(await db.watchlist.count({ removed_at: null })).toBe(2);
+    expect(calls.n).toBe(1);
+  });
+
+  // -- DELETE /api/watchlist/:id --------------------------------------------
+
+  it("DELETE /api/watchlist/:id removes the entry and audits it", async () => {
+    const label = await account("wl-del");
+    const { lister } = catalogue();
+    const added = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    const res = await api("DELETE", `/api/watchlist/${added.body.data.id}`, {
+      symbolLister: lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual(added.body.data);
+    expect((await api("GET", "/api/watchlist", { symbolLister: lister })).body.data).toEqual([]);
+    expect((await watchlistAudit()).map((row) => row.action)).toEqual([
+      "watchlist.added",
+      "watchlist.removed",
+    ]);
+    // Soft delete: the row is still there, marked.
+    const row = await db.watchlist.findOne({ id: added.body.data.id });
+    expect(row?.removed_by).toBe(HUMAN);
+    expect(row?.removed_at).toBe(T0);
+  });
+
+  it("DELETE never asks the exchange, so a delisting cannot trap an entry", async () => {
+    // Decision: removal does NOT re-check tradability. Driven with a lister that
+    // always fails -- the removal must still succeed, and must not have called
+    // it at all.
+    const label = await account("wl-del-down");
+    const added = await api("POST", "/api/watchlist", {
+      symbolLister: catalogue().lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    const { lister, calls } = unreachable();
+    const res = await api("DELETE", `/api/watchlist/${added.body.data.id}`, { symbolLister: lister });
+
+    expect(res.status).toBe(200);
+    expect(calls.n).toBe(0);
+    expect(await db.watchlist.count({ removed_at: null })).toBe(0);
+  });
+
+  it("records the verified email as the REMOVAL actor too, whatever the caller sends", async () => {
+    // The same audit-truth property as the add, on the other half. A removal is
+    // the entry's last recorded human act, and `removed_by` is the only place it
+    // is kept -- so a caller-supplied actor here would be a false record of who
+    // took a pair off the list.
+    const label = await account("wl-del-actor");
+    const { lister } = catalogue();
+    const added = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      email: "real@example.com",
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    const res = await api(
+      "DELETE",
+      `/api/watchlist/${added.body.data.id}?actor=someone-else%40example.com`,
+      { symbolLister: lister, email: "real@example.com" },
+    );
+
+    expect(res.status).toBe(200);
+    const row = await db.watchlist.findOne({ id: added.body.data.id });
+    expect(row?.removed_by).toBe("real@example.com");
+    const removal = (await watchlistAudit()).find((r) => r.action === "watchlist.removed")!;
+    expect(removal.actor).toBe("real@example.com");
+  });
+
+  it("DELETE is 404 unknown_watchlist_entry for an id that does not exist", async () => {
+    const res = await api("DELETE", `/api/watchlist/nope-${suffix}`, {
+      symbolLister: catalogue().lister,
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_watchlist_entry");
+    expect(await watchlistAudit()).toEqual([]);
+  });
+
+  it("DELETE is 404 not_watched for an entry already removed", async () => {
+    const label = await account("wl-twice");
+    const { lister } = catalogue();
+    const added = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+    const path = `/api/watchlist/${added.body.data.id}`;
+    expect((await api("DELETE", path, { symbolLister: lister })).status).toBe(200);
+
+    const res = await api("DELETE", path, { symbolLister: lister });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("not_watched");
+    // No second removal audit entry for a removal that did not happen.
+    expect((await watchlistAudit()).filter((r) => r.action === "watchlist.removed")).toHaveLength(1);
+  });
+
+  it("DELETE on a STALE id does not remove the live entry for the same pair", async () => {
+    // The one guard this handler adds that the module cannot. The migration's
+    // unique index is PARTIAL, so a removed row and a live row may share
+    // (account, pair). The module is addressed by pair; passing a dead row's
+    // pair through would silently kill the live entry that replaced it.
+    const label = await account("wl-stale");
+    const { lister } = catalogue();
+    const body = { accountLabel: label, pair: "BTCUSD", note: "n" };
+
+    const first = await api("POST", "/api/watchlist", { symbolLister: lister, body });
+    await api("DELETE", `/api/watchlist/${first.body.data.id}`, { symbolLister: lister });
+    const second = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { ...body, note: "back on, the range tightened" },
+    });
+    expect(second.body.data.id).not.toBe(first.body.data.id);
+
+    const res = await api("DELETE", `/api/watchlist/${first.body.data.id}`, { symbolLister: lister });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("not_watched");
+    // The live entry is untouched.
+    const live = await api("GET", "/api/watchlist", { symbolLister: lister });
+    expect(live.body.data).toEqual([second.body.data]);
+  });
+
+  it("DELETE carries an optional ?note= into the audit entry", async () => {
+    const label = await account("wl-note");
+    const { lister } = catalogue();
+    const added = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    await api("DELETE", `/api/watchlist/${added.body.data.id}?note=superseded%20by%20solusd`, {
+      symbolLister: lister,
+    });
+
+    const removal = (await watchlistAudit()).find((r) => r.action === "watchlist.removed")!;
+    expect((removal.details_json as { note: unknown }).note).toBe("superseded by solusd");
+  });
+
+  it("DELETE is 400 for a present-but-blank ?note=", async () => {
+    const label = await account("wl-blank-note");
+    const { lister } = catalogue();
+    const added = await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+
+    const res = await api("DELETE", `/api/watchlist/${added.body.data.id}?note=%20%20`, {
+      symbolLister: lister,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_field");
+    expect(await db.watchlist.count({ removed_at: null })).toBe(1);
+  });
+
+  // -- GET /api/watchlist ----------------------------------------------------
+
+  it("GET spans every account unscoped, and narrows with ?accountLabel=", async () => {
+    const gem = await account("wl-g");
+    const bin = await account("wl-b", "binance");
+    const { lister } = catalogue();
+    const binanceLister: SymbolLister = async () => ({ ok: true, value: ["BTCUSDT"], at: T0 });
+
+    await api("POST", "/api/watchlist", {
+      symbolLister: lister,
+      body: { accountLabel: gem, pair: "BTCUSD", note: "gemini one" },
+    });
+    await api("POST", "/api/watchlist", {
+      symbolLister: binanceLister,
+      body: { accountLabel: bin, pair: "BTCUSDT", note: "binance one" },
+    });
+
+    const all = await api("GET", "/api/watchlist", { symbolLister: lister });
+    expect(all.status).toBe(200);
+    expect(all.body.data.map((e: { pair: string }) => e.pair)).toEqual(["BTCUSD", "BTCUSDT"]);
+
+    const scoped = await api("GET", `/api/watchlist?accountLabel=${bin}`, { symbolLister: lister });
+    expect(scoped.status).toBe(200);
+    expect(scoped.body.data).toEqual([
+      { id: expect.any(String), accountLabel: bin, pair: "BTCUSDT", note: "binance one", addedBy: HUMAN, addedAt: T0 },
+    ]);
+  });
+
+  it("GET is 404 for an unregistered ?accountLabel=, not an empty list", async () => {
+    // A typo'd label would otherwise report "nothing is watched" about an
+    // account that does not exist, and the caller could not tell the difference.
+    const res = await api("GET", `/api/watchlist?accountLabel=gemini-mian-${suffix}`, {
+      symbolLister: catalogue().lister,
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_account");
+  });
+
+  it("GET returns an empty list for a registered account with nothing watched", async () => {
+    const label = await account("wl-empty");
+    const res = await api("GET", `/api/watchlist?accountLabel=${label}`, {
+      symbolLister: catalogue().lister,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toStrictEqual({ data: [], error: null });
+  });
+
+  // -- Routing and auth ------------------------------------------------------
+
+  it("is routed on the three methods it declares and no others", async () => {
+    const collectionOther = await api("PUT", "/api/watchlist", { symbolLister: catalogue().lister });
+    expect(collectionOther.status).toBe(405);
+    expect(collectionOther.body.error.code).toBe("method_not_allowed");
+
+    const itemOther = await api("POST", `/api/watchlist/some-id`, { symbolLister: catalogue().lister });
+    expect(itemOther.status).toBe(405);
+  });
+
+  it("refuses an unauthenticated write", async () => {
+    const label = await account("wl-auth");
+    const res = await api("POST", "/api/watchlist", {
+      token: null,
+      symbolLister: catalogue().lister,
+      body: { accountLabel: label, pair: "BTCUSD", note: "n" },
+    });
+    expect(res.status).toBe(401);
+    expect(await db.watchlist.count()).toBe(0);
+  });
+});
+
 describe("bot creation dispatches exchange from the account registry (step 11)", () => {
   async function createBotBody(account: string, id: string, exchange?: string) {
     const body: Record<string, unknown> = {

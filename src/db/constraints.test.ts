@@ -9,6 +9,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Database } from "./database";
 import {
+  accountRow,
   alertRow,
   auditLogRow,
   botInstanceRow,
@@ -17,6 +18,7 @@ import {
   orderRow,
   rawD1,
   tradeRow,
+  watchlistRow,
 } from "./test-helpers";
 
 let db: Database;
@@ -294,6 +296,50 @@ describe("alerts and audit_log", () => {
     );
     const row = await db.auditLog.findOne({ id: "al-2" });
     expect(row?.details_json).toEqual({ version: "0.1.0", environment: "testnet" });
+  });
+});
+
+describe("watchlist", () => {
+  // These are the guarantees that survive a RAW `wrangler d1 execute`, which is
+  // how the list is edited for now. The cap, the tradability check and the audit
+  // entry all live in /src/research/watchlist.ts and none of them run on a hand-
+  // written INSERT -- so what the schema itself enforces is the whole of what a
+  // manual edit cannot get wrong, and it is worth knowing exactly.
+  beforeEach(async () => {
+    await db.accounts.insert(accountRow());
+  });
+
+  it("refuses an entry for an account that is not registered", async () => {
+    // Without a registered account there is no `accounts.exchange`, so there is
+    // no venue to validate the pair against -- an unvalidatable row.
+    await expect(
+      db.watchlist.insert(watchlistRow({ account_label: "never-registered" })),
+    ).rejects.toThrow(/FOREIGN KEY/);
+  });
+
+  it("refuses a second LIVE entry for the same account and pair", async () => {
+    await db.watchlist.insert(watchlistRow({ id: "wl-1" }));
+    await expect(db.watchlist.insert(watchlistRow({ id: "wl-2" }))).rejects.toThrow(/UNIQUE/);
+  });
+
+  it("allows re-adding a pair whose earlier entry was removed", async () => {
+    // Why the unique index is PARTIAL. A plain UNIQUE would forbid this
+    // forever, and changing your mind twice about a coin is ordinary.
+    await db.watchlist.insert(
+      watchlistRow({ id: "wl-1", removed_by: "owner@example.com", removed_at: 1_760_000_100_000 }),
+    );
+    await db.watchlist.insert(watchlistRow({ id: "wl-2" }));
+    expect(await db.watchlist.count()).toBe(2);
+  });
+
+  it("refuses a half-recorded removal in either direction", async () => {
+    await db.watchlist.insert(watchlistRow({ id: "wl-1" }));
+    await expect(
+      db.watchlist.update({ id: "wl-1" }, { removed_at: 1_760_000_100_000 }),
+    ).rejects.toThrow(/CHECK/);
+    await expect(
+      db.watchlist.update({ id: "wl-1" }, { removed_by: "owner@example.com" }),
+    ).rejects.toThrow(/CHECK/);
   });
 });
 

@@ -23,8 +23,17 @@ import {
   circuitBreakerView,
   killSwitchView,
   manualAdjustmentView,
+  watchlistEntryView,
   type BotFees,
 } from "./serialize";
+import {
+  addToWatchlist,
+  readWatchlist,
+  removeFromWatchlist,
+  type TradablePairSource,
+  type WatchlistAccount,
+  type WatchlistPorts,
+} from "../research";
 import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
 import type {
   AlertCategory,
@@ -872,6 +881,222 @@ export async function getAccountSymbols(ctx: ApiContext): Promise<Response> {
     cached: listing.cached,
     fetchedAt: listing.fetchedAt,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Watchlist (section 21.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The account, as the watchlist module wants it, or 404.
+ *
+ * `WatchlistAccount` is `{ label, exchange }` and the exchange comes from the
+ * registry, never from the request -- the same derivation `createBot` uses and
+ * for the same reason step 11 gave: a free-typed exchange on the request lets a
+ * caller pick which venue their pair is validated against, which is a
+ * validation that validates nothing.
+ */
+async function requireWatchlistAccount(
+  ctx: ApiContext,
+  label: string,
+): Promise<WatchlistAccount> {
+  const account = await ctx.db.accounts.findOne({ account_label: label });
+  if (account === null) {
+    throw notFound("unknown_account", `no registered account ${JSON.stringify(label)}`);
+  }
+  return { label, exchange: account.exchange };
+}
+
+/**
+ * Wire the watchlist's `TradablePairSource` port to the REAL cached listing.
+ *
+ * This is the same `listAccountSymbols` call `getAccountSymbols` makes, with the
+ * same KV cache and the same `ctx.symbolLister` (defaulting to
+ * `envSymbolLister`, which resolves the account's exchange, builds a real
+ * client, and calls `listTradablePairs`). Reused rather than reached for
+ * directly, so the watchlist's tradability check and the dropdown the operator
+ * reads cannot disagree about what the venue lists, and so a check does not
+ * bypass the cache and spend a full-catalogue exchange request per add.
+ *
+ * The cache being shared has one consequence worth naming: a tradable set up to
+ * an hour old can approve a pair the venue delisted in the meantime. That is the
+ * safe direction -- the pipeline that consumes this list re-reads the venue
+ * before it can propose anything, and a stale ACCEPT costs one wasted candidate
+ * while a stale REJECT would block a real one. A read failure is never cached
+ * (`listAccountSymbols` returns failures without writing), so the fail-closed
+ * refusal is always against a live attempt.
+ */
+function tradablePairsFor(ctx: ApiContext): TradablePairSource {
+  const cache: SymbolCacheStore | null =
+    ctx.env.SYMBOL_CACHE === undefined ? null : new KvSymbolCacheStore(ctx.env.SYMBOL_CACHE);
+  return async (account) =>
+    await listAccountSymbols({
+      account,
+      env: ctx.env,
+      now: ctx.now,
+      lister: ctx.symbolLister,
+      cache,
+    });
+}
+
+function watchlistPorts(ctx: ApiContext): WatchlistPorts {
+  return {
+    db: ctx.db,
+    now: ctx.now,
+    newId: ctx.newId,
+    listTradablePairs: tradablePairsFor(ctx),
+  };
+}
+
+/**
+ * GET /api/watchlist -- the live section 21.3 watchlist.
+ *
+ * `?accountLabel=` narrows to one account; omitted, it spans every account,
+ * which is what a general-entry-point pipeline run over the whole list wants.
+ *
+ * An UNREGISTERED `accountLabel` is a 404, not an empty list, following
+ * `getAccountSymbols` rather than `listAlerts`. The difference is that
+ * `listAlerts`' filters are closed enumerations where a typo cannot look like a
+ * real value, whereas an account label is free text: returning `[]` for
+ * `gemini-mian` reports "nothing is watched" about an account that does not
+ * exist, and the caller cannot tell that from the truth.
+ */
+export async function listWatchlist(ctx: ApiContext): Promise<Response> {
+  const accountLabel = ctx.url.searchParams.get("accountLabel");
+  if (accountLabel !== null) {
+    await requireWatchlistAccount(ctx, accountLabel);
+  }
+  const entries = await readWatchlist(
+    ctx.db,
+    accountLabel === null ? {} : { accountLabel },
+  );
+  return ok(entries.map(watchlistEntryView));
+}
+
+/**
+ * POST /api/watchlist -- add one pair to the watchlist.
+ *
+ * A thin wrapper, in the strict sense this layer means it: the cap, the
+ * tradability check, the duplicate check, the human-actor rule and the audit
+ * entry all live in `addToWatchlist` and none of them are re-implemented,
+ * re-ordered or second-guessed here. What this adds is the HTTP shape, the
+ * registry lookup that turns a label into a `WatchlistAccount`, and the port
+ * wiring above.
+ *
+ * THE ACTOR IS `ctx.actor` AND IS NEVER READ FROM THE BODY. That is this
+ * layer's standing rule (see the file header) and it matters more than usual
+ * here, because the module refuses automated actors on purpose: a body-supplied
+ * actor would let any authenticated caller write "chosen deliberately by the
+ * operators" under someone else's name, in the one table whose entire value is
+ * that a named human vouched for each row. An `actor` field in the body is
+ * therefore REFUSED rather than ignored -- silently overriding it would record a
+ * different person than the caller believes they recorded, and the audit log is
+ * the thing this refusal exists to keep true.
+ *
+ * Failures, all raised by the module and mapped in envelope.ts:
+ *   - `cap_exceeded` (409)            -- the list already holds 10.
+ *   - `already_watched` (409)         -- the pair is live on this account.
+ *   - `pair_not_tradable` (400)       -- the venue does not list it.
+ *   - `tradable_set_unreadable` (503) -- the venue could not be asked.
+ *   - `requires_human_actor` (403)    -- unreachable over HTTP today, since
+ *     `ctx.actor` is a verified Access email, but the module still checks and
+ *     the mapping exists so it cannot become a silent 400 later.
+ */
+export async function addWatchlistEntry(ctx: ApiContext): Promise<Response> {
+  const body = await readJsonObject(ctx.request);
+  if (body.actor !== undefined) {
+    throw badRequest(
+      "actor_not_accepted",
+      `field "actor" is not accepted: the actor is the email verified from the ` +
+        `Cloudflare Access token, so a body-supplied one would be recorded as ` +
+        `someone else. Remove the field.`,
+    );
+  }
+
+  const accountLabel = requireString(body, "accountLabel");
+  const pair = requireString(body, "pair");
+  const note = requireString(body, "note");
+  const account = await requireWatchlistAccount(ctx, accountLabel);
+
+  const entry = await addToWatchlist(watchlistPorts(ctx), {
+    account,
+    pair,
+    note,
+    actor: ctx.actor,
+  });
+  return ok(watchlistEntryView(entry), 201);
+}
+
+/**
+ * DELETE /api/watchlist/:id -- take one pair off the watchlist.
+ *
+ * Addressed by ENTRY ID where the module is addressed by (account, pair),
+ * because an id is what `GET /api/watchlist` just handed the caller and it is
+ * the only stable handle on a row. The adaptation is a lookup, and it carries
+ * one guard that is NOT redundant with the module's own:
+ *
+ * A pair can be removed and later re-added, which the migration's PARTIAL unique
+ * index exists to allow. So an old, already-removed row and a new, live row can
+ * share `(account_label, pair)`. Passing the old row's pair straight through
+ * would make `removeFromWatchlist` match the LIVE one and remove it -- a DELETE
+ * on a dead id silently killing a different entry. Refusing a non-live id here
+ * is what closes that; the module cannot, because by the time it sees the pair
+ * the id is gone.
+ *
+ * What is deliberately NOT duplicated is the liveness DECISION itself: the
+ * module still owns it (its `UPDATE` is conditional on `removed_at IS NULL`, so
+ * a removal racing another loses properly). This guard answers a different
+ * question -- "does this id name the live entry for that pair" -- and a test and
+ * a mutant pin it.
+ *
+ * REMOVAL DOES NOT RE-CHECK TRADABILITY. Settled deliberately: refusing to
+ * remove a delisted pair would trap exactly the entry most in need of removing,
+ * and an exchange outage would be enough to freeze the list. It is the same
+ * stance `unarchiveBot` takes ("the risk-REDUCING direction ... a gate here
+ * could only ever strand a bot") and the same one `halt` takes in asserting
+ * neither latch.
+ *
+ * Failures:
+ *   - `unknown_watchlist_entry` (404) -- no row with that id.
+ *   - `not_watched` (404)             -- the row exists but is not live.
+ */
+export async function removeWatchlistEntry(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const row = await ctx.db.watchlist.findOne({ id });
+  if (row === null) {
+    throw notFound("unknown_watchlist_entry", `no watchlist entry ${JSON.stringify(id)}`);
+  }
+  if (row.removed_at !== null) {
+    throw new ApiError(
+      404,
+      "not_watched",
+      `watchlist entry ${JSON.stringify(id)} (${row.pair} on ${row.account_label}) was ` +
+        `already removed by ${row.removed_by}. The pair may have been added again ` +
+        `since, under a new id -- removing it is a separate request against that id.`,
+    );
+  }
+
+  const account = await requireWatchlistAccount(ctx, row.account_label);
+
+  // `?note=` rather than a body. A DELETE with no body is the normal case and
+  // `readJsonObject` would turn one into an `invalid_json` 400, so an optional
+  // body here would mean either a second body reader that tolerates emptiness or
+  // a required body on a request that needs none. The note is optional in the
+  // module too (see its header: the ADD's note is the justification nothing else
+  // records; a removal's is usually "we are done with it"), so a query parameter
+  // matches what it is -- a nicety, not a field.
+  const note = ctx.url.searchParams.get("note");
+  if (note !== null && note.trim() === "") {
+    throw badRequest("invalid_field", `query parameter "note", if given, must not be blank`);
+  }
+
+  const removed = await removeFromWatchlist(watchlistPorts(ctx), {
+    account,
+    pair: row.pair,
+    ...(note === null ? {} : { note }),
+    actor: ctx.actor,
+  });
+  return ok(watchlistEntryView(removed));
 }
 
 // ---------------------------------------------------------------------------

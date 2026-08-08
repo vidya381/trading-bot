@@ -20,6 +20,7 @@ import type {
   ManualAdjustmentRow,
   OrderRow,
   TradeRow,
+  WatchlistRow,
 } from "./schema";
 
 // Children before parents, so the deletes do not trip the foreign keys that D1
@@ -35,8 +36,9 @@ const TABLES_CHILDREN_FIRST = [
   "circuit_breakers",
   "global_kill_switch",
   "bot_instances",
-  // No table foreign-keys to `accounts`, so its position is free; last, beside
-  // the other parent-ish tables.
+  // Migration 0008 gave `accounts` its first child, so this is no longer free:
+  // `watchlist.account_label` REFERENCES accounts, and D1 enforces it.
+  "watchlist",
   "accounts",
 ] as const;
 
@@ -144,6 +146,20 @@ export function accountRow(overrides: Partial<AccountRow> = {}): AccountRow {
     exchange: "binance",
     created_at: T0,
     updated_at: T0,
+    ...overrides,
+  };
+}
+
+export function watchlistRow(overrides: Partial<WatchlistRow> = {}): WatchlistRow {
+  return {
+    id: "wl-1",
+    account_label: "main",
+    pair: "BTCUSDT",
+    note: "deep book, the reference pair for every comparison",
+    added_by: "owner@example.com",
+    added_at: T0,
+    removed_by: null,
+    removed_at: null,
     ...overrides,
   };
 }

@@ -45,6 +45,12 @@ const ROUTES: readonly Route[] = [
   route("POST", "/api/bots/:id/unarchive", handlers.unarchiveBot),
   route("GET", "/api/accounts", handlers.listAccounts),
   route("GET", "/api/accounts/:label/symbols", handlers.getAccountSymbols),
+  // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
+  // dashboard control for these is deliberately a later step; today they are the
+  // curl-callable surface that replaces editing the table by hand.
+  route("GET", "/api/watchlist", handlers.listWatchlist),
+  route("POST", "/api/watchlist", handlers.addWatchlistEntry),
+  route("DELETE", "/api/watchlist/:id", handlers.removeWatchlistEntry),
   route("GET", "/api/alerts", handlers.listAlerts),
   route("POST", "/api/manual-adjustments", handlers.createManualAdjustment),
   route("GET", "/api/circuit-breakers", handlers.listCircuitBreakers),

@@ -71,6 +71,9 @@ rather than trusting the header alone.
 | `POST /api/bots/:id/unarchive` | the same boolean, back. Never status-gated; idempotent (`not_archived`) |
 | `GET /api/accounts` | registered accounts and their exchange, from the `accounts` table (step 11) |
 | `GET /api/accounts/:label/symbols` | the account's live tradable pairs via its real client's `listTradablePairs`, KV-cached (step 11) |
+| `GET /api/watchlist` | `readWatchlist` (section 21.3, `/src/research`); `?accountLabel=` narrows, an unregistered one is a 404 rather than an empty list |
+| `POST /api/watchlist` | `addToWatchlist` — cap, fail-closed tradability, duplicate and audit all in the module. `TradablePairSource` is wired to the same cached `listAccountSymbols` the symbols endpoint uses. A body `actor` is **refused** (400), never ignored |
+| `DELETE /api/watchlist/:id` | `removeFromWatchlist` (a soft delete). Addressed by id, so the handler adds one guard the module cannot: a non-live id is refused, because a removed row and a live row may share `(account, pair)`. Deliberately never re-checks tradability — see below |
 | `GET /api/alerts` | `alerts`, filtered by category/severity/resolved |
 | `POST /api/manual-adjustments` | `manual_adjustments` insert + audit entry |
 | `GET /api/circuit-breakers` | `readCircuitBreaker` per account |
@@ -80,6 +83,49 @@ rather than trusting the header alone.
 | `POST /api/kill-switch/reset` | `resetGlobalKillSwitchFromEnv` |
 | `GET /api/reconciliation` | `audit_log` `reconciliation.run` entries |
 | `GET /api/health` (+ `/health`) | version/environment probe, unauthenticated |
+
+## The watchlist endpoints (section 21.3)
+
+Thin, in the strict sense this layer means it: the cap, the fail-closed
+tradability check, the duplicate check, the human-actor rule and both audit
+entries all live in `/src/research/watchlist.ts` and none of them are
+re-implemented here. What this layer adds is the HTTP shape, the registry lookup
+that turns an `accountLabel` into a `WatchlistAccount`, and the port wiring.
+
+**The `TradablePairSource` port is the real one.** `tradablePairsFor` calls the
+same `listAccountSymbols` as `GET /api/accounts/:label/symbols`, with the same
+KV cache and the same `ctx.symbolLister` (defaulting to `envSymbolLister` →
+`listTradablePairs`). Shared deliberately: the watchlist's idea of what a venue
+lists cannot drift from the dropdown an operator reads, and a check does not
+spend a full-catalogue exchange request per add. A read failure is never cached,
+so the fail-closed refusal is always against a live attempt.
+
+**A body `actor` is refused, not ignored.** The actor is always `ctx.actor`, the
+email verified off the Access JWT. That is this layer's standing rule, and it
+bites hardest here: the module refuses automated actors on purpose, so a
+body-supplied actor would let any authenticated caller write "chosen
+deliberately by the operators" under someone else's name — in the one table
+whose entire value is that a named human vouched for each row. Silently
+overriding it would record a different person than the caller believes they
+recorded.
+
+**Removal does not re-check tradability, deliberately.** Refusing to remove a
+*delisted* pair would trap exactly the entry most in need of removing, and an
+exchange outage would be enough to freeze the list. This is the same stance the
+rest of this layer already takes on shrinking actions: `unarchive` is never
+status-gated ("a gate here could only ever strand a bot"), and `halt` asserts
+neither risk latch. A gate belongs on the action that adds risk, not on its
+reversal.
+
+**Status mapping** reuses codes with the same *shape* of refusal rather than
+inventing per-endpoint ones — `cap_exceeded`/`already_watched` 409 (a conflict
+with current state, like `duplicate_bot_instance`), `not_watched` 404,
+`pair_not_tradable` 400, `tradable_set_unreadable` 503 (the "dependency is down"
+tier with `not_attached`, and **not** the symbols endpoint's 502, because this is
+a refusal to write on unverifiable input rather than a relayed read failure).
+
+**No dashboard control yet** — deliberately a later step. These are the
+curl-callable surface that replaces editing the table by hand.
 
 ## Archiving (`archived`, step 26)
 

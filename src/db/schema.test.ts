@@ -129,6 +129,11 @@ describe("the schema as a whole", () => {
       "manual_adjustments",
       "orders",
       "trades",
+      // Not in section 8.2. Added by migration 0008: the section 21.3 fixed
+      // watchlist, moved out of code/config so the research pipeline's
+      // candidate list is editable without a deploy. Storage only -- nothing
+      // in section 21 beyond this table exists yet.
+      "watchlist",
     ]);
   });
 
@@ -165,6 +170,10 @@ describe("the schema as a whole", () => {
       // Also a latch, not an amount. Section 7.4 is a one-click emergency stop,
       // with no threshold of its own.
       global_kill_switch: [],
+      // A list of pairs and who chose them. The one bound it carries -- 21.3's
+      // 10 entries -- is a ROW COUNT, not a monetary amount, and lives in
+      // /src/research/watchlist.ts.
+      watchlist: [],
     };
 
     for (const spec of Object.values(ALL_TABLES)) {

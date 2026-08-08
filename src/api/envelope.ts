@@ -123,6 +123,35 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   requires_reason: 400,
   // Strategy validation (sections 6.2, 6.3).
   invalid_parameter: 400,
+  // Section 21.3's watchlist (`/src/research/watchlist.ts`). Each of these
+  // reuses the status an existing code with the same SHAPE of refusal already
+  // carries, rather than picking a fresh one per endpoint:
+  //
+  //   cap_exceeded            409, like `duplicate_bot_instance` -- the request
+  //                           is well formed and conflicts with current state;
+  //                           removing a pair makes the identical request work.
+  //   already_watched         409, the same conflict, and the closest analogue
+  //                           in this table is literally a duplicate insert.
+  //   not_watched             404, like `unknown_bot_instance` -- the thing the
+  //                           caller named is not there to act on.
+  //   pair_not_tradable       400. The caller sent a bad field value and can fix
+  //                           it by asking differently, which is exactly what
+  //                           `invalid_parameter` means one row up.
+  //   tradable_set_unreadable 503, joining `not_attached` and `throttled` as the
+  //                           "a dependency is down, retry later" tier. NOT 502:
+  //                           this is a REFUSAL to write on unverifiable input,
+  //                           not a proxied exchange error, which is why it
+  //                           differs from the symbols endpoint's 502 (that one
+  //                           IS relaying a failed read the caller asked for).
+  //
+  // `requires_human_actor` is deliberately absent: the watchlist reuses the
+  // kill switch's spelling, so it is already mapped to 403 six rows above. A
+  // second entry would be a second place to change.
+  cap_exceeded: 409,
+  already_watched: 409,
+  not_watched: 404,
+  pair_not_tradable: 400,
+  tradable_set_unreadable: 503,
 };
 
 interface CodedError {

@@ -41,6 +41,7 @@ import type {
   TradeRow,
 } from "../db/schema";
 import type { BotSnapshot } from "../durable-objects/bot-instance";
+import type { WatchlistEntry } from "../research";
 import { toDecimalString, type Money } from "../shared/money";
 
 /** A money value as the exact decimal string the API speaks. */
@@ -137,6 +138,33 @@ export function manualAdjustmentView(row: ManualAdjustmentRow) {
     note: row.note,
     reconciledAt: row.reconciled_at,
     createdAt: row.created_at,
+  };
+}
+
+/**
+ * One live watchlist entry (section 21.3, migration 0008).
+ *
+ * The module's `WatchlistEntry` is already camelCase and carries no money, so
+ * this is a rename rather than a conversion: `exchangePair` becomes `pair`,
+ * which is what every other endpoint in this surface calls that field
+ * (`bot.pair`, the symbols endpoint's `pairs`). The module keeps the longer name
+ * because inside the research code it has to be unmistakable that the string is
+ * the VENUE's spelling and not a normalised one; over HTTP the field sits beside
+ * `accountLabel`, which already says which venue.
+ *
+ * `removed_at`/`removed_by` are deliberately not exposed. Every entry this view
+ * ever sees is live -- `readWatchlist` returns nothing else -- so a `removedAt`
+ * field would be `null` on every row the API has ever returned, which is a
+ * column that teaches a frontend the wrong shape.
+ */
+export function watchlistEntryView(entry: WatchlistEntry) {
+  return {
+    id: entry.id,
+    accountLabel: entry.accountLabel,
+    pair: entry.exchangePair,
+    note: entry.note,
+    addedBy: entry.addedBy,
+    addedAt: entry.addedAt,
   };
 }
 
