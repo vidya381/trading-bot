@@ -16,6 +16,7 @@
 import type { Database } from "../db/database";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import type { SymbolLister } from "../workers/symbols";
+import type { CandleLister } from "../workers/candles";
 
 /** Everything a handler is given: the request, the verified actor, and ports. */
 export interface ApiContext {
@@ -35,6 +36,14 @@ export interface ApiContext {
    * JWT path.
    */
   readonly symbolLister: SymbolLister;
+  /**
+   * Reaches an account's exchange for its candles (section 21.4). Injected
+   * (default `envCandleLister`) for the same reason `symbolLister` is: the
+   * candles endpoint's tests drive every refusal and the truncation reporting
+   * without a live exchange call. Separate from `symbolLister` because the two
+   * answer different questions of the venue and only one of them is cached.
+   */
+  readonly candleLister: CandleLister;
   readonly now: () => number;
   readonly newId: () => string;
 }

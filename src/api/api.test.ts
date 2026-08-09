@@ -31,6 +31,8 @@ import type { Jwks } from "./access";
 import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
 import type { SymbolLister } from "../workers/symbols";
+import type { CandleLister } from "../workers/candles";
+import type { Candle } from "../shared/exchange-client";
 
 const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const HUMAN = "owner@example.com";
@@ -119,6 +121,8 @@ interface ApiCall {
   readonly headerEmail?: string | null;
   /** Inject the symbols endpoint's lister so no live exchange call is made. */
   readonly symbolLister?: SymbolLister;
+  /** Inject the candles endpoint's lister, for the same reason. */
+  readonly candleLister?: CandleLister;
 }
 
 async function api(method: string, path: string, call: ApiCall = {}): Promise<{ status: number; body: any }> {
@@ -145,6 +149,7 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
     newId: () => `api-${(idCounter += 1)}`,
     access: { now: () => clock, fetchJwks: async () => key.jwks, jwksCache },
     ...(call.symbolLister !== undefined ? { symbolLister: call.symbolLister } : {}),
+    ...(call.candleLister !== undefined ? { candleLister: call.candleLister } : {}),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -2515,5 +2520,474 @@ describe("bot creation dispatches exchange from the account registry (step 11)",
     const res = await createBotBody(account, `xb-${suffix}`, "kraken");
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("invalid_exchange");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Candles (section 21.4, Stage 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The HTTP surface over `/src/research/candles.ts`.
+ *
+ * The module's own rules -- the interval gate, fail-closed tradability, the
+ * truncation arithmetic, the five refusals -- already have their own file of
+ * tests. What is proved HERE is the endpoint layer's share and only that:
+ * query parsing, that each of the module's coded refusals reaches HTTP as the
+ * intended status through `STATUS_BY_CODE` rather than a hand-written one, that
+ * the depth fields are actually VISIBLE over the wire, and that the
+ * `TradablePairSource` port is the real cached `listAccountSymbols` shared with
+ * the watchlist rather than a stub only tests see.
+ *
+ * That last one matters more than it looks: the whole reason this endpoint
+ * exists is to be curl-ed against a real venue, and an endpoint wired to a
+ * different tradable-set path than the rest of the system would verify the
+ * wrong thing.
+ *
+ * The exchange is injected through `candleLister` (and `symbolLister` for the
+ * tradability gate) -- the SAME seams the Worker defaults to the real listers
+ * on. NOTHING HERE CONTACTS GEMINI OR BINANCE.
+ */
+describe("candles endpoint (section 21.4)", () => {
+  const MINUTE = 60_000;
+  const GEMINI_PAIRS = ["BTCUSD", "ETHUSD", "SOLUSD"];
+
+  function catalogueLister(pairs: readonly string[] = GEMINI_PAIRS): SymbolLister {
+    return async () => ({ ok: true, value: [...pairs], at: T0 });
+  }
+
+  function candleAt(openTime: number, close: bigint): Candle {
+    return {
+      pair: "BTCUSD",
+      openTime,
+      closeTime: openTime + MINUTE,
+      open: close - 1n,
+      high: close + 2n,
+      low: close - 3n,
+      close,
+      volume: 400_000_000n,
+      closed: true,
+    };
+  }
+
+  /** A venue holding a fixed recent window, filtered by `since` as the client does. */
+  function windowLister(oldestOpen: number, count: number) {
+    const calls: { pair: string; interval: string; since?: number }[] = [];
+    const all = Array.from({ length: count }, (_, i) =>
+      candleAt(oldestOpen + i * MINUTE, 100_000_000n + BigInt(i) * 1_000_000n),
+    );
+    const lister: CandleLister = async (_account, query) => {
+      calls.push({ pair: query.pair, interval: query.interval, ...(query.since === undefined ? {} : { since: query.since }) });
+      const since = query.since;
+      return {
+        ok: true,
+        value: since === undefined ? all : all.filter((c) => c.closeTime > since),
+        at: T0,
+      };
+    };
+    return { lister, calls, all };
+  }
+
+  /** A venue call that fails. */
+  function failingCandles(kind: "transport" | "exchange_error" = "transport"): CandleLister {
+    return async () => ({ ok: false, kind, message: "connect ETIMEDOUT", retryable: true, at: T0 });
+  }
+
+  async function account(prefix: string, exchange: "gemini" | "binance" = "gemini") {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange, created_at: T0, updated_at: T0 });
+    return label;
+  }
+
+  function candlesPath(label: string, query: Record<string, string>) {
+    const params = new URLSearchParams(query);
+    return `/api/accounts/${label}/candles?${params.toString()}`;
+  }
+
+  // -- The successful read ---------------------------------------------------
+
+  it("returns the full window shape, with money as decimal strings", async () => {
+    const label = await account("cd-ok");
+    const { lister, calls } = windowLister(T0 - 3 * MINUTE, 3);
+
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeNull();
+    expect(res.body.data).toEqual({
+      accountLabel: label,
+      exchange: "gemini",
+      pair: "BTCUSD",
+      interval: "1m",
+      fetchedAt: T0,
+      requestedSince: null,
+      earliestOpenTime: T0 - 3 * MINUTE,
+      earliestCloseTime: T0 - 2 * MINUTE,
+      latestCloseTime: T0,
+      truncated: false,
+      missingHistoryMs: null,
+      count: 3,
+      // Money as EXACT decimal strings at scale 8, never JS numbers -- a
+      // fractional cent or a value past 2^53 would lose precision as a number,
+      // and `JSON.stringify` throws on the underlying bigint outright.
+      candles: [
+        { openTime: T0 - 3 * MINUTE, closeTime: T0 - 2 * MINUTE, open: "0.99999999", high: "1.00000002", low: "0.99999997", close: "1.00000000", volume: "4.00000000", closed: true },
+        { openTime: T0 - 2 * MINUTE, closeTime: T0 - MINUTE, open: "1.00999999", high: "1.01000002", low: "1.00999997", close: "1.01000000", volume: "4.00000000", closed: true },
+        { openTime: T0 - MINUTE, closeTime: T0, open: "1.01999999", high: "1.02000002", low: "1.01999997", close: "1.02000000", volume: "4.00000000", closed: true },
+      ],
+    });
+    // The venue was asked exactly what the caller asked for, once.
+    expect(calls).toEqual([{ pair: "BTCUSD", interval: "1m" }]);
+  });
+
+  it("carries ?since= through and reports a satisfied range as untruncated", async () => {
+    const label = await account("cd-since");
+    const oldest = T0 - 30 * MINUTE;
+    const { lister, calls } = windowLister(oldest, 30);
+    const wanted = T0 - 10 * MINUTE;
+
+    const res = await api(
+      "GET",
+      candlesPath(label, { pair: "BTCUSD", interval: "1m", since: String(wanted) }),
+      { symbolLister: catalogueLister(), candleLister: lister },
+    );
+
+    expect(res.status).toBe(200);
+    expect(calls).toEqual([{ pair: "BTCUSD", interval: "1m", since: wanted }]);
+    expect(res.body.data.requestedSince).toBe(wanted);
+    expect(res.body.data.truncated).toBe(false);
+    expect(res.body.data.missingHistoryMs).toBeNull();
+    expect(res.body.data.count).toBe(10);
+  });
+
+  it("REPORTS TRUNCATION over the wire when the window cannot reach back far enough", async () => {
+    // The reason this endpoint exists. 21.7's open question 1 says Gemini's
+    // /v2/candles has no time-range parameter; this asserts the shortfall is
+    // legible in the RESPONSE BODY, not merely computed internally, so a real
+    // curl against a real venue can settle the question.
+    const label = await account("cd-trunc");
+    const oldest = T0 - 30 * MINUTE;
+    const { lister } = windowLister(oldest, 30);
+    const wanted = T0 - 24 * 60 * MINUTE;
+
+    const res = await api(
+      "GET",
+      candlesPath(label, { pair: "BTCUSD", interval: "1m", since: String(wanted) }),
+      { symbolLister: catalogueLister(), candleLister: lister },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.truncated).toBe(true);
+    expect(res.body.data.missingHistoryMs).toBe(oldest - wanted);
+    expect(res.body.data.requestedSince).toBe(wanted);
+    expect(res.body.data.earliestOpenTime).toBe(oldest);
+    expect(res.body.data.count).toBe(30);
+    // A 200, not an error: the caller gets what there was AND is told what is
+    // missing. Failing the request would hide real candles behind a limitation.
+    expect(res.body.error).toBeNull();
+  });
+
+  it("carries the IN-PROGRESS candle's closed:false through to the wire", async () => {
+    // A mutation run found this too: every fixture here was a closed candle, so
+    // hardcoding `closed: true` in the serializer passed everything. Gemini
+    // really does send the in-progress candle at the end of its window, and
+    // `closed` is the ONLY thing telling a consumer to drop it. Published as
+    // false, it costs one candle; published as true, it is a partial bar that
+    // looks final and enters a volatility read as though the period had ended.
+    const label = await account("cd-inprogress");
+    const closedTwo = [
+      candleAt(T0 - 3 * MINUTE, 100_000_000n),
+      candleAt(T0 - 2 * MINUTE, 101_000_000n),
+    ];
+    const inProgress: Candle = { ...candleAt(T0 - MINUTE, 102_000_000n), closed: false };
+    const lister: CandleLister = async () => ({
+      ok: true,
+      value: [...closedTwo, inProgress],
+      at: T0,
+    });
+
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.candles.map((c: { closed: boolean }) => c.closed)).toEqual([
+      true,
+      true,
+      false,
+    ]);
+    // It is NOT filtered out on the way through: the count and the depth fields
+    // still describe the whole window the venue sent.
+    expect(res.body.data.count).toBe(3);
+    expect(res.body.data.latestCloseTime).toBe(T0);
+  });
+
+  it("count matches the candles array, so a jq check needs no download", async () => {
+    const label = await account("cd-count");
+    const { lister } = windowLister(T0 - 7 * MINUTE, 7);
+
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.body.data.count).toBe(res.body.data.candles.length);
+    expect(res.body.data.count).toBe(7);
+  });
+
+  it("shares the watchlist's cached tradable set rather than a second path", async () => {
+    // Two candle requests must cost ONE catalogue call: that is what proves the
+    // gate goes through `listAccountSymbols` (and its KV cache) rather than
+    // around it, exactly as the watchlist's own two-adds-one-call test does.
+    const label = await account("cd-cache");
+    let catalogueCalls = 0;
+    const symbolLister: SymbolLister = async () => {
+      catalogueCalls += 1;
+      return { ok: true, value: [...GEMINI_PAIRS], at: T0 };
+    };
+    const { lister } = windowLister(T0 - 2 * MINUTE, 2);
+    const path = candlesPath(label, { pair: "BTCUSD", interval: "1m" });
+
+    expect((await api("GET", path, { symbolLister, candleLister: lister })).status).toBe(200);
+    expect((await api("GET", path, { symbolLister, candleLister: lister })).status).toBe(200);
+
+    expect(catalogueCalls).toBe(1);
+  });
+
+  // -- Query parsing (this layer's own refusals) -----------------------------
+
+  it("is 400 missing_field with no ?pair=", async () => {
+    const label = await account("cd-nopair");
+    const res = await api("GET", candlesPath(label, { interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: windowLister(T0, 1).lister,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+  });
+
+  it("is 400 missing_field for a present-but-blank ?pair=", async () => {
+    // A mutation run found this. `?pair=` reaches the module as "" and is
+    // refused there as untradable -- also a 400, which is why dropping the
+    // blank check here changed no status and no test. But the code would be
+    // `pair_not_tradable`, telling an operator the venue does not list a symbol
+    // they never named, and it would spend a catalogue call to say so.
+    const label = await account("cd-blankpair");
+    let catalogueCalls = 0;
+    const symbolLister: SymbolLister = async () => {
+      catalogueCalls += 1;
+      return { ok: true, value: [...GEMINI_PAIRS], at: T0 };
+    };
+
+    const res = await api("GET", candlesPath(label, { pair: "  ", interval: "1m" }), {
+      symbolLister,
+      candleLister: windowLister(T0, 1).lister,
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+    expect(catalogueCalls).toBe(0);
+  });
+
+  it("is 400 missing_field with no ?interval=", async () => {
+    const label = await account("cd-nointerval");
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD" }), {
+      symbolLister: catalogueLister(),
+      candleLister: windowLister(T0, 1).lister,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+  });
+
+  it("is 400 invalid_filter for a string that is not an interval at all", async () => {
+    // Distinct from `interval_not_verified`: "1w" is not a CandleInterval, so
+    // this layer refuses it while parsing. The module never sees it.
+    const label = await account("cd-badinterval");
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1w" }), {
+      symbolLister: catalogueLister(),
+      candleLister: windowLister(T0, 1).lister,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_filter");
+    expect(res.body.error.message).toContain("1m");
+  });
+
+  it.each([["abc"], [""], ["-1"], ["1.5"], ["1e3x"]])(
+    "is 400 invalid_field for ?since=%s",
+    async (value) => {
+      const label = await account(`cd-since-${value === "" ? "empty" : value.replace(/\W/g, "")}`);
+      const res = await api(
+        "GET",
+        candlesPath(label, { pair: "BTCUSD", interval: "1m", since: value }),
+        { symbolLister: catalogueLister(), candleLister: windowLister(T0, 1).lister },
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe("invalid_field");
+    },
+  );
+
+  it("accepts ?since=0 as a real value rather than treating it as absent", async () => {
+    // The falsy-zero trap. `since=0` asks for everything and must reach the
+    // module as 0, not as "no range requested" -- which the response's
+    // `requestedSince` is what proves.
+    const label = await account("cd-zero");
+    const { lister, calls } = windowLister(T0 - 2 * MINUTE, 2);
+
+    const res = await api(
+      "GET",
+      candlesPath(label, { pair: "BTCUSD", interval: "1m", since: "0" }),
+      { symbolLister: catalogueLister(), candleLister: lister },
+    );
+
+    expect(res.status).toBe(200);
+    expect(calls).toEqual([{ pair: "BTCUSD", interval: "1m", since: 0 }]);
+    expect(res.body.data.requestedSince).toBe(0);
+    expect(res.body.data.truncated).toBe(true);
+  });
+
+  // -- The module's refusals, each mapped through STATUS_BY_CODE -------------
+
+  it("is 400 interval_not_verified for a real but unverified interval", async () => {
+    const label = await account("cd-unverified");
+    let candleCalls = 0;
+    const lister: CandleLister = async () => {
+      candleCalls += 1;
+      return { ok: true, value: [candleAt(T0, 100_000_000n)], at: T0 };
+    };
+
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1h" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("interval_not_verified");
+    expect(res.body.error.message).toContain('"1h"');
+    // The gate is BEFORE the venue call, over HTTP as well as in the module.
+    expect(candleCalls).toBe(0);
+  });
+
+  it("is 404 unknown_account for an unregistered label", async () => {
+    // The row this endpoint added to STATUS_BY_CODE. `unknown_account` is
+    // thrown here by the MODULE, not as an ApiError, so without that row it
+    // would take the table's 400 default -- the same URL answering 400 where
+    // /symbols answers 404.
+    const res = await api(
+      "GET",
+      candlesPath(`nope-${suffix}`, { pair: "BTCUSD", interval: "1m" }),
+      { symbolLister: catalogueLister(), candleLister: windowLister(T0, 1).lister },
+    );
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_account");
+  });
+
+  it("is 400 pair_not_tradable for a pair the venue does not list", async () => {
+    const label = await account("cd-untradable");
+    let candleCalls = 0;
+    const lister: CandleLister = async () => {
+      candleCalls += 1;
+      return { ok: true, value: [candleAt(T0, 100_000_000n)], at: T0 };
+    };
+
+    const res = await api("GET", candlesPath(label, { pair: "PEPEUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("pair_not_tradable");
+    expect(candleCalls).toBe(0);
+  });
+
+  it("is 400 pair_not_tradable for a case-folded near-miss, naming the venue's spelling", async () => {
+    // Step 28's live finding, over the wire on this endpoint: the catalogue is
+    // `BTCUSD`, and `btcusd` must be refused with the real spelling named.
+    const label = await account("cd-case");
+    const res = await api("GET", candlesPath(label, { pair: "btcusd", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: windowLister(T0, 1).lister,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("pair_not_tradable");
+    expect(res.body.error.message).toContain("BTCUSD");
+  });
+
+  it("is 503 tradable_set_unreadable when the venue cannot be asked", async () => {
+    // NOT 502. This is a refusal to fetch on input this system could not
+    // verify, which is the `not_attached`/`throttled` tier, and it is
+    // deliberately a different status from the failed read below.
+    const label = await account("cd-noset");
+    const symbolLister: SymbolLister = async () => ({
+      ok: false,
+      kind: "transport",
+      message: "connect ETIMEDOUT",
+      retryable: true,
+      at: T0,
+    });
+
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister,
+      candleLister: windowLister(T0, 1).lister,
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("tradable_set_unreadable");
+  });
+
+  it("is 502 candles_unavailable when the venue call fails", async () => {
+    const label = await account("cd-down");
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: failingCandles(),
+    });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("candles_unavailable");
+    // The venue's own account of the failure survives to the caller.
+    expect(res.body.error.message).toContain("connect ETIMEDOUT");
+    // And no empty window was returned in its place.
+    expect(res.body.data).toBeNull();
+  });
+
+  it("is 502 no_candles_returned for a successful but empty response", async () => {
+    const label = await account("cd-empty");
+    const empty: CandleLister = async () => ({ ok: true, value: [], at: T0 });
+
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: empty,
+    });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("no_candles_returned");
+    expect(res.body.data).toBeNull();
+  });
+
+  // -- The route itself ------------------------------------------------------
+
+  it("requires an Access token like every other route", async () => {
+    const label = await account("cd-auth");
+    const res = await api("GET", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      token: null,
+      symbolLister: catalogueLister(),
+      candleLister: windowLister(T0, 1).lister,
+    });
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("access_jwt_missing");
+  });
+
+  it("is 405 on a write method, not 404", async () => {
+    // Read-only by construction: the path exists, the method does not.
+    const label = await account("cd-method");
+    const res = await api("POST", candlesPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: windowLister(T0, 1).lister,
+    });
+    expect(res.status).toBe(405);
+    expect(res.body.error.code).toBe("method_not_allowed");
   });
 });

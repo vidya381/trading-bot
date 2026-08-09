@@ -152,6 +152,42 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   not_watched: 404,
   pair_not_tradable: 400,
   tradable_set_unreadable: 503,
+  // Section 21.4 Stage 1's candle fetch (`/src/research/candles.ts`). Same rule
+  // as the watchlist rows above: reuse the status an existing code with the same
+  // SHAPE of refusal already carries.
+  //
+  //   unknown_account       404, like `unknown_bot_instance` and `not_watched`
+  //                         -- the thing the caller named is not there. THIS ROW
+  //                         IS LOAD-BEARING IN A WAY THE OTHERS ARE NOT: the
+  //                         same code is thrown elsewhere in this surface as a
+  //                         `notFound(...)` ApiError, which carries its own
+  //                         status and never consults this table. `fetchCandleWindow`
+  //                         throws it as a MODULE error instead, so without this
+  //                         row it would take the table's 400 default -- a
+  //                         missing account reported as a bad request, and the
+  //                         same URL answering 404 or 400 depending on which
+  //                         handler happened to look the account up.
+  //   interval_not_verified 400, like `pair_not_tradable` and `invalid_parameter`
+  //                         -- a bad field value the caller fixes by asking
+  //                         differently (`interval=1m`).
+  //   candles_unavailable   502, and deliberately NOT the 503 that
+  //                         `tradable_set_unreadable` takes two rows up. That
+  //                         one is a refusal to act on input this system could
+  //                         not verify; this one is a READ THE CALLER ASKED FOR
+  //                         that the venue failed to serve, which is precisely
+  //                         what the symbols endpoint already relays as a 502
+  //                         (`exchange_unavailable`). Same tier, same meaning.
+  //   no_candles_returned   502, with `candles_unavailable`. The venue answered
+  //                         successfully and the answer was unusable, which is
+  //                         what a bad gateway IS. Not 404: the pair is listed
+  //                         -- tradability passed before the fetch ran -- so
+  //                         this is not a missing resource, and reporting it as
+  //                         one would tell the caller to stop asking about a
+  //                         pair the venue says it trades.
+  unknown_account: 404,
+  interval_not_verified: 400,
+  candles_unavailable: 502,
+  no_candles_returned: 502,
 };
 
 interface CodedError {

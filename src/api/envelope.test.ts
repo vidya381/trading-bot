@@ -62,6 +62,42 @@ describe("STATUS_BY_CODE covers the watchlist's refusals", () => {
     expect(await statusAndCode(coded(code))).toEqual({ status, code });
   });
 
+  it.each([
+    // Section 21.4's candle fetch. Each reuses the status tier an existing code
+    // with the same SHAPE of refusal already carries.
+    //
+    // The load-bearing one. `unknown_account` is thrown as a `notFound(...)`
+    // ApiError by `getAccountSymbols` and `requireWatchlistAccount` -- which
+    // carries its own status and never reaches this table. `fetchCandleWindow`
+    // throws it as a MODULE error, so this row is the only thing standing
+    // between it and the table's 400 default: the same missing account
+    // answering 404 on /symbols and 400 on /candles.
+    ["unknown_account", 404],
+    // A bad field value the caller fixes by asking differently (`interval=1m`),
+    // like `pair_not_tradable` and `invalid_parameter`.
+    ["interval_not_verified", 400],
+    // A read the caller asked for that the venue failed to serve -- the
+    // symbols endpoint's 502 tier, NOT `tradable_set_unreadable`'s 503. That
+    // one refuses to act on unverifiable input; these relay a failed read.
+    ["candles_unavailable", 502],
+    // The venue answered successfully and the answer was unusable, which is
+    // what a bad gateway is. Not 404: tradability passed before the fetch, so
+    // the pair is listed and this is not a missing resource.
+    ["no_candles_returned", 502],
+  ])("maps %s to %i", async (code, status) => {
+    expect(await statusAndCode(coded(code))).toEqual({ status, code });
+  });
+
+  it("keeps the candle read failure and the unverifiable-input refusal apart", async () => {
+    // The distinction is the whole reason both rows exist, and a single table
+    // is exactly where it would quietly collapse into one number.
+    const read = await statusAndCode(coded("candles_unavailable"));
+    const refusal = await statusAndCode(coded("tradable_set_unreadable"));
+    expect(read.status).toBe(502);
+    expect(refusal.status).toBe(503);
+    expect(read.status).not.toBe(refusal.status);
+  });
+
   it("carries the module's own message through verbatim", async () => {
     // The codes are for the caller's code; the message is for the human reading
     // it, and the module's messages name the exact remedy (which pair, whose

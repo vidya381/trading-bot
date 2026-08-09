@@ -77,9 +77,10 @@
 import { NON_HUMAN_ACTORS } from "../capital";
 import type { Database } from "../db";
 import type { AuditLogRow, WatchlistRow } from "../db/schema";
-import type { ExchangeId } from "../db/schema";
 import type { Pair, Timestamp } from "../shared/exchange-client";
-import type { SymbolListing } from "../workers/symbols";
+import { checkTradable, type TradablePairSource, type VenueAccount } from "./tradability";
+
+export type { TradablePairSource } from "./tradability";
 
 /**
  * 21.3's bound: "A small set of 5-10 coins ... Expandable later by an explicit
@@ -97,23 +98,14 @@ import type { SymbolListing } from "../workers/symbols";
  */
 export const WATCHLIST_MAX_ENTRIES = 10;
 
-/** The account a watchlist entry belongs to, and therefore the venue to check. */
-export interface WatchlistAccount {
-  readonly label: string;
-  readonly exchange: ExchangeId;
-}
-
 /**
- * How this module reaches the tradable set.
+ * The account a watchlist entry belongs to, and therefore the venue to check.
  *
- * A port rather than a direct call, for the reason `SymbolLister` already is
- * one: tests exercise the cap and the refusals without a network call. In
- * production this is `(account) => listAccountSymbols({ account, env, now,
- * lister: envSymbolLister, cache })`, so the KV cache and the real
- * `listTradablePairs` are reused exactly as the symbols endpoint uses them,
- * with no second path to the venue.
+ * An alias for `VenueAccount`, which is the same `{ label, exchange }` the
+ * candle fetch and the tradability check take. Kept under this name because it
+ * is what the API layer and `index.ts` already import.
  */
-export type TradablePairSource = (account: WatchlistAccount) => Promise<SymbolListing>;
+export type WatchlistAccount = VenueAccount;
 
 export interface WatchlistPorts {
   readonly db: Database;
@@ -233,61 +225,25 @@ function requireText(value: string, field: string): string {
 /**
  * Assert the pair is one the account's venue will actually trade.
  *
- * FAIL CLOSED IN BOTH DIRECTIONS, which is the whole point:
- *
- *   * listed, and the pair is absent  -> refuse (`pair_not_tradable`)
- *   * the listing itself failed       -> refuse (`tradable_set_unreadable`)
- *
- * The second is the one worth stating. An exchange outage produces no tradable
- * set, and treating that as permission to store the pair "to fix later" is the
- * same substitution section 5.6 forbids when it refuses to read "could not reach
- * the exchange" as a price move. The entry that gets stored on an outage is
- * never revisited; it is simply a pair nothing can validate, sitting in the one
- * list whose entire value is that a human vouched for every row.
- *
- * The comparison is EXACT, not case-insensitive, and the live run at step 28
- * turned this from a defensible preference into a demonstrated one. What
- * `listTradablePairs` reports is NOT the venue's wire format: Gemini's
- * `/v1/symbols` returns lowercase, separator-less symbols and `parseSymbolList`
- * upper-cases them to this system's `Pair` convention, so the real listing is
- * `BTCUSD` -- 392 of them, read live 2026-08-08. A `btcusd` written from memory
- * of the Gemini API was refused, correctly, which is exactly the mistake a
- * case-folded match would have swallowed while storing a string every later
- * exchange call would have had to re-spell.
- *
- * The refusal message carries near-matches for that reason: the operator is told
- * the venue's own spelling rather than left to guess which of the two
- * conventions applies.
+ * The decision itself lives in `tradability.ts` and is shared with section
+ * 21.4's candle fetch -- see that module's header for why it fails closed in
+ * both directions and why the comparison is exact. What stays here is the
+ * refusal's shape: a `WatchlistError` carrying the shared code and message, so
+ * the API layer's status mapping is untouched.
  */
 async function assertTradable(
   ports: WatchlistPorts,
   account: WatchlistAccount,
   pair: Pair,
 ): Promise<void> {
-  const listing = await ports.listTradablePairs(account);
-  if (!listing.ok) {
-    throw new WatchlistError(
-      "tradable_set_unreadable",
-      `cannot confirm ${JSON.stringify(pair)} is tradable on ${account.exchange} for ` +
-        `account ${JSON.stringify(account.label)}: ${listing.failure.message}. Refusing ` +
-        `rather than storing it unchecked -- an entry nothing validated is exactly ` +
-        `what this list must not contain.`,
-    );
-  }
-
-  if (listing.pairs.includes(pair)) return;
-
-  const folded = pair.toLowerCase();
-  const near = listing.pairs.filter((candidate) => candidate.toLowerCase() === folded);
-  throw new WatchlistError(
-    "pair_not_tradable",
-    `${JSON.stringify(pair)} is not tradable on ${account.exchange} for account ` +
-      `${JSON.stringify(account.label)}` +
-      (near.length > 0
-        ? `. That venue spells it ${near.map((c) => JSON.stringify(c)).join(" or ")}; ` +
-          `the symbol is stored exactly as the exchange reports it.`
-        : `. ${listing.pairs.length} pairs were listed${listing.cached ? " (from cache)" : ""}.`),
+  const refusal = await checkTradable(
+    ports.listTradablePairs,
+    account,
+    pair,
+    `Refusing rather than storing it unchecked -- an entry nothing validated is ` +
+      `exactly what this list must not contain.`,
   );
+  if (refusal !== null) throw new WatchlistError(refusal.code, refusal.message);
 }
 
 export interface AddToWatchlistRequest {

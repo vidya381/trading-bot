@@ -19,12 +19,13 @@
  * This is the home the step 3.2 open question 2 asked for -- "when order
  * execution is wired, it should reuse `resolveDefaultExchange`'s base-URL
  * derivation rather than re-deriving it, so the 'impossible to get backwards'
- * property has a single home." Today its one caller is the account
- * pair-listing endpoint; the future bot-execution wiring reaches for the same
- * function.
+ * property has a single home." Its callers are the account pair-listing
+ * endpoint and section 21.4's candle fetch, both through `clientForAccount`
+ * below; the future bot-execution wiring reaches for the same function.
  */
 
-import type { Timestamp } from "../shared/exchange-client";
+import type { ExchangeOutcome } from "../shared/downtime";
+import type { RestExchangeClient, Timestamp } from "../shared/exchange-client";
 import type { ExchangeId } from "../db/schema";
 import { resolveDefaultExchange, type ExchangeResolution } from "./exchange";
 import { resolveGeminiExchange } from "./exchange-gemini";
@@ -45,4 +46,54 @@ export function resolveExchangeForAccount(
     case "gemini":
       return resolveGeminiExchange(env, now);
   }
+}
+
+/**
+ * A real, ready client for one registered account -- the whole no-bot-required
+ * resolution path, in one place.
+ *
+ * This is the two-step `envSymbolLister` has performed since step 11 (resolve
+ * the account's exchange, then ask the resolved factory for a client), named
+ * and lifted here because section 21.4's candle fetch needs the SAME client for
+ * the SAME reason: an account-scoped call with no bot instance to borrow an
+ * attached client from. Written once so there is one answer to "which client
+ * does this account get", not one per caller.
+ *
+ * A resolution failure (missing secret, non-trading `ENVIRONMENT`) is folded
+ * into a non-retryable `exchange_error` outcome carrying the resolver's own
+ * reason -- which names the exact secret and the command to set it -- so a
+ * caller has ONE failure shape covering both "cannot build a client" and, once
+ * it makes its call, "the client's call failed".
+ */
+export function clientForAccount(
+  account: { readonly label: string; readonly exchange: ExchangeId },
+  env: Env,
+  now: () => Timestamp,
+): ExchangeOutcome<RestExchangeClient> {
+  const resolution = resolveExchangeForAccount(account.exchange, env, now);
+  if (!resolution.ok) {
+    return {
+      ok: false,
+      kind: "exchange_error",
+      message: resolution.reason,
+      retryable: false,
+      at: now(),
+    };
+  }
+
+  const client = resolution.exchangeFor(account.label);
+  if (client === null) {
+    // `ExchangeFactory` may return null for an account it declines to build a
+    // client for. `ok:true` resolutions here always build one, so this is
+    // belt-and-braces -- surfaced as a clear failure rather than a null deref.
+    return {
+      ok: false,
+      kind: "exchange_error",
+      message: `no exchange client could be built for account ${JSON.stringify(account.label)}`,
+      retryable: false,
+      at: now(),
+    };
+  }
+
+  return { ok: true, value: client, at: now() };
 }

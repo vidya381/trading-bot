@@ -35,7 +35,7 @@
 import type { ExchangeOutcome } from "../shared/downtime";
 import type { Pair, Timestamp } from "../shared/exchange-client";
 import type { ExchangeId } from "../db/schema";
-import { resolveExchangeForAccount } from "./exchange-dispatch";
+import { clientForAccount } from "./exchange-dispatch";
 
 declare global {
   interface Env {
@@ -142,34 +142,19 @@ export type SymbolLister = (
 ) => Promise<ExchangeOutcome<Pair[]>>;
 
 /**
- * The real lister: dispatch to the account's exchange, build the client, call
- * `listTradablePairs`.
+ * The real lister: get the account's client, call `listTradablePairs`.
  *
- * A resolution failure (missing secret, non-trading `ENVIRONMENT`) is folded
- * into a non-retryable `exchange_error` outcome carrying the resolver's own
- * reason -- which names the exact secret and the command to set it -- so the one
- * return type covers both "cannot build a client" and "the client's call
- * failed", and the caller has one failure shape to map.
+ * The client resolution is `clientForAccount` (exchange-dispatch.ts), which is
+ * this function's own two steps lifted out at the step 21.4 candle work so that
+ * the candle fetch resolves a client the same way rather than a second way. Its
+ * failure outcome is already an `ExchangeOutcome`, so it is returned as-is and
+ * the caller keeps ONE failure shape to map for both "cannot build a client"
+ * and "the client's call failed".
  */
 export const envSymbolLister: SymbolLister = async (account, env, now) => {
-  const resolution = resolveExchangeForAccount(account.exchange, env, now);
-  if (!resolution.ok) {
-    return { ok: false, kind: "exchange_error", message: resolution.reason, retryable: false, at: now() };
-  }
-  const client = resolution.exchangeFor(account.label);
-  if (client === null) {
-    // `ExchangeFactory` may return null for an account it declines to build a
-    // client for. `ok:true` resolutions here always build one, so this is
-    // belt-and-braces -- surfaced as a clear failure rather than a null deref.
-    return {
-      ok: false,
-      kind: "exchange_error",
-      message: `no exchange client could be built for account ${JSON.stringify(account.label)}`,
-      retryable: false,
-      at: now(),
-    };
-  }
-  return client.listTradablePairs();
+  const client = clientForAccount(account, env, now);
+  if (!client.ok) return client;
+  return client.value.listTradablePairs();
 };
 
 /** The result of a pair-listing: the pairs, whether it was served from cache. */

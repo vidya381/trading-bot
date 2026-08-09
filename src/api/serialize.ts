@@ -41,7 +41,8 @@ import type {
   TradeRow,
 } from "../db/schema";
 import type { BotSnapshot } from "../durable-objects/bot-instance";
-import type { WatchlistEntry } from "../research";
+import type { CandleWindow, WatchlistEntry } from "../research";
+import type { Candle } from "../shared/exchange-client";
 import { toDecimalString, type Money } from "../shared/money";
 
 /** A money value as the exact decimal string the API speaks. */
@@ -165,6 +166,73 @@ export function watchlistEntryView(entry: WatchlistEntry) {
     note: entry.note,
     addedBy: entry.addedBy,
     addedAt: entry.addedAt,
+  };
+}
+
+/**
+ * One OHLCV candle (section 21.4 Stage 1).
+ *
+ * The five money fields go through `money()` for the reason at the top of this
+ * file, and it bites harder here than anywhere else: `Candle` carries five
+ * bigints per row and a window is hundreds of rows, so a missed conversion is
+ * not a wrong number -- `JSON.stringify` throws outright and the endpoint
+ * returns a 500. An explicit view rather than `jsonSafe` because the shape is
+ * fixed, small, and worth reading in one place.
+ *
+ * `closed` is carried through rather than filtered on. The in-progress candle
+ * comes back `closed: false` when the venue sent one, and a consumer that must
+ * drop it (a backfill) can, while one that wants the live partial (a volatility
+ * read at this instant) still has it. Dropping it here would take that choice
+ * away and silently shorten every window by one.
+ */
+export function candleView(candle: Candle) {
+  return {
+    openTime: candle.openTime,
+    closeTime: candle.closeTime,
+    open: money(candle.open),
+    high: money(candle.high),
+    low: money(candle.low),
+    close: money(candle.close),
+    volume: money(candle.volume),
+    closed: candle.closed,
+  };
+}
+
+/**
+ * A candle window and its honest account of how much history it actually is
+ * (section 21.4, and 21.7's open question 1 about Gemini's fixed window).
+ *
+ * EVERY DEPTH FIELD IS PUBLISHED, and that is the point of the endpoint rather
+ * than a convenience. Gemini's `/v2/candles` takes no time-range parameter, so
+ * a request for more history than its window holds comes back short; if the
+ * only visible evidence of that were the length of the `candles` array, a
+ * caller would have to know the interval, do the arithmetic, and think to do it
+ * at all. `truncated` and `missingHistoryMs` say it outright, and
+ * `earliestOpenTime`/`earliestCloseTime` say how far back the window really
+ * reaches. 21.7: "the Assess stage must be told how much history it actually
+ * received and must not reason as though it had more."
+ *
+ * `count` is published even though it equals `candles.length`, because the
+ * cheapest possible check an operator makes against this endpoint -- and the
+ * one a `curl | jq '.data | {count, truncated, missingHistoryMs}'` reaches for
+ * -- should not require pulling the whole array down to perform.
+ */
+export function candleWindowView(window: CandleWindow) {
+  return {
+    accountLabel: window.accountLabel,
+    exchange: window.exchange,
+    pair: window.pair,
+    interval: window.interval,
+    // 21.5 requirement 4's fetch time: when the venue answered, not now.
+    fetchedAt: window.fetchedAt,
+    requestedSince: window.requestedSince,
+    earliestOpenTime: window.earliestOpenTime,
+    earliestCloseTime: window.earliestCloseTime,
+    latestCloseTime: window.latestCloseTime,
+    truncated: window.truncated,
+    missingHistoryMs: window.missingHistoryMs,
+    count: window.candles.length,
+    candles: window.candles.map(candleView),
   };
 }
 

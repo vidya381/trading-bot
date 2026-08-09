@@ -20,6 +20,7 @@ import {
   alertView,
   botDetail,
   botSummary,
+  candleWindowView,
   circuitBreakerView,
   killSwitchView,
   manualAdjustmentView,
@@ -28,8 +29,10 @@ import {
 } from "./serialize";
 import {
   addToWatchlist,
+  fetchCandleWindow,
   readWatchlist,
   removeFromWatchlist,
+  type CandleSource,
   type TradablePairSource,
   type WatchlistAccount,
   type WatchlistPorts,
@@ -49,7 +52,7 @@ import {
   listAccountSymbols,
   type SymbolCacheStore,
 } from "../workers/symbols";
-import type { Asset, Pair } from "../shared/exchange-client";
+import type { Asset, CandleInterval, Pair } from "../shared/exchange-client";
 import { fromDecimalString, toDecimalString, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { readGlobalKillSwitch } from "../reconciliation/kill-switch";
@@ -1097,6 +1100,149 @@ export async function removeWatchlistEntry(ctx: ApiContext): Promise<Response> {
     actor: ctx.actor,
   });
   return ok(watchlistEntryView(removed));
+}
+
+// ---------------------------------------------------------------------------
+// Candles (section 21.4, Stage 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The seven values `CandleInterval` declares, for parsing a query string.
+ *
+ * NOT the same list as `VERIFIED_INTERVALS`, and the difference is the whole
+ * point of having both. This one answers "is that string an interval at all"
+ * (`1w` is not) and belongs to the HTTP layer, which has to turn free text into
+ * a typed value before anything else can look at it. The module's list answers
+ * "has that interval been verified against a real venue" (`6h` is real and
+ * unverified), which is a POLICY the module owns and re-checks for every
+ * caller, HTTP or not. Two different refusals, deliberately not merged: folding
+ * them into one would either let the layer decide policy or make the module
+ * parse strings.
+ */
+const CANDLE_INTERVALS: readonly CandleInterval[] = ["1m", "5m", "15m", "30m", "1h", "6h", "1d"];
+
+/**
+ * Wire the candle fetch's `CandleSource` port to the real per-account lister.
+ *
+ * `envCandleLister` resolves a client through `clientForAccount` -- the same
+ * function `envSymbolLister` uses -- so the candle call and the tradability
+ * check that gates it reach the venue through one resolution path.
+ *
+ * Unlike `tradablePairsFor` there is no cache here, deliberately: a tradable
+ * set is reference data that ages well, while a candle's entire value is that
+ * it is current, and 21.5 requirement 4 times a proposal from when its data was
+ * fetched. See `workers/candles.ts`.
+ */
+function candleSourceFor(ctx: ApiContext): CandleSource {
+  return async (account, query) => await ctx.candleLister(account, query, ctx.env, ctx.now);
+}
+
+/**
+ * GET /api/accounts/:label/candles -- real candles for any tradable pair.
+ *
+ * The curl-able surface over `fetchCandleWindow` (section 21.4, Stage 1), and
+ * it exists for one concrete reason beyond convenience: 21.7's open question 1
+ * is a claim about how deep Gemini's `/v2/candles` window actually is, and that
+ * claim cannot be settled by a test. Every candle in this repository's suite
+ * comes from a stub modelling a fixed window; only a real request against a
+ * real venue can say whether `truncated` and `missingHistoryMs` report the
+ * truth. This endpoint is how that gets checked.
+ *
+ * A THIN WRAPPER in the strict sense this layer means it: the interval gate,
+ * the registry lookup, the tradability check, the fail-closed refusals and the
+ * truncation arithmetic all live in `fetchCandleWindow` and none of them is
+ * re-implemented, re-ordered or second-guessed here. What this adds is query
+ * parsing, the port wiring, and the serialization of `Candle`'s five bigints.
+ *
+ * READ-ONLY. No write, no audit entry, no state of any kind -- unlike the
+ * watchlist endpoints, there is nothing here for an audit log to record. The
+ * Access gate still applies, as it does to every route in this table.
+ *
+ * `pair` and `interval` are REQUIRED rather than defaulted. A default pair is
+ * meaningless, and a default `interval=1m` would hide the one thing this
+ * endpoint is for: making the interval an explicit, refusable choice.
+ *
+ * Failures:
+ *   - `missing_field` (400)            -- no `pair`, or no `interval`.
+ *   - `invalid_filter` (400)           -- `interval` is not an interval at all.
+ *   - `invalid_field` (400)            -- `since` is not a non-negative integer.
+ *   - `interval_not_verified` (400)    -- a real interval, unverified on a venue.
+ *   - `unknown_account` (404)          -- no such registered account.
+ *   - `pair_not_tradable` (400)        -- the venue does not list it.
+ *   - `tradable_set_unreadable` (503)  -- the venue could not be asked.
+ *   - `candles_unavailable` (502)      -- the venue was asked and failed.
+ *   - `no_candles_returned` (502)      -- it answered, with nothing usable.
+ *
+ * The last six are the module's own codes, mapped in envelope.ts rather than
+ * turned into statuses here, so a second caller of the module gets the same
+ * statuses without this handler being involved.
+ */
+export async function getAccountCandles(ctx: ApiContext): Promise<Response> {
+  const label = ctx.params.label!;
+
+  const pair = ctx.url.searchParams.get("pair");
+  if (pair === null || pair.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "pair" is required and must be the venue's own symbol, ` +
+        `exactly as GET /api/accounts/${label}/symbols reports it`,
+    );
+  }
+
+  const interval = ctx.url.searchParams.get("interval");
+  if (interval === null || interval.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "interval" is required and must be one of ${CANDLE_INTERVALS.join(", ")}`,
+    );
+  }
+  if (!CANDLE_INTERVALS.includes(interval as CandleInterval)) {
+    throw badRequest(
+      "invalid_filter",
+      `interval must be one of ${CANDLE_INTERVALS.join(", ")}, not ${JSON.stringify(interval)}`,
+    );
+  }
+
+  // `since` is an epoch-millisecond timestamp, parsed strictly, and the blank
+  // case is checked SEPARATELY rather than left to `Number`. `Number("")` is
+  // 0, not NaN -- so `?since=` with nothing after it would silently become
+  // "since the epoch", which is a real and very different request from the one
+  // a caller who fumbled the shell quoting meant to make. `Number("12abc")` is
+  // NaN, which would reach `getCandles` and filter every candle out, producing
+  // an empty window blamed on the venue rather than on the query.
+  const sinceParam = ctx.url.searchParams.get("since");
+  let since: number | undefined;
+  if (sinceParam !== null) {
+    const parsed = Number(sinceParam);
+    if (sinceParam.trim() === "" || !Number.isInteger(parsed) || parsed < 0) {
+      throw badRequest(
+        "invalid_field",
+        `query parameter "since", if given, must be a non-negative integer of ` +
+          `epoch milliseconds, not ${JSON.stringify(sinceParam)}`,
+      );
+    }
+    since = parsed;
+  }
+
+  const window = await fetchCandleWindow(
+    {
+      db: ctx.db,
+      // The SAME port the watchlist endpoints use, so the candle fetch's
+      // tradability gate and the dropdown an operator reads cannot disagree
+      // about what the venue lists, and a fetch spends no extra full-catalogue
+      // request.
+      listTradablePairs: tradablePairsFor(ctx),
+      getCandles: candleSourceFor(ctx),
+    },
+    {
+      accountLabel: label,
+      pair,
+      interval: interval as CandleInterval,
+      ...(since === undefined ? {} : { since }),
+    },
+  );
+
+  return ok(candleWindowView(window));
 }
 
 // ---------------------------------------------------------------------------

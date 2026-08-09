@@ -30,6 +30,7 @@ import { resolveRoute, route, type ApiContext, type Route } from "./router";
 import { databaseFrom, type Database } from "../db";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import { envSymbolLister, type SymbolLister } from "../workers/symbols";
+import { envCandleLister, type CandleLister } from "../workers/candles";
 
 const ROUTES: readonly Route[] = [
   route("GET", "/api/bots", handlers.listBots),
@@ -45,6 +46,10 @@ const ROUTES: readonly Route[] = [
   route("POST", "/api/bots/:id/unarchive", handlers.unarchiveBot),
   route("GET", "/api/accounts", handlers.listAccounts),
   route("GET", "/api/accounts/:label/symbols", handlers.getAccountSymbols),
+  // Section 21.4 Stage 1's candle fetch (/src/research/candles.ts). Read-only,
+  // and the only way its truncation reporting can be checked against a REAL
+  // venue window rather than a modelled one.
+  route("GET", "/api/accounts/:label/candles", handlers.getAccountCandles),
   // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
   // dashboard control for these is deliberately a later step; today they are the
   // curl-callable surface that replaces editing the table by hand.
@@ -77,6 +82,8 @@ export interface ApiOptions {
   readonly access?: Pick<AccessConfig, "now" | "fetchJwks" | "jwksCache">;
   /** Injected by tests so the symbols endpoint makes no live exchange call. */
   readonly symbolLister?: SymbolLister;
+  /** Injected by tests so the candles endpoint makes no live exchange call. */
+  readonly candleLister?: CandleLister;
 }
 
 function requireBotNamespace(
@@ -152,6 +159,7 @@ export async function handleApiRequest(
       db,
       botNamespace: requireBotNamespace(env, options.botNamespace),
       symbolLister: options.symbolLister ?? envSymbolLister,
+      candleLister: options.candleLister ?? envCandleLister,
       now: options.now ?? (() => Date.now()),
       newId: options.newId ?? (() => crypto.randomUUID()),
     };

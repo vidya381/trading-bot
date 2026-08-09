@@ -2,14 +2,16 @@
 
 Section 21 (LLM-assisted research and bot proposals) is **PLANNED, NOT YET
 BUILT**, and that banner still holds. There is no pipeline, no prompt, no
-proposal record, no Workers AI call and no endpoint in this folder.
+proposal record and no Workers AI call in this folder.
 
-What exists is the storage for **21.3's fixed watchlist**, and a read path for a
-pipeline stage that does not exist yet.
+What exists is the storage for **21.3's fixed watchlist**, a read path for a
+pipeline stage that does not exist yet, and **21.4 Stage 1's candle fetch**.
 
 | File | What it is |
 | --- | --- |
 | `watchlist.ts` | `addToWatchlist` / `removeFromWatchlist` / `readWatchlist`: the deliberate half of candidate selection, over `watchlist` (migration 0008) |
+| `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by both callers below |
+| `candles.ts` | `fetchCandleWindow`: 21.4 Stage 1's candle fetch for **any** listed, tradable pair — no bot required — reporting how much history it actually got |
 
 ## The two candidate sources stay apart
 
@@ -77,14 +79,69 @@ recorded about proposals nobody acted on.
 
 ## Deliberately deferred
 
-- **A dashboard control for editing the list.** Not built, on purpose. Editing
-  is `wrangler d1 execute` for now.
-- **Candidate selection, the trending pull, `getCandles` for arbitrary pairs,
-  and everything LLM-shaped.** None of it exists.
-- **Any API endpoint.** Nothing here is reachable over HTTP.
+- **A dashboard control for either the list or the candle window.** Not built,
+  on purpose. Both have a curl-able endpoint instead; a UI is its own step.
+- **Candidate selection, the trending pull, and everything LLM-shaped.** None of
+  it exists.
 
-`readWatchlist` currently has **no caller**. It is the seam the pipeline will
-consume.
+`readWatchlist` currently has **no non-test caller**. It is the seam the
+pipeline will consume. `fetchCandleWindow`'s only caller is its endpoint.
+
+## `fetchCandleWindow` removes a scoping limit, not the depth limit
+
+Reaching `getCandles` used to mean holding a client, and every route to one ran
+through a bot's attached client — so "candles for a pair" meant "candles for a
+pair that already has a bot". A candidate coin has no bot by definition. This
+resolves a client from the account registry instead, through the same
+`clientForAccount` the symbol listing uses.
+
+What it does **not** do is reach deeper history. Gemini's `/v2/candles` takes no
+time-range parameter and returns a fixed recent window (spec 21.7, open question
+1). That is reported rather than worked around: `earliestCloseTime` says how far
+back the window actually goes, and `truncated` / `missingHistoryMs` say when the
+requested range was not fully covered. 21.7's requirement is that "the Assess
+stage must be told how much history it actually received and must not reason as
+though it had more".
+
+Every failure throws a `CandleWindowError` — unverified interval, unknown
+account, untradable pair, unreadable tradable set, failed candle call, and a
+call that succeeded with an empty array. None returns an empty window, because
+an empty array flows into an average as though it meant something (§5.6, 21.5
+requirement 6).
+
+## Only `1m` is a verified interval
+
+`VERIFIED_INTERVALS` is `["1m"]`, and anything else is refused with
+`interval_not_verified` before any I/O happens. `CandleInterval` declares all
+seven both venues nominally support, and its own docblock has said since step 14
+that each "must be verified per exchange before first use" — a comment nothing
+enforced. It has to be enforced here because the failure is silent: the venues
+spell the wider intervals differently (Gemini writes `1hr`/`6hr`/`1day`), so a
+wrong mapping returns correctly-shaped candles of the **wrong duration**, which
+every type check passes and no later reader can detect.
+
+Widening it is one line in `candles.ts` plus the pin in `candles.test.ts` that
+asserts its current contents — the pin exists so widening cannot happen as a
+silent one-character edit. Neither is the hard part: an interval belongs on that
+list only once someone has read that venue's candles at that timeframe and
+confirmed the duration.
+
+## `GET /api/accounts/:label/candles`
+
+Read-only, behind Access like every other route, taking `?pair=`, `?interval=`
+and an optional `?since=`. It publishes the whole `CandleWindow` — including
+`truncated`, `missingHistoryMs`, `earliestOpenTime` and `count` — because the
+depth limit above is a claim about a real venue that no test in this repository
+can settle. Every candle in the suite comes from a stub modelling a fixed
+window; only a real request can say whether the truncation reporting is
+accurate.
+
+The module's codes map to statuses in `api/envelope.ts`, reusing existing tiers:
+`interval_not_verified` and `pair_not_tradable` 400, `unknown_account` 404,
+`candles_unavailable` and `no_candles_returned` 502 (a read the caller asked for
+that the venue failed to serve — the symbols endpoint's tier),
+`tradable_set_unreadable` 503 (a refusal to act on input that could not be
+verified — a different thing, deliberately a different status).
 
 ## What the manual edit path bypasses
 
