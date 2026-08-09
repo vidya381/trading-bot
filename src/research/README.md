@@ -4,16 +4,63 @@ Section 21 (LLM-assisted research and bot proposals) is **PLANNED, NOT YET
 BUILT**, and that banner still holds. There is no pipeline, no prompt, no
 proposal record and no Workers AI call in this folder.
 
-What exists is the storage for **21.3's fixed watchlist**, a read path for a
-pipeline stage that does not exist yet, and **two of 21.4 Stage 1's three
-fetches**.
+What exists is the storage for **21.3's fixed watchlist**, **two of 21.4 Stage
+1's three fetches**, and **candidate selection for both of 21.2's entry
+points** — the first thing in this folder that consumes the others.
 
 | File | What it is |
 | --- | --- |
 | `watchlist.ts` | `addToWatchlist` / `removeFromWatchlist` / `readWatchlist`: the deliberate half of candidate selection, over `watchlist` (migration 0008) |
-| `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by both callers below |
+| `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by every caller below |
 | `candles.ts` | `fetchCandleWindow`: 21.4 Stage 1's candle fetch for **any** listed, tradable pair — no bot required — reporting how much history it actually got |
 | `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
+| `candidates.ts` | `selectNamedCandidate` / `selectGeneralCandidates`: 21.2's two entry points, feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it |
+
+## Candidate selection: one shape, two entry points, merged provenance
+
+21.2 says the entry points "differ **only** in how the candidate coin or coins
+are chosen", so both functions return the same `CandidateSet` holding the same
+`Candidate`. They are kept from converging by their ports rather than by
+discipline: `NamedCandidatePorts` has no trending source in it, so the named
+path cannot reach a vendor even by mistake.
+
+Deduplication **merges provenance rather than dropping it**. A coin on both the
+watchlist and the trending pull is one candidate carrying two sources, and
+`Candidate.sources` is a non-empty tuple, so a candidate that came from nowhere
+is unrepresentable. 21.5 requirement 2 needs "**which** watchlist entry, or
+**which** trending pull, and when" — so the sources carry `entryId` and `pullId`
+respectively, plus the vendor's raw item by identity.
+
+**A failed trending pull is fatal, not a fall back to the watchlist.** 21.5
+requirement 6 names "the trending source is unreachable" as a fail-closed
+condition, and 21.3 says the trending pull exists because "it is the only way
+the system can ever surface something the operators did not already think to
+look for". A watchlist-only set returned under the name "general candidates"
+would be a degraded result indistinguishable from a good one. An explicit
+watchlist-only entry point could be added later, deliberately and under its own
+name; what must not exist is a general run that quietly becomes one.
+
+### Spot versus perpetual: a flagged gap, live today
+
+Gemini's real catalogue carries **perpetual** pairs (`HYPEGUSDPERP`,
+`HYPEUSDCPERP`) alongside spot, and `parseSymbolList` passes every string
+through unfiltered. **Nothing in this repository knows what a perpetual is** —
+`grep -rn "PERP" src/` returns nothing — so `addToWatchlist`,
+`fetchCandleWindow` and `selectNamedCandidate` would all accept one with zero
+resistance, while every order, fill and PnL path here is spot.
+
+Candidate selection's trending path is the only place this is structurally safe,
+and only incidentally: `${BASE}${QUOTE}` cannot construct a `PERP` suffix, and
+`checkTradable`'s near-match is an exact equality so no perp is ever offered as
+"the venue's own spelling". Two tests pin both. **The human-typed paths have no
+protection**, and this needs its own decision — a spot-only filter at the shared
+tradability level, or a recorded accepted-risk. See decision log 31.
+
+A trending pull that matches nothing on the venue is a **fact**, not a failure,
+and is reported as one: `TrendingPullReport` carries what came back, what was
+accepted, and every rejection with the exact pairs that were tried. That last
+field is load-bearing — without it, "the pair-spelling convention does not hold
+on this venue" is indistinguishable from "a quiet day".
 
 ## The two candidate sources stay apart
 
@@ -87,13 +134,22 @@ recorded about proposals nobody acted on.
   decision on how (and whether) to verify it against the real CoinDesk API — the
   same order the candle step took, where the endpoint existed to make the
   function checkable and was written once there was something to check.
-- **Candidate selection, the trending pull, and everything LLM-shaped.** None of
-  it exists.
+- **A trending vendor, and any transport for one.** `TrendingSource` is a port
+  and nothing implements it. No trending API has been called from this
+  repository, and the vendor research is in decision log 31.
+- **An HTTP endpoint for candidate selection**, and everything LLM-shaped —
+  Assess, Derive, proposal assembly, the proposal record, the audit table.
 
-`readWatchlist` currently has **no non-test caller**. It is the seam the
-pipeline will consume. `fetchCandleWindow`'s only caller is its endpoint.
-`fetchNewsSentiment` has **no non-test caller at all**, and `envNewsFetcher`'s
-`fetch` call has never executed against CoinDesk.
+`fetchCandleWindow`'s only caller is its endpoint. `fetchNewsSentiment` has **no
+non-test caller at all**, and `envNewsFetcher`'s `fetch` call has never executed
+against CoinDesk. `readWatchlist` finally has a non-test caller —
+`selectGeneralCandidates` — which itself has none.
+
+**Watchlist entries are not re-checked against the venue at selection time.**
+A pair delisted after it was added stays a candidate until someone removes it.
+This is the gap step 28 already recorded on `readWatchlist` ("says nothing about
+the tradable set having gone stale underneath" it); closing it changes what
+membership of the watchlist means, which is a decision rather than a detail.
 
 ## `fetchCandleWindow` removes a scoping limit, not the depth limit
 

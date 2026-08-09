@@ -6,16 +6,45 @@
  * this folder. What exists is the storage for 21.3's fixed watchlist -- the
  * deliberate, human-chosen half of candidate selection -- the read path a later
  * stage will consume, 21.4 Stage 1's candle fetch for arbitrary tradable pairs,
- * and 21.4 Stage 1's news-and-sentiment fetch.
+ * 21.4 Stage 1's news-and-sentiment fetch, and 21.2/21.3's candidate selection
+ * for both entry points.
  *
  * The news fetch's wire format is ASSUMED, not verified: nothing here has ever
  * called CoinDesk and this project holds no key for it. See `news.ts`'s header
  * before relying on any of it.
  *
- * The trending pull, 21.3's other source, is not here and must not be added
- * here as a writer of the same table. See `watchlist.ts`'s header for why the
- * separation is structural rather than stylistic.
+ * The trending pull, 21.3's other source, has a PORT (`TrendingSource`) and no
+ * vendor: no trending API has been chosen, no client exists, and nothing here
+ * has ever called one. It also must never be added as a writer of the watchlist
+ * table -- see `watchlist.ts`'s header for why that separation is structural
+ * rather than stylistic, and `candidates.ts`'s for how the two sources are
+ * merged at read time without losing which is which.
  */
+
+export {
+  selectGeneralCandidates,
+  selectNamedCandidate,
+  CandidateSelectionError,
+  type Candidate,
+  type CandidateEntryPoint,
+  type CandidateSelectionErrorCode,
+  type CandidateSet,
+  type CandidateSource,
+  type GeneralCandidatePorts,
+  type NamedCandidatePorts,
+  type NamedCandidateSource,
+  type SelectGeneralCandidatesRequest,
+  type SelectNamedCandidateRequest,
+  type TrendingCandidateSource,
+  type TrendingCoin,
+  type TrendingPull,
+  type TrendingPullReport,
+  type TrendingRejection,
+  type TrendingRejectionReason,
+  type TrendingSource,
+  type WatchlistCandidateSource,
+  type WatchlistReadReport,
+} from "./candidates";
 
 export {
   fetchCandleWindow,
