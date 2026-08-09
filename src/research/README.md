@@ -5,13 +5,15 @@ BUILT**, and that banner still holds. There is no pipeline, no prompt, no
 proposal record and no Workers AI call in this folder.
 
 What exists is the storage for **21.3's fixed watchlist**, a read path for a
-pipeline stage that does not exist yet, and **21.4 Stage 1's candle fetch**.
+pipeline stage that does not exist yet, and **two of 21.4 Stage 1's three
+fetches**.
 
 | File | What it is |
 | --- | --- |
 | `watchlist.ts` | `addToWatchlist` / `removeFromWatchlist` / `readWatchlist`: the deliberate half of candidate selection, over `watchlist` (migration 0008) |
 | `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by both callers below |
 | `candles.ts` | `fetchCandleWindow`: 21.4 Stage 1's candle fetch for **any** listed, tradable pair — no bot required — reporting how much history it actually got |
+| `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
 
 ## The two candidate sources stay apart
 
@@ -81,11 +83,17 @@ recorded about proposals nobody acted on.
 
 - **A dashboard control for either the list or the candle window.** Not built,
   on purpose. Both have a curl-able endpoint instead; a UI is its own step.
+- **An HTTP endpoint for the news fetch.** Deliberately not built yet, pending a
+  decision on how (and whether) to verify it against the real CoinDesk API — the
+  same order the candle step took, where the endpoint existed to make the
+  function checkable and was written once there was something to check.
 - **Candidate selection, the trending pull, and everything LLM-shaped.** None of
   it exists.
 
 `readWatchlist` currently has **no non-test caller**. It is the seam the
 pipeline will consume. `fetchCandleWindow`'s only caller is its endpoint.
+`fetchNewsSentiment` has **no non-test caller at all**, and `envNewsFetcher`'s
+`fetch` call has never executed against CoinDesk.
 
 ## `fetchCandleWindow` removes a scoping limit, not the depth limit
 
@@ -142,6 +150,85 @@ The module's codes map to statuses in `api/envelope.ts`, reusing existing tiers:
 that the venue failed to serve — the symbols endpoint's tier),
 `tradable_set_unreadable` 503 (a refusal to act on input that could not be
 verified — a different thing, deliberately a different status).
+
+## `fetchNewsSentiment` is written against an **unverified** wire format
+
+**No call to CoinDesk has ever been made from this repository, and this project
+holds no CoinDesk key.** Their reference docs render client-side from a spec
+that can only be read by calling the API host, which was not done. The host, the
+paths, the `Authorization: Apikey` scheme, the `{ Data, Err }` envelope, the
+`PUBLISHED_ON`-is-seconds assumption and every field name in
+`COINDESK_WIRE_FIELDS` are **inferences from CoinDesk's public documentation
+index and published descriptions of the API** — not observations.
+
+What *is* established from public sources: the sentiment is a **label**
+(`POSITIVE` / `NEUTRAL` / `NEGATIVE`), not a number, and it is produced by
+prompting a general-purpose language model to categorise each article. 21.4's
+reasoning for choosing this vendor survives that — the label is computed outside
+*this* system and a human can check it against the headline — but nothing may
+treat it as a calibrated score. `fetchNewsSentiment` therefore returns the
+labels and their counts and **no derived sentiment index of any kind**.
+
+Every assumption is checked at parse time and a violated one **throws**, so a
+wrong guess surfaces as `unexpected_category_payload` /
+`unexpected_article_payload` naming the field, not as zero articles. The
+assumptions are collected in `COINDESK_WIRE_FIELDS` (pinned by a test, like
+`VERIFIED_INTERVALS`) and `COINDESK_ENDPOINTS` in `src/workers/news.ts`, so
+correcting them after a live run is one visible diff.
+
+## Coverage is asked as its own question (21.7 open question 2)
+
+> "CoinDesk's coverage of newly listed coins is unverified… If coverage is
+> empty, that is a fact the proposal must state, not a gap to paper over."
+
+An article request alone **cannot** answer that: an empty list means both "this
+vendor has never heard of this coin" and "this vendor covers it and published
+nothing recently". So the category listing is asked **first**, and the article
+request is spent only when there is a category to spend it on.
+
+| result | means |
+| --- | --- |
+| `not_covered` | the vendor lists no category for this asset. No article request was made |
+| `no_articles_in_window` | it does, and returned nothing |
+| `covered` | it does, and returned articles |
+
+They are **separate variants**, not a flag beside an array: the covered variant's
+`articles` is a non-empty tuple type and the other two carry no `articles` field
+at all, so "covered with zero articles" cannot be constructed and a reader that
+forgets to check `coverage` cannot reach an empty array.
+
+**The distinction is only as good as its premise** — that the category list
+enumerates assets. That premise is unverified like the rest. If a live run shows
+the category list is a small fixed taxonomy rather than an asset index, **this
+design is wrong and must be replaced by a plain statement that the vendor cannot
+tell the two apart**, not by a heuristic that guesses.
+
+A spelling difference is **never** reported as no coverage. `"btc"` against a
+vendor writing `"BTC"` throws `asset_spelling_mismatch` carrying the vendor's
+own spelling — the same exact-match discipline `checkTradable` uses, and for a
+sharper reason: a false "nobody is writing about this coin" reads like a finding
+rather than like the mistake it is.
+
+## The news fetch takes an **asset**, not a pair, and never caches
+
+`fetchNewsSentiment({ asset: "BTC" })`. It does not derive `BTC` from `BTCUSD`:
+Gemini's symbols are concatenated and separator-less, so splitting one needs the
+venue's own symbol details, and a guess at the split point is wrong for exactly
+the newly-listed, oddly-named coins 21.3's trending source exists to surface.
+
+Nothing is cached, matching `envCandleLister`'s reasoning: 21.5 requirement 4
+times a proposal from when its data was fetched, and a cache would make that
+timestamp a lie that looks exactly like the truth. Every result carries
+`fetchedAt` and `coverageCheckedAt` — the two calls happen at different instants
+and one number for both would claim something nothing observed.
+
+Every failure throws a `NewsSentimentError`: `invalid_asset`, `invalid_limit`,
+`asset_spelling_mismatch`, `categories_unreadable`, `news_unavailable`,
+`vendor_error` (an error in the envelope beside an HTTP 200 — the shape a silent
+failure takes with this vendor), `unexpected_category_payload`,
+`unexpected_article_payload`. One malformed article fails the whole fetch rather
+than being dropped, and an article with no `SENTIMENT` is refused outright,
+because that field is the entire reason 21.4 chose this vendor.
 
 ## What the manual edit path bypasses
 
