@@ -7,7 +7,12 @@
  * deliberate, human-chosen half of candidate selection -- the read path a later
  * stage will consume, 21.4 Stage 1's candle fetch for arbitrary tradable pairs,
  * 21.4 Stage 1's news-and-sentiment fetch, and 21.2/21.3's candidate selection
- * for both entry points.
+ * for both entry points, and 21.4 Stage 1's over-concentration FLAG.
+ *
+ * The concentration check is a flag for a human, never a filter: it reads
+ * `bot_instances` and states what an account already holds. Its two thresholds
+ * are POLICY CHOICES verified against nothing -- see
+ * `DEFAULT_CONCENTRATION_POLICY` before quoting either number.
  *
  * The news fetch's wire format is ASSUMED, not verified: nothing here has ever
  * called CoinDesk and this project holds no key for it. See `news.ts`'s header
@@ -45,6 +50,30 @@ export {
   type WatchlistCandidateSource,
   type WatchlistReadReport,
 } from "./candidates";
+
+export {
+  assessCandidateSetConcentration,
+  assessConcentration,
+  checkCandidateConcentration,
+  readAccountExposure,
+  ConcentrationError,
+  DEFAULT_CONCENTRATION_POLICY,
+  type AccountExposure,
+  type AssessConcentrationOptions,
+  type AssetConcentrationFacts,
+  type AssetSignalBasis,
+  type BaseAssetResolution,
+  type CandidateSetConcentration,
+  type ConcentrationErrorCode,
+  type ConcentrationFacts,
+  type ConcentrationFlag,
+  type ConcentrationFlagCode,
+  type ConcentrationPolicy,
+  type ConcentrationPorts,
+  type ConcentrationResult,
+  type ExposureBot,
+  type PairHolding,
+} from "./concentration";
 
 export {
   fetchCandleWindow,

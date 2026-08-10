@@ -4,9 +4,9 @@ Section 21 (LLM-assisted research and bot proposals) is **PLANNED, NOT YET
 BUILT**, and that banner still holds. There is no pipeline, no prompt, no
 proposal record and no Workers AI call in this folder.
 
-What exists is the storage for **21.3's fixed watchlist**, **two of 21.4 Stage
-1's three fetches**, and **candidate selection for both of 21.2's entry
-points** — the first thing in this folder that consumes the others.
+What exists is the storage for **21.3's fixed watchlist**, **all three of 21.4
+Stage 1's reads**, and **candidate selection for both of 21.2's entry points** —
+the first thing in this folder that consumes the others.
 
 | File | What it is |
 | --- | --- |
@@ -15,6 +15,7 @@ points** — the first thing in this folder that consumes the others.
 | `candles.ts` | `fetchCandleWindow`: 21.4 Stage 1's candle fetch for **any** listed, tradable pair — no bot required — reporting how much history it actually got |
 | `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
 | `candidates.ts` | `selectNamedCandidate` / `selectGeneralCandidates`: 21.2's two entry points, feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it |
+| `concentration.ts` | `readAccountExposure` + `assessConcentration`: 21.4 Stage 1's third read — what the account already holds on a candidate's pair and asset. **A flag for a human, never a filter**, and its two thresholds are **policy choices verified against nothing** |
 
 ## Candidate selection: one shape, two entry points, merged provenance
 
@@ -83,6 +84,190 @@ and is reported as one: `TrendingPullReport` carries what came back, what was
 accepted, and every rejection with the exact pairs that were tried. That last
 field is load-bearing — without it, "the pair-spelling convention does not hold
 on this venue" is indistinguishable from "a quiet day".
+
+## The over-concentration flag is a flag, and structurally not a filter
+
+21.4: *"This is a flag on the proposal for the human to weigh, presented
+prominently, **not a silent filter**."*
+
+So nothing in `concentration.ts` refuses, drops, reorders or scores a candidate.
+`assessCandidateSetConcentration` returns exactly one result per candidate in the
+candidate's own order, and there is no return value a caller could read as a
+rejection. Its only two error codes are a blank field and a **failed read** —
+never "this candidate is bad". That is a different shape from every other refusal
+in this folder (`pair_not_tradable`, `interval_not_verified`, `not_covered`), and
+deliberately: those answer *can this system honestly do this at all*, which is a
+capability fact. This answers *should you want to*, which 21.1 puts on the
+human's side of the boundary.
+
+### The two thresholds are POLICY, not findings
+
+21.4 names two cases and gives no numbers. `DEFAULT_CONCENTRATION_POLICY` holds
+both, in the same category as `VERIFIED_INTERVALS` and
+`DERIVATIVE_NAME_SUFFIXES` — **nothing has been verified against anything**, no
+backtest supports them, and no operator has yet said they are right.
+
+| | value | the judgement in it |
+| --- | --- | --- |
+| `samePairBotCountFlagAt` | **2** committed bots already on the pair | 21.4's own example ("a third bot on a pair that already has two") read as a *boundary* rather than an illustration. The looser of the two available readings of one sentence |
+| `assetCapitalShareFlagAtPct` | **40%** of committed capital in the candidate's base asset | An argument, not evidence: 21.3 bounds the watchlist at 5–10 coins, so the design assumes a book spread over several, and at 40% one asset is more than two equal-weight positions' worth. 25% or 60% is equally defensible |
+
+Both comparisons are **at or above** — exactly 2 flags, exactly 40.00000000%
+flags — which the `FlagAt` in each name states and which is tested one step out
+in both directions. The money boundary is decided by **cross-multiplied bigint**,
+never by comparing a share already rounded to SCALE, so a value a hair under 40%
+that *renders* as `40.00000000` does not flag. On today's real account (9 of 11
+bots on `BTCUSD`) any threshold below ~80% fires identically, so **the live data
+cannot discriminate between candidate values either**.
+
+### Verified against real testnet state, 2026-08-10T20:35:36Z
+
+The live `bot_instances` read, and what the fold produces from it. Every figure
+below is real except where marked.
+
+| | |
+| --- | --- |
+| bots on `gemini-main` | **13** — 11 `BTCUSD`, 2 `DOGEUSD` |
+| statuses | 7 running, 1 halted, 1 halted+archived, 2 created, 2 running (DOGE). **None stopped** |
+| capital assets | **`USD` only** |
+| committed capital | **1750.00 USD** (all 13, since none are stopped) |
+| BTC-derived | **1650.00 USD** across 11 bots |
+| DOGE-derived | **100.00 USD** across 2 bots |
+
+Computed output under `DEFAULT_CONCENTRATION_POLICY`, confirmed against by-hand
+arithmetic before it was pinned:
+
+| candidate | `samePairBots` | base-asset share | flags |
+| --- | --- | --- | --- |
+| `BTCUSD` | 11 | **94.28571429%** (1650/1750) | `same_pair_bot_count`, `asset_capital_share` |
+| `DOGEUSD` | 2 | **5.71428571%** (100/1750) | `same_pair_bot_count` **only** |
+| `LINKUSD` | 0 | 0.00000000% | none — `no_concentration` |
+
+**`DOGEUSD` still flags**, on the count signal, at exactly the boundary: two
+existing bots is the threshold, so a third DOGE proposal is flagged even though
+its share is 5.7%. "DOGE does not flag" is the natural summary of the share
+figure and it is wrong about the result; a test pins it.
+
+**`v-perp-1` is a SPOT bot.** Its pair is `BTCUSD`; the name is leftover from a
+rejected-then-reused botId in step 32's perpetual regression test. It counts as
+one of the eleven, and a test says so by name — nothing in this repository infers
+an instrument from a bot id, and a future reader grepping for "perp" will find
+this.
+
+**Two things in the pinned fixture are still not real, and are named in the
+test:** the **per-bot split** of each pair total (the read gave pair totals, not
+per-bot figures — distributed evenly, which is licensed by a test asserting the
+report is *invariant* to the split given the same totals), and the **bot ids**
+apart from `v-spot-1` and `v-perp-1`.
+
+#### Two paths that are correct and unobserved
+
+Same shape as step 31's merge/dedup path and step 32's Binance permission gap —
+built, tested against fixtures, never exercised against real data. Not new kinds
+of problem, and not fixed here:
+
+1. **The stopped-bot exclusion.** The rule that makes `committed` something other
+   than a plain `SUM` of the column exists because `releaseBotCapital` leaves
+   `allocated_capital` behind. **No bot in this account has ever been stopped**, so
+   the rule has only ever run against fixtures.
+2. **The multi-quote-asset path.** Per-capital-asset grouping and the longest-first
+   suffix strip both have real code. This account has only ever used `USD`, so one
+   group is all that has ever been observed.
+
+#### The bot count keeps moving, and this is the third correction
+
+Log 32 recorded 11 bots against a prediction of 0. This read found **13** — two
+more (`v-spot-1`, `v-perp-1`) created by steps 32/33's own live verification runs.
+Step 28 hit the same class of surprise on the watchlist. **Verification runs
+create real bots, so the count is stale the moment it is written down**, which is
+exactly what 10.14 says ("anything which can change after an entry is written must
+be read from the system, never quoted from this log"). Any future step that needs
+a bot count must run the `SELECT`. Stating it plainly here because three
+occurrences is a pattern, not a run of bad luck.
+
+### It reports facts, not a verdict
+
+Every result — flagged or clean — carries the counts, exact `bigint` money
+totals, the **bot ids**, the pairs held, the quote assets used and the policy
+applied, so a human can re-run the same `SELECT` and get the same numbers (21.5
+requirement 2). The flag's `statement` renders those facts and adds nothing to
+them. `"3 existing bots on BTCUSD"` is checkable only if you can go and look at
+which three.
+
+### Three states, never two
+
+| | |
+| --- | --- |
+| the `bot_instances` read **failed** | throws `bot_list_unreadable` |
+| the account has **no bot rows at all** | clean, `rowsRead: 0` |
+| it has rows and **all are stopped** | clean, `rowsRead > 0`, `committedBots: 0` |
+
+The first is the whole point. A check built to surface risk that reports *no
+concentration* because it could not look would hide exactly the risk it exists to
+catch, inside a proposal that then reads as reassuring (§5.6, 21.5 requirement
+6). The last two are both clean and are **not the same sentence** — step 24's
+`audit_empty_balance_set` distinction, step 30's coverage variants. And clean is
+a **variant** (`assessment: "no_concentration"`), not an empty flag array: the
+flagged variant's `flags` is a non-empty tuple, so "flagged with nothing to show"
+cannot be constructed.
+
+### What it borrows from step 25, and why not by calling it
+
+`dashboard/src/accountTotals.ts` is **dashboard-side**: it folds a `Bot[]` the
+page already fetched over HTTP, imports `./api/types` and `./derive`, and
+**touches no database at all**. There was nothing here it could have been called
+for. Two of its *rules* are reused, as rules:
+
+1. **`stopped` bots are excluded from committed capital**, because
+   `releaseBotCapital` subtracts a closed bot's allocation from the ledger but
+   **leaves `bot_instances.allocated_capital` on the row** as history. Summing
+   every row reports returned capital as still committed — an overstatement
+   growing with every bot ever closed. Stopped bots are still **counted and
+   reported beside** the figures, because `close` does not flatten a position, so
+   one can genuinely still hold inventory.
+2. **Grouped by capital asset, always.** A share over a total blending USD and
+   USDT is a percentage of nothing, and it looks completely normal.
+
+**Archived bots count**, exactly as step 26 settled for the account totals:
+`archived` is a view flag orthogonal to `status`, and a concentration figure that
+moved when someone flipped a dashboard toggle would be step 25's silent omission
+in a new place. Pinned by a test.
+
+### The base asset is a naming inference, and says so
+
+21.4's second case is about an **asset**, and `bot_instances` has **no base-asset
+column** — only `pair` and `capital_asset`. Neither is the asset in question: by
+pair, `BTCUSD` and `BTCUSDT` are two unrelated things; by capital asset, every
+bot on the real account is `USD`, so the share is 100% for every candidate
+forever and **a flag that always fires is not a flag**.
+
+`news.ts` refuses to split `BTCUSD` into `BTC` — *"a guess at the split point is
+wrong for exactly the newly-listed, oddly-named coins 21.3's trending source
+exists to surface"* — and that refusal stands. This does something narrower: the
+quote assets are **observed**, not guessed (the distinct `capital_asset` values on
+the account's own bots, plus any the caller states, the same list
+`selectGeneralCandidates` already takes from an operator), and a pair is split
+only when it **ends in one of them, longest first** so `BTCUSDT` strips `USDT`
+rather than becoming `BTCT`. A pair matching none is **not** split and is
+**counted**, which makes every base-asset figure that had one a stated **floor**.
+
+It is safe here in a way it would not be in `news.ts` because **the output cannot
+block anything**: a wrong split yields a sentence a human can see is wrong — the
+report names the suffix it stripped — never a refused pair or an order. Known
+limits, both real: a venue writing `BTC-USD` splits to nothing (neither venue
+here does), and a ticker ending in a quote asset's letters would mis-split. When
+no split is possible the signal **degrades to the exact pair and says so**, never
+to silence.
+
+### The same-pair match is case-insensitive, unlike `checkTradable`
+
+Deliberately the opposite rule, because the string is a **grouping key that never
+leaves the process** rather than a symbol about to be sent to a venue. The two
+failure directions are not equal: folding when it was unnecessary over-counts a
+flag a human weighs and dismisses, while **not** folding when it was necessary
+reports "0 bots on `BTCUSD`" with nine `btcusd` rows in the table — a false clean
+result. `samePairSpellings` reports every spelling matched, so the fold is never
+silent.
 
 ## The two candidate sources stay apart
 
@@ -159,13 +344,20 @@ recorded about proposals nobody acted on.
 - **A trending vendor, and any transport for one.** `TrendingSource` is a port
   and nothing implements it. No trending API has been called from this
   repository, and the vendor research is in decision log 31.
-- **An HTTP endpoint for candidate selection**, and everything LLM-shaped —
-  Assess, Derive, proposal assembly, the proposal record, the audit table.
+- **An HTTP endpoint for candidate selection or the concentration flag**, and
+  everything LLM-shaped — Assess, Derive, proposal assembly, the proposal record,
+  the audit table.
+- **A stopped bot, and a second capital asset, on the real account.** Both code
+  paths exist and are fixture-tested; neither has ever been observed live. See
+  the two unobserved paths above.
 
 `fetchCandleWindow`'s only caller is its endpoint. `fetchNewsSentiment` has **no
 non-test caller at all**, and `envNewsFetcher`'s `fetch` call has never executed
 against CoinDesk. `readWatchlist` finally has a non-test caller —
-`selectGeneralCandidates` — which itself has none.
+`selectGeneralCandidates` — which itself has none. `concentration.ts` has **no
+non-test caller either**: it consumes `candidates.ts`'s `Candidate` and
+`CandidateSet` types, but nothing yet calls both in sequence, because the thing
+that would is the proposal pipeline.
 
 **Watchlist entries are not re-checked against the venue at selection time.**
 A pair delisted after it was added stays a candidate until someone removes it.
