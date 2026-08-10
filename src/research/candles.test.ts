@@ -45,9 +45,15 @@ import { accountRow, botInstanceRow, freshDatabase } from "../db/test-helpers";
 const T0 = 1_910_000_000_000;
 const MINUTE = 60_000;
 
-/** The venue catalogues the stub lister answers with, per account. */
+/**
+ * The venue catalogues the stub lister answers with, per account.
+ *
+ * `HYPEUSDCPERP` is a REAL Gemini symbol (decision log 31) and `PERPUSD` is the
+ * shape of a real spot ticker that merely contains "perp" -- both here so the
+ * naming heuristic is tested against a catalogue shaped like the real one.
+ */
 const CATALOGUE: Record<string, string[]> = {
-  "gemini-main": ["BTCUSD", "ETHUSD", "SOLUSD"],
+  "gemini-main": ["BTCUSD", "ETHUSD", "SOLUSD", "PERPUSD", "HYPEUSDCPERP"],
   main: ["BTCUSDT", "ETHUSDT"],
 };
 
@@ -227,6 +233,40 @@ describe("reach", () => {
       }),
     ).rejects.toMatchObject({ code: "pair_not_tradable" });
     expect(stub.calls).toEqual([]);
+  });
+
+  it("refuses candles for a perpetual the venue lists, and spends no request", async () => {
+    // Decision log 31's flagged gap at this path: `HYPEUSDCPERP` IS on Gemini's
+    // catalogue, so before step 33 this fetched real candles for a real
+    // instrument with margin, funding and liquidation semantics that nothing in
+    // this system models -- and returned a window indistinguishable from a spot
+    // one. A NAMING INFERENCE, not the structural check; see `tradability.ts`.
+    const stub = fixedWindow(windowOf("HYPEUSDCPERP", T0, 3));
+
+    await expect(
+      fetchCandleWindow(portsWith(stub.source), {
+        accountLabel: "gemini-main",
+        pair: "HYPEUSDCPERP",
+        interval: "1m",
+      }),
+    ).rejects.toMatchObject({ code: "pair_not_spot_by_name" });
+    // The refusal comes before the venue is asked, like every other gate here.
+    expect(stub.calls).toEqual([]);
+  });
+
+  it("still fetches candles for PERPUSD, which contains 'perp' but does not end in it", async () => {
+    // The `endsWith`-versus-`includes` distinction at this path. A substring
+    // match would deny an operator candles for a genuine spot pair.
+    const stub = fixedWindow(windowOf("PERPUSD", T0, 3));
+
+    const window = await fetchCandleWindow(portsWith(stub.source), {
+      accountLabel: "gemini-main",
+      pair: "PERPUSD",
+      interval: "1m",
+    });
+
+    expect(window.candles).toHaveLength(3);
+    expect(stub.calls).toHaveLength(1);
   });
 
   it("passes the interval and since straight through to the client", async () => {

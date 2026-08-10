@@ -25,7 +25,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { ApiError, errorResponse } from "./envelope";
+import { ApiError, errorResponse, statusForCode } from "./envelope";
 
 /** A wrapped module's error: a real `Error` carrying a `code`. */
 function coded(code: string, message = "refused"): Error {
@@ -86,6 +86,29 @@ describe("STATUS_BY_CODE covers the watchlist's refusals", () => {
     ["no_candles_returned", 502],
   ])("maps %s to %i", async (code, status) => {
     expect(await statusAndCode(coded(code))).toEqual({ status, code });
+  });
+
+  it("maps pair_not_spot_by_name to 400, and STATES it rather than inheriting it", async () => {
+    // The research paths' naming heuristic (step 33). A bad field value the
+    // caller fixes by naming a spot pair -- the same tier as `pair_not_tradable`
+    // and, deliberately, a DIFFERENT CODE from `instrument_not_spot`: both mean
+    // "not spot", but one is a field the venue published and this one is an
+    // inference from a naming convention Gemini has never documented. An
+    // operator reading a log must be able to tell which check spoke.
+    expect(await statusAndCode(coded("pair_not_spot_by_name"))).toEqual({
+      status: 400,
+      code: "pair_not_spot_by_name",
+    });
+
+    // THE SECOND ASSERTION IS NOT REDUNDANT, and it exists because a mutation
+    // run proved the first one is not enough: deleting the table row entirely
+    // failed NO test, since the table's own default is also 400 and an absent
+    // row is indistinguishable from a stated one at runtime today. Passing an
+    // alien fallback is what tells them apart -- and the difference stops being
+    // cosmetic the moment anything changes that default, at which point every
+    // code with a row keeps its status and every code without one moves.
+    expect(statusForCode("pair_not_spot_by_name", 599)).toBe(400);
+    expect(statusForCode("some_future_refusal_with_no_row", 599)).toBe(599);
   });
 
   it("keeps the candle read failure and the unverifiable-input refusal apart", async () => {

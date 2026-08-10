@@ -150,8 +150,21 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   cap_exceeded: 409,
   already_watched: 409,
   not_watched: 404,
+  //   pair_not_spot_by_name   400, with `pair_not_tradable`, and for the same
+  //                           reason: a field value this system will not act on
+  //                           that the caller can fix by naming a spot pair.
+  //                           Deliberately a SEPARATE code from
+  //                           `instrument_not_spot` further down even though
+  //                           both mean "not spot", because the EVIDENCE
+  //                           differs -- that one is a field the venue
+  //                           published, this one is an inference from a naming
+  //                           convention the venue never documented. Collapsing
+  //                           them would make an operator reading a log unable
+  //                           to tell which check spoke, and would let a change
+  //                           to either one hide inside the other's row.
   pair_not_tradable: 400,
   tradable_set_unreadable: 503,
+  pair_not_spot_by_name: 400,
   // Section 21.4 Stage 1's candle fetch (`/src/research/candles.ts`). Same rule
   // as the watchlist rows above: reuse the status an existing code with the same
   // SHAPE of refusal already carries.

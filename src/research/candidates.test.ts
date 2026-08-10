@@ -59,6 +59,9 @@ const CATALOGUE: Record<string, string[]> = {
     "DOGEUSD",
     "HYPEGUSDPERP",
     "HYPEUSDCPERP",
+    // The shape of Perpetual Protocol's real spot ticker: contains "perp",
+    // does not end in it, and must stay acceptable at every research path.
+    "PERPUSD",
   ],
   main: ["BTCUSDT", "ETHUSDT"],
 };
@@ -327,12 +330,15 @@ describe("selectGeneralCandidates: the trending half", () => {
     // PnL path in this system is spot. Surfacing one as "that venue spells it
     // ..." would invite an operator to trade something this system cannot.
     //
-    // It holds today because `checkTradable`'s near-match is an exact
-    // case-insensitive equality, not a prefix or substring match. That is
-    // INCIDENTAL: nothing in this repository knows what a perpetual is
-    // (`grep -rn "PERP" src/` returns nothing). Pinned here so that a later,
-    // fuzzier near-match -- which would look like a usability improvement in
-    // isolation -- cannot quietly start recommending one.
+    // It holds because `checkTradable`'s near-match is an exact
+    // case-insensitive equality, not a prefix or substring match. That was
+    // INCIDENTAL when it was written -- nothing in this repository knew what a
+    // perpetual was -- and it is still the near-match rule doing the work here,
+    // not the naming heuristic added later: `${BASE}${QUOTE}` cannot construct
+    // a `PERP` suffix, so this path never presents one to be name-matched.
+    // Pinned so that a later, fuzzier near-match -- which would look like a
+    // usability improvement in isolation -- cannot quietly start recommending
+    // one.
     const ports = generalPorts({
       fetchTrending: trending([
         coin({ coinId: "hyperliquid", symbol: "HYPE", name: "Hyperliquid", rank: 11 }),
@@ -709,6 +715,39 @@ describe("selectNamedCandidate", () => {
     expect((error as CandidateSelectionError).code).toBe("pair_not_tradable");
     expect((error as Error).message).not.toContain("PERP");
     expect((error as Error).message).not.toContain("spells it");
+  });
+
+  it("refuses a perpetual the human named directly, which the venue does list", async () => {
+    // THE HUMAN-TYPED PATH decision log 31 flagged. The test above is about a
+    // perpetual being RECOMMENDED; this one is about one being ACCEPTED. An
+    // operator who reads `HYPEUSDCPERP` off Gemini's own listing and asks for a
+    // named research run on it got a valid candidate before step 33, because
+    // the catalogue check's only question is whether the venue lists the
+    // string -- and it does.
+    //
+    // A NAMING INFERENCE, not the structural `product_type` check the order
+    // path uses. See `tradability.ts` for what it cannot promise.
+    const error = await selectNamedCandidate(namedPorts(), {
+      accountLabel: "gemini-main",
+      pair: "HYPEUSDCPERP",
+      requestedBy: "owner@example.com",
+    }).catch((e: unknown) => e);
+
+    expect((error as CandidateSelectionError).code).toBe("pair_not_spot_by_name");
+    expect((error as Error).message).toContain("HYPEUSDCPERP");
+  });
+
+  it("accepts a named PERPUSD, which contains 'perp' but does not end in it", async () => {
+    // The `endsWith`-versus-`includes` distinction at the named entry point.
+    // Perpetual Protocol is a real token; refusing its spot pair as a
+    // derivative is the false reject the heuristic is written to avoid.
+    const set = await selectNamedCandidate(namedPorts(), {
+      accountLabel: "gemini-main",
+      pair: "PERPUSD",
+      requestedBy: "owner@example.com",
+    });
+
+    expect(set.candidates.map((c) => c.pair)).toEqual(["PERPUSD"]);
   });
 
   it("refuses when the tradable set cannot be read", async () => {

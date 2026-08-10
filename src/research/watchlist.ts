@@ -121,6 +121,8 @@ export type WatchlistErrorCode =
   | "pair_not_tradable"
   /** The tradable set could not be read, so tradability is unknown. */
   | "tradable_set_unreadable"
+  /** Listed, but its NAME says perpetual. An inference; see `tradability.ts`. */
+  | "pair_not_spot_by_name"
   /** The pair is already on the live list for this account. */
   | "already_watched"
   /** No live entry for this account and pair, so there is nothing to remove. */
@@ -230,6 +232,13 @@ function requireText(value: string, field: string): string {
  * both directions and why the comparison is exact. What stays here is the
  * refusal's shape: a `WatchlistError` carrying the shared code and message, so
  * the API layer's status mapping is untouched.
+ *
+ * It OPTS IN to the naming heuristic, which is the only spot-versus-perpetual
+ * check this path can afford: the real one costs an exchange request per symbol
+ * and this path is on the write path of a human typing a symbol they saw on the
+ * venue's own listing. Before it existed, `HYPEUSDCPERP` was accepted here with
+ * zero resistance -- it IS on Gemini's list. Read `tradability.ts` on what that
+ * heuristic does not guarantee before relying on it for anything more.
  */
 async function assertTradable(
   ports: WatchlistPorts,
@@ -242,6 +251,7 @@ async function assertTradable(
     pair,
     `Refusing rather than storing it unchecked -- an entry nothing validated is ` +
       `exactly what this list must not contain.`,
+    "reject-derivative-names",
   );
   if (refusal !== null) throw new WatchlistError(refusal.code, refusal.message);
 }

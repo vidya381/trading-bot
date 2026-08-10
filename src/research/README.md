@@ -11,7 +11,7 @@ points** — the first thing in this folder that consumes the others.
 | File | What it is |
 | --- | --- |
 | `watchlist.ts` | `addToWatchlist` / `removeFromWatchlist` / `readWatchlist`: the deliberate half of candidate selection, over `watchlist` (migration 0008) |
-| `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by every caller below |
+| `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by every caller below, plus an **opt-in** naming heuristic for perpetuals; `checkSpotInstrument`: the structural "is it spot?" the order path uses |
 | `candles.ts` | `fetchCandleWindow`: 21.4 Stage 1's candle fetch for **any** listed, tradable pair — no bot required — reporting how much history it actually got |
 | `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
 | `candidates.ts` | `selectNamedCandidate` / `selectGeneralCandidates`: 21.2's two entry points, feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it |
@@ -40,21 +40,43 @@ would be a degraded result indistinguishable from a good one. An explicit
 watchlist-only entry point could be added later, deliberately and under its own
 name; what must not exist is a general run that quietly becomes one.
 
-### Spot versus perpetual: a flagged gap, live today
+### Spot versus perpetual: closed twice, with two different strengths
 
 Gemini's real catalogue carries **perpetual** pairs (`HYPEGUSDPERP`,
 `HYPEUSDCPERP`) alongside spot, and `parseSymbolList` passes every string
-through unfiltered. **Nothing in this repository knows what a perpetual is** —
-`grep -rn "PERP" src/` returns nothing — so `addToWatchlist`,
-`fetchCandleWindow` and `selectNamedCandidate` would all accept one with zero
-resistance, while every order, fill and PnL path here is spot.
+through unfiltered. Until step 32 nothing in this repository knew what a
+perpetual was, so `addToWatchlist`, `fetchCandleWindow` and
+`selectNamedCandidate` all accepted one with zero resistance, while every order,
+fill and PnL path here is spot. It is now checked in two places, and **the two
+are not equally strong — that difference is the point, not an oversight**:
 
-Candidate selection's trending path is the only place this is structurally safe,
-and only incidentally: `${BASE}${QUOTE}` cannot construct a `PERP` suffix, and
-`checkTradable`'s near-match is an exact equality so no perp is ever offered as
-"the venue's own spelling". Two tests pin both. **The human-typed paths have no
-protection**, and this needs its own decision — a spot-only filter at the shared
-tradability level, or a recorded accepted-risk. See decision log 31.
+| where | what it reads | strength |
+| --- | --- | --- |
+| `POST /api/bots` (`checkSpotInstrument`) | Gemini's own `product_type` / `contract_type` fields, one uncached request per symbol | **structural.** The venue states it. Verified live, step 32 |
+| watchlist, candles, both candidate entry points (`checkTradable`, opt-in) | the symbol's own last characters against `DERIVATIVE_NAME_SUFFIXES` | **an inference.** Free, and Gemini publishes no such naming rule |
+
+The research paths take the cheap one because they cannot afford the other:
+`checkTradable` runs on every watchlist add, every candle fetch and up to ~15
+times per candidate-selection run, and the structural check costs a request per
+symbol. The match is `endsWith`, never `includes`, so `PERPUSD` — Perpetual
+Protocol's real spot ticker — is not refused; a test pins exactly that.
+
+**The order path deliberately opts OUT** of the naming heuristic
+(`"structural-check-elsewhere"`). Letting a weaker inference answer first would
+put a guess in the refusal message on the endpoint that reserves capital, and
+would mask `checkSpotInstrument` from its own most realistic input — a regression
+test in `api.test.ts` pins that `HYPEUSDCPERP` there is still refused by
+`instrument_not_spot`. **Residual risk stays, in both directions**: a perpetual
+that does not follow the naming convention passes the research paths silently,
+and a future spot pair ending in those letters is wrongly refused. The false
+reject is the preferred direction because it is loud, immediately fixable in one
+table, and cannot block a legitimate bot. See decision logs 31 and 32.
+
+Candidate selection's trending path was already structurally safe before any of
+this, and only incidentally: `${BASE}${QUOTE}` cannot construct a `PERP` suffix,
+and `checkTradable`'s near-match is an exact equality so no perp is ever offered
+as "the venue's own spelling". Two tests pin both, and they are still what does
+the work there.
 
 A trending pull that matches nothing on the venue is a **fact**, not a failure,
 and is reported as one: `TrendingPullReport` carries what came back, what was

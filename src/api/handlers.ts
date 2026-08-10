@@ -380,6 +380,31 @@ async function resolveBotExchange(
  * "HYPEUSDCPERP is a derivative ... not a spot pair" rather than the flatly
  * untrue "not tradable".
  *
+ * ── WHY THIS GATE OPTS **OUT** OF THE NAMING HEURISTIC ──
+ *
+ * `checkTradable` can also refuse a pair whose SYMBOL ends in a venue's
+ * derivative suffix (`pair_not_spot_by_name`). The four research paths opt in,
+ * because a cheap inference is the only spot check they can afford. THIS gate
+ * passes `"structural-check-elsewhere"` and deliberately does not, for two
+ * reasons that are both about keeping the real check real:
+ *
+ *  1. EVIDENCE. This is the endpoint that reserves capital. Its refusal should
+ *     say "the venue reported product_type: swap", which is a fact Gemini
+ *     stated, and not "the symbol ends in PERP", which is something this
+ *     repository inferred. Running the heuristic first would downgrade the
+ *     message a human reads on the one path where it matters most.
+ *  2. MASKING. The heuristic runs before `checkSpotInstrument` and reaches the
+ *     same conclusion about the same inputs, so it would answer for every
+ *     realistic perpetual -- `HYPEUSDCPERP` included -- and `checkSpotInstrument`
+ *     could be deleted outright with every test still green. That is precisely
+ *     the multi-signal masking decision log 32 made a standing convention about,
+ *     arriving one layer up: across two FUNCTIONS rather than two fields. A
+ *     regression test in `api.test.ts` pins that `HYPEUSDCPERP` here is still
+ *     answered by `instrument_not_spot`, never `pair_not_spot_by_name`.
+ *
+ * Nothing is lost by opting out: this gate's structural check is strictly
+ * stronger than the heuristic, catching perpetuals the naming rule would miss.
+ *
  * ── WHY HERE AND NOT INSIDE THE DURABLE OBJECT ──
  *
  * Both checks run in the HANDLER, before `botStub` is even asked for, because
@@ -408,7 +433,13 @@ async function assertBotPairIsSpotTradable(
     `Refusing rather than creating a bot on it -- capital would be reserved and ` +
     `orders eventually placed against a symbol nothing validated.`;
 
-  const listed = await checkTradable(tradablePairsFor(ctx), account, pair, refusing);
+  const listed = await checkTradable(
+    tradablePairsFor(ctx),
+    account,
+    pair,
+    refusing,
+    "structural-check-elsewhere",
+  );
   if (listed !== null) {
     throw new ApiError(statusForCode(listed.code), listed.code, listed.message);
   }
@@ -1102,6 +1133,8 @@ export async function listWatchlist(ctx: ApiContext): Promise<Response> {
  *   - `cap_exceeded` (409)            -- the list already holds 10.
  *   - `already_watched` (409)         -- the pair is live on this account.
  *   - `pair_not_tradable` (400)       -- the venue does not list it.
+ *   - `pair_not_spot_by_name` (400)   -- it IS listed, and its name says perp.
+ *                                        An inference, not the venue's word.
  *   - `tradable_set_unreadable` (503) -- the venue could not be asked.
  *   - `requires_human_actor` (403)    -- unreachable over HTTP today, since
  *     `ctx.actor` is a verified Access email, but the module still checks and
@@ -1271,6 +1304,8 @@ function candleSourceFor(ctx: ApiContext): CandleSource {
  *   - `interval_not_verified` (400)    -- a real interval, unverified on a venue.
  *   - `unknown_account` (404)          -- no such registered account.
  *   - `pair_not_tradable` (400)        -- the venue does not list it.
+ *   - `pair_not_spot_by_name` (400)    -- it IS listed, and its name says perp.
+ *                                         An inference, not the venue's word.
  *   - `tradable_set_unreadable` (503)  -- the venue could not be asked.
  *   - `candles_unavailable` (502)      -- the venue was asked and failed.
  *   - `no_candles_returned` (502)      -- it answered, with nothing usable.

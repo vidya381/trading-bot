@@ -78,6 +78,7 @@ export {
 export {
   checkTradable,
   checkSpotInstrument,
+  type DerivativeNamePolicy,
   type InstrumentRefusal,
   type InstrumentRefusalCode,
   type SymbolDetailSource,

@@ -40,9 +40,26 @@ const T0 = 1_910_000_000_000;
 const GEMINI: WatchlistAccount = { label: "gemini-main", exchange: "gemini" };
 const BINANCE: WatchlistAccount = { label: "main", exchange: "binance" };
 
-/** The venue catalogues the stub lister answers with, per account. */
+/**
+ * The venue catalogues the stub lister answers with, per account.
+ *
+ * `HYPEUSDCPERP` is a REAL Gemini symbol (decision log 31's live run) and is in
+ * the fixture because it is genuinely listed -- that is the whole reason this
+ * path accepted a perpetual for so long. `PERPUSD` is the shape of Perpetual
+ * Protocol's real spot ticker, here as the false reject the naming heuristic
+ * must not produce.
+ */
 const CATALOGUE: Record<string, string[]> = {
-  "gemini-main": ["BTCUSD", "ETHUSD", "SOLUSD", "LINKUSD", "DOGEUSD", "AVAXUSD"],
+  "gemini-main": [
+    "BTCUSD",
+    "ETHUSD",
+    "SOLUSD",
+    "LINKUSD",
+    "DOGEUSD",
+    "AVAXUSD",
+    "PERPUSD",
+    "HYPEUSDCPERP",
+  ],
   main: ["BTCUSDT", "ETHUSDT"],
 };
 
@@ -225,6 +242,34 @@ describe("pair validation", () => {
     await expect(add("btcusd")).rejects.toMatchObject({ code: "pair_not_tradable" });
     await expect(add("btcusd")).rejects.toThrow(/"BTCUSD"/);
     expect(await db.watchlist.count()).toBe(0);
+  });
+
+  it("refuses a perpetual the venue really does list, and stores nothing", async () => {
+    // DECISION LOG 31'S FLAGGED GAP, at the path it named first. `HYPEUSDCPERP`
+    // IS on Gemini's catalogue, so every check this path had before step 33
+    // passed it: a human who copied a symbol off the venue's own listing got a
+    // perpetual onto the watchlist with zero resistance, and nothing downstream
+    // -- up to and including a proposal a human is asked to approve -- would
+    // ever have said it was not spot.
+    //
+    // This is a NAMING INFERENCE, not the structural check. The real one
+    // (`checkSpotInstrument`, step 32) costs an exchange request per symbol,
+    // which this path cannot afford; see `tradability.ts` on what that trade
+    // buys and what it does not.
+    await expect(add("HYPEUSDCPERP")).rejects.toMatchObject({ code: "pair_not_spot_by_name" });
+    expect(await db.watchlist.count()).toBe(0);
+    expect(await auditActions()).toEqual([]);
+  });
+
+  it("still accepts PERPUSD, a real spot ticker that merely contains 'perp'", async () => {
+    // The `endsWith`-versus-`includes` distinction, at the caller. A substring
+    // match would refuse Perpetual Protocol's genuine spot pair and tell an
+    // operator it was a derivative -- the false reject decision log 31 flagged
+    // before any of this code existed.
+    const entry = await add("PERPUSD");
+
+    expect(entry.exchangePair).toBe("PERPUSD");
+    expect(await watchlistSize(db)).toBe(1);
   });
 
   it("refuses when the tradable set cannot be READ, rather than storing unchecked", async () => {

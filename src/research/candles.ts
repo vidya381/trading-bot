@@ -128,6 +128,8 @@ export type CandleWindowErrorCode =
   | "pair_not_tradable"
   /** The tradable set could not be read, so tradability is unknown. */
   | "tradable_set_unreadable"
+  /** Listed, but its NAME says perpetual. An inference; see `tradability.ts`. */
+  | "pair_not_spot_by_name"
   /** The candle call failed: transport, exchange error, or rate limit. */
   | "candles_unavailable"
   /** The call succeeded and returned nothing. See the header. */
@@ -251,6 +253,9 @@ export async function fetchCandleWindow(
     `Refusing rather than fetching candles for a symbol nothing validated -- an ` +
       `unlisted symbol either errors at the venue or returns a window for a pair ` +
       `this account cannot trade, and the second is worse.`,
+    // Opted in: candles for a perpetual are real candles for an instrument
+    // nothing downstream can model, which is the same "worse" case one line up.
+    "reject-derivative-names",
   );
   if (refusal !== null) throw new CandleWindowError(refusal.code, refusal.message);
 

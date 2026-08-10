@@ -2745,6 +2745,49 @@ describe("bot creation refuses untradable and non-spot pairs (POST /api/bots)", 
     expect(retry.status).toBe(201);
   });
 
+  it("REGRESSION: the perp refusal here comes from product_type, never from the name", async () => {
+    // THE MASKING TEST. Step 33 added a cheap naming heuristic to
+    // `checkTradable` for the research paths, which cannot afford the
+    // per-symbol request `checkSpotInstrument` costs. That heuristic runs in the
+    // SAME function this gate calls FIRST, and reaches the SAME conclusion about
+    // the SAME string -- so had this gate opted into it, `HYPEUSDCPERP` would be
+    // refused by an inference before `checkSpotInstrument` was ever reached, and
+    // the structural check could then have been DELETED OUTRIGHT with every test
+    // in this file still green.
+    //
+    // That is decision log 32's own standing convention arriving one layer up:
+    // multiple signals that each independently reach one conclusion let any of
+    // them silently backstop the others. There it was two FIELDS in one parser;
+    // here it is two FUNCTIONS at one gate.
+    //
+    // So `assertBotPairIsSpotTradable` passes "structural-check-elsewhere", and
+    // this test exists to keep it that way. It must survive whatever the
+    // research paths do, because the thing it protects is the evidence behind a
+    // refusal on the endpoint that reserves capital.
+    const account = await botAccount("perp-evidence");
+    const ports = botPorts({ HYPEUSDCPERP: "derivative" });
+    const id = `pev-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      ...ports,
+      body: createBody(account, id, "HYPEUSDCPERP"),
+    });
+
+    // The per-symbol details request WAS spent. If the naming heuristic had
+    // answered, `checkTradable` would have refused and this would be empty --
+    // which is the single assertion that would have failed had the gate opted
+    // in, and the reason this test is not redundant with the one above it.
+    expect(ports.detailCalls).toEqual(["HYPEUSDCPERP"]);
+
+    expect(res.body.error.code).toBe("instrument_not_spot");
+    expect(res.body.error.code).not.toBe("pair_not_spot_by_name");
+    // The message carries what the VENUE said, not what this repository guessed
+    // from a suffix Gemini has never documented.
+    expect(res.body.error.message).toContain("derivative");
+    expect(res.body.error.message).not.toContain("ENDS IN");
+    expect(res.body.error.message).not.toContain("NOT A STATEMENT FROM THE VENUE");
+  });
+
   it("refuses when the venue reports an instrument type this code cannot map", async () => {
     const account = await botAccount("unmapped");
     const id = `unm-${suffix}`;

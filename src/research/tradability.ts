@@ -14,10 +14,16 @@
  * for a fetch that must not run -- and both take the code and the message from
  * here, so the two refusals are the same refusal wearing the caller's name.
  *
- * ── Fail closed in BOTH directions ──
+ * ── Fail closed in EVERY direction ──
  *
  *   * listed, and the pair is absent  -> `pair_not_tradable`
  *   * the listing itself failed       -> `tradable_set_unreadable`
+ *   * listed, but the NAME says perp,
+ *     and the call site asked         -> `pair_not_spot_by_name`
+ *
+ * The third is opt-in per call site and is an INFERENCE, not a venue statement.
+ * It carries a long warning of its own further down; read that before treating
+ * it as a spot check. The real one is `checkSpotInstrument`.
  *
  * The second is the one that rots quietly. An exchange outage produces no
  * tradable set, and treating that as permission to proceed is the same
@@ -59,12 +65,141 @@ export interface VenueAccount {
  */
 export type TradablePairSource = (account: VenueAccount) => Promise<SymbolListing>;
 
-export type TradabilityRefusalCode = "pair_not_tradable" | "tradable_set_unreadable";
+export type TradabilityRefusalCode =
+  | "pair_not_tradable"
+  | "tradable_set_unreadable"
+  /** The venue lists it, and its NAME says derivative. An inference; see below. */
+  | "pair_not_spot_by_name";
 
 /** Why the pair may not be acted on, in the caller's own error's words. */
 export interface TradabilityRefusal {
   readonly code: TradabilityRefusalCode;
   readonly message: string;
+}
+
+// ---------------------------------------------------------------------------
+// The naming heuristic: A NAMING-CONVENTION INFERENCE, NOT A STRUCTURAL GUARANTEE
+// ---------------------------------------------------------------------------
+
+/**
+ * ── READ THIS BEFORE TRUSTING ANYTHING BELOW ──
+ *
+ * `checkSpotInstrument`, further down this file, is the REAL spot-versus-
+ * derivative check: it reads Gemini's documented `product_type` / `contract_type`
+ * fields off that symbol's own details payload, and it is what stands between a
+ * human's typo and a real order at `POST /api/bots` (step 32, verified live
+ * against real sandbox data). This is not that, and it must never be described
+ * as if it were.
+ *
+ * This is a SUFFIX MATCH ON A STRING. It exists because `checkSpotInstrument`
+ * costs one uncached exchange request per symbol, and `checkTradable` is called
+ * on every watchlist add, every candle fetch, and up to ~15 times (times each
+ * quote asset) per candidate-selection run. Those paths cannot afford a
+ * per-symbol network call, so before step 33 they had NO spot check at all --
+ * `addToWatchlist`, `fetchCandleWindow` and `selectNamedCandidate` would each
+ * accept `HYPEUSDCPERP` with zero resistance, because the venue genuinely does
+ * list it (decision log 31's flagged gap; decision log 32 closed it only at the
+ * order path and said so).
+ *
+ * ── WHAT THIS PROTECTS ──
+ *
+ *   * a perpetual cannot be WATCHLISTED (`addToWatchlist`)
+ *   * a perpetual cannot have CANDLES FETCHED for it (`fetchCandleWindow`)
+ *   * a perpetual cannot be selected as a NAMED research candidate
+ *     (`selectNamedCandidate`)
+ *   * nor as a GENERAL one (`selectGeneralCandidates`) -- where it was already
+ *     structurally unreachable, since `${BASE}${QUOTE}` cannot construct a
+ *     `PERP` suffix; opted in anyway so the four research paths do not differ
+ *
+ * ── WHAT THIS DOES NOT DO, STATED PLAINLY ──
+ *
+ *   * It does NOT replace `checkSpotInstrument`. The order path does not use it
+ *     at all -- see `DerivativeNamePolicy` and `assertBotPairIsSpotTradable`.
+ *   * It is NOT a structural guarantee. GEMINI PUBLISHES NO SUCH NAMING RULE:
+ *     their derivatives reference states no naming convention whatsoever. This
+ *     is an OBSERVATION about their current data -- `HYPEGUSDPERP` and
+ *     `HYPEUSDCPERP` seen in the real catalogue (log 31), and `HYPEUSDCPERP`
+ *     confirmed live to report `product_type: "swap"` (log 32) -- and an
+ *     observation can stop being true without anyone announcing it.
+ *   * RESIDUAL RISK, BOTH DIRECTIONS, NEITHER HYPOTHETICAL-ONLY:
+ *       - FALSE ACCEPT: a real perpetual that does not end in `perp` sails
+ *         through every research path. Nothing here would notice.
+ *       - FALSE REJECT: a real spot pair whose symbol happens to end in these
+ *         letters is refused. `PERPUSD` (Perpetual Protocol, a real token) is
+ *         the known near-miss and is why the match is `endsWith` and not
+ *         `includes` -- but a future venue pair literally ending in `PERP`
+ *         would be wrongly blocked.
+ *
+ * ── WHICH FAILURE DIRECTION WAS CHOSEN, AND WHY IT IS THE SAFE ONE ──
+ *
+ * A FALSE REJECT is preferred, and it stays preferred because it is LOUD: an
+ * operator tries to watchlist a pair, gets a refusal naming this exact heuristic
+ * and this exact file, and the fix is one entry in the table below plus a test.
+ * The pair is blocked from three research conveniences in the meantime and from
+ * nothing else -- `POST /api/bots` never consults this, so a false reject cannot
+ * stop a legitimate bot from being created.
+ *
+ * A FALSE ACCEPT is silent by construction: a perpetual on the watchlist looks
+ * exactly like a spot pair on the watchlist, and it would be discovered by
+ * something downstream mis-modelling margin, funding or liquidation. That is the
+ * asymmetry section 5.6 keeps making -- a refusal is a fact, a wrong acceptance
+ * is a fact nobody has yet.
+ */
+
+/**
+ * WHICH VENUES NAME THEIR DERIVATIVES, and how -- stated once, per venue.
+ *
+ * A `Record<ExchangeId, ...>` for the same reason `VENUE_PUBLISHES_INSTRUMENT_TYPE`
+ * below is one: a third exchange FAILS TO COMPILE here until someone answers the
+ * question for it. Silently defaulting to "no perps on this venue" is exactly
+ * the false accept described above, applied to an entire venue at once.
+ *
+ *  - `gemini`  `["perp"]`. Observed, not documented -- `HYPEGUSDPERP` and
+ *    `HYPEUSDCPERP` in the real catalogue, alongside spot pairs on the same
+ *    host. Lower-case because the comparison folds the pair, not the table.
+ *
+ *  - `binance` `[]`, and the empty array is an ANSWER rather than a blank:
+ *    this system only reaches Binance's spot host (`/api/v3/exchangeInfo`), so
+ *    there is no derivative catalogue to name-match against here. Binance's
+ *    perpetuals live on `fapi.binance.com`, which this system has no client for
+ *    and cannot reach. If a client for it is ever added, this row becomes wrong
+ *    and must change -- it says "nothing to match", not "nothing exists".
+ *
+ * Suffixes only. A substring match would refuse `PERPUSD` -- Perpetual
+ * Protocol's real spot ticker -- and the whole point of a cheap heuristic is
+ * that it is cheap to be right about.
+ */
+const DERIVATIVE_NAME_SUFFIXES: Readonly<Record<ExchangeId, readonly string[]>> = {
+  gemini: ["perp"],
+  binance: [],
+};
+
+/**
+ * Whether a CALL SITE wants the naming heuristic. Required, with no default.
+ *
+ * There is no default because the two answers are not "on" and "off by
+ * accident" -- they are two different arguments, and a sixth call site added
+ * later must make one of them rather than inherit whichever was convenient.
+ */
+export type DerivativeNamePolicy =
+  /** Research paths: cheap, and the only spot check they can afford. */
+  | "reject-derivative-names"
+  /**
+   * The order path. It runs `checkSpotInstrument` on the real `product_type`
+   * field immediately afterwards, and letting this weaker inference answer
+   * FIRST would do two bad things: replace real venue evidence with a guess in
+   * the refusal a human reads, and mask the structural check from its own most
+   * realistic input, so deleting that check would leave every test green.
+   */
+  | "structural-check-elsewhere";
+
+/** The suffix that matched, so the refusal can name its own evidence. */
+function derivativeNameSuffix(exchange: ExchangeId, pair: Pair): string | null {
+  const folded = pair.toLowerCase();
+  for (const suffix of DERIVATIVE_NAME_SUFFIXES[exchange]) {
+    if (folded.endsWith(suffix)) return suffix;
+  }
+  return null;
 }
 
 /**
@@ -75,12 +210,20 @@ export interface TradabilityRefusal {
  * the unreadable-set message: the venue facts are shared, but "and so nothing
  * was stored" and "and so no candles were fetched" are not the same sentence
  * and a reader of either message deserves the accurate one.
+ *
+ * `names` decides whether the naming heuristic above also applies. It runs
+ * AFTER the catalogue answers, never before, for the ordering reason step 32
+ * gave at the bot gate: the strongest TRUE fact should be the one that
+ * surfaces. An unlisted `FOOPERP` is `pair_not_tradable` -- which is what is
+ * actually wrong with it -- and only a pair the venue really does list can be
+ * refused for looking like a derivative.
  */
 export async function checkTradable(
   listTradablePairs: TradablePairSource,
   account: VenueAccount,
   pair: Pair,
   refusing: string,
+  names: DerivativeNamePolicy,
 ): Promise<TradabilityRefusal | null> {
   const listing = await listTradablePairs(account);
   if (!listing.ok) {
@@ -92,7 +235,26 @@ export async function checkTradable(
     };
   }
 
-  if (listing.pairs.includes(pair)) return null;
+  if (listing.pairs.includes(pair)) {
+    if (names === "structural-check-elsewhere") return null;
+    const suffix = derivativeNameSuffix(account.exchange, pair);
+    if (suffix === null) return null;
+    return {
+      code: "pair_not_spot_by_name",
+      message:
+        `${JSON.stringify(pair)} is listed on ${account.exchange} for account ` +
+        `${JSON.stringify(account.label)}, but its symbol ENDS IN ` +
+        `${JSON.stringify(suffix.toUpperCase())}, which on that venue names a perpetual ` +
+        `rather than a spot pair. Every order, fill, position and PnL path in this ` +
+        `system is spot (section 4.5); nothing in it understands margin, funding or ` +
+        `liquidation. ` +
+        `THIS IS AN INFERENCE FROM A NAMING CONVENTION, NOT A STATEMENT FROM THE ` +
+        `VENUE: ${account.exchange} publishes no such naming rule, and this is an ` +
+        `observation about its current catalogue. If this pair really is spot, the ` +
+        `refusal is wrong and the fix is DERIVATIVE_NAME_SUFFIXES in ` +
+        `src/research/tradability.ts. ${refusing}`,
+    };
+  }
 
   const folded = pair.toLowerCase();
   const near = listing.pairs.filter((candidate) => candidate.toLowerCase() === folded);

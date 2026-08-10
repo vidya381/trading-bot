@@ -290,6 +290,8 @@ export type CandidateSelectionErrorCode =
   | "pair_not_tradable"
   /** The tradable set could not be read, so tradability is unknown. */
   | "tradable_set_unreadable"
+  /** Listed, but its NAME says perpetual. An inference; see `tradability.ts`. */
+  | "pair_not_spot_by_name"
   /** The trending pull failed. See the module header for why this is fatal. */
   | "trending_unavailable";
 
@@ -401,6 +403,9 @@ export async function selectNamedCandidate(
     `Refusing rather than admitting it as a candidate -- a coin this account cannot ` +
       `trade cannot become a bot, so a proposal about it can only ever waste the ` +
       `human review it was written for.`,
+    // Opted in. THIS is the path decision log 31 flagged: a human types a symbol
+    // they saw on the venue's own listing, and `HYPEUSDCPERP` is on that listing.
+    "reject-derivative-names",
   );
   if (refusal !== null) throw new CandidateSelectionError(refusal.code, refusal.message);
 
@@ -603,6 +608,11 @@ export async function selectGeneralCandidates(
         `Refusing the whole selection rather than recording this coin as untradable -- ` +
           `"could not check" is not "checked and not listed", and a rejection list that ` +
           `cannot tell them apart is a false record of what this venue offers.`,
+        // Opted in although it is INERT here, and deliberately so: `${BASE}${QUOTE}`
+        // cannot construct a `PERP` suffix, so this path was already structurally
+        // safe (log 31). Opting out would make the four research paths differ on a
+        // risk check for a reason that is true today and true by accident.
+        "reject-derivative-names",
       );
       if (refusal === null) {
         matched = true;
