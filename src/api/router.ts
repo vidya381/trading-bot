@@ -15,7 +15,7 @@
 
 import type { Database } from "../db/database";
 import type { BotInstance } from "../durable-objects/bot-instance";
-import type { SymbolLister } from "../workers/symbols";
+import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
 
 /** Everything a handler is given: the request, the verified actor, and ports. */
@@ -44,6 +44,14 @@ export interface ApiContext {
    * answer different questions of the venue and only one of them is cached.
    */
   readonly candleLister: CandleLister;
+  /**
+   * Reaches an account's exchange for ONE symbol's details, which is where a
+   * venue that lists both says whether a symbol is spot or a perpetual.
+   * Injected (default `envSymbolDetailLister`) for the same reason the two
+   * above are. Separate from `symbolLister` because it is a per-symbol,
+   * uncached request rather than a cached full-catalogue one.
+   */
+  readonly symbolDetailLister: SymbolDetailLister;
   readonly now: () => number;
   readonly newId: () => string;
 }

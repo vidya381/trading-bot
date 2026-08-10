@@ -14,7 +14,7 @@
  * state for the frontend to reflect it without a second fetch, per the brief.
  */
 
-import { ApiError, badRequest, notFound, ok } from "./envelope";
+import { ApiError, badRequest, notFound, ok, statusForCode } from "./envelope";
 import type { ApiContext } from "./router";
 import {
   alertView,
@@ -29,11 +29,15 @@ import {
 } from "./serialize";
 import {
   addToWatchlist,
+  checkSpotInstrument,
+  checkTradable,
   fetchCandleWindow,
   readWatchlist,
   removeFromWatchlist,
   type CandleSource,
+  type SymbolDetailSource,
   type TradablePairSource,
+  type VenueAccount,
   type WatchlistAccount,
   type WatchlistPorts,
 } from "../research";
@@ -351,6 +355,70 @@ async function resolveBotExchange(
   return bodyExchange;
 }
 
+/**
+ * THE GATE: a new bot's pair must be one this venue lists, AND must be spot.
+ *
+ * Until this existed, `POST /api/bots` -- the endpoint that reserves capital and
+ * eventually places real orders -- performed no tradability check of any kind.
+ * `pair` was a free-typed string stored verbatim, and `bot-instance.ts` never
+ * called `listTradablePairs`. A typo, a delisted symbol, a pair from the wrong
+ * venue, or one of Gemini's perpetuals all reached bot creation identically, and
+ * the first thing that would notice was an order failing at the exchange with
+ * capital already reserved against it.
+ *
+ * ── WHY BOTH CHECKS, AND IN THIS ORDER ──
+ *
+ * `checkTradable` first: it is one KV-cached full-catalogue read shared with the
+ * watchlist and the symbols dropdown, so in the ordinary case it costs no
+ * exchange request at all, and it rejects the overwhelmingly common mistake (a
+ * mistyped or non-existent pair) before anything is spent. `checkSpotInstrument`
+ * second: it is one uncached per-symbol request, so it is only ever paid for a
+ * pair the venue has already confirmed it lists.
+ *
+ * That ordering also makes the messages honest. A perpetual IS on the venue's
+ * list, so it passes the first check and is refused by the second, by name --
+ * "HYPEUSDCPERP is a derivative ... not a spot pair" rather than the flatly
+ * untrue "not tradable".
+ *
+ * ── WHY HERE AND NOT INSIDE THE DURABLE OBJECT ──
+ *
+ * Both checks run in the HANDLER, before `botStub` is even asked for, because
+ * the property that matters is not "creation is refused" but "NOTHING HAPPENED".
+ * `BotInstance.create` reserves capital through `createBotInstanceWithCapital`
+ * (the `bot_instances` row, the `capital_ledger` reservation and the
+ * `capital.allocated` audit entry are one pipeline) and then writes the object's
+ * own storage. A check inside that method would already have instantiated the
+ * Durable Object; a check after the reservation would leave capital allocated to
+ * a bot that was refused. Refusing out here means a rejected request touches no
+ * ledger, writes no row, and brings no Durable Object into existence.
+ *
+ * Neither refusal re-implements anything: both come from
+ * `/src/research/tradability.ts`, the same functions the watchlist write path,
+ * the candle fetch and both candidate entry points already gate on, reached
+ * through the same `tradablePairsFor` port wiring -- so bot creation and the
+ * dropdown an operator picks a pair from cannot disagree about what the venue
+ * lists.
+ */
+async function assertBotPairIsSpotTradable(
+  ctx: ApiContext,
+  account: VenueAccount,
+  pair: Pair,
+): Promise<void> {
+  const refusing =
+    `Refusing rather than creating a bot on it -- capital would be reserved and ` +
+    `orders eventually placed against a symbol nothing validated.`;
+
+  const listed = await checkTradable(tradablePairsFor(ctx), account, pair, refusing);
+  if (listed !== null) {
+    throw new ApiError(statusForCode(listed.code), listed.code, listed.message);
+  }
+
+  const spot = await checkSpotInstrument(symbolDetailsFor(ctx), account, pair, refusing);
+  if (spot !== null) {
+    throw new ApiError(statusForCode(spot.code), spot.code, spot.message);
+  }
+}
+
 export async function createBot(ctx: ApiContext): Promise<Response> {
   const body = await readJsonObject(ctx.request);
 
@@ -372,11 +440,17 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
     allocatedCapital,
     actor: ctx.actor,
   };
-  const stub = botStub(ctx, botInstanceId);
 
+  // FREE CHECKS FIRST, NETWORK LAST -- the order `addToWatchlist` documents and
+  // for the same reason. Decoding the strategy parameters is pure and local, so
+  // a request that is malformed in BOTH its params and its pair reports the
+  // params and spends no exchange request. The decoded params are held rather
+  // than sent so that nothing reaches the Durable Object until the venue checks
+  // below have passed.
+  let create: (stub: DurableObjectStub<BotInstance>) => Promise<unknown>;
   if (strategy === "dca") {
     const params = decodeDcaParams({ ...rawParams, strategy: "dca", schemaVersion: DCA_SCHEMA_VERSION });
-    await stub.create({ ...base, params });
+    create = (stub) => stub.create({ ...base, params });
   } else if (strategy === "grid") {
     const params = decodeGridParams({
       // Default the two optional grid fields to null so the frontend may omit
@@ -387,10 +461,16 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
       strategy: "grid",
       schemaVersion: GRID_SCHEMA_VERSION,
     });
-    await stub.createGrid({ ...base, params });
+    create = (stub) => stub.createGrid({ ...base, params });
   } else {
     throw badRequest("invalid_strategy", `strategy must be "dca" or "grid", got ${JSON.stringify(strategy)}`);
   }
+
+  // The gate. Throws before any capital is reserved and before `botStub` brings
+  // a Durable Object into existence -- see `assertBotPairIsSpotTradable`.
+  await assertBotPairIsSpotTradable(ctx, { label: accountLabel, exchange }, pair);
+
+  await create(botStub(ctx, botInstanceId));
 
   // Return the created bot so the frontend reflects it without a second fetch.
   const row = await ctx.db.botInstances.findOne({ id: botInstanceId });
@@ -940,6 +1020,28 @@ function tradablePairsFor(ctx: ApiContext): TradablePairSource {
       lister: ctx.symbolLister,
       cache,
     });
+}
+
+/**
+ * Wire the `SymbolDetailSource` port to the REAL per-symbol details call.
+ *
+ * The sibling of `tradablePairsFor` above, and deliberately NOT routed through
+ * the same KV cache. That cache holds one array of pair NAMES per account; this
+ * asks about one symbol and wants a different payload entirely. More to the
+ * point, the asymmetry `tradablePairsFor` documents runs the other way here: a
+ * stale ACCEPT from the pair listing costs one wasted candidate, because the
+ * pipeline re-reads the venue before proposing anything. A stale accept from
+ * THIS check would let a perpetual through the one gate standing between a
+ * human's typo and a bot on an instrument this system cannot model, and nothing
+ * downstream asks the question a second time.
+ *
+ * `ctx.symbolDetailLister` defaults to `envSymbolDetailLister`, which resolves
+ * the account's client through the same `clientForAccount` the pair listing and
+ * the candle fetch use. One resolution path, now four callers.
+ */
+function symbolDetailsFor(ctx: ApiContext): SymbolDetailSource {
+  return async (account, pair) =>
+    await ctx.symbolDetailLister(account, pair, ctx.env, ctx.now);
 }
 
 function watchlistPorts(ctx: ApiContext): WatchlistPorts {

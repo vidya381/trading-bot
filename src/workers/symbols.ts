@@ -33,7 +33,7 @@
  */
 
 import type { ExchangeOutcome } from "../shared/downtime";
-import type { Pair, Timestamp } from "../shared/exchange-client";
+import type { Pair, SymbolFilters, Timestamp } from "../shared/exchange-client";
 import type { ExchangeId } from "../db/schema";
 import { clientForAccount } from "./exchange-dispatch";
 
@@ -155,6 +155,52 @@ export const envSymbolLister: SymbolLister = async (account, env, now) => {
   const client = clientForAccount(account, env, now);
   if (!client.ok) return client;
   return client.value.listTradablePairs();
+};
+
+/**
+ * The port that reaches an exchange for ONE symbol's details.
+ *
+ * Sibling of `SymbolLister` above, and separate from it for the reason
+ * `CandleLister` is separate too: it asks the venue a different question, over a
+ * different endpoint, with a different cost. `listTradablePairs` is one
+ * full-catalogue request answering "what does this venue trade"; this is one
+ * per-symbol request answering "what IS this symbol" -- on Gemini,
+ * `GET /v1/symbols/details/:symbol`, which carries the `product_type` /
+ * `contract_type` fields that say whether it is spot or a perpetual.
+ *
+ * DELIBERATELY NOT CACHED, unlike the pair listing one file section up. The
+ * cache there exists because a dropdown asks for the whole catalogue on every
+ * page load; this is asked once per bot CREATION, which is a rare, deliberate,
+ * human-initiated act. A cache would add a staleness window to the one check
+ * standing between a human's typo and a bot on an instrument this system cannot
+ * model, and would buy nothing measurable in return.
+ */
+export type SymbolDetailLister = (
+  account: { readonly label: string; readonly exchange: ExchangeId },
+  pair: Pair,
+  env: Env,
+  now: () => Timestamp,
+) => Promise<ExchangeOutcome<SymbolFilters>>;
+
+/**
+ * The real one: get the account's client, call `getSymbolFilters`.
+ *
+ * Same two steps and the same single resolution path as `envSymbolLister` and
+ * `envCandleLister` -- `clientForAccount` resolves the account's exchange and
+ * builds the client, and its failure is already an `ExchangeOutcome`, so a
+ * caller has ONE failure shape for "no client could be built" and "the venue
+ * call failed".
+ *
+ * `getSymbolFilters` is reused rather than a narrower "just tell me the
+ * instrument type" call being added to `RestExchangeClient`: the payload that
+ * answers the instrument question is the SAME payload section 4.3 already
+ * fetches for tick size and step size, and a second method would be a second
+ * place to keep in step with Gemini's response shape.
+ */
+export const envSymbolDetailLister: SymbolDetailLister = async (account, pair, env, now) => {
+  const client = clientForAccount(account, env, now);
+  if (!client.ok) return client;
+  return client.value.getSymbolFilters(pair);
 };
 
 /** The result of a pair-listing: the pairs, whether it was served from cache. */

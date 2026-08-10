@@ -54,6 +54,35 @@ export type SymbolStatus =
   | "CANCEL_ONLY";
 
 /**
+ * WHAT KIND OF INSTRUMENT a symbol names, as the VENUE ITSELF reports it.
+ *
+ * Every order, fill, position and PnL path in this system is SPOT (section 4.5:
+ * "Grid and DCA strategies use limit orders exclusively"; nothing anywhere
+ * understands margin, funding or liquidation). A venue that lists perpetual
+ * futures in the same catalogue as its spot pairs will therefore hand this
+ * system an instrument it cannot model, and decision log 31 found exactly that:
+ * Gemini's live catalogue carries `HYPEGUSDPERP` and `HYPEUSDCPERP` alongside
+ * `BTCUSD`, with nothing in this repository able to tell them apart.
+ *
+ * This is deliberately NOT derived from the symbol string. A `PERP` suffix is a
+ * naming convention observed in Gemini's data and documented as a rule NOWHERE
+ * in their reference, so inferring from it is a guess in both directions: a perp
+ * named without the suffix passes, and a real spot pair whose base asset is
+ * literally `PERP` (Perpetual Protocol is a real token) would be refused. The
+ * three values below come from a real structured field or from nothing.
+ *
+ *  - `spot`       -- the venue said so, in a field meaning instrument type.
+ *  - `derivative` -- the venue said this is a swap/perpetual/futures contract.
+ *  - `unknown`    -- the venue sent a value this code cannot map. Distinct from
+ *                    the field being ABSENT (which is `undefined` on
+ *                    `SymbolFilters` below), because "Gemini changed its enum"
+ *                    and "Binance publishes no such field" are different facts
+ *                    and only one of them is a reason to stop trusting a
+ *                    payload.
+ */
+export type InstrumentKind = "spot" | "derivative" | "unknown";
+
+/**
  * A symbol's trading rules, cached and periodically refreshed (section 4.3).
  * Used to validate and round an order before it is constructed, and again
  * independently before it is sent.
@@ -90,6 +119,22 @@ export interface SymbolFilters {
    * just as firmly as one below the floor.
    */
   maxNotional: Money;
+  /**
+   * What kind of instrument this symbol names, when the venue publishes it.
+   *
+   * OPTIONAL, and the absence is meaningful rather than a gap to be filled in
+   * later: it means THIS VENUE'S PAYLOAD CARRIES NO INSTRUMENT-TYPE FIELD AT
+   * ALL. Binance's `/api/v3/exchangeInfo` is the spot API and its perpetuals
+   * live behind a different host (`fapi.binance.com`, `contractType:
+   * PERPETUAL`) that this system does not know exists, so there is no field to
+   * read and no ambiguity to resolve. Gemini's `/v1/symbols/details/:symbol`
+   * does publish one, and populates this.
+   *
+   * `undefined` is therefore NOT "we did not check" -- see
+   * `checkSpotInstrument` in `/src/research/tradability.ts`, which turns the
+   * distinction into a per-venue policy rather than letting each caller guess.
+   */
+  instrument?: InstrumentKind;
   /** When these filters were fetched, so staleness can be judged. */
   fetchedAt: Timestamp;
 }

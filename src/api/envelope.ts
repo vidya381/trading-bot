@@ -188,7 +188,46 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   interval_not_verified: 400,
   candles_unavailable: 502,
   no_candles_returned: 502,
+  // Bot creation's tradability gate (`/src/research/tradability.ts`, wired in
+  // `createBot`). `pair_not_tradable` and `tradable_set_unreadable` are NOT
+  // repeated here -- the watchlist rows above already map them, and bot creation
+  // reuses the same `checkTradable` and therefore the same two codes. That reuse
+  // is the point: one refusal, one status, one place to change it.
+  //
+  //   instrument_not_spot      400, with `pair_not_tradable`. The caller sent a
+  //                            field value this system will not act on and can
+  //                            fix by asking differently (name a spot pair).
+  //   instrument_type_unknown  502. The venue answered SUCCESSFULLY and the
+  //                            answer was unusable, which is what a bad gateway
+  //                            is -- the same reasoning `no_candles_returned`
+  //                            carries one row up. Deliberately not 400: there
+  //                            is nothing the caller can rephrase, because the
+  //                            problem is the venue's payload, not their input.
+  //   instrument_unreadable    503, joining `tradable_set_unreadable`,
+  //                            `not_attached` and `throttled` in the "a
+  //                            dependency is down, retry later" tier. Same
+  //                            shape as its tradability twin: a REFUSAL to
+  //                            create on input that could not be verified, not
+  //                            a proxied read the caller asked for.
+  instrument_not_spot: 400,
+  instrument_type_unknown: 502,
+  instrument_unreadable: 503,
 };
+
+/**
+ * The status a coded module refusal maps to, for a handler that must build the
+ * `ApiError` itself rather than throwing the module's own error class.
+ *
+ * `createBot` needs this: the tradability and instrument checks return REFUSAL
+ * VALUES rather than throwing (see `tradability.ts` on why), so there is no
+ * coded error for `errorResponse` to catch and the handler has to construct
+ * one. Reading the status from this table rather than writing `400` at the call
+ * site keeps this file's opening claim true -- that it is "the single place an
+ * error becomes an HTTP status" -- instead of quietly becoming one of two.
+ */
+export function statusForCode(code: string, fallback = 400): number {
+  return STATUS_BY_CODE[code] ?? fallback;
+}
 
 interface CodedError {
   readonly code: string;

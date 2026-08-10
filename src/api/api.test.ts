@@ -30,9 +30,9 @@ import { fromDecimalString as m, toDecimalString } from "../shared/money";
 import type { Jwks } from "./access";
 import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
-import type { SymbolLister } from "../workers/symbols";
+import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
-import type { Candle } from "../shared/exchange-client";
+import type { Candle, SymbolFilters } from "../shared/exchange-client";
 
 const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const HUMAN = "owner@example.com";
@@ -123,6 +123,8 @@ interface ApiCall {
   readonly symbolLister?: SymbolLister;
   /** Inject the candles endpoint's lister, for the same reason. */
   readonly candleLister?: CandleLister;
+  /** Inject bot creation's per-symbol details lister, for the same reason. */
+  readonly symbolDetailLister?: SymbolDetailLister;
 }
 
 async function api(method: string, path: string, call: ApiCall = {}): Promise<{ status: number; body: any }> {
@@ -150,6 +152,9 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
     access: { now: () => clock, fetchJwks: async () => key.jwks, jwksCache },
     ...(call.symbolLister !== undefined ? { symbolLister: call.symbolLister } : {}),
     ...(call.candleLister !== undefined ? { candleLister: call.candleLister } : {}),
+    ...(call.symbolDetailLister !== undefined
+      ? { symbolDetailLister: call.symbolDetailLister }
+      : {}),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -175,6 +180,95 @@ async function createDcaBot(id: string, account: string, capital = "500"): Promi
       actor: HUMAN,
     }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Bot-creation tradability fixtures (the POST /api/bots gate)
+// ---------------------------------------------------------------------------
+
+/**
+ * A catalogue shaped like Gemini's REAL one: spot pairs and perpetuals in ONE
+ * list, which is the whole reason the gate needs two checks rather than one.
+ *
+ * `HYPEUSDCPERP` and `HYPEGUSDPERP` are not invented. They were read off
+ * Gemini's live catalogue during step 31's verification run, alongside the fact
+ * that no spot `HYPEUSD` exists -- so a perpetual really is something an
+ * operator can see on the venue's own listing and type in good faith.
+ */
+const BOT_CATALOGUE: readonly string[] = [
+  TEST_PAIR,
+  "BTCUSD",
+  "DOGEUSD",
+  "HYPEUSDCPERP",
+  "HYPEGUSDPERP",
+];
+
+/** A lister answering with that catalogue, counting how often it is asked. */
+function botCatalogue(pairs: readonly string[] = BOT_CATALOGUE) {
+  const calls = { n: 0 };
+  const lister: SymbolLister = async () => {
+    calls.n += 1;
+    return { ok: true, value: [...pairs], at: T0 };
+  };
+  return { lister, calls };
+}
+
+/**
+ * `SymbolFilters` as `parseSymbolDetails` would build them, with the instrument
+ * type the venue reported.
+ *
+ * `instrument` is passed explicitly rather than derived from the pair name,
+ * deliberately: deriving it here would make the fixture agree with a suffix
+ * heuristic, and the point of this gate is that it reads a FIELD. A test whose
+ * fixture encodes the naming convention could not tell the two apart.
+ */
+function symbolFilters(
+  pair: string,
+  instrument: SymbolFilters["instrument"],
+): SymbolFilters {
+  return {
+    pair,
+    baseAsset: "BTC",
+    quoteAsset: "USD",
+    status: "TRADING",
+    tickSize: m("0.01"),
+    minPrice: m("0"),
+    maxPrice: m("0"),
+    stepSize: m("0.00000001"),
+    minQuantity: m("0.00001"),
+    maxQuantity: m("0"),
+    minNotional: m("0"),
+    maxNotional: m("0"),
+    ...(instrument === undefined ? {} : { instrument }),
+    fetchedAt: T0,
+  };
+}
+
+/**
+ * A details lister that reports each pair's instrument type from an explicit
+ * map, defaulting to `spot`. Counts calls so a test can assert the per-symbol
+ * request was NOT spent when the catalogue check already refused.
+ */
+function botDetails(byPair: Readonly<Record<string, SymbolFilters["instrument"]>> = {}) {
+  const calls: string[] = [];
+  const lister: SymbolDetailLister = async (_account, pair) => {
+    calls.push(pair);
+    const instrument = pair in byPair ? byPair[pair] : "spot";
+    return { ok: true, value: symbolFilters(pair, instrument), at: T0 };
+  };
+  return { lister, calls };
+}
+
+/** The two ports a bot creation needs, with the venue answering normally. */
+function botPorts(byPair: Readonly<Record<string, SymbolFilters["instrument"]>> = {}) {
+  const catalogue = botCatalogue();
+  const details = botDetails(byPair);
+  return {
+    symbolLister: catalogue.lister,
+    symbolDetailLister: details.lister,
+    catalogueCalls: catalogue.calls,
+    detailCalls: details.calls,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +597,7 @@ describe("bots", () => {
     const id = `c${suffix}`;
 
     const res = await api("POST", "/api/bots", {
+      ...botPorts(),
       body: {
         botInstanceId: id,
         accountLabel: account,
@@ -553,6 +648,7 @@ describe("bots", () => {
     const account = `acct-${suffix}`;
     await seedBalance(account, "100"); // less than the requested 500
     const res = await api("POST", "/api/bots", {
+      ...botPorts(),
       body: {
         botInstanceId: `x${suffix}`,
         accountLabel: account,
@@ -2469,7 +2565,7 @@ describe("bot creation dispatches exchange from the account registry (step 11)",
       params: dcaParamsJson,
     };
     if (exchange !== undefined) body.exchange = exchange;
-    return api("POST", "/api/bots", { body });
+    return api("POST", "/api/bots", { ...botPorts(), body });
   }
 
   it("derives the exchange from the registry when the account is registered, body exchange omitted", async () => {
@@ -2520,6 +2616,252 @@ describe("bot creation dispatches exchange from the account registry (step 11)",
     const res = await createBotBody(account, `xb-${suffix}`, "kraken");
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("invalid_exchange");
+  });
+});
+
+/**
+ * POST /api/bots refuses a pair the venue does not list, and refuses a
+ * PERPETUAL that it does.
+ *
+ * Before this gate existed, `pair` was a free-typed string that reached bot
+ * creation with no check of any kind -- `bot-instance.ts` has never called
+ * `listTradablePairs`. So these tests are not defending a refinement; they are
+ * the first thing standing between a typo and a bot with capital reserved
+ * against a symbol that does not exist.
+ *
+ * THE LOAD-BEARING ASSERTION IN EVERY REFUSAL TEST IS NOT THE STATUS CODE. It
+ * is that NOTHING HAPPENED: no `bot_instances` row, no `capital_ledger`
+ * allocation, no `capital.allocated` audit entry, and no Durable Object -- the
+ * last proved by re-using the same bot id afterwards and getting a 201 rather
+ * than the 409 `already_created` a live object would answer with. A gate that
+ * returns the right error after reserving capital is worse than no gate, because
+ * it looks correct.
+ */
+describe("bot creation refuses untradable and non-spot pairs (POST /api/bots)", () => {
+  /** A registered account, unique per test so the KV symbol cache cannot leak. */
+  async function botAccount(prefix: string, exchange: "gemini" | "binance" = "gemini") {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange, created_at: T0, updated_at: T0 });
+    await seedBalance(label);
+    return label;
+  }
+
+  function createBody(account: string, id: string, pair: string) {
+    return {
+      botInstanceId: id,
+      accountLabel: account,
+      pair,
+      capitalAsset: "USDT",
+      allocatedCapital: "500",
+      strategy: "dca",
+      params: dcaParamsJson,
+    };
+  }
+
+  /** Assert a refused request left no trace anywhere. */
+  async function expectNoSideEffects(account: string, id: string) {
+    expect(await db.botInstances.findOne({ id })).toBeNull();
+
+    const ledger = await db.capitalLedger.findOne({ account_label: account, asset: "USDT" });
+    expect(ledger!.total_allocated).toBe(m("0"));
+
+    const audit = await db.auditLog.findMany({ where: { target_bot_instance_id: id } });
+    expect(audit).toEqual([]);
+  }
+
+  it("creates a bot on a real spot pair (201), reading the venue's instrument type", async () => {
+    const account = await botAccount("spot-ok");
+    const ports = botPorts();
+    const id = `sok-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      ...ports,
+      body: createBody(account, id, "BTCUSD"),
+    });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data).toMatchObject({ id, status: "created" });
+    // Both questions were actually asked of the venue, in order.
+    expect(ports.catalogueCalls.n).toBe(1);
+    expect(ports.detailCalls).toEqual(["BTCUSD"]);
+  });
+
+  it("refuses a pair the venue does not list, before any ledger allocation or DO", async () => {
+    const account = await botAccount("unlisted");
+    const ports = botPorts();
+    const id = `unl-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      ...ports,
+      body: createBody(account, id, "FAKEUSD"),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("pair_not_tradable");
+    await expectNoSideEffects(account, id);
+
+    // The per-symbol request was NEVER spent: the cached catalogue answered
+    // first, which is the whole reason the two checks are in this order.
+    expect(ports.detailCalls).toEqual([]);
+
+    // NOTHING was created -- proved by the id still being free.
+    const retry = await api("POST", "/api/bots", {
+      ...botPorts(),
+      body: createBody(account, id, "BTCUSD"),
+    });
+    expect(retry.status).toBe(201);
+  });
+
+  it("refuses a REAL Gemini perpetual by name, before any ledger allocation or DO", async () => {
+    const account = await botAccount("perp");
+    const ports = botPorts({ HYPEUSDCPERP: "derivative" });
+    const id = `perp-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      ...ports,
+      body: createBody(account, id, "HYPEUSDCPERP"),
+    });
+
+    expect(res.status).toBe(400);
+    // A DISTINCT code from `pair_not_tradable`: the venue does list this pair.
+    // Reporting it as "not tradable" would be flatly untrue and would send an
+    // operator hunting for a spelling mistake that is not there.
+    expect(res.body.error.code).toBe("instrument_not_spot");
+    expect(res.body.error.message).toContain("HYPEUSDCPERP");
+    expect(res.body.error.message).toContain("derivative");
+    expect(res.body.error.message).toContain("perpetual swap");
+
+    await expectNoSideEffects(account, id);
+
+    // It really did pass the catalogue check -- the perp IS listed -- so the
+    // refusal came from the instrument field and nothing else.
+    expect(ports.catalogueCalls.n).toBe(1);
+    expect(ports.detailCalls).toEqual(["HYPEUSDCPERP"]);
+
+    const retry = await api("POST", "/api/bots", {
+      ...botPorts(),
+      body: createBody(account, id, "BTCUSD"),
+    });
+    expect(retry.status).toBe(201);
+  });
+
+  it("refuses when the venue reports an instrument type this code cannot map", async () => {
+    const account = await botAccount("unmapped");
+    const id = `unm-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      ...botPorts({ BTCUSD: "unknown" }),
+      body: createBody(account, id, "BTCUSD"),
+    });
+
+    // 502, not 400: the venue answered successfully and the answer was
+    // unusable. There is nothing the caller can rephrase.
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("instrument_type_unknown");
+    await expectNoSideEffects(account, id);
+  });
+
+  it("refuses when the venue reports NO instrument type at all (fail closed)", async () => {
+    const account = await botAccount("absent");
+    const id = `abs-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      // `undefined` -- the field simply is not on the payload.
+      ...botPorts({ BTCUSD: undefined }),
+      body: createBody(account, id, "BTCUSD"),
+    });
+
+    // THE ONE THAT LOOKS WRONG AND IS NOT. Gemini lists spot and perpetuals in
+    // one catalogue, so on that venue "no instrument type" and "this might be a
+    // perpetual" are the same sentence. A field that did not arrive is not a
+    // field that said "spot".
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("instrument_type_unknown");
+    expect(res.body.error.message).toContain("did not report");
+    await expectNoSideEffects(account, id);
+  });
+
+  it("refuses when the tradable set cannot be read at all (503)", async () => {
+    const account = await botAccount("cat-down");
+    const id = `cd-${suffix}`;
+    const details = botDetails();
+
+    const res = await api("POST", "/api/bots", {
+      symbolLister: async () => ({
+        ok: false,
+        kind: "transport" as const,
+        message: "connect ETIMEDOUT",
+        retryable: true,
+        at: T0,
+      }),
+      symbolDetailLister: details.lister,
+      body: createBody(account, id, "BTCUSD"),
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("tradable_set_unreadable");
+    await expectNoSideEffects(account, id);
+    expect(details.calls).toEqual([]);
+  });
+
+  it("refuses when the symbol details cannot be read at all (503)", async () => {
+    const account = await botAccount("det-down");
+    const id = `dd-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      symbolLister: botCatalogue().lister,
+      symbolDetailLister: async () => ({
+        ok: false,
+        kind: "exchange_error" as const,
+        message: "502 from venue",
+        retryable: true,
+        at: T0,
+      }),
+      body: createBody(account, id, "BTCUSD"),
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("instrument_unreadable");
+    await expectNoSideEffects(account, id);
+  });
+
+  it("asks BINANCE no instrument question, because its spot endpoint has none", async () => {
+    const account = await botAccount("bin", "binance");
+    const ports = botPorts();
+    const id = `bin-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      ...ports,
+      body: createBody(account, id, TEST_PAIR),
+    });
+
+    expect(res.status).toBe(201);
+    // The catalogue check still runs -- that is venue-independent. The
+    // per-symbol details request does NOT, because `/api/v3/exchangeInfo` is
+    // the spot API and Binance's perpetuals are a different host this system
+    // cannot reach. Spending a request to ask an unanswerable question would be
+    // theatre.
+    expect(ports.catalogueCalls.n).toBe(1);
+    expect(ports.detailCalls).toEqual([]);
+  });
+
+  it("reports a bad strategy parameter without spending an exchange request", async () => {
+    const account = await botAccount("params-first");
+    const ports = botPorts();
+    const noStop: Record<string, unknown> = { ...dcaParamsJson };
+    delete noStop.stopLossPct;
+
+    const res = await api("POST", "/api/bots", {
+      ...ports,
+      body: { ...createBody(account, `pf-${suffix}`, "FAKEUSD"), params: noStop },
+    });
+
+    // Free checks first, network last: the pair is ALSO invalid here, and the
+    // params still win because deciding them costs nothing.
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_parameter");
+    expect(ports.catalogueCalls.n).toBe(0);
+    expect(ports.detailCalls).toEqual([]);
   });
 });
 

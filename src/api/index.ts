@@ -29,7 +29,12 @@ import * as handlers from "./handlers";
 import { resolveRoute, route, type ApiContext, type Route } from "./router";
 import { databaseFrom, type Database } from "../db";
 import type { BotInstance } from "../durable-objects/bot-instance";
-import { envSymbolLister, type SymbolLister } from "../workers/symbols";
+import {
+  envSymbolLister,
+  envSymbolDetailLister,
+  type SymbolLister,
+  type SymbolDetailLister,
+} from "../workers/symbols";
 import { envCandleLister, type CandleLister } from "../workers/candles";
 
 const ROUTES: readonly Route[] = [
@@ -84,6 +89,11 @@ export interface ApiOptions {
   readonly symbolLister?: SymbolLister;
   /** Injected by tests so the candles endpoint makes no live exchange call. */
   readonly candleLister?: CandleLister;
+  /**
+   * Injected by tests so bot creation's spot-instrument check makes no live
+   * exchange call.
+   */
+  readonly symbolDetailLister?: SymbolDetailLister;
 }
 
 function requireBotNamespace(
@@ -160,6 +170,7 @@ export async function handleApiRequest(
       botNamespace: requireBotNamespace(env, options.botNamespace),
       symbolLister: options.symbolLister ?? envSymbolLister,
       candleLister: options.candleLister ?? envCandleLister,
+      symbolDetailLister: options.symbolDetailLister ?? envSymbolDetailLister,
       now: options.now ?? (() => Date.now()),
       newId: options.newId ?? (() => crypto.randomUUID()),
     };

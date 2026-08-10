@@ -77,6 +77,10 @@ export {
 
 export {
   checkTradable,
+  checkSpotInstrument,
+  type InstrumentRefusal,
+  type InstrumentRefusalCode,
+  type SymbolDetailSource,
   type TradabilityRefusal,
   type TradabilityRefusalCode,
   type VenueAccount,

@@ -28,6 +28,7 @@
  */
 
 import type {
+  InstrumentKind,
   Pair,
   SymbolFilters,
   SymbolStatus,
@@ -100,6 +101,73 @@ function mapStatus(raw: unknown, pair: Pair): SymbolStatus {
           `refusing to guess whether the symbol is tradable`,
       );
   }
+}
+
+/**
+ * Read Gemini's INSTRUMENT TYPE off a `symbols/details` payload.
+ *
+ * These two fields are real structured data, documented by Gemini as such, and
+ * this parser has been receiving them and throwing them away since step 3.4.
+ * From their reference for `GET /v1/symbols/details/:symbol`:
+ *
+ *   product_type   "Instrument type `spot` / `swap`"   (swap == perpetual)
+ *   contract_type  "`vanilla` / `linear` / `inverse`"
+ *
+ * and their own spot example is `"product_type": "spot", "contract_type":
+ * "vanilla"` while a perpetual is `swap` + `linear`/`inverse`.
+ *
+ * ── WHY `product_type` DECIDES AND `contract_type` ONLY CORROBORATES ──
+ *
+ * `product_type` is the field that literally means "instrument type" and has
+ * exactly two documented values, one of which is the question being asked.
+ * `contract_type` describes a contract's settlement MATHS (linear settles in the
+ * quote currency, inverse in the base), and `vanilla` is what Gemini writes for
+ * the case where there is no contract at all. So `product_type` is the direct
+ * answer and `contract_type` is a second opinion about it.
+ *
+ * They are still BOTH read, because a disagreement between them is information:
+ * `product_type: "spot"` alongside `contract_type: "linear"` is a payload no
+ * documented instrument produces, and mapping it to `spot` on the strength of
+ * the first field would be this code deciding it understands Gemini better than
+ * Gemini does. That maps to `unknown`, which refuses -- the same posture
+ * `mapStatus` takes on an unrecognised status and `parseStatus` takes on the
+ * Binance side.
+ *
+ * A MISSING `contract_type` is NOT a disagreement and does not refuse:
+ * `product_type` alone is a complete answer. A missing `product_type` IS
+ * refused, via `unknown`, because that is the field that answers the question.
+ *
+ * ── THE COMPARISON IS EXACT AND LOWER-CASE, AND THAT IS DELIBERATE ──
+ *
+ * Gemini documents these values in lower case (`spot`, `swap`, `vanilla`) and
+ * this compares against them exactly, with no case folding. Step 28's live run
+ * established the rule for the SYMBOL side -- `btcusd` was refused because the
+ * catalogue spells it `BTCUSD` -- and the reasoning carries: a case-insensitive
+ * match here would accept `"SPOT"`, `"Spot"` and `"sPoT"` as though this code
+ * had seen them in a real payload, when it has seen none of them. If Gemini ever
+ * changes the casing, the honest outcome is `unknown` and a loud refusal naming
+ * the value received, not a silent acceptance.
+ */
+export function parseInstrumentKind(record: Record<string, unknown>): InstrumentKind {
+  const productType = record["product_type"];
+  const contractType = record["contract_type"];
+
+  // A contract type that names a real contract settles the question on its own:
+  // `linear` and `inverse` are Gemini's two perpetual settlement conventions and
+  // neither exists for a spot pair.
+  if (contractType === "linear" || contractType === "inverse") return "derivative";
+
+  if (productType === "swap") return "derivative";
+
+  if (productType === "spot") {
+    // Absent is fine (see above); present-and-not-`vanilla` is a contradiction,
+    // and `linear`/`inverse` have already been caught, so anything reaching here
+    // that is not `undefined` and not `vanilla` is a value this code cannot map.
+    if (contractType === undefined || contractType === "vanilla") return "spot";
+    return "unknown";
+  }
+
+  return "unknown";
 }
 
 /**
@@ -191,6 +259,13 @@ export function parseSymbolDetails(body: unknown, fetchedAt: Timestamp): SymbolF
     baseAsset,
     quoteAsset,
     status: mapStatus(record["status"], pair),
+    // Read rather than discarded, as of the bot-creation tradability gate.
+    // Unlike `mapStatus`, an unrecognised value here does NOT throw: the caller
+    // that cares (`checkSpotInstrument`) refuses on `unknown` with a message
+    // naming the instrument, and a throw would take down `getSymbolFilters` for
+    // the order path too -- where these fields have never been needed and where
+    // section 4.3's validation must keep working for every existing bot.
+    instrument: parseInstrumentKind(record),
     // INVERTED on purpose -- see the function and file headers.
     tickSize: incrementToMoney(record["quote_increment"], "quote_increment", pair),
     stepSize: incrementToMoney(record["tick_size"], "tick_size", pair),
