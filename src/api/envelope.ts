@@ -225,6 +225,29 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   instrument_not_spot: 400,
   instrument_type_unknown: 502,
   instrument_unreadable: 503,
+  // Section 21.4 Stage 1's assembly endpoint (`/src/research/gather.ts`).
+  //
+  //   no_trending_vendor    503, joining `tradable_set_unreadable`,
+  //                         `not_attached` and `instrument_unreadable` in the
+  //                         "a dependency this system needs is not there" tier.
+  //                         It is raised as an `ApiError` by `getAccountGather`
+  //                         and therefore carries its own status without
+  //                         consulting this table -- the row exists so the code
+  //                         has ONE documented status if anything else ever
+  //                         throws it, rather than silently taking the 400
+  //                         default. Deliberately NOT 501: the endpoint is
+  //                         implemented and two of its three doors work.
+  //   trending_unavailable  503, and UNREACHABLE OVER HTTP TODAY -- the general
+  //                         door refuses before `selectGeneralCandidates` is
+  //                         ever called, so nothing can produce this code
+  //                         through the API. The row is here for the same
+  //                         reason `requires_human_actor`'s is: the module
+  //                         still throws it, and when a vendor is finally wired
+  //                         this must not quietly become a 400. A failed
+  //                         trending pull is a dependency being down, which is
+  //                         the tier above, not a caller's bad request.
+  no_trending_vendor: 503,
+  trending_unavailable: 503,
 };
 
 /**

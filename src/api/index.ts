@@ -55,6 +55,11 @@ const ROUTES: readonly Route[] = [
   // and the only way its truncation reporting can be checked against a REAL
   // venue window rather than a modelled one.
   route("GET", "/api/accounts/:label/candles", handlers.getAccountCandles),
+  // Section 21.4 Stage 1's ASSEMBLY (/src/research/gather.ts). Read-only, and
+  // the only way decision log 35's open question can be answered: it is the
+  // first caller in this system to issue N venue candle requests under one
+  // request, which no test can measure because every test drives a stub.
+  route("GET", "/api/accounts/:label/gather", handlers.getAccountGather),
   // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
   // dashboard control for these is deliberately a later step; today they are the
   // curl-callable surface that replaces editing the table by hand.

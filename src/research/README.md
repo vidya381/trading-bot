@@ -5,7 +5,7 @@ BUILT**, and that banner still holds. There is no pipeline, no prompt, no
 proposal record and no Workers AI call in this folder.
 
 What exists is the storage for **21.3's fixed watchlist**, **all three of 21.4
-Stage 1's reads**, **candidate selection for both of 21.2's entry points**, and
+Stage 1's reads**, **candidate selection for 21.2's entry points and one deliberate third door**, and
 **the assembly that collects Stage 1's inputs into one bundle per candidate** —
 the last of which reads nothing new and consumes everything above it.
 
@@ -15,7 +15,7 @@ the last of which reads nothing new and consumes everything above it.
 | `tradability.ts` | `checkTradable`: "will this account's venue trade this pair?", asked once and shared by every caller below, plus an **opt-in** naming heuristic for perpetuals; `checkSpotInstrument`: the structural "is it spot?" the order path uses |
 | `candles.ts` | `fetchCandleWindow`: 21.4 Stage 1's candle fetch for **any** listed, tradable pair — no bot required — reporting how much history it actually got |
 | `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
-| `candidates.ts` | `selectNamedCandidate` / `selectGeneralCandidates`: 21.2's two entry points, feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it |
+| `candidates.ts` | `selectNamedCandidate` / `selectWatchlistCandidates` / `selectGeneralCandidates`: three doors feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it, so the general door cannot run at all today |
 | `concentration.ts` | `readAccountExposure` + `assessConcentration`: 21.4 Stage 1's third read — what the account already holds on a candidate's pair and asset. **A flag for a human, never a filter**, and its two thresholds are **policy choices verified against nothing** |
 | `gather.ts` | `gatherCandidateData` / `gatherCandidateSetData`: Stage 1's four inputs collected into one bundle per candidate. **No read of its own.** Returns an **honest partial** bundle — one input's failure never removes another's result — and carries the **paused** news slot |
 
@@ -97,10 +97,10 @@ Not a duplicated guess: it genuinely was one read, and N identical recorded
 failures is an accurate report of it. Candles are unaffected and still fetched
 per candidate.
 
-## Candidate selection: one shape, two entry points, merged provenance
+## Candidate selection: one shape, three doors, merged provenance
 
 21.2 says the entry points "differ **only** in how the candidate coin or coins
-are chosen", so both functions return the same `CandidateSet` holding the same
+are chosen", so every function returns the same `CandidateSet` holding the same
 `Candidate`. They are kept from converging by their ports rather than by
 discipline: `NamedCandidatePorts` has no trending source in it, so the named
 path cannot reach a vendor even by mistake.
@@ -117,9 +117,34 @@ requirement 6 names "the trending source is unreachable" as a fail-closed
 condition, and 21.3 says the trending pull exists because "it is the only way
 the system can ever surface something the operators did not already think to
 look for". A watchlist-only set returned under the name "general candidates"
-would be a degraded result indistinguishable from a good one. An explicit
-watchlist-only entry point could be added later, deliberately and under its own
-name; what must not exist is a general run that quietly becomes one.
+would be a degraded result indistinguishable from a good one.
+
+### The third door, and the deviation from 21.2 it represents
+
+That last paragraph used to end "an explicit watchlist-only entry point could be
+added later, deliberately and under its own name". **It has been**, and this is
+the record of it: `selectWatchlistCandidates` sources the watchlist half alone,
+returning `entryPoint: "watchlist"` and `trending: null`.
+
+**This is a deviation from 21.2, which names two entry points, and it is recorded
+as one rather than folded in quietly.** The justification is 21.2's own rule —
+the doors "differ **only** in how the candidate coin or coins are chosen", which
+is exactly and only what this differs in. Same `CandidateSet`, same `Candidate`,
+same everything downstream; no second prompt set and no second code path below
+selection.
+
+What 21.2 forbids is untouched: `selectGeneralCandidates` still throws
+`trending_unavailable` rather than degrade, **nothing routes to the watchlist
+door as a fallback**, and a caller reaches it only by naming it. A door an
+operator has to ask for by name is the opposite of a silent degradation, and the
+set says which door it came through so the two are not confusable even with the
+set alone in hand.
+
+It exists because it is the only way to run the N-candidate gather that decision
+log 35's open question is about, and `WatchlistCandidatePorts` holds **no
+catalogue port at all**, so it cannot re-check tradability even by mistake —
+matching `selectGeneralCandidates`' treatment of the identical rows, so the two
+doors cannot disagree about them.
 
 ### Spot versus perpetual: closed twice, with two different strengths
 
@@ -424,9 +449,12 @@ recorded about proposals nobody acted on.
 - **A trending vendor, and any transport for one.** `TrendingSource` is a port
   and nothing implements it. No trending API has been called from this
   repository, and the vendor research is in decision log 31.
-- **An HTTP endpoint for candidate selection, the concentration flag or Stage 1
-  assembly**, and everything LLM-shaped — Assess, Derive, proposal assembly, the
-  proposal record, the audit table.
+- **Everything LLM-shaped** — Assess, Derive, proposal assembly, the proposal
+  record, the audit table. Stage 1 assembly now HAS an endpoint
+  (`GET /api/accounts/:label/gather`), built so decision log 35's rate-budget
+  open question has a real caller to measure; candidate selection and the
+  concentration flag still have none of their own, and are reachable only
+  through that one.
 - **Any judgement about whether a bundle is good enough.** `gather.ts`
   deliberately does not rank, filter or refuse. That is Stage 4's job and
   building it here would put a policy decision in the collection layer.
@@ -441,10 +469,15 @@ recorded about proposals nobody acted on.
 `fetchCandleWindow` now has two callers: its endpoint, and `gather.ts`.
 `fetchNewsSentiment` still has **no non-test caller at all**, and
 `envNewsFetcher`'s `fetch` call has never executed against CoinDesk — `gather.ts`
-deliberately does not call it, and holds no port that could. `readWatchlist`'s
-caller is `selectGeneralCandidates`, which itself has none. `concentration.ts`'s
-caller is now `gather.ts`. **`gather.ts` itself has no non-test caller**, because
-the thing that would call it is the proposal pipeline.
+deliberately does not call it, and holds no port that could. `readWatchlist` now
+has two callers, `selectGeneralCandidates` and `selectWatchlistCandidates`.
+`concentration.ts`'s caller is `gather.ts`, and **`gather.ts` now has a real
+non-test caller** — `getAccountGather` — which is the condition decision log 35
+set before its rate-budget question could honestly be measured.
+
+**`selectGeneralCandidates` still has no reachable caller**, because the endpoint
+refuses that door before calling it: there is no trending vendor to call and a
+stub that failed would report a pull that was never attempted.
 
 **Watchlist entries are not re-checked against the venue at selection time.**
 A pair delisted after it was added stays a candidate until someone removes it.

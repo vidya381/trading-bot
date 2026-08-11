@@ -103,8 +103,24 @@ import type { Pair, Timestamp } from "../shared/exchange-client";
 import { checkTradable, type TradablePairSource, type VenueAccount } from "./tradability";
 import { readWatchlist } from "./watchlist";
 
-/** Which of 21.2's two doors this run came through. */
-export type CandidateEntryPoint = "named" | "general";
+/**
+ * Which door this run came through.
+ *
+ * 21.2 names TWO ("named coin" and "general"), and `watchlist` is a third that
+ * the spec does not name. The deviation is deliberate and is argued where it is
+ * introduced (`selectWatchlistCandidates`), but the one-line version belongs
+ * here, beside the type it widens: 21.2's rule is that the entry points "differ
+ * ONLY in how the candidate coin or coins are chosen", which is exactly and only
+ * what this adds. Every door still produces the same `CandidateSet` holding the
+ * same `Candidate` shape, and everything downstream still reads one type.
+ *
+ * What 21.2 forbids is a GENERAL run that quietly degrades into a watchlist-only
+ * one when the trending pull is unavailable. That prohibition is untouched --
+ * `selectGeneralCandidates` still throws `trending_unavailable` rather than
+ * degrade -- and a separately named door an operator has to ask for by name is
+ * the opposite of a silent degradation.
+ */
+export type CandidateEntryPoint = "named" | "general" | "watchlist";
 
 /**
  * A human named this coin (21.2, "tell me about DOGE").
@@ -304,12 +320,26 @@ export class CandidateSelectionError extends Error {
   }
 }
 
-/** What both entry points need. Notably, no trending source. */
-export interface NamedCandidatePorts {
+/**
+ * The smallest port set any door needs: the registry, and a clock.
+ *
+ * The watchlist door needs exactly this and nothing more, and the absence of
+ * `listTradablePairs` is load-bearing rather than incidental -- the same
+ * technique `NamedCandidatePorts` uses to make the named door structurally
+ * unable to reach a trending vendor. A watchlist entry's pair was checked
+ * against the venue when it was added and is deliberately NOT re-checked here
+ * (see the module header), so a door that held a catalogue port would be holding
+ * one it must not use.
+ */
+export interface WatchlistCandidatePorts {
   /** The account registry. The exchange comes from here, never from a caller. */
   readonly db: Database;
-  readonly listTradablePairs: TradablePairSource;
   readonly now: () => Timestamp;
+}
+
+/** What the named entry point needs. Notably, no trending source. */
+export interface NamedCandidatePorts extends WatchlistCandidatePorts {
+  readonly listTradablePairs: TradablePairSource;
 }
 
 /** What the general entry point additionally needs. */
@@ -323,6 +353,12 @@ export interface SelectNamedCandidateRequest {
   /** The venue's own symbol, exactly as `listTradablePairs` reports it. */
   readonly pair: Pair;
   /** Who asked. Recorded on the candidate's source (21.5 requirement 2). */
+  readonly requestedBy: string;
+}
+
+export interface SelectWatchlistCandidatesRequest {
+  readonly accountLabel: string;
+  /** Who asked. Recorded on the set, as the other two doors record it. */
   readonly requestedBy: string;
 }
 
@@ -426,6 +462,121 @@ export async function selectNamedCandidate(
       { accountLabel: account.label, exchange: account.exchange, pair, sources: [source] },
     ],
     watchlist: null,
+    trending: null,
+  };
+}
+
+/**
+ * Collect sources per pair, preserving first-seen order and MERGING duplicates.
+ *
+ * Shared by the watchlist and general doors rather than written twice, because
+ * the merge rule is 21.5 requirement 2's ("which watchlist entry, or which
+ * trending pull, and when") and a second copy of it is a second thing to drift.
+ *
+ * `order` is kept beside the map rather than relying on `Map` iteration order:
+ * the ordering is a documented guarantee, and it should not rest on an
+ * implementation detail of whatever key type a later change introduces.
+ */
+function sourceCollector() {
+  const order: Pair[] = [];
+  const sourcesByPair = new Map<Pair, CandidateSource[]>();
+
+  return {
+    contribute(pair: Pair, source: CandidateSource): void {
+      const existing = sourcesByPair.get(pair);
+      if (existing === undefined) {
+        sourcesByPair.set(pair, [source]);
+        order.push(pair);
+        return;
+      }
+      existing.push(source);
+    },
+    candidates(account: VenueAccount): Candidate[] {
+      return order.map((pair) => ({
+        accountLabel: account.label,
+        exchange: account.exchange,
+        pair,
+        sources: nonEmptySources(sourcesByPair.get(pair)),
+      }));
+    },
+  };
+}
+
+/**
+ * The operators' watchlist ALONE, as a candidate set, under its own name.
+ *
+ * ── WHY THIS EXISTS, AND WHY IT IS NOT A DEGRADED GENERAL RUN ──
+ *
+ * `selectGeneralCandidates` refuses to return a watchlist-only set when the
+ * trending pull fails, and that refusal is correct and is untouched: 21.3 says
+ * the trending source exists because "it is the only way the system can ever
+ * surface something the operators did not already think to look for", so a
+ * general run without it is not a smaller general run. What must not exist is a
+ * general run that QUIETLY BECOMES one.
+ *
+ * This is the other half of that sentence, which the module header has named
+ * since the general door was written: "An explicit watchlist-only entry point is
+ * a thing an operator could be given later, ON PURPOSE and under its own name."
+ * A caller reaches this by asking for it by name; nothing routes here as a
+ * fallback, and no failure anywhere degrades into it. The set it returns says
+ * `entryPoint: "watchlist"` and `trending: null`, so a reader cannot mistake one
+ * for the other even with the set alone in front of them.
+ *
+ * ── THE DEVIATION FROM 21.2, STATED RATHER THAN BURIED ──
+ *
+ * 21.2 names two entry points. This is a third, and the justification is that
+ * 21.2's own rule is that the doors "differ ONLY in how the candidate coin or
+ * coins are chosen" -- which is exactly and only what this differs in. It
+ * produces the same `CandidateSet`, holding the same `Candidate` shape, feeding
+ * the identical downstream. There is no second prompt set, no second proposal
+ * format and no second code path below this function.
+ *
+ * ── NO TRADABILITY RE-CHECK, deliberately ──
+ *
+ * Matching `selectGeneralCandidates`' treatment of the same entries exactly. A
+ * watchlist pair was checked against the venue by `addToWatchlist` when it was
+ * added and is not re-checked here; the staleness that creates is real, is the
+ * gap steps 28 and 31 both recorded, and is NOT closed here, because closing it
+ * changes what the watchlist means and that is a decision rather than a detail.
+ * Re-checking in this door but not in the general one would be worse than
+ * either: two doors disagreeing about the same rows.
+ *
+ * That is also why `WatchlistCandidatePorts` holds no `TradablePairSource` --
+ * the guarantee is structural, not a promise made in a comment.
+ */
+export async function selectWatchlistCandidates(
+  ports: WatchlistCandidatePorts,
+  request: SelectWatchlistCandidatesRequest,
+): Promise<CandidateSet> {
+  const selectedAt = ports.now();
+  const requestedBy = requireText(request.requestedBy, "requestedBy");
+  const account = await resolveAccount(ports.db, request.accountLabel);
+
+  const readAt = ports.now();
+  const entries = await readWatchlist(ports.db, { accountLabel: account.label });
+
+  const collector = sourceCollector();
+  for (const entry of entries) {
+    collector.contribute(entry.exchangePair, {
+      kind: "watchlist",
+      entryId: entry.id,
+      note: entry.note,
+      addedBy: entry.addedBy,
+      addedAt: entry.addedAt,
+    });
+  }
+
+  return {
+    entryPoint: "watchlist",
+    accountLabel: account.label,
+    exchange: account.exchange,
+    requestedBy,
+    selectedAt,
+    candidates: collector.candidates(account),
+    watchlist: { readAt, entriesRead: entries.length },
+    // Null rather than an empty report, and the distinction is the same one
+    // `selectNamedCandidate` draws: a report of zero coins returned would claim
+    // a pull that never happened.
     trending: null,
   };
 }
@@ -552,22 +703,11 @@ export async function selectGeneralCandidates(
     );
   }
 
-  // Insertion-ordered, so `order` is the answer to "which pair came first" and
-  // the map is only the answer to "and from where". Kept as two structures
-  // rather than relying on Map iteration order, because the ordering is a
-  // documented guarantee here and should not rest on an implementation detail
-  // of whatever key type a later change introduces.
-  const order: Pair[] = [];
-  const sourcesByPair = new Map<Pair, CandidateSource[]>();
-  const contribute = (pair: Pair, source: CandidateSource): void => {
-    const existing = sourcesByPair.get(pair);
-    if (existing === undefined) {
-      sourcesByPair.set(pair, [source]);
-      order.push(pair);
-      return;
-    }
-    existing.push(source);
-  };
+  // Insertion-ordered and merging, so "which pair came first" and "and from
+  // where" stay two separate answers. Shared with the watchlist door, which
+  // collects the identical entries the identical way.
+  const collector = sourceCollector();
+  const contribute = collector.contribute;
 
   for (const entry of entries) {
     contribute(entry.exchangePair, {
@@ -659,12 +799,7 @@ export async function selectGeneralCandidates(
     exchange: account.exchange,
     requestedBy,
     selectedAt,
-    candidates: order.map((pair) => ({
-      accountLabel: account.label,
-      exchange: account.exchange,
-      pair,
-      sources: nonEmptySources(sourcesByPair.get(pair)),
-    })),
+    candidates: collector.candidates(account),
     watchlist: { readAt, entriesRead: entries.length },
     trending: {
       pullId,

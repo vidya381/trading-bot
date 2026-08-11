@@ -28,11 +28,13 @@ import {
   CandidateSelectionError,
   selectGeneralCandidates,
   selectNamedCandidate,
+  selectWatchlistCandidates,
   type CandidateSource,
   type GeneralCandidatePorts,
   type NamedCandidatePorts,
   type TrendingCoin,
   type TrendingSource,
+  type WatchlistCandidatePorts,
 } from "./candidates";
 import type { TradablePairSource } from "./tradability";
 import type { Database } from "../db/database";
@@ -822,5 +824,219 @@ describe("the two entry points produce the same candidate shape (21.2)", () => {
     expect(g?.exchange).toBe(n?.exchange);
     expect(sourceKinds(g?.sources ?? [])).toEqual(["watchlist"]);
     expect(sourceKinds(n?.sources ?? [])).toEqual(["named"]);
+  });
+});
+
+/**
+ * The watchlist door: 21.3's deliberate half, alone and under its own name.
+ *
+ * The properties that matter here are mostly about what it must NOT be
+ * mistakable for. A watchlist-only set is a perfectly well-formed candidate set
+ * -- that is exactly why `selectGeneralCandidates` refuses to return one on a
+ * failed pull -- so the tests that earn their place are the ones asserting this
+ * door is distinguishable from that failure mode, and that nothing routes here
+ * by accident.
+ */
+describe("selectWatchlistCandidates (the third door)", () => {
+  const WATCHLIST = {
+    accountLabel: "gemini-main",
+    requestedBy: "owner@example.com",
+  } as const;
+
+  function watchlistPortsFor(overrides: Partial<WatchlistCandidatePorts> = {}): WatchlistCandidatePorts {
+    return { db, now, ...overrides };
+  }
+
+  it("returns every live entry as a candidate, in the read path's order", async () => {
+    await watch("BTCUSD", { id: "wl-1" });
+    await watch("ETHUSD", { id: "wl-2" });
+    await watch("SOLUSD", { id: "wl-3" });
+
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.candidates.map((c) => c.pair)).toEqual(["BTCUSD", "ETHUSD", "SOLUSD"]);
+    expect(set.watchlist).toEqual({ readAt: expect.any(Number), entriesRead: 3 });
+  });
+
+  /**
+   * The load-bearing distinction of this whole door. A general run that fell
+   * back to the watchlist and this door produce candidate lists that are
+   * IDENTICAL; the only thing telling them apart is on the set.
+   */
+  it("is distinguishable from a degraded general run by the set alone", async () => {
+    await watch("BTCUSD", { id: "wl-1" });
+
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.entryPoint).toBe("watchlist");
+    // Null, NOT a zero-coin report: a report would claim a pull that never
+    // happened, which is the same lie `NEWS_NOT_YET_AVAILABLE` refuses to tell
+    // one module over.
+    expect(set.trending).toBeNull();
+  });
+
+  it("carries which watchlist entry, its note and its author on every candidate", async () => {
+    await watch("BTCUSD", { id: "wl-99", note: "deepest book on the venue" });
+
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.candidates[0]?.sources).toEqual([
+      {
+        kind: "watchlist",
+        entryId: "wl-99",
+        note: "deepest book on the venue",
+        addedBy: "owner@example.com",
+        addedAt: T0 - 10_000,
+      },
+    ]);
+  });
+
+  /**
+   * An empty watchlist is a FACT, not a failure -- the same stance the general
+   * door takes toward a trending pull that matched nothing. Refusing here would
+   * make "nobody has put anything on the list" indistinguishable from an error.
+   */
+  it("returns an empty candidate list rather than refusing, for an empty watchlist", async () => {
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.candidates).toEqual([]);
+    expect(set.watchlist).toEqual({ readAt: expect.any(Number), entriesRead: 0 });
+    expect(set.entryPoint).toBe("watchlist");
+  });
+
+  it("reads the exchange from the registry and refuses an unknown account", async () => {
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+    expect(set.exchange).toBe("gemini");
+
+    await expect(
+      selectWatchlistCandidates(watchlistPortsFor(), { ...WATCHLIST, accountLabel: "nope" }),
+    ).rejects.toMatchObject({ code: "unknown_account" });
+  });
+
+  it("refuses a blank requester rather than recording an anonymous run", async () => {
+    await expect(
+      selectWatchlistCandidates(watchlistPortsFor(), { ...WATCHLIST, requestedBy: "   " }),
+    ).rejects.toMatchObject({ code: "missing_field" });
+  });
+
+  /**
+   * A removed entry is gone from this door too. `readWatchlist` owns the
+   * liveness rule and this asserts the door did not route around it -- the
+   * failure mode being a gather that spends a venue candle request on a pair
+   * the operators deliberately took off the list.
+   */
+  it("ignores removed entries", async () => {
+    await watch("BTCUSD", { id: "wl-live" });
+    await db.watchlist.insert(
+      watchlistRow({
+        id: "wl-dead",
+        account_label: "gemini-main",
+        pair: "ETHUSD",
+        removed_by: "owner@example.com",
+        removed_at: T0 - 5_000,
+      }),
+    );
+
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.candidates.map((c) => c.pair)).toEqual(["BTCUSD"]);
+    expect(set.watchlist?.entriesRead).toBe(1);
+  });
+
+  /**
+   * Another account's entries are another account's. A gather is one account's
+   * exposure read plus its own candidates, and leaking a pair across accounts
+   * would produce a well-formed bundle about the wrong book.
+   */
+  it("scopes to the requested account", async () => {
+    await watch("BTCUSD", { id: "wl-gemini" });
+    await db.watchlist.insert(
+      watchlistRow({ id: "wl-other", account_label: "main", pair: "BTCUSDT" }),
+    );
+
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.candidates.map((c) => c.pair)).toEqual(["BTCUSD"]);
+  });
+
+  /**
+   * The structural guarantee, asserted as a fact about the call rather than as
+   * a promise in a comment: this door holds no catalogue port, so it cannot
+   * re-check tradability even by mistake. `listingCalls` counts every call the
+   * shared stub lister receives.
+   */
+  it("reaches no venue at all -- no catalogue call, no tradability re-check", async () => {
+    await watch("BTCUSD", { id: "wl-1" });
+    await watch("ETHUSD", { id: "wl-2" });
+    listingCalls = 0;
+
+    await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(listingCalls).toBe(0);
+  });
+
+  /**
+   * Deliberate, and NOT an oversight: `selectGeneralCandidates` does not
+   * re-check watchlist entries either, so a door that did would make the two
+   * disagree about the same rows. `HYPEGUSDPERP` is a real string from Gemini's
+   * live catalogue; if the watchlist somehow holds a perpetual, this door
+   * returns it exactly as the general door would, and the staleness gap steps
+   * 28/31 recorded stays one gap rather than becoming two behaviours.
+   */
+  it("does not re-validate entries, matching the general door exactly", async () => {
+    await watch("HYPEGUSDPERP", { id: "wl-perp" });
+    await watch("DELISTEDUSD", { id: "wl-gone" });
+
+    const viaWatchlist = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+    const viaGeneral = await selectGeneralCandidates(generalPorts(), GENERAL);
+
+    // Neither door dropped either pair, and the assertion is that the two
+    // AGREE rather than that they produce some order written down here: the
+    // order is `readWatchlist`'s (added_at, then id) and is that module's to
+    // own. A literal list here would pin this test to a detail one table over.
+    expect(viaWatchlist.candidates.map((c) => c.pair).sort()).toEqual([
+      "DELISTEDUSD",
+      "HYPEGUSDPERP",
+    ]);
+    expect(viaGeneral.candidates.map((c) => c.pair)).toEqual(
+      viaWatchlist.candidates.map((c) => c.pair),
+    );
+  });
+
+  /**
+   * 21.2's rule holds across all three doors: they differ only in how the
+   * candidates are chosen, and everything downstream reads one shape.
+   */
+  it("produces the same candidate shape as the other two doors (21.2)", async () => {
+    await watch("BTCUSD", { id: "wl-btc" });
+
+    const watchlistSet = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+    const general = await selectGeneralCandidates(generalPorts(), GENERAL);
+    const named = await selectNamedCandidate(namedPorts(), {
+      accountLabel: "gemini-main",
+      pair: "BTCUSD",
+      requestedBy: "owner@example.com",
+    });
+
+    const w = watchlistSet.candidates[0];
+    expect(Object.keys(w ?? {}).sort()).toEqual(Object.keys(named.candidates[0] ?? {}).sort());
+    expect(Object.keys(w ?? {}).sort()).toEqual(Object.keys(general.candidates[0] ?? {}).sort());
+    expect(w?.pair).toBe("BTCUSD");
+    expect(w?.accountLabel).toBe("gemini-main");
+    expect(w?.exchange).toBe("gemini");
+    expect(sourceKinds(w?.sources ?? [])).toEqual(["watchlist"]);
+  });
+
+  /**
+   * `selectedAt` is when selection ran; `watchlist.readAt` is when the table
+   * was read. The clock advances on every tick, so a version that reused one
+   * instant for both fails here rather than in a proposal (21.5 requirement 4).
+   */
+  it("keeps the selection instant and the read instant apart", async () => {
+    await watch("BTCUSD", { id: "wl-1" });
+
+    const set = await selectWatchlistCandidates(watchlistPortsFor(), WATCHLIST);
+
+    expect(set.watchlist?.readAt).toBeGreaterThan(set.selectedAt);
   });
 });

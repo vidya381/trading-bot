@@ -41,7 +41,17 @@ import type {
   TradeRow,
 } from "../db/schema";
 import type { BotSnapshot } from "../durable-objects/bot-instance";
-import type { CandleWindow, WatchlistEntry } from "../research";
+import type {
+  AccountExposure,
+  Candidate,
+  CandidateGatherBundle,
+  CandidateSetGatherBundle,
+  CandleWindow,
+  ConcentrationResult,
+  GatheredInput,
+  NewsInput,
+  WatchlistEntry,
+} from "../research";
 import type { Candle } from "../shared/exchange-client";
 import { toDecimalString, type Money } from "../shared/money";
 
@@ -233,6 +243,219 @@ export function candleWindowView(window: CandleWindow) {
     missingHistoryMs: window.missingHistoryMs,
     count: window.candles.length,
     candles: window.candles.map(candleView),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1 gather bundles (section 21.4, `/src/research/gather.ts`)
+// ---------------------------------------------------------------------------
+
+/**
+ * A module's OWN error, as the two fields a caller can act on.
+ *
+ * WHY THIS FUNCTION HAS TO EXIST AT ALL, stated because the bug it prevents is
+ * silent and total: `Error`'s `name`, `message` and `stack` are NON-ENUMERABLE,
+ * so `JSON.stringify(new CandleWindowError("candles_unavailable", "..."))` is
+ * `{}` -- not a throw, not a warning, an empty object. A bundle that put the
+ * error object straight on the wire would return 200 with `"error": {}` in every
+ * failed slot, which is precisely the "honestly reported" half of this endpoint
+ * failing while the shape still looks right. `code` is a own-property and would
+ * survive; `message` would not, so the failure would arrive coded and mute.
+ *
+ * `code` is carried verbatim -- `candles_unavailable`, `interval_not_verified`,
+ * `pair_not_tradable`, `bot_list_unreadable`, `missing_field` -- because
+ * `gather.ts` invents no error vocabulary and neither does this. The same code a
+ * direct caller reads off `error.code`, and the same one `STATUS_BY_CODE` maps
+ * when the SAME error reaches HTTP as a top-level refusal from the candles
+ * endpoint. Two surfaces, one vocabulary.
+ */
+export function moduleErrorView(error: { readonly code: string; readonly message: string }) {
+  return { code: error.code, message: error.message };
+}
+
+/**
+ * A value that was THROWN rather than refused, described without trusting it.
+ *
+ * The `threw_unexpectedly` arm's `error` is typed `unknown` on purpose
+ * (`gather.ts`: "a thrown non-Error is legal JavaScript"), so this must handle a
+ * string, a null, a symbol, or an object whose `toString` throws. It has no
+ * `code`, deliberately: inventing one would dress a port failure up as one of
+ * the module's enumerated refusals, which is the exact distinction the third
+ * arm exists to preserve.
+ *
+ * THE DESCRIPTION IS ITSELF FALLIBLE AND IS GUARDED. `String(Object.create(null))`
+ * throws `TypeError: Cannot convert object to primitive value`. An endpoint
+ * whose entire purpose is reporting failures must not fail while describing one,
+ * so the conversion is wrapped and a value that will not describe itself is
+ * reported as exactly that rather than taking the response down with it.
+ */
+export function thrownErrorView(error: unknown) {
+  if (error instanceof Error) {
+    return { name: error.name, message: error.message };
+  }
+  let message: string;
+  try {
+    message = String(error);
+  } catch {
+    message =
+      "a thrown value that cannot be converted to a string (its toString threw, or it has " +
+      "a null prototype). Reported rather than allowed to fail this response.";
+  }
+  return { name: typeof error, message };
+}
+
+/**
+ * One `GatheredInput` arm, with the value rendered by the caller's own view.
+ *
+ * THE DISCRIMINANT IS CARRIED THROUGH UNCHANGED, and that is the whole contract
+ * of this endpoint. A caller reads `outcome` and gets `ok` / `failed` /
+ * `threw_unexpectedly` -- three distinguishable states, never collapsed into a
+ * boolean, because "the venue refused for a reason it enumerated" and "something
+ * beneath it broke" are different facts a human weighing a proposal needs apart
+ * (`gather.ts`'s design note 2).
+ *
+ * `failedAt` rides on the failure arms and NOT on `ok`, mirroring the type
+ * exactly: a slot that succeeded has a real fetch time inside its own value
+ * (`fetchedAt`, `readAt`) and does not need an observation time, while a slot
+ * that failed has no fetch time to report because no fetch succeeded to supply
+ * one (21.5 requirement 4).
+ */
+export function gatheredInputView<T, E extends { readonly code: string; readonly message: string }, V>(
+  input: GatheredInput<T, E>,
+  valueView: (value: T) => V,
+) {
+  if (input.outcome === "ok") {
+    return { outcome: "ok" as const, value: valueView(input.value) };
+  }
+  if (input.outcome === "failed") {
+    return {
+      outcome: "failed" as const,
+      error: moduleErrorView(input.error),
+      failedAt: input.failedAt,
+    };
+  }
+  return {
+    outcome: "threw_unexpectedly" as const,
+    error: thrownErrorView(input.error),
+    failedAt: input.failedAt,
+  };
+}
+
+/**
+ * The paused news slot (decision log 30), carried verbatim.
+ *
+ * Every field is already a string and there is nothing to convert, so this is an
+ * explicit re-statement rather than a passthrough -- which is the point. It has
+ * NO `error`, NO `failedAt` and NO `fetchedAt`, and listing the three fields it
+ * DOES have makes that absence a property of this function rather than of the
+ * object that happened to be passed in. A later edit that added a `failedAt`
+ * here would have to be written on purpose.
+ */
+export function newsInputView(news: NewsInput) {
+  return {
+    outcome: news.outcome,
+    reason: news.reason,
+    decisionLogEntry: news.decisionLogEntry,
+  };
+}
+
+/**
+ * One candidate, with its provenance intact (21.5 requirement 2).
+ *
+ * `jsonSafe` rather than a field-by-field view, and the reason is `sources`:
+ * a `TrendingCandidateSource` carries `raw`, the vendor's own item BY IDENTITY,
+ * whose shape is by definition unknown to this layer. A hand-written view would
+ * have to either drop it -- destroying exactly the "actual raw data it used"
+ * requirement 2 asks for -- or copy it blind, which is what `jsonSafe` already
+ * does correctly and with the bigint pass applied all the way down.
+ *
+ * The whole tuple is carried, never summarised: `sources` is the answer to
+ * "WHICH watchlist entry, or WHICH trending pull, and when", and a coin on both
+ * lists is one candidate with two sources.
+ */
+export function candidateView(candidate: Candidate) {
+  return jsonSafe(candidate);
+}
+
+/**
+ * One concentration result, flagged or clean.
+ *
+ * `jsonSafe` for a REASON THAT IS EASY TO MISS AND HAS EXACTLY ONE INSTANCE:
+ * `ConcentrationResult` renders its own money to decimal strings already
+ * (`committed`, `samePairCommitted`, every `*SharePct`) -- but `facts.policy` is
+ * the `ConcentrationPolicy` echoed verbatim so the numbers are reconstructable,
+ * and its `assetCapitalShareFlagAtPct` is a raw `Money` bigint (`40n * ONE`).
+ * That single field is the one thing standing between this endpoint and a
+ * `TypeError: Do not know how to serialize a BigInt` on EVERY successful
+ * response. A test and a mutant both pin it, because "the policy echo" is the
+ * last place someone auditing money fields would look.
+ */
+export function concentrationResultView(result: ConcentrationResult) {
+  return jsonSafe(result);
+}
+
+/**
+ * The ONE `bot_instances` read a set-wide gather did, reported beside its results.
+ *
+ * Published for 21.5 requirement 2's reason -- "the actual raw data it used" --
+ * and `jsonSafe` because `AccountExposure.committed[]`/`stopped[]` are
+ * `ExposureBot`s carrying `allocatedCapital` as a raw `Money` bigint. That is
+ * the second of the two bigint sites in a bundle, and unlike the policy echo it
+ * is one per bot rather than one per result.
+ */
+export function accountExposureView(exposure: AccountExposure) {
+  return jsonSafe(exposure);
+}
+
+/**
+ * Everything Stage 1 gathered about ONE candidate.
+ *
+ * The four slots are INDEPENDENT FIELDS with no shared status and no "first
+ * error", which is what makes "candles failed", "concentration failed" and
+ * "everything succeeded" three distinguishable states over the wire rather than
+ * one degraded one. Nothing here computes an overall success flag, deliberately:
+ * a top-level boolean is precisely the summary that would let a reader stop
+ * looking at which inputs actually worked, and deciding whether a bundle is fit
+ * to use is Stage 4's judgement, which does not exist yet.
+ *
+ * `assembledAt` is published beside them and is NOT a fetch time -- it is when
+ * assembly ran. The real fetch times are inside the slots
+ * (`candles.value.fetchedAt`, `concentration.value.readAt`, each source's own),
+ * and a caller timing staleness from `assembledAt` would be reading a render
+ * time as a data time (21.5 requirement 4).
+ */
+export function candidateGatherBundleView(bundle: CandidateGatherBundle) {
+  return {
+    candidate: candidateView(bundle.candidate),
+    candles: gatheredInputView(bundle.candles, candleWindowView),
+    news: newsInputView(bundle.news),
+    concentration: gatheredInputView(bundle.concentration, concentrationResultView),
+    assembledAt: bundle.assembledAt,
+  };
+}
+
+/**
+ * A whole `CandidateSet`'s bundles, plus the one read behind them.
+ *
+ * `set` is carried whole so the SET-level provenance survives: 21.5 requirement
+ * 2's "which trending pull, and when" lives on `set.trending.fetchedAt` and
+ * `set.watchlist.readAt`, which are per-set facts and are deliberately not
+ * copied onto each candidate.
+ *
+ * `bundles` has exactly `set.candidates.length` entries in the set's own order,
+ * with NO filtering -- a candidate whose every input failed is still in its own
+ * position, which is what makes position `i` meaningful against
+ * `set.candidates[i]`. `count` is published for the same reason
+ * `candleWindowView`'s is: the cheapest check an operator makes against this
+ * endpoint should not require pulling every bundle down to perform.
+ */
+export function candidateSetGatherBundleView(bundle: CandidateSetGatherBundle) {
+  return {
+    set: jsonSafe(bundle.set),
+    exposure: gatheredInputView(bundle.exposure, accountExposureView),
+    count: bundle.bundles.length,
+    bundles: bundle.bundles.map(candidateGatherBundleView),
+    assembledAt: bundle.assembledAt,
   };
 }
 

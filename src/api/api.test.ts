@@ -3376,3 +3376,616 @@ describe("candles endpoint (section 21.4)", () => {
     expect(res.body.error.code).toBe("method_not_allowed");
   });
 });
+
+/**
+ * The HTTP surface over `/src/research/gather.ts` (section 21.4 Stage 1).
+ *
+ * WHAT IS PROVED HERE, and what deliberately is not. The assembly's own rules --
+ * per-input isolation, the one-read-for-N-candidates design, the news pause, the
+ * timestamp discipline -- have their own file of tests against the module. What
+ * this file owns is the layer's share, and one property that exists ONLY at this
+ * boundary and cannot be observed from inside the module at all:
+ *
+ *   EVERY INPUT'S OUTCOME MUST SURVIVE SERIALIZATION.
+ *
+ * That is not a restatement of the module's tests. `gather.ts` records a failure
+ * as a real `CandleWindowError` instance, and `Error`'s `message` and `name` are
+ * NON-ENUMERABLE -- so a bundle that reached `JSON.stringify` unserialized comes
+ * back with `"error": {}` on every failed slot: a 200, correctly shaped, and
+ * mute about what went wrong. Equally, `ConcentrationFacts.policy` carries a raw
+ * `Money` bigint that throws `TypeError` outright inside `JSON.stringify`. Both
+ * bugs are invisible to every test that stops at the module, which is why the
+ * failure tests below assert THROUGH THE WIRE (`res.body`) rather than against a
+ * returned object.
+ *
+ * The exchange is injected through `candleLister`/`symbolLister` -- the same
+ * seams the Worker defaults to the real listers on. NOTHING HERE CONTACTS
+ * GEMINI, BINANCE, OR ANY TRENDING VENDOR.
+ */
+describe("gather endpoint (section 21.4 Stage 1 assembly)", () => {
+  const MINUTE = 60_000;
+  const GEMINI_PAIRS = ["BTCUSD", "ETHUSD", "SOLUSD", "DOGEUSD"];
+  /** Deliberately far from `clock`, so a surviving `fetchedAt` is a real assertion. */
+  const VENUE_ANSWERED_AT = 1_960_000_000_000;
+
+  function catalogueLister(pairs: readonly string[] = GEMINI_PAIRS): SymbolLister {
+    return async () => ({ ok: true, value: [...pairs], at: T0 });
+  }
+
+  function candleAt(pair: string, openTime: number, close: bigint): Candle {
+    return {
+      pair,
+      openTime,
+      closeTime: openTime + MINUTE,
+      open: close - 1n,
+      high: close + 2n,
+      low: close - 3n,
+      close,
+      volume: 400_000_000n,
+      closed: true,
+    };
+  }
+
+  /** A venue answering with three candles per pair, recording what it was asked. */
+  function venue() {
+    const calls: { pair: string; interval: string }[] = [];
+    const lister: CandleLister = async (_account, query) => {
+      calls.push({ pair: query.pair, interval: query.interval });
+      return {
+        ok: true,
+        value: [
+          candleAt(query.pair, T0 - 3 * MINUTE, 100_000_000n),
+          candleAt(query.pair, T0 - 2 * MINUTE, 101_000_000n),
+          candleAt(query.pair, T0 - MINUTE, 102_000_000n),
+        ],
+        at: VENUE_ANSWERED_AT,
+      };
+    };
+    return { lister, calls };
+  }
+
+  /** A venue that fails for ONE named pair and answers for every other. */
+  function venueFailingFor(badPair: string) {
+    const calls: string[] = [];
+    const lister: CandleLister = async (_account, query) => {
+      calls.push(query.pair);
+      if (query.pair === badPair) {
+        return { ok: false, kind: "transport", message: "connect ETIMEDOUT", retryable: true, at: VENUE_ANSWERED_AT };
+      }
+      return {
+        ok: true,
+        value: [candleAt(query.pair, T0 - MINUTE, 100_000_000n)],
+        at: VENUE_ANSWERED_AT,
+      };
+    };
+    return { lister, calls };
+  }
+
+  async function account(prefix: string) {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    return label;
+  }
+
+  async function watch(label: string, pair: string, id: string) {
+    await db.watchlist.insert({
+      id: `${id}-${suffix}`,
+      account_label: label,
+      pair,
+      note: `${pair} is on the list on purpose`,
+      added_by: HUMAN,
+      added_at: T0 - 10_000,
+      removed_by: null,
+      removed_at: null,
+    });
+  }
+
+  /** A committed bot, so concentration has something real to report. */
+  async function bot(label: string, id: string, pair: string, allocated: string) {
+    await db.botInstances.insert(
+      botInstanceRow({
+        id: `${id}-${suffix}`,
+        account_label: label,
+        exchange: "gemini",
+        pair,
+        allocated_capital: m(allocated),
+        capital_asset: "USD",
+        status: "running",
+      }),
+    );
+  }
+
+  function gatherPath(label: string, query: Record<string, string>) {
+    return `/api/accounts/${label}/gather?${new URLSearchParams(query).toString()}`;
+  }
+
+  // -- The successful gather --------------------------------------------------
+
+  it("returns a full named bundle with every input's own outcome and timestamp", async () => {
+    const label = await account("gt-named");
+    await bot(label, "b1", "BTCUSD", "500");
+    await bot(label, "b2", "BTCUSD", "500");
+    const { lister, calls } = venue();
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeNull();
+    expect(res.body.data.entryPoint).toBe("named");
+
+    const bundle = res.body.data.bundle;
+
+    // The candidate, verbatim, with the provenance 21.5 requirement 2 needs --
+    // including WHO asked, taken from the verified Access token and never a
+    // caller-supplied string.
+    expect(bundle.candidate).toEqual({
+      accountLabel: label,
+      exchange: "gemini",
+      pair: "BTCUSD",
+      sources: [
+        { kind: "named", requestedAs: "BTCUSD", requestedBy: HUMAN, requestedAt: expect.any(Number) },
+      ],
+    });
+
+    // Candles: the outcome, and the VENUE's own answer instant -- not `now`.
+    expect(bundle.candles.outcome).toBe("ok");
+    expect(bundle.candles.value.fetchedAt).toBe(VENUE_ANSWERED_AT);
+    expect(bundle.candles.value.count).toBe(3);
+    expect(bundle.candles.value.candles[0].close).toBe("1.00000000");
+    // A successful slot carries no `failedAt`: it has a real fetch time inside.
+    expect(bundle.candles.failedAt).toBeUndefined();
+
+    // Concentration: the flag, its facts, and the READ's own instant.
+    expect(bundle.concentration.outcome).toBe("ok");
+    expect(bundle.concentration.value.assessment).toBe("flagged");
+    expect(bundle.concentration.value.readAt).toEqual(expect.any(Number));
+    expect(bundle.concentration.value.samePairBots).toBe(2);
+
+    // The news slot is a STATE, not a failure and not an absence.
+    expect(bundle.news).toEqual({
+      outcome: "not_yet_available",
+      reason: expect.stringContaining("No news or sentiment vendor has been chosen"),
+      decisionLogEntry: "docs/decision-log/30.md",
+    });
+    expect(bundle.news.error).toBeUndefined();
+    expect(bundle.news.failedAt).toBeUndefined();
+    expect(bundle.news.fetchedAt).toBeUndefined();
+
+    expect(bundle.assembledAt).toEqual(expect.any(Number));
+    expect(res.body.data.selectedAt).toEqual(expect.any(Number));
+
+    // One candidate, one venue candle request.
+    expect(calls).toEqual([{ pair: "BTCUSD", interval: "1m" }]);
+  });
+
+  /**
+   * THE SERIALIZATION BOUNDARY'S SHARPEST EDGE, and the reason this test is
+   * separate from the one above rather than an assertion inside it.
+   *
+   * `ConcentrationFacts.policy` is echoed so a human can reconstruct the
+   * numbers, and `assetCapitalShareFlagAtPct` inside it is a raw `Money` bigint
+   * -- the ONE bigint on this path that is not already rendered by the module.
+   * Unconverted, `JSON.stringify` throws `TypeError: Do not know how to
+   * serialize a BigInt` and this endpoint returns 500 on every successful
+   * gather. It is also the last field anyone auditing money would look at,
+   * because it is policy rather than an amount.
+   */
+  it("renders the policy echo's bigint threshold as a decimal string", async () => {
+    const label = await account("gt-policy");
+    await bot(label, "b1", "BTCUSD", "500");
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: venue().lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.bundle.concentration.value.policy).toEqual({
+      samePairBotCountFlagAt: 2,
+      assetCapitalShareFlagAtPct: "40.00000000",
+    });
+  });
+
+  // -- A REAL per-input failure, all the way to the wire ----------------------
+
+  /**
+   * The test the brief asked for by name: a genuine `fetchCandleWindow` refusal
+   * driven through the endpoint, asserted on `res.body`.
+   *
+   * Two independent bugs die here, and neither is visible from inside the
+   * module. First, `Error`'s non-enumerable `message` -- an unserialized error
+   * arrives as `{}`, so `expect(...message).toContain(...)` is what proves the
+   * explicit view ran. Second, isolation surviving the wire: the concentration
+   * slot must still carry its real result in the SAME response, because a
+   * candle failure erasing a successfully-read risk flag is the exact outcome
+   * `gather.ts` exists to prevent.
+   */
+  it("carries a real candle failure to the wire with its code AND message, without touching the other slots", async () => {
+    const label = await account("gt-fail");
+    await bot(label, "b1", "BTCUSD", "500");
+    await bot(label, "b2", "BTCUSD", "500");
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: venueFailingFor("BTCUSD").lister,
+    });
+
+    // A 200. Assembly ran; one input failed. The status is NOT the answer.
+    expect(res.status).toBe(200);
+    expect(res.body.error).toBeNull();
+
+    const bundle = res.body.data.bundle;
+    expect(bundle.candles.outcome).toBe("failed");
+    // The producing module's OWN code, not a flattened restatement.
+    expect(bundle.candles.error.code).toBe("candles_unavailable");
+    // The message survived. `{}` here is the non-enumerable-property bug.
+    expect(bundle.candles.error.message).toContain("connect ETIMEDOUT");
+    expect(bundle.candles.failedAt).toEqual(expect.any(Number));
+    // A failed slot has no value to read. The type says so; so does the wire.
+    expect(bundle.candles.value).toBeUndefined();
+
+    // ISOLATION, over the wire: the risk flag is untouched and still real.
+    expect(bundle.concentration.outcome).toBe("ok");
+    expect(bundle.concentration.value.assessment).toBe("flagged");
+    expect(bundle.concentration.value.samePairBots).toBe(2);
+    // And the paused news slot is still exactly itself.
+    expect(bundle.news.outcome).toBe("not_yet_available");
+  });
+
+  /**
+   * The THIRD outcome state, which the two above do not reach. `fetchCandleWindow`
+   * does not wrap its ports, so a `CandleLister` that throws RAW produces
+   * something that is not a `CandleWindowError` and never will be -- and
+   * `gather.ts` keeps that a distinct state rather than dressing it up as one of
+   * the module's enumerated refusals. This asserts the distinction survives the
+   * wire: no `code` field, because inventing one is exactly the lie the third
+   * arm exists to prevent.
+   */
+  it("carries a raw port throw as threw_unexpectedly, with no invented code", async () => {
+    const label = await account("gt-threw");
+    await bot(label, "b1", "BTCUSD", "500");
+    const throwing: CandleLister = async () => {
+      throw new TypeError("fetch failed: undefined is not an object");
+    };
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: throwing,
+    });
+
+    expect(res.status).toBe(200);
+    const candles = res.body.data.bundle.candles;
+    expect(candles.outcome).toBe("threw_unexpectedly");
+    expect(candles.error).toEqual({
+      name: "TypeError",
+      message: "fetch failed: undefined is not an object",
+    });
+    // NOT a refusal the module enumerated, so it must carry no code.
+    expect(candles.error.code).toBeUndefined();
+    expect(candles.failedAt).toEqual(expect.any(Number));
+    // Still isolated: concentration is untouched.
+    expect(res.body.data.bundle.concentration.outcome).toBe("ok");
+  });
+
+  it("describes a thrown NON-Error rather than reporting an empty object", async () => {
+    const label = await account("gt-threw-string");
+    const throwing: CandleLister = async () => {
+      // Legal JavaScript, and the reason `error` is typed `unknown`.
+      throw "the driver threw a bare string";
+    };
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: throwing,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.bundle.candles.error).toEqual({
+      name: "string",
+      message: "the driver threw a bare string",
+    });
+  });
+
+  /**
+   * AN ENDPOINT THAT REPORTS FAILURES MUST NOT FAIL WHILE DESCRIBING ONE.
+   *
+   * `String(Object.create(null))` throws `TypeError: Cannot convert object to
+   * primitive value`. Unguarded, that throw escapes the serializer, is caught by
+   * `handleApiRequest`'s funnel, and turns a 200-with-one-failed-slot into a
+   * blanket 500 -- losing the concentration result that was read successfully,
+   * which is the precise failure `gather.ts`'s isolation exists to prevent,
+   * reintroduced one layer up at the very last moment.
+   */
+  it("survives a thrown value that cannot be converted to a string", async () => {
+    const label = await account("gt-threw-hostile");
+    await bot(label, "b1", "BTCUSD", "500");
+    const throwing: CandleLister = async () => {
+      throw Object.create(null);
+    };
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: throwing,
+    });
+
+    // Not a 500.
+    expect(res.status).toBe(200);
+    expect(res.body.data.bundle.candles.outcome).toBe("threw_unexpectedly");
+    expect(res.body.data.bundle.candles.error.message).toContain("cannot be converted to a string");
+    // The successfully-read risk flag survived the hostile throw.
+    expect(res.body.data.bundle.concentration.outcome).toBe("ok");
+    expect(res.body.data.bundle.concentration.value.assessment).toBeDefined();
+  });
+
+  it("reports an interval the module refuses as that input's own failure, not a 400", async () => {
+    const label = await account("gt-unverified");
+
+    // `6h` parses as a real interval at this layer and is refused by the module
+    // as unverified -- so it arrives as a RECORDED failure on the candles slot
+    // rather than as a request-level refusal. The same error the candles
+    // endpoint returns as a top-level 400, in its other correct place.
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD", interval: "6h" }), {
+      symbolLister: catalogueLister(),
+      candleLister: venue().lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.bundle.candles.outcome).toBe("failed");
+    expect(res.body.data.bundle.candles.error.code).toBe("interval_not_verified");
+    // `not.toBe("")` would PASS for `undefined`, which is exactly the shape the
+    // non-enumerable-message bug takes. Assert the type and the content.
+    expect(typeof res.body.data.bundle.candles.error.message).toBe("string");
+    expect(res.body.data.bundle.candles.error.message).toContain("6h");
+  });
+
+  // -- The watchlist door: N candidates, in the set's order -------------------
+
+  it("returns one bundle per candidate in the set's order, and reads bot_instances once", async () => {
+    const label = await account("gt-set");
+    await watch(label, "BTCUSD", "w1");
+    await watch(label, "ETHUSD", "w2");
+    await watch(label, "SOLUSD", "w3");
+    await bot(label, "b1", "BTCUSD", "500");
+    const { lister, calls } = venue();
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "watchlist", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.entryPoint).toBe("watchlist");
+
+    const set = res.body.data.set;
+    expect(set.count).toBe(3);
+    // `bundles[i]` is `set.candidates[i]`, always.
+    expect(set.bundles.map((b: any) => b.candidate.pair)).toEqual(
+      set.set.candidates.map((c: any) => c.pair),
+    );
+    expect(set.bundles.map((b: any) => b.candidate.pair)).toEqual(["BTCUSD", "ETHUSD", "SOLUSD"]);
+
+    // The set-level provenance survived, and says which door this came through.
+    expect(set.set.entryPoint).toBe("watchlist");
+    expect(set.set.trending).toBeNull();
+    expect(set.set.watchlist).toEqual({ readAt: expect.any(Number), entriesRead: 3 });
+
+    // ONE bot_instances read for N candidates, reported beside the results, with
+    // its money rendered -- `ExposureBot.allocatedCapital` is the other bigint.
+    expect(set.exposure.outcome).toBe("ok");
+    expect(set.exposure.value.rowsRead).toBe(1);
+    expect(set.exposure.value.committed[0].allocatedCapital).toBe("500.00000000");
+
+    // N candidates cost exactly N candle requests -- the number the live
+    // rate-budget question is about.
+    expect(calls.map((c) => c.pair)).toEqual(["BTCUSD", "ETHUSD", "SOLUSD"]);
+  });
+
+  /**
+   * A failing candidate keeps its POSITION and its neighbours keep their data.
+   * A set that dropped it, or stopped at it, would still return a well-formed
+   * response -- which is why the assertion is on the whole ordered list.
+   */
+  it("keeps a failed candidate in position without disturbing its neighbours", async () => {
+    const label = await account("gt-partial");
+    await watch(label, "BTCUSD", "w1");
+    await watch(label, "ETHUSD", "w2");
+    await watch(label, "SOLUSD", "w3");
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "watchlist", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: venueFailingFor("ETHUSD").lister,
+    });
+
+    expect(res.status).toBe(200);
+    const bundles = res.body.data.set.bundles;
+    expect(bundles).toHaveLength(3);
+    expect(bundles.map((b: any) => [b.candidate.pair, b.candles.outcome])).toEqual([
+      ["BTCUSD", "ok"],
+      ["ETHUSD", "failed"],
+      ["SOLUSD", "ok"],
+    ]);
+    expect(bundles[1].candles.error.code).toBe("candles_unavailable");
+    expect(bundles[0].candles.value.count).toBe(1);
+    expect(bundles[2].candles.value.count).toBe(1);
+  });
+
+  it("returns an empty bundle list for an empty watchlist, not a refusal", async () => {
+    const label = await account("gt-empty");
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "watchlist", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: venue().lister,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.set.count).toBe(0);
+    expect(res.body.data.set.bundles).toEqual([]);
+    expect(res.body.data.set.set.watchlist.entriesRead).toBe(0);
+  });
+
+  // -- The general door refuses, and says why ---------------------------------
+
+  it("is 503 no_trending_vendor for entryPoint=general, naming the pause not an outage", async () => {
+    const label = await account("gt-general");
+    const { lister, calls } = venue();
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "general", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: lister,
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("no_trending_vendor");
+    // It must not read as a transient vendor failure -- there is no vendor.
+    expect(res.body.error.message).toContain("NO TRENDING VENDOR HAS BEEN CHOSEN");
+    expect(res.body.error.message).toContain("entryPoint=watchlist");
+    // BEFORE any work: no venue was called.
+    expect(calls).toEqual([]);
+  });
+
+  /**
+   * The refusal must not depend on any other parameter being well formed, or a
+   * caller learns "interval is required" for a door that could never run.
+   */
+  it("refuses general BEFORE parsing interval, so the reason is the real one", async () => {
+    const label = await account("gt-general-bare");
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "general" }), {
+      symbolLister: catalogueLister(),
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("no_trending_vendor");
+  });
+
+  /**
+   * It refuses even for an account that does not exist. The refusal is about
+   * this system's missing vendor, not about the request, so it must not be
+   * reachable only after a registry read succeeds.
+   */
+  it("refuses general before the registry read", async () => {
+    const res = await api("GET", gatherPath(`nope-${suffix}`, { entryPoint: "general", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("no_trending_vendor");
+  });
+
+  // -- Request-level refusals -------------------------------------------------
+
+  it("is 400 missing_field with no entryPoint", async () => {
+    const label = await account("gt-noentry");
+    const res = await api("GET", gatherPath(label, { interval: "1m" }), {
+      symbolLister: catalogueLister(),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+  });
+
+  it("is 400 invalid_filter for an entryPoint that is not one", async () => {
+    const label = await account("gt-badentry");
+    const res = await api("GET", gatherPath(label, { entryPoint: "everything", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_filter");
+    expect(res.body.error.message).toContain("watchlist");
+  });
+
+  it("is 400 missing_field for a named request with no pair", async () => {
+    const label = await account("gt-nopair");
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+  });
+
+  it("is 400 missing_field with no interval, and offers no default", async () => {
+    const label = await account("gt-nointerval");
+    const res = await api("GET", gatherPath(label, { entryPoint: "named", pair: "BTCUSD" }), {
+      symbolLister: catalogueLister(),
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+    expect(res.body.error.message).toContain("no default");
+  });
+
+  /**
+   * REFUSED, not ignored. A silently-dropped `pair` reads exactly like a filter
+   * that was applied -- someone would conclude the watchlist run only gathered
+   * that pair, and the bundle list would not obviously contradict them.
+   */
+  it("is 400 invalid_field for a pair sent to the watchlist door", async () => {
+    const label = await account("gt-straypair");
+    await watch(label, "BTCUSD", "w1");
+
+    const res = await api("GET", gatherPath(label, { entryPoint: "watchlist", pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+      candleLister: venue().lister,
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_field");
+    expect(res.body.error.message).toContain("only valid with entryPoint=named");
+  });
+
+  it("rejects a malformed since rather than reading it as the epoch", async () => {
+    const label = await account("gt-since");
+    for (const value of ["", "abc", "-1", "1.5"]) {
+      const res = await api(
+        "GET",
+        gatherPath(label, { entryPoint: "watchlist", interval: "1m", since: value }),
+        { symbolLister: catalogueLister(), candleLister: venue().lister },
+      );
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe("invalid_field");
+    }
+  });
+
+  it("is 404 unknown_account for an unregistered account", async () => {
+    const res = await api(
+      "GET",
+      gatherPath(`nope-${suffix}`, { entryPoint: "watchlist", interval: "1m" }),
+      { symbolLister: catalogueLister(), candleLister: venue().lister },
+    );
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_account");
+  });
+
+  /**
+   * A NAMED candidate that the venue does not list is a request-level refusal,
+   * because selection failed and there is no candidate to bundle. That is the
+   * boundary between this endpoint's 4xx and its 200-with-a-failed-slot, and it
+   * is worth pinning because the two look similar from outside.
+   */
+  it("is 400 pair_not_tradable for a named pair the venue does not list", async () => {
+    const label = await account("gt-untradable");
+    const res = await api(
+      "GET",
+      gatherPath(label, { entryPoint: "named", pair: "PEPEUSD", interval: "1m" }),
+      { symbolLister: catalogueLister(), candleLister: venue().lister },
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("pair_not_tradable");
+  });
+
+  it("requires Access like every other route, and is read-only", async () => {
+    const label = await account("gt-auth");
+
+    const unauth = await api("GET", gatherPath(label, { entryPoint: "watchlist", interval: "1m" }), {
+      token: null,
+    });
+    expect(unauth.status).toBe(401);
+
+    const written = await api("POST", gatherPath(label, { entryPoint: "watchlist", interval: "1m" }), {
+      symbolLister: catalogueLister(),
+    });
+    expect(written.status).toBe(405);
+    expect(written.body.error.code).toBe("method_not_allowed");
+  });
+});

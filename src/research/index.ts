@@ -38,6 +38,7 @@
 export {
   selectGeneralCandidates,
   selectNamedCandidate,
+  selectWatchlistCandidates,
   CandidateSelectionError,
   type Candidate,
   type CandidateEntryPoint,
@@ -49,6 +50,8 @@ export {
   type NamedCandidateSource,
   type SelectGeneralCandidatesRequest,
   type SelectNamedCandidateRequest,
+  type SelectWatchlistCandidatesRequest,
+  type WatchlistCandidatePorts,
   type TrendingCandidateSource,
   type TrendingCoin,
   type TrendingPull,

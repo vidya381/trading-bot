@@ -20,6 +20,8 @@ import {
   alertView,
   botDetail,
   botSummary,
+  candidateGatherBundleView,
+  candidateSetGatherBundleView,
   candleWindowView,
   circuitBreakerView,
   killSwitchView,
@@ -32,9 +34,16 @@ import {
   checkSpotInstrument,
   checkTradable,
   fetchCandleWindow,
+  gatherCandidateData,
+  gatherCandidateSetData,
   readWatchlist,
   removeFromWatchlist,
+  selectNamedCandidate,
+  selectWatchlistCandidates,
+  type CandidateEntryPoint,
   type CandleSource,
+  type GatherPorts,
+  type GatherRequest,
   type SymbolDetailSource,
   type TradablePairSource,
   type VenueAccount,
@@ -1380,6 +1389,275 @@ export async function getAccountCandles(ctx: ApiContext): Promise<Response> {
   );
 
   return ok(candleWindowView(window));
+}
+
+// ---------------------------------------------------------------------------
+// Gather (section 21.4, Stage 1 assembly)
+// ---------------------------------------------------------------------------
+
+/** The three doors `CandidateEntryPoint` declares, for parsing a query string. */
+const GATHER_ENTRY_POINTS: readonly CandidateEntryPoint[] = ["named", "general", "watchlist"];
+
+/**
+ * The ports Stage 1 assembly needs, wired to the SAME reals every other
+ * research endpoint uses.
+ *
+ * `tradablePairsFor` is the cached `listAccountSymbols` the watchlist writes and
+ * the candles endpoint read through; `candleSourceFor` is the uncached
+ * per-account lister. Reused rather than reached for directly, so a gather and a
+ * single-pair candle fetch cannot disagree about what the venue lists, and so N
+ * candidates cost N candle requests and NOT N full-catalogue requests on top.
+ *
+ * That second point is the one this endpoint exists to measure: see the handler.
+ */
+function gatherPorts(ctx: ApiContext): GatherPorts {
+  return {
+    db: ctx.db,
+    listTradablePairs: tradablePairsFor(ctx),
+    getCandles: candleSourceFor(ctx),
+    now: ctx.now,
+  };
+}
+
+/**
+ * A comma-separated query parameter as a list, or undefined when absent.
+ *
+ * Blank entries are dropped rather than refused: `?quoteAssets=USD,` is a shell
+ * artefact, not a request for a quote asset named "". A present-but-entirely-
+ * blank value IS refused, because that is someone meaning something by it.
+ */
+function optionalCsv(ctx: ApiContext, name: string): readonly string[] | undefined {
+  const raw = ctx.url.searchParams.get(name);
+  if (raw === null) return undefined;
+  const values = raw.split(",").map((value) => value.trim()).filter((value) => value !== "");
+  if (values.length === 0) {
+    throw badRequest(
+      "invalid_field",
+      `query parameter ${JSON.stringify(name)}, if given, must name at least one value`,
+    );
+  }
+  return values;
+}
+
+/**
+ * GET /api/accounts/:label/gather -- Stage 1's assembled bundle, over the wire.
+ *
+ * The curl-able surface over `gatherCandidateData` / `gatherCandidateSetData`
+ * (section 21.4 Stage 1, `/src/research/gather.ts`), and like the candles
+ * endpoint it exists for a reason beyond convenience: decision log 35 closed
+ * with an open question that no test can answer, because every test in this
+ * repository drives an injected `CandleSource`. `gatherCandidateSetData` is the
+ * first thing here that issues N venue candle requests under ONE caller's
+ * request, and whether that is survivable against a real venue is a fact about
+ * production. This endpoint is how that gets measured. Log 35 deferred it until
+ * a real caller existed rather than inventing one to generate load; this is that
+ * caller, and the measurement is now against the shape that will actually run.
+ *
+ * A THIN WRAPPER in the strict sense this layer means it. The assembly, the
+ * per-input isolation, the one-read-for-N-candidates design, the quote-asset
+ * merge and every failure state live in `gather.ts` and candidate selection
+ * lives in `candidates.ts`; none of it is re-implemented, re-ordered or
+ * second-guessed here. What this adds is query parsing, the port wiring, and the
+ * serialization of a shape that contains bigints in two places.
+ *
+ * READ-ONLY. No write, no audit entry, no state. The Access gate still applies.
+ *
+ * ── THE THREE DOORS ──
+ *
+ *   `?entryPoint=named&pair=X`  ONE candidate, through `selectNamedCandidate`,
+ *                               then `gatherCandidateData`. `pair` required.
+ *   `?entryPoint=watchlist`     The operators' watchlist, through
+ *                               `selectWatchlistCandidates`, then
+ *                               `gatherCandidateSetData`. THE ONE THAT ANSWERS
+ *                               THE OPEN QUESTION: 21.3 bounds the watchlist at
+ *                               5-10 coins, so this is the N-candidate run.
+ *   `?entryPoint=general`       REFUSED, 503, before any work. See below.
+ *
+ * ── WHY `general` REFUSES RATHER THAN RUNS ──
+ *
+ * `selectGeneralCandidates` requires a `TrendingSource`, and NO VENDOR HAS BEEN
+ * CHOSEN (decision logs 30 and 31): there is no trending client anywhere in this
+ * repository outside a test stub. The refusal is raised HERE, before the
+ * registry read and before anything else, rather than by handing the module a
+ * stub that fails -- and that distinction is the same one `NEWS_NOT_YET_AVAILABLE`
+ * draws one layer down. A stub that returned a failed `ExchangeOutcome` would
+ * produce `trending_unavailable`, which says a pull was attempted and did not
+ * answer. No pull was attempted. There is nothing to attempt it with, and a
+ * message implying a transient vendor outage would send an operator to check a
+ * vendor's status page for a vendor this project has never had.
+ *
+ * `interval` is NOT parsed before this refusal, deliberately: a general request
+ * must fail for the reason it actually fails for, not for a missing parameter it
+ * would also have needed.
+ *
+ * ── WHAT COMES BACK ──
+ *
+ * A discriminated shape keyed on `entryPoint`, so the two gather functions'
+ * genuinely different return types stay distinguishable rather than being forced
+ * into one flattened object:
+ *
+ *   `{ entryPoint: "named",     selectedAt, bundle: CandidateGatherBundle }`
+ *   `{ entryPoint: "watchlist", set: CandidateSetGatherBundle }`
+ *
+ * EVERY INPUT'S OWN OUTCOME IS ON THE WIRE -- `ok` / `failed` /
+ * `threw_unexpectedly` / `not_yet_available` -- with each failure carrying the
+ * producing module's own `code` and each success carrying its own `fetchedAt` or
+ * `readAt`. There is deliberately NO top-level success flag: a 200 here means
+ * "assembly ran", never "every input worked", and the whole point of the shape
+ * is that a human can see WHICH inputs succeeded. Collapsing that into a boolean
+ * is the one thing this endpoint must not do.
+ *
+ * A 200 WITH EVERY SLOT FAILED IS A CORRECT RESPONSE, and callers must not treat
+ * the status as the answer.
+ *
+ * Failures (the request itself, as opposed to an input):
+ *   - `missing_field` (400)            -- no `entryPoint`, no `interval`, or a
+ *                                         named request with no `pair`.
+ *   - `invalid_filter` (400)           -- `entryPoint` or `interval` is not one.
+ *   - `invalid_field` (400)            -- `since`/`quoteAssets` malformed, or a
+ *                                         `pair` sent to a door that has no use
+ *                                         for one (refused, never ignored).
+ *   - `no_trending_vendor` (503)       -- `entryPoint=general`. See above.
+ *   - `unknown_account` (404)          -- no such registered account.
+ *   - `pair_not_tradable` (400)        -- named, and the venue does not list it.
+ *   - `pair_not_spot_by_name` (400)    -- named, and its name says perp.
+ *   - `tradable_set_unreadable` (503)  -- named, and the venue could not be asked.
+ *
+ * The candle and concentration codes are deliberately ABSENT from that list.
+ * They are not request failures here: a failed candle fetch is a recorded state
+ * on one slot of a 200, which is exactly what `gather.ts` exists to guarantee
+ * and the opposite of what the candles endpoint does with the identical error.
+ */
+export async function getAccountGather(ctx: ApiContext): Promise<Response> {
+  const label = ctx.params.label!;
+
+  const entryPoint = ctx.url.searchParams.get("entryPoint");
+  if (entryPoint === null || entryPoint.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "entryPoint" is required and must be one of ${GATHER_ENTRY_POINTS.join(", ")}`,
+    );
+  }
+  if (!GATHER_ENTRY_POINTS.includes(entryPoint as CandidateEntryPoint)) {
+    throw badRequest(
+      "invalid_filter",
+      `entryPoint must be one of ${GATHER_ENTRY_POINTS.join(", ")}, not ${JSON.stringify(entryPoint)}`,
+    );
+  }
+
+  // Before the registry read, before the interval parse, before anything. See
+  // the docblock: the honest refusal is "there is no vendor", and it must not be
+  // reachable only after some other parameter happens to be well formed.
+  if (entryPoint === "general") {
+    throw new ApiError(
+      503,
+      "no_trending_vendor",
+      `the general entry point needs a live trending pull (21.3) and NO TRENDING VENDOR HAS ` +
+        `BEEN CHOSEN, so there is nothing to call: no client for any vendor exists in this ` +
+        `system and this project holds no key for one (see docs/decision-log/30.md and 31.md). ` +
+        `This is NOT a vendor outage and retrying will not help -- no request was attempted. ` +
+        `selectGeneralCandidates deliberately refuses to fall back to the watchlist alone, ` +
+        `because a general run that quietly becomes a watchlist re-read is a degraded result ` +
+        `indistinguishable from a good one (21.5 requirement 6). To gather over the ` +
+        `operators' watchlist, ask for it by name: entryPoint=watchlist.`,
+    );
+  }
+
+  const interval = ctx.url.searchParams.get("interval");
+  if (interval === null || interval.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "interval" is required and must be one of ${CANDLE_INTERVALS.join(", ")}. ` +
+        `There is no default: a wrong interval returns correctly-shaped candles of a DIFFERENT ` +
+        `duration, which passes every type check and which no downstream reader can detect.`,
+    );
+  }
+  if (!CANDLE_INTERVALS.includes(interval as CandleInterval)) {
+    throw badRequest(
+      "invalid_filter",
+      `interval must be one of ${CANDLE_INTERVALS.join(", ")}, not ${JSON.stringify(interval)}`,
+    );
+  }
+
+  // The same strict parse the candles endpoint uses, and for the same reasons:
+  // `Number("")` is 0, not NaN, so `?since=` would silently mean "since the
+  // epoch"; `Number("12abc")` is NaN, which would filter every candle out and
+  // blame the venue for the query.
+  const sinceParam = ctx.url.searchParams.get("since");
+  let since: number | undefined;
+  if (sinceParam !== null) {
+    const parsed = Number(sinceParam);
+    if (sinceParam.trim() === "" || !Number.isInteger(parsed) || parsed < 0) {
+      throw badRequest(
+        "invalid_field",
+        `query parameter "since", if given, must be a non-negative integer of ` +
+          `epoch milliseconds, not ${JSON.stringify(sinceParam)}`,
+      );
+    }
+    since = parsed;
+  }
+
+  const quoteAssets = optionalCsv(ctx, "quoteAssets");
+  const request: GatherRequest = {
+    interval: interval as CandleInterval,
+    ...(since === undefined ? {} : { since }),
+    ...(quoteAssets === undefined ? {} : { quoteAssets }),
+  };
+
+  const pair = ctx.url.searchParams.get("pair");
+  const ports = gatherPorts(ctx);
+
+  if (entryPoint === "named") {
+    if (pair === null || pair.trim() === "") {
+      throw badRequest(
+        "missing_field",
+        `query parameter "pair" is required for entryPoint=named and must be the venue's own ` +
+          `symbol, exactly as GET /api/accounts/${label}/symbols reports it`,
+      );
+    }
+    const set = await selectNamedCandidate(ports, {
+      accountLabel: label,
+      pair,
+      // The layer's standing rule: the actor is the email VERIFIED off the
+      // Access token, never a caller-supplied string. It lands on the
+      // candidate's own source as `requestedBy` (21.5 requirement 2).
+      requestedBy: ctx.actor,
+    });
+    // `selectNamedCandidate` returns a one-candidate set by construction, and
+    // this is the one place that fact is relied on. Read rather than asserted:
+    // the set exists because selection succeeded, and selection's failures are
+    // throws that never reach here.
+    const bundle = await gatherCandidateData(ports, set.candidates[0]!, request);
+    return ok({
+      entryPoint: "named" as const,
+      // The only set-level fact a single bundle does not already carry. The
+      // rest -- account, exchange, who asked, when they asked -- is on the
+      // candidate and its source.
+      selectedAt: set.selectedAt,
+      bundle: candidateGatherBundleView(bundle),
+    });
+  }
+
+  // `pair` has no meaning for a watchlist run: the pairs ARE the watchlist. It
+  // is refused rather than ignored, the same stance `addWatchlistEntry` takes
+  // with a body-supplied `actor` -- silently dropping a parameter a caller
+  // clearly meant something by is how someone concludes this endpoint filtered
+  // when it did not.
+  if (pair !== null) {
+    throw badRequest(
+      "invalid_field",
+      `query parameter "pair" is only valid with entryPoint=named. A watchlist run gathers ` +
+        `every live watchlist entry for this account, so a pair here would be ignored -- and ` +
+        `an ignored parameter reads exactly like a filter that was applied.`,
+    );
+  }
+
+  const set = await selectWatchlistCandidates(ports, {
+    accountLabel: label,
+    requestedBy: ctx.actor,
+  });
+  const bundle = await gatherCandidateSetData(ports, set, request);
+  return ok({ entryPoint: "watchlist" as const, set: candidateSetGatherBundleView(bundle) });
 }
 
 // ---------------------------------------------------------------------------
