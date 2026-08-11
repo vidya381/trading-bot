@@ -21,6 +21,42 @@ const migrations = await readD1Migrations("./migrations");
 export default defineConfig({
   plugins: [
     cloudflareTest({
+      // Do not open a remote proxy session for bindings that have no local
+      // simulation. THIS IS WHAT LETS THE `ai` BINDING EXIST AT ALL.
+      //
+      // Workers AI has no local implementation: miniflare's `ai` plugin builds
+      // a `remoteProxyClientWorker` and nothing else (see its AI_PLUGIN, which
+      // has no local branch). The pool therefore calls wrangler's
+      // `maybeStartOrUpdateRemoteProxySession` at CONFIG-PARSE TIME -- before a
+      // single test runs -- and in this project that session is refused,
+      // because the testnet Worker sits behind Cloudflare Access and there is
+      // no service token in the test environment. The whole suite then reports
+      // 0 tests and an error per test file. Decision log 37 recorded that as
+      // the blocking open problem for wiring Assess, and described it as a
+      // structural incompatibility -- WHICH IT IS NOT. See docs/decision-log/38.md,
+      // which supersedes that framing.
+      //
+      // The gate is one option, and the failure was a DEFAULT rather than
+      // anything this project configured. In @cloudflare/vitest-pool-workers
+      // 0.18.6 the pool declares `remoteBindings: z.boolean().default(true)`
+      // (dist/pool/index.mjs:2514) and starts the session only
+      // `if (options.remoteBindings)` (:2603). Setting it false skips the
+      // handshake entirely, so `ai` stays declared in wrangler.jsonc for real
+      // deploys while tests never try to reach Cloudflare.
+      //
+      // WHAT THIS COSTS, STATED PLAINLY: `env.AI` still EXISTS in tests as a
+      // binding object, but it is wired to a proxy client with no connection
+      // string, so CALLING it fails. That is the correct trade and not a
+      // limitation to work around -- nothing in this repository may call a
+      // model from a test. `AssessModel` (src/research/assess.ts) is an
+      // injected port precisely so the model is never reached from the suite,
+      // and a test that somehow did call `env.AI` SHOULD fail loudly rather
+      // than quietly contact a paid API.
+      //
+      // Safe for everything else here because this project has no remote-only
+      // bindings: D1, KV, R2 and Durable Objects are all locally simulated by
+      // miniflare, and none of them is declared with `experimental_remote`.
+      remoteBindings: false,
       wrangler: {
         configPath: "./wrangler.jsonc",
         // Always the testnet environment. Tests must never load production

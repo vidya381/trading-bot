@@ -62,6 +62,9 @@
 			"build": {
 				"command": "node scripts/verify-dashboard-build.mjs testnet"
 			},
+			"ai": {
+				"binding": "AI"
+			},
 			"workers_dev": true,
 			// Spec section 11.3 / build step 10 (dashboard). The React dashboard
 			// (in /dashboard) is served as static assets from THIS Worker, so there
