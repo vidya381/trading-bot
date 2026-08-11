@@ -5,8 +5,9 @@ BUILT**, and that banner still holds. There is no pipeline, no prompt, no
 proposal record and no Workers AI call in this folder.
 
 What exists is the storage for **21.3's fixed watchlist**, **all three of 21.4
-Stage 1's reads**, and **candidate selection for both of 21.2's entry points** —
-the first thing in this folder that consumes the others.
+Stage 1's reads**, **candidate selection for both of 21.2's entry points**, and
+**the assembly that collects Stage 1's inputs into one bundle per candidate** —
+the last of which reads nothing new and consumes everything above it.
 
 | File | What it is |
 | --- | --- |
@@ -16,6 +17,85 @@ the first thing in this folder that consumes the others.
 | `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
 | `candidates.ts` | `selectNamedCandidate` / `selectGeneralCandidates`: 21.2's two entry points, feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it |
 | `concentration.ts` | `readAccountExposure` + `assessConcentration`: 21.4 Stage 1's third read — what the account already holds on a candidate's pair and asset. **A flag for a human, never a filter**, and its two thresholds are **policy choices verified against nothing** |
+| `gather.ts` | `gatherCandidateData` / `gatherCandidateSetData`: Stage 1's four inputs collected into one bundle per candidate. **No read of its own.** Returns an **honest partial** bundle — one input's failure never removes another's result — and carries the **paused** news slot |
+
+## Stage 1 assembly is collection, not judgement
+
+`gather.ts` adds no read. It calls `fetchCandleWindow` and
+`readAccountExposure`/`assessConcentration`, carries the `Candidate` verbatim,
+and puts the paused news state in the fourth slot.
+
+**A bundle always comes back.** Each input's real state is recorded on its own
+slot, and deciding whether the result is fit to show a human is **Stage 4's job**
+(21.4, "Explain and assemble"), which does not exist yet.
+
+That is not a weakening of 21.5 requirement 6, and the distinction is the whole
+design:
+
+- **Within** an input, fail-closed is untouched. `fetchCandleWindow` still throws
+  six ways rather than returning a short window; `readAccountExposure` still
+  throws rather than reporting "no concentration" for a read it could not do.
+  Nothing in assembly catches those and substitutes a value.
+- **Between** inputs, a failure is **recorded, not propagated**. A failed candle
+  fetch puts the real `CandleWindowError` — with its real code — in the candles
+  slot and leaves every other slot alone.
+
+The failure a whole-bundle throw would cause is specific: one unreachable venue
+would erase a concentration flag that was read successfully from D1 and is
+exactly what 21.4 wants "presented prominently". Losing a real risk signal
+because an unrelated fetch failed is not failing closed; it is failing closed on
+the wrong thing.
+
+### It composes the existing types and invents no error vocabulary
+
+`GatheredInput<T, E>` has three states and no taxonomy of its own. The `failed`
+arm carries **the producing module's own error object** — a real
+`CandleWindowError`, a real `ConcentrationError` — so `error.code` reads exactly
+as it would for a direct caller. A second vocabulary restating
+`candles_unavailable` as some flatter `fetch_failed` would drift from the first.
+
+The third state, `threw_unexpectedly`, exists because it is **reachable**:
+`fetchCandleWindow` does not wrap its ports, so a `Database` or `CandleSource`
+that throws raw produces something that is not a `CandleWindowError`. Folding it
+into `failed` would mean typing `error` as `CandleWindowError` while sometimes
+holding a D1 exception.
+
+`readAccountExposure` catches broadly and normalises, so **concentration has no
+reachable `threw_unexpectedly` today**. A test pins that, so a change removing
+that catch shows up there rather than in a proposal.
+
+### The news slot is a state, not a TODO
+
+Every bundle carries `NEWS_NOT_YET_AVAILABLE`, a frozen shared value in the same
+discriminant position every other input's state lives in. It has **no `error`, no
+`failedAt` and no `fetchedAt`**, because no request was made and a timestamp
+would claim one was — so it is structurally incapable of being rendered as a
+failed fetch. `GatherPorts` also holds **no news source**, so assembly cannot
+reach a vendor even by mistake.
+
+`NewsInput` is a **one-armed union on purpose**. The `ok`/`failed` arms are not
+pre-declared, because nothing can produce them. When a vendor is chosen (decision
+log 30 lists the three conditions, none met), the arms are added and every
+exhaustive switch stops compiling until each is handled — which is why the pause
+lives in the type instead of a comment.
+
+### Every fetch keeps its own timestamp
+
+The sub-fetches are not simultaneous, so no single bundle-level fetch time is
+manufactured. `candles.value.fetchedAt` is the venue's answer instant,
+`concentration.value.readAt` the D1 read's, `candidate.sources[]` carries each
+provenance time, and a failed slot's `failedAt` is when the failure was
+*observed*. `assembledAt` sits beside them and is **not** one of them — it is
+when assembly ran, the same kind of thing `CandidateSet.selectedAt` is.
+
+### One read for N candidates, and what a failed read then means
+
+`gatherCandidateSetData` does **one** `bot_instances` read for the whole set —
+step 34's design — and reports it on `exposure`. If that read fails, every
+candidate's concentration slot carries **that same error object by identity**.
+Not a duplicated guess: it genuinely was one read, and N identical recorded
+failures is an accurate report of it. Candles are unaffected and still fetched
+per candidate.
 
 ## Candidate selection: one shape, two entry points, merged provenance
 
@@ -344,20 +424,27 @@ recorded about proposals nobody acted on.
 - **A trending vendor, and any transport for one.** `TrendingSource` is a port
   and nothing implements it. No trending API has been called from this
   repository, and the vendor research is in decision log 31.
-- **An HTTP endpoint for candidate selection or the concentration flag**, and
-  everything LLM-shaped — Assess, Derive, proposal assembly, the proposal record,
-  the audit table.
+- **An HTTP endpoint for candidate selection, the concentration flag or Stage 1
+  assembly**, and everything LLM-shaped — Assess, Derive, proposal assembly, the
+  proposal record, the audit table.
+- **Any judgement about whether a bundle is good enough.** `gather.ts`
+  deliberately does not rank, filter or refuse. That is Stage 4's job and
+  building it here would put a policy decision in the collection layer.
+- **Concurrent gathering.** `gatherCandidateSetData` fetches candles one
+  candidate at a time, so a general run does not burst the rate budget section
+  5.4 owns. Isolation does not depend on the ordering, so this can change later
+  without changing what a bundle means.
 - **A stopped bot, and a second capital asset, on the real account.** Both code
   paths exist and are fixture-tested; neither has ever been observed live. See
   the two unobserved paths above.
 
-`fetchCandleWindow`'s only caller is its endpoint. `fetchNewsSentiment` has **no
-non-test caller at all**, and `envNewsFetcher`'s `fetch` call has never executed
-against CoinDesk. `readWatchlist` finally has a non-test caller —
-`selectGeneralCandidates` — which itself has none. `concentration.ts` has **no
-non-test caller either**: it consumes `candidates.ts`'s `Candidate` and
-`CandidateSet` types, but nothing yet calls both in sequence, because the thing
-that would is the proposal pipeline.
+`fetchCandleWindow` now has two callers: its endpoint, and `gather.ts`.
+`fetchNewsSentiment` still has **no non-test caller at all**, and
+`envNewsFetcher`'s `fetch` call has never executed against CoinDesk — `gather.ts`
+deliberately does not call it, and holds no port that could. `readWatchlist`'s
+caller is `selectGeneralCandidates`, which itself has none. `concentration.ts`'s
+caller is now `gather.ts`. **`gather.ts` itself has no non-test caller**, because
+the thing that would call it is the proposal pipeline.
 
 **Watchlist entries are not re-checked against the venue at selection time.**
 A pair delisted after it was added stays a candidate until someone removes it.

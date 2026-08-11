@@ -7,7 +7,16 @@
  * deliberate, human-chosen half of candidate selection -- the read path a later
  * stage will consume, 21.4 Stage 1's candle fetch for arbitrary tradable pairs,
  * 21.4 Stage 1's news-and-sentiment fetch, and 21.2/21.3's candidate selection
- * for both entry points, and 21.4 Stage 1's over-concentration FLAG.
+ * for both entry points, 21.4 Stage 1's over-concentration FLAG, and the
+ * assembly that collects those inputs into one bundle per candidate.
+ *
+ * The assembly (`gather.ts`) reads nothing new. It returns an HONEST PARTIAL
+ * bundle: each input's real success or failure is recorded on its own slot, and
+ * one input's failure never removes another's result. Whether a bundle is fit to
+ * show a human is Stage 4's judgement and is NOT made here.
+ *
+ * The news slot in every bundle is `NEWS_NOT_YET_AVAILABLE` -- a deliberate
+ * paused state, never a failed fetch. See decision log 30.
  *
  * The concentration check is a flag for a human, never a filter: it reads
  * `bot_instances` and states what an account already holds. Its two thresholds
@@ -74,6 +83,22 @@ export {
   type ExposureBot,
   type PairHolding,
 } from "./concentration";
+
+export {
+  gatherCandidateData,
+  gatherCandidateSetData,
+  NEWS_NOT_YET_AVAILABLE,
+  type CandidateGatherBundle,
+  type CandidateSetGatherBundle,
+  type CandleInput,
+  type ConcentrationInput,
+  type ExposureInput,
+  type GatherPorts,
+  type GatherRequest,
+  type GatheredInput,
+  type NewsInput,
+  type NewsNotYetAvailable,
+} from "./gather";
 
 export {
   fetchCandleWindow,
