@@ -36,6 +36,7 @@ import {
   type SymbolDetailLister,
 } from "../workers/symbols";
 import { envCandleLister, type CandleLister } from "../workers/candles";
+import type { AssessModel } from "../research/assess";
 
 const ROUTES: readonly Route[] = [
   route("GET", "/api/bots", handlers.listBots),
@@ -60,6 +61,11 @@ const ROUTES: readonly Route[] = [
   // first caller in this system to issue N venue candle requests under one
   // request, which no test can measure because every test drives a stub.
   route("GET", "/api/accounts/:label/gather", handlers.getAccountGather),
+  // Section 21.4 Stage 2 (Assess). ONE named candidate: gather, then one model
+  // call, then a response carrying both. Deliberately not the watchlist -- at
+  // 10.5-20.3 s per assessment a multi-candidate synchronous request is a
+  // different design problem, not a parameter on this one.
+  route("GET", "/api/accounts/:label/assess", handlers.getAccountAssess),
   // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
   // dashboard control for these is deliberately a later step; today they are the
   // curl-callable surface that replaces editing the table by hand.
@@ -94,6 +100,11 @@ export interface ApiOptions {
   readonly symbolLister?: SymbolLister;
   /** Injected by tests so the candles endpoint makes no live exchange call. */
   readonly candleLister?: CandleLister;
+  /**
+   * Injected by tests so the assess endpoint makes NO live model call. Absent in
+   * the Worker, where `getAccountAssess` builds the real one from `env.AI`.
+   */
+  readonly assessModel?: AssessModel;
   /**
    * Injected by tests so bot creation's spot-instrument check makes no live
    * exchange call.
@@ -175,6 +186,7 @@ export async function handleApiRequest(
       botNamespace: requireBotNamespace(env, options.botNamespace),
       symbolLister: options.symbolLister ?? envSymbolLister,
       candleLister: options.candleLister ?? envCandleLister,
+      ...(options.assessModel === undefined ? {} : { assessModel: options.assessModel }),
       symbolDetailLister: options.symbolDetailLister ?? envSymbolDetailLister,
       now: options.now ?? (() => Date.now()),
       newId: options.newId ?? (() => crypto.randomUUID()),

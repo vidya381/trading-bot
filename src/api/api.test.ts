@@ -32,6 +32,7 @@ import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
 import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
+import type { AssessModel } from "../research/assess";
 import type { Candle, SymbolFilters } from "../shared/exchange-client";
 
 const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
@@ -125,6 +126,10 @@ interface ApiCall {
   readonly candleLister?: CandleLister;
   /** Inject bot creation's per-symbol details lister, for the same reason. */
   readonly symbolDetailLister?: SymbolDetailLister;
+  /** Inject the assess endpoint's model, so NO test ever reaches a paid vendor. */
+  readonly assessModel?: AssessModel;
+  /** Inject a Database, to drive a read failure the real one cannot be made to produce. */
+  readonly db?: Database;
 }
 
 async function api(method: string, path: string, call: ApiCall = {}): Promise<{ status: number; body: any }> {
@@ -155,6 +160,8 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
     ...(call.symbolDetailLister !== undefined
       ? { symbolDetailLister: call.symbolDetailLister }
       : {}),
+    ...(call.assessModel !== undefined ? { assessModel: call.assessModel } : {}),
+    ...(call.db !== undefined ? { db: call.db } : {}),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -3987,5 +3994,386 @@ describe("gather endpoint (section 21.4 Stage 1 assembly)", () => {
     });
     expect(written.status).toBe(405);
     expect(written.body.error.code).toBe("method_not_allowed");
+  });
+});
+
+/**
+ * The assess endpoint (section 21.4 Stage 2) -- gather then one model call.
+ *
+ * NO TEST HERE REACHES A MODEL. Every assessment is driven by an injected fake
+ * that records its calls, and three tests assert the call count POSITIVELY
+ * rather than inferring it from the response -- `news.ts`'s mutation lesson
+ * (decision log 30), where a test asserted the right conclusion for the wrong
+ * reason and, under mutation, pointed the suite at a live vendor.
+ *
+ * Five properties, each one this endpoint would look correct without:
+ *
+ *  1. THE WHOLE ANSWER IS ON THE WIRE. Strategy, claims with their citations
+ *     RESOLVED to real evidence, every evidence item OFFERED (not just the cited
+ *     ones), the envelope shape, the duplicate-key report, and the gather bundle
+ *     that produced it all. Anything missing here is a proposal a human cannot
+ *     check (21.5 requirement 2).
+ *  2. A FAILED INPUT IS REPORTED, NOT HIDDEN. A failed concentration read comes
+ *     back in the bundle with its own code, beside a real assessment -- because
+ *     the prompt states it as missing and the answer is still grounded.
+ *  3. NO PRICES MEANS NO MODEL CALL. The precondition fires before the model,
+ *     and the model is asked ZERO times.
+ *  4. A BAD ANSWER IS A FAILED REQUEST. A parse refusal is a 502 carrying the
+ *     parser's own code -- never a 200 with a degraded body.
+ *  5. THE BIGINTS SURVIVE. The bundle carries `policy.assetCapitalShareFlagAtPct`
+ *     and `allocatedCapital`, both of which throw `JSON.stringify` unconverted
+ *     (decision log 36). These assertions run against `res.body`, after
+ *     serialization, because that is the only place the bug exists.
+ */
+describe("assess endpoint (section 21.4 Stage 2)", () => {
+  const MINUTE = 60_000;
+  const VENUE_ANSWERED_AT = 1_960_000_000_000;
+
+  const catalogue: SymbolLister = async () => ({ ok: true, value: ["BTCUSD", "ETHUSD"], at: T0 });
+
+  function candleAt(pair: string, openTime: number, close: bigint): Candle {
+    return {
+      pair,
+      openTime,
+      closeTime: openTime + MINUTE,
+      open: close - 1n,
+      high: close + 2n,
+      low: close - 3n,
+      close,
+      volume: 400_000_000n,
+      closed: true,
+    };
+  }
+
+  const goodVenue: CandleLister = async (_account, query) => ({
+    ok: true,
+    value: [
+      candleAt(query.pair, T0 - 3 * MINUTE, 100_000_000n),
+      candleAt(query.pair, T0 - 2 * MINUTE, 101_000_000n),
+      candleAt(query.pair, T0 - MINUTE, 102_000_000n),
+    ],
+    at: VENUE_ANSWERED_AT,
+  });
+
+  const deadVenue: CandleLister = async () => ({
+    ok: false,
+    kind: "transport",
+    message: "connect ETIMEDOUT",
+    retryable: true,
+    at: VENUE_ANSWERED_AT,
+  });
+
+  async function account(prefix: string) {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    return label;
+  }
+
+  async function bot(label: string, id: string, pair: string, allocated: string) {
+    await db.botInstances.insert(
+      botInstanceRow({
+        id: `${id}-${suffix}`,
+        account_label: label,
+        exchange: "gemini",
+        pair,
+        allocated_capital: m(allocated),
+        capital_asset: "USD",
+        status: "running",
+      }),
+    );
+  }
+
+  /** A model that answers with whatever it is given, and counts its calls. */
+  function fakeModel(answer: unknown) {
+    const prompts: string[] = [];
+    const model: AssessModel = async (request) => {
+      prompts.push(request.prompt);
+      return { text: answer, raw: answer };
+    };
+    return { model, prompts };
+  }
+
+  /** The shape a real call really returns (decision logs 37, 39). */
+  const goodAnswer = (citations: string[] = ["candles.range_pct"]) => ({
+    response: {
+      strategy: "grid",
+      claims: [{ statement: "The range is wide relative to the close.", citations }],
+    },
+  });
+
+  const assessPath = (label: string, query: Record<string, string>) =>
+    `/api/accounts/${label}/assess?${new URLSearchParams(query).toString()}`;
+
+  // -- Property 1: the whole answer ------------------------------------------
+
+  it("returns the assessment and the bundle it was drawn from", async () => {
+    const label = await account("as-ok");
+    await bot(label, "b1", "BTCUSD", "500");
+    const { model, prompts } = fakeModel(goodAnswer());
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+
+    expect(res.status).toBe(200);
+    expect(prompts, "the model was not called exactly once").toHaveLength(1);
+
+    const { assess, bundle, entryPoint } = res.body.data;
+    expect(entryPoint).toBe("named");
+
+    expect(assess.strategy).toBe("grid");
+    expect(assess.model).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+    expect(assess.envelope).toBe("envelope_object");
+    expect(assess.duplicateKeyCheck).toBe("unavailable_transport_parsed");
+    expect(assess.promptVersion).toBe("assess/1");
+    expect(assess.promptChars).toBe(prompts[0]!.length);
+    expect(typeof assess.latencyMs).toBe("number");
+
+    // The claim's citation is RESOLVED: id, label, the rendered value, and the
+    // path into the bundle. A bare id would leave a reader unable to check it.
+    expect(assess.claims).toHaveLength(1);
+    const cited = assess.claims[0].citations[0];
+    expect(cited.id).toBe("candles.range_pct");
+    expect(typeof cited.label).toBe("string");
+    // TYPE AND CONTENT, not `not.toBe("")`. A dropped field is `undefined`, and
+    // `expect(undefined).not.toBe("")` PASSES -- the exact weak-assertion bug
+    // decision log 36 recorded, found here again by the mutation run.
+    expect(typeof cited.value).toBe("string");
+    expect(cited.value).toMatch(/%$/);
+    expect(typeof cited.source).toBe("string");
+    expect(cited.source).toContain("candles.value.candles");
+    // And the resolved citation carries the SAME value the evidence table does,
+    // so the two cannot drift into disagreeing about one datum.
+    const offered = assess.evidence.find((e: { id: string }) => e.id === "candles.range_pct");
+    expect(offered).toBeDefined();
+    expect(cited.value).toBe(offered.value);
+    expect(cited.source).toBe(offered.source);
+
+    // Everything OFFERED, so what the model ignored is visible.
+    expect(assess.evidence.length).toBeGreaterThan(assess.claims[0].citations.length);
+    expect(assess.evidence.some((e: { id: string }) => e.id === "concentration.status")).toBe(true);
+    expect(assess.evidence.some((e: { id: string }) => e.id === "news.status")).toBe(true);
+
+    // The settings that produced it, echoed whole.
+    expect(assess.settings.temperature).toBe(0);
+    expect(assess.settings.seed).toBe(20260811);
+    expect(assess.settings.responseFormat.type).toBe("json_schema");
+
+    // And the raw source data beside the answer.
+    expect(bundle.candles.outcome).toBe("ok");
+    expect(bundle.candles.value.count).toBe(3);
+    expect(bundle.news.outcome).toBe("not_yet_available");
+    expect(bundle.candidate.pair).toBe("BTCUSD");
+  });
+
+  // -- Property 5: the bigints that throw JSON.stringify ----------------------
+
+  it("serializes the bundle's money fields rather than returning a 500", async () => {
+    const label = await account("as-money");
+    await bot(label, "b1", "BTCUSD", "500");
+    await bot(label, "b2", "BTCUSD", "500");
+    const { model } = fakeModel(goodAnswer());
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+
+    expect(res.status).toBe(200);
+    // The policy threshold: a POLICY field, not an amount, and the last place
+    // anyone auditing money looks. Unconverted it is a 500 on every success.
+    expect(res.body.data.bundle.concentration.value.policy.assetCapitalShareFlagAtPct).toBe("40.00000000");
+    expect(res.body.data.bundle.candles.value.candles[0].close).toBe("1.00000000");
+  });
+
+  // -- Property 2: a failed input is reported, not hidden ---------------------
+
+  it("still assesses when the concentration read failed, and reports the failure", async () => {
+    const label = await account("as-conc");
+    const { model, prompts } = fakeModel(goodAnswer());
+    // A Proxy rather than a spread: `Database`'s own methods (`tableExists`,
+    // which the schema guard calls before any handler runs) may live on a
+    // prototype, and a spread would drop them and turn this into a 500 for a
+    // reason that has nothing to do with what is being tested.
+    // Methods are bound to the TARGET, not the proxy. `Database` uses private
+    // fields (`#d1`), and a private field read through a Proxy receiver throws
+    // "Cannot read private member ... from an object whose class did not declare
+    // it" -- which would turn this into a 500 for a reason that has nothing to do
+    // with what is being tested. The schema guard calls `tableExists` before any
+    // handler runs, so it fails first and the test never reaches the assertion.
+    const brokenBots = new Proxy(db.botInstances, {
+      get(target, prop) {
+        if (prop === "findMany") {
+          return async () => {
+            throw new Error("D1 refused the read");
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const broken = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "botInstances") return brokenBots;
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as Database;
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+      db: broken,
+    });
+
+    expect(res.status).toBe(200);
+    expect(prompts).toHaveLength(1);
+    // The assessment happened...
+    expect(res.body.data.assess.strategy).toBe("grid");
+    // ...the gap is reported with the producing module's OWN code...
+    expect(res.body.data.bundle.concentration.outcome).toBe("failed");
+    expect(res.body.data.bundle.concentration.error.code).toBe("bot_list_unreadable");
+    // ...and the model was TOLD it was missing rather than not told at all.
+    expect(prompts[0]).toContain("bot_list_unreadable");
+    expect(prompts[0]).toContain("MISSING");
+  });
+
+  // -- Property 3: no prices, no model call ----------------------------------
+
+  it("refuses with no candle window, and does NOT call the model", async () => {
+    const label = await account("as-nocandles");
+    const { model, prompts } = fakeModel(goodAnswer());
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: deadVenue,
+      assessModel: model,
+    });
+
+    // 502, and `candles_unavailable`: the venue answered badly, which is the
+    // same distinction that code draws one stage earlier. The generic
+    // `no_price_history` is what the precondition threw; the wire reports why.
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("candles_unavailable");
+    expect(res.body.error.message).toContain("no assessment was attempted");
+    expect(res.body.error.message).toContain("BTCUSD");
+    expect(prompts, "a model call was spent on a candidate with no prices").toHaveLength(0);
+  });
+
+  it("refuses an untradable pair before any model call", async () => {
+    const label = await account("as-untradable");
+    const { model, prompts } = fakeModel(goodAnswer());
+
+    const res = await api("GET", assessPath(label, { pair: "NOPEUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("pair_not_tradable");
+    expect(prompts).toHaveLength(0);
+  });
+
+  // -- Property 4: a bad answer is a failed request --------------------------
+
+  it("turns a parse refusal into a 502 carrying the parser's own code", async () => {
+    const label = await account("as-badjson");
+    const { model, prompts } = fakeModel({ response: "I'd suggest a grid here." });
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("not_json");
+    expect(res.body.data).toBeNull();
+    expect(prompts, "the endpoint retried a refused answer").toHaveLength(1);
+  });
+
+  it("refuses a hedged strategy rather than coercing it", async () => {
+    const label = await account("as-hedged");
+    const { model } = fakeModel({
+      response: { strategy: "dca or grid", claims: [{ statement: "x", citations: ["candles.count"] }] },
+    });
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("strategy_not_recognised");
+  });
+
+  it("refuses an invented citation, so ungrounded prose never reaches a human", async () => {
+    const label = await account("as-invented");
+    const { model } = fakeModel(goodAnswer(["candles.rsi_14"]));
+
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("citation_unknown");
+  });
+
+  // -- Parameters -------------------------------------------------------------
+
+  it("requires `pair`", async () => {
+    const label = await account("as-nopair");
+    const res = await api("GET", assessPath(label, { interval: "1m" }), { symbolLister: catalogue });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+  });
+
+  it("requires `interval`, with no default", async () => {
+    const label = await account("as-nointerval");
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD" }), { symbolLister: catalogue });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("missing_field");
+    expect(res.body.error.message).toContain("DIFFERENT");
+  });
+
+  /**
+   * The refusal must name the REAL cause, not the proximate one.
+   *
+   * `1h` is a declared interval that `VERIFIED_INTERVALS` does not contain, so
+   * the candle fetch refuses with `interval_not_verified` and the bundle comes
+   * back with no window -- which then trips `assessCandidate`'s
+   * `no_price_history` precondition. Reporting THAT would send an operator to
+   * check the venue's prices when the actual answer is "this system has never
+   * verified that interval". The endpoint surfaces the candle module's own code
+   * and status instead, with the precondition itself untouched.
+   */
+  it("names the real reason a candle window is missing, not just `no_price_history`", async () => {
+    const label = await account("as-badinterval");
+    const { model, prompts } = fakeModel(goodAnswer());
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1h" }), {
+      symbolLister: catalogue,
+      candleLister: goodVenue,
+      assessModel: model,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("interval_not_verified");
+    // Both halves: what actually failed, and that nothing was assessed because of it.
+    expect(res.body.error.message).toContain("no assessment was attempted");
+    expect(res.body.error.message).toContain("BTCUSD");
+    expect(prompts).toHaveLength(0);
+  });
+
+  it("is Access-gated like every other route", async () => {
+    const label = await account("as-auth");
+    const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), { token: null });
+    expect(res.status).toBe(401);
   });
 });

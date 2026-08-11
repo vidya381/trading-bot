@@ -43,11 +43,14 @@ import type {
 import type { BotSnapshot } from "../durable-objects/bot-instance";
 import type {
   AccountExposure,
+  AssessResult,
   Candidate,
   CandidateGatherBundle,
   CandidateSetGatherBundle,
   CandleWindow,
+  CitedClaim,
   ConcentrationResult,
+  EvidenceItem,
   GatheredInput,
   NewsInput,
   WatchlistEntry,
@@ -687,5 +690,77 @@ export function botDetail(
     orders: orders.map(orderView),
     trades: trades.map(tradeView),
     alerts: alerts.map(alertView),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Section 21.4 Stage 2 (Assess)
+// ---------------------------------------------------------------------------
+
+/**
+ * One citable datum, exactly as the model was shown it.
+ *
+ * All four fields, and each is load-bearing for 21.5 requirement 2: `id` is
+ * what a claim cites, `label` is what the model read beside it, `value` is the
+ * rendered datum BYTE-IDENTICAL to what went into the prompt, and `source` is
+ * the path into the gather bundle it came from. Dropping `source` would leave a
+ * reader able to see the number but not to check where it came from, which is
+ * the difference between evidence and assertion.
+ */
+export function evidenceItemView(item: EvidenceItem) {
+  return { id: item.id, label: item.label, value: item.value, source: item.source };
+}
+
+/**
+ * One claim, with its citations RESOLVED rather than referenced.
+ *
+ * The citations are whole `EvidenceItem`s, not id strings. A list of bare ids
+ * would make a human look each one up to check the reasoning, which is the same
+ * as not shipping them (21.5 requirement 2 wants the reasoning checkable
+ * against the real source, not merely traceable to it).
+ */
+export function citedClaimView(claim: CitedClaim) {
+  return {
+    statement: claim.statement,
+    citations: claim.citations.map(evidenceItemView),
+  };
+}
+
+/**
+ * A whole assessment, over the wire.
+ *
+ * WHAT IS DELIBERATELY HERE:
+ *
+ *   * `evidence` is EVERYTHING the model was offered, not only what it cited.
+ *     What a model IGNORED is only visible from the difference between this and
+ *     the citations, and a model that ignored the concentration flag is a fact
+ *     worth being able to see.
+ *   * `envelope` and `duplicateKeyCheck` are published because they vary per
+ *     call and say WHICH GUARANTEES ACTUALLY HELD for this particular answer
+ *     (decision log 37): on the object path the duplicate-key protection is
+ *     structurally unavailable, and a response that hid that would be claiming
+ *     a check it never ran.
+ *   * `settings` is echoed whole, `response_format` schema included, so the
+ *     determinism stance a given answer was produced under is reconstructable
+ *     rather than assumed from today's constants.
+ *
+ * WHAT IS DELIBERATELY ABSENT: `promptText`. It is ~16KB and, for the one job a
+ * reader needs it for -- checking a claim against the datum it cites -- the
+ * `evidence` array carries the same values in a form that is actually
+ * comparable. `promptChars` is published so the size is still visible.
+ * The bundle travels beside this in the response, so the raw source is not lost.
+ */
+export function assessResultView(result: AssessResult, latencyMs: number) {
+  return {
+    strategy: result.strategy,
+    claims: result.claims.map(citedClaimView),
+    evidence: result.evidence.map(evidenceItemView),
+    promptVersion: result.promptVersion,
+    promptChars: result.promptText.length,
+    model: result.model,
+    settings: jsonSafe(result.settings),
+    envelope: result.envelope,
+    duplicateKeyCheck: result.duplicateKeyCheck,
+    latencyMs,
   };
 }

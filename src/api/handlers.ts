@@ -27,6 +27,7 @@ import {
   killSwitchView,
   manualAdjustmentView,
   watchlistEntryView,
+  assessResultView,
   type BotFees,
 } from "./serialize";
 import {
@@ -38,8 +39,12 @@ import {
   gatherCandidateSetData,
   readWatchlist,
   removeFromWatchlist,
+  assessCandidate,
+  AssessError,
+  AssessParseError,
   selectNamedCandidate,
   selectWatchlistCandidates,
+  type AssessResult,
   type CandidateEntryPoint,
   type CandleSource,
   type GatherPorts,
@@ -65,6 +70,7 @@ import {
   listAccountSymbols,
   type SymbolCacheStore,
 } from "../workers/symbols";
+import { envAssessModel } from "../workers/assess";
 import type { Asset, CandleInterval, Pair } from "../shared/exchange-client";
 import { fromDecimalString, toDecimalString, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
@@ -1659,6 +1665,178 @@ export async function getAccountGather(ctx: ApiContext): Promise<Response> {
   const bundle = await gatherCandidateSetData(ports, set, request);
   return ok({ entryPoint: "watchlist" as const, set: candidateSetGatherBundleView(bundle) });
 }
+
+// ---------------------------------------------------------------------------
+// Section 21.4 Stage 2 (Assess)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/accounts/:label/assess -- gather ONE named candidate and assess it.
+ *
+ * The first endpoint that runs a model. It is deliberately the SMALLEST one that
+ * can: a single named pair, one gather, one assess, one response.
+ *
+ * ── WHY ONE CANDIDATE, AND NOT THE WATCHLIST ──
+ *
+ * Assess costs 10.5-20.3 s per call across the four live samples this project
+ * has taken (decision logs 37, 39). A watchlist run is 5-10 candidates plus a
+ * trending pull, so a synchronous multi-candidate request is minutes long and is
+ * a DIFFERENT DESIGN PROBLEM -- queued, or streamed, or chunked -- rather than a
+ * variant of this one. This endpoint answers "does one real candidate work end
+ * to end". `entryPoint` is fixed to `named` and there is no batch parameter to
+ * grow one accidentally.
+ *
+ * ── THE DURATION QUESTION, SETTLED BEFORE BUILDING ──
+ *
+ * A 10-20 s handler is safe here, and that is checked rather than assumed.
+ * Cloudflare documents HTTP-triggered Workers as having **no wall-clock duration
+ * limit** ("no hard limit ... as long as the client remains connected"), and CPU
+ * time -- the limit that does exist, 30 s by default on Workers Paid -- excludes
+ * time spent waiting on network requests. A Workers AI call is almost entirely
+ * that wait. See the session notes for the full citation and the one real
+ * caveat: a runtime update gives in-flight requests a 30-second grace period,
+ * which a 20 s request could in principle collide with.
+ *
+ * ── WHAT FAILS THE REQUEST, AND WHAT MERELY GETS REPORTED ──
+ *
+ * The rule is: **the model is asked only when the question can be grounded, and
+ * every other gather failure is REPORTED rather than propagated.**
+ *
+ *   * NO CANDLE WINDOW -> the request fails (`no_price_history`, 503).
+ *     `assessCandidate` refuses before spending a model call, and this endpoint
+ *     does not work around that. A strategy pick with no prices could only come
+ *     from training knowledge, which 21.5 requirement 1 forbids.
+ *   * CONCENTRATION FAILED, or the paused news slot -> the assessment RUNS, and
+ *     the failure is stated to the model as missing (`buildAssessPrompt`) and
+ *     returned verbatim in `bundle.concentration`. Refusing here would be the
+ *     over-propagation `gather.ts` exists to avoid: losing a usable, grounded
+ *     strategy assessment because an unrelated D1 read failed. The human still
+ *     sees the gap, prominently, in the same response.
+ *
+ * A model that answers badly is NOT a degraded success: `AssessParseError`
+ * becomes a 502 with the parser's own code, because the upstream answered and
+ * its answer was unusable -- exactly what `candles_unavailable` means one stage
+ * earlier.
+ *
+ * ── IT PERSISTS NOTHING ──
+ *
+ * No proposal record, no audit row, no D1 write of any kind. 21.5 requirement
+ * 5's full audit logging belongs to pipeline assembly (Stage 4) and is NOT
+ * satisfied, partially satisfied, or begun here. This endpoint returns a live
+ * result and forgets it.
+ */
+export async function getAccountAssess(ctx: ApiContext): Promise<Response> {
+  const label = ctx.params.label!;
+
+  const pair = ctx.url.searchParams.get("pair");
+  if (pair === null || pair.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "pair" is required and must be the venue's own symbol, exactly as ` +
+        `GET /api/accounts/${label}/symbols reports it`,
+    );
+  }
+
+  // Required with no default, for the reason `getAccountGather` and
+  // `fetchCandleWindow` both give: a wrong interval does not error, it returns
+  // correctly-shaped candles of a DIFFERENT duration that no reader downstream
+  // can distinguish -- and here that would reach a model as fact.
+  const interval = ctx.url.searchParams.get("interval");
+  if (interval === null || interval.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "interval" is required and must be one of ${CANDLE_INTERVALS.join(", ")}. ` +
+        `There is no default: a wrong interval returns correctly-shaped candles of a DIFFERENT ` +
+        `duration, which passes every type check and which no downstream reader can detect.`,
+    );
+  }
+  if (!CANDLE_INTERVALS.includes(interval as CandleInterval)) {
+    throw badRequest(
+      "invalid_filter",
+      `interval must be one of ${CANDLE_INTERVALS.join(", ")}, not ${JSON.stringify(interval)}`,
+    );
+  }
+
+  const sinceParam = ctx.url.searchParams.get("since");
+  let since: number | undefined;
+  if (sinceParam !== null) {
+    const parsed = Number(sinceParam);
+    if (sinceParam.trim() === "" || !Number.isInteger(parsed) || parsed < 0) {
+      throw badRequest(
+        "invalid_field",
+        `query parameter "since", if given, must be a non-negative integer of ` +
+          `epoch milliseconds, not ${JSON.stringify(sinceParam)}`,
+      );
+    }
+    since = parsed;
+  }
+
+  const request: GatherRequest = {
+    interval: interval as CandleInterval,
+    ...(since === undefined ? {} : { since }),
+    ...(() => {
+      const quoteAssets = optionalCsv(ctx, "quoteAssets");
+      return quoteAssets === undefined ? {} : { quoteAssets };
+    })(),
+  };
+
+  const ports = gatherPorts(ctx);
+  const set = await selectNamedCandidate(ports, {
+    accountLabel: label,
+    pair,
+    // The layer's standing rule: the actor is the email VERIFIED off the Access
+    // token, never a caller-supplied string (21.5 requirement 2).
+    requestedBy: ctx.actor,
+  });
+  const bundle = await gatherCandidateData(ports, set.candidates[0]!, request);
+
+  const model = ctx.assessModel ?? envAssessModel(ctx.env);
+
+  const startedAt = ctx.now();
+  let result: AssessResult;
+  try {
+    result = await assessCandidate(model, bundle);
+  } catch (error) {
+    // The parser's twenty codes share one status but keep their OWN code on the
+    // wire -- a second vocabulary restating them would drift, which is the rule
+    // `GatheredInput` follows one layer down. 502 because the model answered and
+    // its answer was unusable, the same distinction `candles_unavailable` draws
+    // against `tradable_set_unreadable`.
+    if (error instanceof AssessParseError) {
+      throw new ApiError(502, error.code, error.message);
+    }
+    // `assessCandidate` refuses a bundle with no usable candle window, and its
+    // code says only THAT -- `no_price_history` -- because at that layer the
+    // reason is genuinely not known. Here it is: the candle slot is right there
+    // carrying the producing module's own error. Reporting the proximate cause
+    // when the real one is in hand would send an operator to look at prices when
+    // the actual answer is "you asked for an interval this system has never
+    // verified". So the underlying code and message are surfaced, with the
+    // precondition itself UNCHANGED and unbypassed -- `assessCandidate` is still
+    // what refused, and it still ran before any model call.
+    if (error instanceof AssessError && bundle.candles.outcome === "failed") {
+      const cause = bundle.candles.error;
+      throw new ApiError(
+        statusForCode(cause.code, 502),
+        cause.code,
+        `${cause.message} -- so no assessment was attempted for ${bundle.candidate.pair}: ${error.message}`,
+      );
+    }
+    throw error;
+  }
+  const latencyMs = ctx.now() - startedAt;
+
+  return ok({
+    entryPoint: "named" as const,
+    selectedAt: set.selectedAt,
+    // The bundle travels WITH the assessment, never instead of it: every input's
+    // real state, including any that failed, beside the answer drawn from them
+    // (21.5 requirement 2's "display the actual raw data it used").
+    bundle: candidateGatherBundleView(bundle),
+    assess: assessResultView(result, latencyMs),
+  });
+}
+
 
 // ---------------------------------------------------------------------------
 // Alerts

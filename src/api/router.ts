@@ -17,6 +17,7 @@ import type { Database } from "../db/database";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
+import type { AssessModel } from "../research/assess";
 
 /** Everything a handler is given: the request, the verified actor, and ports. */
 export interface ApiContext {
@@ -44,6 +45,14 @@ export interface ApiContext {
    * answer different questions of the venue and only one of them is cached.
    */
   readonly candleLister: CandleLister;
+  /**
+   * Reaches Workers AI for the Assess stage (section 21.4). Injected for the
+   * same reason `candleLister` is, and one reason stronger: a test that fell
+   * through to the real binding would spend money at a paid vendor, so the
+   * default is built from `env` only at the call site and every test supplies a
+   * stub. `assess.test.ts` asserts the stub is called exactly once per request.
+   */
+  readonly assessModel?: AssessModel;
   /**
    * Reaches an account's exchange for ONE symbol's details, which is where a
    * venue that lists both says whether a symbol is spot or a perpetual.

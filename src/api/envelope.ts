@@ -247,6 +247,31 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   //                         trending pull is a dependency being down, which is
   //                         the tier above, not a caller's bad request.
   no_trending_vendor: 503,
+
+  // Section 21.4 Stage 2 (Assess, /src/research/assess.ts + /src/workers/assess.ts).
+  //
+  //   no_price_history  503, joining `tradable_set_unreadable` and
+  //                     `no_trending_vendor`. The request is well formed and the
+  //                     system cannot serve it right now because an UPSTREAM
+  //                     input is missing -- `assessCandidate` refuses to ask a
+  //                     model to judge volatility with no prices, since the only
+  //                     place such an answer could come from is the training
+  //                     knowledge 21.5 requirement 1 forbids. Retrying later,
+  //                     when the venue answers, is the right response, which is
+  //                     what 503 tells a caller and 400 would not.
+  //
+  //   no_ai_binding     503, with `no_trending_vendor` for the same reason and
+  //                     almost the same sentence: the environment has no vendor
+  //                     configured, NO CALL WAS ATTEMPTED, and retrying without
+  //                     changing the deployment cannot help.
+  //
+  // AssessParseError's twenty codes are deliberately NOT listed here. They share
+  // one status (502, the model answered and its answer was unusable -- exactly
+  // `candles_unavailable`'s distinction one stage earlier) and `getAccountAssess`
+  // maps the class in one place, keeping each real code on the wire. Twenty
+  // near-identical rows would be a second vocabulary to keep in step.
+  no_price_history: 503,
+  no_ai_binding: 503,
   trending_unavailable: 503,
 };
 
