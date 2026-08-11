@@ -16,7 +16,7 @@
     "test:watch": "vitest",
     "test:deploy-guard": "node --test scripts/verify-dashboard-build.test.mjs",
     "typecheck": "tsc --noEmit",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types --strict-vars=false"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.6",
