@@ -1,13 +1,17 @@
 # `/src/research` — groundwork for section 21
 
 Section 21 (LLM-assisted research and bot proposals) is **PLANNED, NOT YET
-BUILT**, and that banner still holds. There is no pipeline, no prompt, no
-proposal record and no Workers AI call in this folder.
+BUILT**, and the part of that banner which matters still holds exactly: **there
+is no Workers AI call, no model binding, no proposal record and no pipeline** in
+this folder or in `wrangler.jsonc`. What has changed is that **there is now a
+prompt** — see the Stage 2 section below, which is the reason the banner is
+qualified rather than repeated unchanged.
 
 What exists is the storage for **21.3's fixed watchlist**, **all three of 21.4
-Stage 1's reads**, **candidate selection for 21.2's entry points and one deliberate third door**, and
+Stage 1's reads**, **candidate selection for 21.2's entry points and one deliberate third door**,
 **the assembly that collects Stage 1's inputs into one bundle per candidate** —
-the last of which reads nothing new and consumes everything above it.
+which reads nothing new and consumes everything above it — and **21.4 Stage 2's
+prompt, its fail-closed parser, and the port a model would sit behind**.
 
 | File | What it is |
 | --- | --- |
@@ -18,6 +22,9 @@ the last of which reads nothing new and consumes everything above it.
 | `candidates.ts` | `selectNamedCandidate` / `selectWatchlistCandidates` / `selectGeneralCandidates`: three doors feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it, so the general door cannot run at all today |
 | `concentration.ts` | `readAccountExposure` + `assessConcentration`: 21.4 Stage 1's third read — what the account already holds on a candidate's pair and asset. **A flag for a human, never a filter**, and its two thresholds are **policy choices verified against nothing** |
 | `gather.ts` | `gatherCandidateData` / `gatherCandidateSetData`: Stage 1's four inputs collected into one bundle per candidate. **No read of its own.** Returns an **honest partial** bundle — one input's failure never removes another's result — and carries the **paused** news slot |
+| `assess-prompt.ts` | `buildAssessPrompt`: the **deterministic, pure** transformation from a bundle to the exact prompt text plus a table of citable `EvidenceItem`s. Every outcome state produces text; a failed input produces **more** text, never silence |
+| `assess-parse.ts` | `parseAssessResponse`: the **strict, fail-closed** reader. Resolves exactly `"dca"` or `"grid"` with cited claims, or throws. No case folding, no fence stripping, no JSON-from-prose extraction, no default |
+| `assess.ts` | The `AssessModel` **port with nothing behind it**, the determinism settings that would be requested, `AssessResult`, and `assessCandidate` — which catches nothing and refuses a bundle with no price history **before** any model call |
 
 ## Stage 1 assembly is collection, not judgement
 
@@ -96,6 +103,103 @@ candidate's concentration slot carries **that same error object by identity**.
 Not a duplicated guess: it genuinely was one read, and N identical recorded
 failures is an accurate report of it. Candles are unaffected and still fetched
 per candidate.
+
+## Stage 2 is a prompt, a parser and an empty port
+
+No model is called from anywhere in this repository. `AssessModel` is abstract,
+`wrangler.jsonc` has no `ai` binding, and every test drives a stub that returns a
+string a human wrote. The two pieces that are built are the two whose
+correctness is checkable **without** a model, and they are the two that decide
+whether 21.5's grounding and fail-closed rules actually hold.
+
+**Grounding is enforced, not requested.** The prompt forbids outside knowledge in
+21.5 requirement 1's own terms, and pairs that instruction with something
+mechanical: every datum is emitted with a stable **evidence id**, every claim
+must cite one, and the parser **refuses the whole response** if a citation names
+an id this run's prompt never emitted. That does not prove a claim's prose is
+true of the datum it cites — nothing mechanical can — but it means every claim
+arrives attached to a real fetched value a human can read beside it.
+
+**A missing input is stated, never omitted.** A failed candle fetch, a failed
+concentration read and the paused news slot each produce a labelled line
+carrying the producing module's own error code and message. An absent section
+would read to a model exactly like "there was nothing to report", and those are
+opposite facts.
+
+**The candle series is bucketed, and the omission is in the prompt.** A real run
+returned 1,440 one-minute candles (decision log 36); the leading candidate
+model's documented context window is 24,000 tokens. So the prompt carries
+whole-window aggregates computed from every candle plus at most
+`CANDLE_BUCKET_COUNT` contiguous buckets, and states in prose how many candles
+there really were and that the individual ones were left out.
+
+**The parser has no lenient path.** No case folding (`"DCA"` is refused), no
+fence stripping, no first-`{`-to-last-`}` extraction, no ignored extra field, no
+dropped bad citation, and no default strategy. It also refuses a duplicate key,
+because `JSON.parse` silently keeps the last of two and
+`{"strategy":"dca","strategy":"grid"}` would otherwise resolve cleanly.
+
+**The transport envelope is unwrapped; the content rules are not relaxed.** One
+real call showed this model, in JSON-schema mode, returning
+`{ response: { strategy: "grid", claims: [...] } }` — `.response` is an
+**already-parsed object**, not the string Cloudflare's own generated type
+declares for that arm. The parser refused it, and that refusal was *correct*: a
+wrong assumption held to the right standard. `unwrapModelEnvelope` now
+recognises the transport shapes (`bare_string`, `envelope_string`,
+`envelope_object`, `bare_object`) and every one of them lands in the **same**
+`validateAnswerObject`, so a rule relaxed for one path would have to be relaxed
+for the other in the same visible edit.
+
+**One protection is sometimes structurally unavailable, and says so.** The
+duplicate-key scan works on the model's own bytes, and on the object path the
+transport already consumed them. Re-stringifying the parsed object and scanning
+*that* would be theatre — it can never find a duplicate — so it is not done.
+Instead every result carries `duplicateKeyCheck: "performed" |
+"unavailable_transport_parsed"`, so an audit record states which guarantees
+actually held for that proposal. Whether `returnRawResponse` recovers the bytes
+is an open question for the next probe, not an assumption.
+
+**Third-party text is delimited and labelled, never removed.** A trending
+vendor's `name`, `symbol` and `coinId`, and a human's watchlist `note`, are free
+text this system did not write, and all of it lands in the DATA section. Each is
+wrapped as `<<<UNTRUSTED_TEXT chars=N>>> … <<<END_UNTRUSTED_TEXT>>>`, and the
+prompt's **rule 3** — stated before any data — says everything between those
+markers is data to report on and never an instruction, on the same footing as
+the price numbers. An injection attempt is emitted **byte for byte**: stripping
+it would be this system silently altering fetched data, and would destroy the
+evidence an operator needs to see that it happened.
+
+**This reduces risk; it does not eliminate it.** A delimiter is a convention a
+model may honour or ignore, and nothing here can force it. Two structural limits
+bound the real damage whether or not the delimiters work, and they are the reason
+this is a reasonable place to stand: **(1)** this stage produces a recommendation
+a human reviews against the real data (21.1) — it creates no bot and has no write
+path to one; **(2)** the citation check still holds, so a hijacked answer can
+still only point at evidence ids this run really emitted. An injection can change
+the *answer*; it cannot change the *data the answer is checked against*.
+
+**Zero retries, deliberately.** `assessCandidate` calls the model exactly once,
+and a parse refusal ends the run. "Retry until it parses" would convert
+fail-closed into fail-open: the accepted answer would be the one selected for
+passing the validator rather than the one the model gave, with disagreeing
+samples discarded silently. It also fights the determinism stance — with
+`temperature: 0` and a fixed seed, a retry that *succeeds* is evidence the
+pinning did not hold, and a loop would consume exactly that signal.
+
+**Open question: 13.5 seconds for one call.** The first real call took
+**13,540 ms** for a ~4,000-token prompt. One sample, not a distribution — but a
+12-candidate general run assessed sequentially would spend **over two and a half
+minutes in model calls alone**, and Stage 3 is a second call per candidate.
+Whether Assess can run synchronously inside an HTTP response, or whether the
+pipeline must be queued, is **unanswered here on purpose**: the answer reshapes
+the endpoint, the proposal record and how a human is told a run is in progress,
+and choosing an architecture from one data point is worse than leaving it open.
+
+**One precondition, in the runner rather than the collector.** `assessCandidate`
+refuses a bundle with no usable candle window **before** calling the model. That
+is not the quality judgement Stage 4 owns — it is the absence of the only input
+the question is about, and a strategy pick with no prices could only come from
+the training knowledge requirement 1 forbids.
 
 ## Candidate selection: one shape, three doors, merged provenance
 

@@ -1,14 +1,32 @@
 /**
  * Groundwork for spec section 21's LLM-assisted research pipeline.
  *
- * Section 21 is PLANNED, NOT YET BUILT, and that is still true: there is no
- * pipeline, no prompt, no proposal record and no Workers AI call anywhere in
- * this folder. What exists is the storage for 21.3's fixed watchlist -- the
- * deliberate, human-chosen half of candidate selection -- the read path a later
- * stage will consume, 21.4 Stage 1's candle fetch for arbitrary tradable pairs,
- * 21.4 Stage 1's news-and-sentiment fetch, and 21.2/21.3's candidate selection
- * for both entry points, 21.4 Stage 1's over-concentration FLAG, and the
- * assembly that collects those inputs into one bundle per candidate.
+ * Section 21 is PLANNED, NOT YET BUILT, and that is still true where it counts:
+ * there is NO WORKERS AI CALL, no model binding, no proposal record and no
+ * pipeline anywhere in this folder or in `wrangler.jsonc`. What exists is the
+ * storage for 21.3's fixed watchlist -- the deliberate, human-chosen half of
+ * candidate selection -- the read path a later stage will consume, 21.4 Stage
+ * 1's candle fetch for arbitrary tradable pairs, 21.4 Stage 1's
+ * news-and-sentiment fetch, and 21.2/21.3's candidate selection for both entry
+ * points, 21.4 Stage 1's over-concentration FLAG, the assembly that collects
+ * those inputs into one bundle per candidate, and -- new, and the reason the
+ * banner above is now qualified -- 21.4 STAGE 2'S PROMPT AND ITS PARSER.
+ *
+ * Stage 2 exists as three pure pieces and an unimplemented port:
+ * `assess-prompt.ts` turns a bundle into the exact text a model would receive,
+ * `assess-parse.ts` reads a model's raw answer or refuses it fail-closed, and
+ * `assess.ts` holds the `AssessModel` port, the determinism settings that would
+ * be requested, and the runner that joins the two. NOTHING BEHIND THAT PORT
+ * EXISTS -- it is abstract in exactly the way `TrendingSource` and `NewsSource`
+ * are, and every test drives a stub that returns a string a human wrote.
+ *
+ * Two Stage 2 decisions worth knowing before reading the code. Third-party text
+ * (a trending vendor's `name`/`symbol`/`coinId`, a watchlist `note`) is WRAPPED
+ * IN DELIMITERS and labelled as data-not-instruction rather than removed, which
+ * REDUCES injection risk without eliminating it -- see `UNTRUSTED_TEXT_TOKEN`
+ * for the two structural limits that actually bound the damage. And there are
+ * ZERO RETRIES: a parse refusal ends the run, because "retry until it parses"
+ * is fail-closed converted into fail-open.
  *
  * The assembly (`gather.ts`) reads nothing new. It returns an HONEST PARTIAL
  * bundle: each input's real success or failure is recorded on its own slot, and
@@ -102,6 +120,47 @@ export {
   type NewsInput,
   type NewsNotYetAvailable,
 } from "./gather";
+
+export {
+  ASSESS_PROMPT_VERSION,
+  ASSESS_STRATEGIES,
+  CANDLE_BUCKET_COUNT,
+  UNTRUSTED_TEXT_TOKEN,
+  bucketCandles,
+  buildAssessPrompt,
+  wrapUntrusted,
+  type AssessPrompt,
+  type CandleBucket,
+  type EvidenceItem,
+} from "./assess-prompt";
+
+export {
+  ASSESS_RESPONSE_SCHEMA,
+  AssessParseError,
+  findDuplicateKey,
+  parseAssessResponse,
+  unwrapModelEnvelope,
+  type AssessEnvelopeShape,
+  type AssessParseErrorCode,
+  type CitedClaim,
+  type DuplicateKeyCheck,
+  type ParsedAssessment,
+  type UnwrappedAnswer,
+} from "./assess-parse";
+
+export {
+  ASSESS_MODEL,
+  ASSESS_MODEL_CONTEXT_TOKENS,
+  ASSESS_MODEL_SETTINGS,
+  AssessError,
+  assessCandidate,
+  type AssessErrorCode,
+  type AssessModel,
+  type AssessModelRequest,
+  type AssessModelResponse,
+  type AssessModelSettings,
+  type AssessResult,
+} from "./assess";
 
 export {
   fetchCandleWindow,
