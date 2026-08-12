@@ -10,8 +10,39 @@ qualified rather than repeated unchanged.
 What exists is the storage for **21.3's fixed watchlist**, **all three of 21.4
 Stage 1's reads**, **candidate selection for 21.2's entry points and one deliberate third door**,
 **the assembly that collects Stage 1's inputs into one bundle per candidate** —
-which reads nothing new and consumes everything above it — and **21.4 Stage 2's
-prompt, its fail-closed parser, and the port a model would sit behind**.
+which reads nothing new and consumes everything above it — **21.4 Stage 2's
+prompt, its fail-closed parser, and the port a model would sit behind**, and now
+**21.4 Stage 3's two strategy-conditional prompts, its strict parser, its
+three-layer validation and a second empty port**.
+
+> ### ⚠ Derive cannot detect a bad upstream judgement
+>
+> This is the single most important thing to know about Stage 3, and it is
+> stated here rather than buried in a module header because it is invisible in
+> the output.
+>
+> Decision log 40 recorded a live Assess run whose grid recommendation was
+> **correctly grounded in real fetched candles and financially meaningless** —
+> the Gemini sandbox those candles came from had sat at one price for 83 minutes
+> and then roughly five hours, and a flat series reads as a tight, stable range,
+> which is exactly the shape that makes "grid" look obviously right.
+>
+> **Derive, handed such a judgement, would faithfully turn it into concrete
+> bounds, line counts and order sizes that look equally plausible** — fully
+> cited, passing every decoder, every validator and every sanity bound, because
+> it is doing its job correctly on the inputs it was given.
+>
+> Nothing in this folder can notice that. Every check Stage 3 performs answers
+> *"is this parameter set internally consistent, grounded in the fetched data,
+> and acceptable to the real create-bot validators?"*. **Not one of them answers
+> *"was the fetched data worth reasoning about?"***, and none can look upstream.
+> A well-grounded proposal derived from a meaningless assessment is
+> indistinguishable, by every mechanism this stage has, from one derived from a
+> good assessment.
+>
+> Derive can only be **well grounded in whatever judgement it is given**. The
+> human in 21.1 is the only part of this pipeline that can tell the two apart.
+> This is tracked, not solved.
 
 | File | What it is |
 | --- | --- |
@@ -21,7 +52,11 @@ prompt, its fail-closed parser, and the port a model would sit behind**.
 | `news.ts` | `fetchNewsSentiment`: 21.4 Stage 1's news and pre-scored sentiment for one asset, with 21.7 open question 2's coverage distinction built in. **Its wire format is assumed, not verified** — see below |
 | `candidates.ts` | `selectNamedCandidate` / `selectWatchlistCandidates` / `selectGeneralCandidates`: three doors feeding one `CandidateSet`. **No trending vendor is chosen** — `TrendingSource` is an abstract port with no client behind it, so the general door cannot run at all today |
 | `concentration.ts` | `readAccountExposure` + `assessConcentration`: 21.4 Stage 1's third read — what the account already holds on a candidate's pair and asset. **A flag for a human, never a filter**, and its two thresholds are **policy choices verified against nothing** |
-| `gather.ts` | `gatherCandidateData` / `gatherCandidateSetData`: Stage 1's four inputs collected into one bundle per candidate. **No read of its own.** Returns an **honest partial** bundle — one input's failure never removes another's result — and carries the **paused** news slot |
+| `gather.ts` | `gatherCandidateData` / `gatherCandidateSetData`: Stage 1's four inputs collected into one bundle per candidate. **No read of its own.** Returns an **honest partial** bundle — one input's failure never removes another's result — and carries the **paused** news slot. Plus `gatherDeriveContext`: Stage 3's **two extra real reads**, deliberately separate |
+| `capital.ts` | `readAccountCapital`: the account's real `capital_ledger` headroom (section 8.5). **A read only** — no reservation, no write, no `total_allocated` touched. The figure it returns is a **prefill**, stale by construction from the instant it is read |
+| `derive-prompt.ts` | `buildDerivePrompt`: **two** deterministic prompt builders, one per strategy, from the **same** evidence, grounding and injection-defence machinery as Stage 2. Never a universal schema with optional fields |
+| `derive-parse.ts` | `parseDeriveResponse` + `validateProposal`: the strict reader and the **three-layer** validation — the real decoders, the real strategy validators, then only what neither of those checks. Any failure refuses the **whole** proposal |
+| `derive.ts` | The `DeriveModel` **port with nothing behind it**, the per-strategy determinism settings, `DeriveResult`, and `deriveParameters` — which catches nothing, calls the model **once**, and refuses four ways **before** spending an inference |
 | `assess-prompt.ts` | `buildAssessPrompt`: the **deterministic, pure** transformation from a bundle to the exact prompt text plus a table of citable `EvidenceItem`s. Every outcome state produces text; a failed input produces **more** text, never silence |
 | `assess-parse.ts` | `parseAssessResponse`: the **strict, fail-closed** reader. Resolves exactly `"dca"` or `"grid"` with cited claims, or throws. No case folding, no fence stripping, no JSON-from-prose extraction, no default |
 | `assess.ts` | The `AssessModel` **port with nothing behind it**, the determinism settings that would be requested, `AssessResult`, and `assessCandidate` — which catches nothing and refuses a bundle with no price history **before** any model call |
@@ -200,6 +235,121 @@ refuses a bundle with no usable candle window **before** calling the model. That
 is not the quality judgement Stage 4 owns — it is the absence of the only input
 the question is about, and a strategy pick with no prices could only come from
 the training knowledge requirement 1 forbids.
+
+## Stage 3 is two prompts, one parser, and three validation layers
+
+**Two prompts and two schemas, never one with optional fields.** A grid bot and
+a DCA bot need different parameters, so `buildDerivePrompt` dispatches on the
+strategy Stage 2 actually chose and builds exactly one branch's field list,
+field contract, worked shape example and JSON schema. The rejected alternative —
+one schema carrying every field of both strategies with the irrelevant ones
+optional — fails specifically: an optional field is a field the model **may**
+fill in, so a DCA proposal would be free to carry an `upperBound`, and
+`requireExactFields` would have nothing exact to require.
+
+What the two share is everything else: the same `EvidenceCollector`, the same
+`collectBundleEvidence` id vocabulary, the same `SHARED_GROUNDING_RULES`, the
+same `wrapUntrusted` injection defence, the same transport reader and the same
+citation check.
+
+**Stage 2's choice is an input, never a question.** The prompt states the
+strategy as decided and forbids arguing with it, and a response naming a
+different one is a **total refusal** (`strategy_disagreement`) rather than a
+signal to weigh — 21.2 says a divergence between stages is a bug, and weighing
+it would put a strategy choice in front of a human that no stage is accountable
+for.
+
+**Every proposed number carries a citation**, by the same mechanism Stage 2's
+claims do. Each field arrives as `{value, citations}`, the citations resolve
+against the ids this run's prompt really emitted, and an empty or invented
+citation is fatal for the whole proposal. The `value` itself is **never
+inspected here** — it goes to the real decoder untouched, which is what makes
+the decoder reuse real rather than nominal.
+
+### The three validation layers, and why the third is smaller than it looks
+
+They run in the real create-bot path's own order:
+
+1. **`decodeGridParams` / `decodeDcaParams`** — the exact decoders
+   `POST /api/bots` runs on a human's own submission, handed the model's
+   `parameters` object with nothing added, removed, renamed or coerced, plus the
+   same two literals the handler adds.
+2. **`validateGridParams` / `validateDcaParams`** — the exact validators
+   `BotInstance.createGrid` / `create` run before any capital is reserved.
+3. **Only what neither of those checks.**
+
+21.5 requirement 3 names an inverted grid range and a zero percentage as sanity
+bounds. **Both are already refused by layer 2, by the real code** —
+`buildLevels` throws `upperBound must be above lowerBound`, and both validators
+throw on every non-positive percentage. A second copy in layer 3 would be the
+duplicated risk check requirement 3's own first bullet forbids **and** — because
+layer 3 runs last — a check that could never fire, which is exactly the
+"theatre" this project refused once already (decision log 37's duplicate-key
+finding). So no copy exists, the cases are tested, and **the tests assert which
+layer refused**, so deleting a real validator from the chain fails the suite
+instead of being silently absorbed.
+
+What layer 3 genuinely adds is three things nothing upstream does:
+
+- **The minimum order floor.** Neither decoder nor validator knows the pair
+  exists; section 4.3's filters are applied at **order** time, far too late to
+  tell a human their proposed size cannot be sent.
+- **The capital headroom comparison.** `validateXParams` checks the config
+  against its own `allocatedCapital`; nothing checks `allocatedCapital` against
+  the **account**.
+- **The capital asset** being one the account actually holds a ledger row for.
+
+### The minimum-order floor is reported, not assumed
+
+**Gemini publishes no notional bounds at all** — `parseSymbolDetails` sets
+`minNotional: DISABLED`. A check written only against `minNotional` would
+therefore be a **permanent no-op on the only venue this system runs against**,
+passing every proposal forever while reading in review like a floor. Gemini
+publishes `min_order_size` instead, which lands on `minQuantity`.
+
+So the check runs in whichever dimension the venue actually publishes, using the
+strategy's own `quantityForLevel`/`quantityForQuote` at the **highest** price an
+order would be placed at (where the implied quantity is smallest), and
+`MinimumOrderCheck` records which floor held **for that proposal** —
+`"notional"`, `"quantity"`, `"both"`, or `"none_published"`. Same instinct as
+`DuplicateKeyCheck`: a guarantee that could not be checked is reported, never
+faked.
+
+### The capital figure is a PREFILL, and that word is load-bearing
+
+`readAccountCapital` reads `capital_ledger` and does the subtraction
+`total_balance - total_allocated`. It **writes nothing, reserves nothing and
+holds no lock**, and 21.1 guarantees this pipeline has no write path to one.
+
+**The binding check remains `createBotInstanceWithCapital`'s**, which re-reads
+the ledger inside a compare-and-swap at the moment a bot is created and refuses
+with `insufficient_capital`. Between Derive's read and that moment there is an
+arbitrarily long gap in which another bot may be created or the balance
+rewritten, so **the headroom Derive proposes within is stale by construction
+from the instant it is read** (21.5 requirement 4). If Derive proposes 500 and
+the ledger has 400 by submission time, the real flow refuses — correctly, and
+without needing to know this stage exists.
+
+The subtraction is restated here; the **check** is not copied. That distinction
+is deliberate: `total_balance - total_allocated` is the definition of
+"available" and already appears verbatim in `AllocationAuditDetails`, while
+comparing it against a request and refusing is `ledger.ts`'s alone.
+
+### Four refusals before the model is called
+
+`deriveParameters` refuses — spending no inference — when there is no price
+history, when the capital ledger could not be **read**, when the account has no
+headroom on any asset, and when the pair's filters could not be read. Each is
+the absence of something the question is *about* rather than a quality
+judgement, and the last is the one that would be easiest to wave through: a
+floor that did not arrive is not a floor that said zero, so proceeding would
+present a parameter set as validated when the one check requirement 3 names that
+nothing else performs could not run at all.
+
+**Zero retries**, for Stage 2's reason, which is stronger here: Assess picks
+between two words, so a resampling loop is at worst a biased coin, while Derive
+proposes nine numbers against validators — a retry loop would be a search
+procedure whose objective is "parameters that squeeze through the checks".
 
 ## Candidate selection: one shape, three doors, merged provenance
 

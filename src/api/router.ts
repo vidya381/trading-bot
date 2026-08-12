@@ -18,6 +18,7 @@ import type { BotInstance } from "../durable-objects/bot-instance";
 import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
 import type { AssessModel } from "../research/assess";
+import type { DeriveModel } from "../research/derive";
 
 /** Everything a handler is given: the request, the verified actor, and ports. */
 export interface ApiContext {
@@ -53,6 +54,15 @@ export interface ApiContext {
    * stub. `assess.test.ts` asserts the stub is called exactly once per request.
    */
   readonly assessModel?: AssessModel;
+  /**
+   * The Stage 3 model, injected for exactly `assessModel`'s reason: **no test in
+   * this repository may fall through to a paid vendor.**
+   *
+   * ⚠ TEMPORARY. Today its only reader is `/api/debug/derive-probe`, which is
+   * itself temporary scaffolding. When the probe is deleted this field goes with
+   * it unless a real Derive endpoint has landed by then.
+   */
+  readonly deriveModel?: DeriveModel;
   /**
    * Reaches an account's exchange for ONE symbol's details, which is where a
    * venue that lists both says whether a symbol is spot or a perpetual.

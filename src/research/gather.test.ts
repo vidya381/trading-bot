@@ -48,7 +48,9 @@ import {
   NEWS_NOT_YET_AVAILABLE,
   gatherCandidateData,
   gatherCandidateSetData,
+  gatherDeriveContext,
   type CandidateGatherBundle,
+  type DeriveContextPorts,
   type GatherPorts,
   type GatherRequest,
   type NewsInput,
@@ -56,11 +58,12 @@ import {
 import { CandleWindowError, type CandleSource } from "./candles";
 import { ConcentrationError, type ConcentrationPolicy } from "./concentration";
 import type { Candidate, CandidateSet, CandidateSource } from "./candidates";
-import type { TradablePairSource } from "./tradability";
+import type { SymbolDetailSource, TradablePairSource } from "./tradability";
 import type { Database } from "../db/database";
-import type { Candle, Timestamp } from "../shared/exchange-client";
+import type { CapitalLedgerRow } from "../db/schema";
+import type { Candle, SymbolFilters, Timestamp } from "../shared/exchange-client";
 import { ONE } from "../shared/money";
-import { accountRow, botInstanceRow, freshDatabase } from "../db/test-helpers";
+import { accountRow, botInstanceRow, capitalLedgerRow, freshDatabase } from "../db/test-helpers";
 
 const T0 = 1_930_000_000_000;
 const MINUTE = 60_000;
@@ -777,3 +780,201 @@ function assessments(bundles: readonly CandidateGatherBundle[]): string[] {
     bundle.concentration.outcome === "ok" ? bundle.concentration.value.assessment : "failed",
   );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3's second gather: the two REAL extra reads
+// ---------------------------------------------------------------------------
+
+/**
+ * `gatherDeriveContext` holds the same four properties as the bundle above --
+ * every failure recorded on its own slot, no failure erasing another's result,
+ * never throwing, each read keeping its own timestamp -- plus one that is new
+ * and is the reason it exists at all: THE CAPITAL FIGURE IS THE REAL ONE, read
+ * from `capital_ledger` through the real repository and the real migrations.
+ *
+ * The database here is real. The symbol-details port is a stub, as every venue
+ * port in this folder is.
+ */
+const SYMBOL_FILTERS: SymbolFilters = {
+  pair: "BTCUSD",
+  baseAsset: "BTC",
+  quoteAsset: "USD",
+  status: "TRADING",
+  tickSize: 1_000_000n,
+  minPrice: 0n,
+  maxPrice: 0n,
+  stepSize: 100_000n,
+  minQuantity: 100_000n,
+  maxQuantity: 0n,
+  // Gemini's real shape: NO notional bounds published. See `parseSymbolDetails`.
+  minNotional: 0n,
+  maxNotional: 0n,
+  fetchedAt: VENUE_ANSWERED_AT,
+};
+
+const symbolDetails: SymbolDetailSource = async () => ({
+  ok: true,
+  value: SYMBOL_FILTERS,
+  at: VENUE_ANSWERED_AT,
+});
+
+const symbolDetailsDown: SymbolDetailSource = async () => ({
+  ok: false,
+  kind: "transport",
+  message: "connect ETIMEDOUT",
+  retryable: true,
+  at: VENUE_ANSWERED_AT,
+});
+
+function derivePorts(overrides: Partial<DeriveContextPorts> = {}): DeriveContextPorts {
+  return { ...ports(), getSymbolDetails: symbolDetails, ...overrides };
+}
+
+async function seedLedger(overrides: Partial<CapitalLedgerRow> = {}): Promise<void> {
+  await db.capitalLedger.insert(
+    capitalLedgerRow({
+      account_label: "gemini-main",
+      asset: "USD",
+      total_balance: 500_000_000_000n,
+      total_allocated: 100_000_000_000n,
+      ...overrides,
+    }),
+  );
+}
+
+describe("gatherDeriveContext", () => {
+  it("reads the account's REAL capital headroom from capital_ledger", async () => {
+    await seedLedger();
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+
+    const derived = await gatherDeriveContext(derivePorts(), bundle);
+
+    if (derived.capital.outcome !== "ok") throw new Error("unreachable");
+    expect(derived.capital.value.rowsRead).toBe(1);
+    // 5000 - 1000, exactly, from the real codec.
+    expect(derived.capital.value.assets[0]!.available).toBe(400_000_000_000n);
+    expect(derived.capital.value.assets[0]!.asset).toBe("USD");
+  });
+
+  it("reads the pair's REAL trading filters through the same port the create-bot gate uses", async () => {
+    await seedLedger();
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+
+    const derived = await gatherDeriveContext(derivePorts(), bundle);
+
+    if (derived.filters.outcome !== "ok") throw new Error("unreachable");
+    expect(derived.filters.value.minQuantity).toBe(100_000n);
+    expect(derived.filters.value.pair).toBe("BTCUSD");
+  });
+
+  it("asks the venue about THIS candidate's account and pair, not a restated one", async () => {
+    await seedLedger();
+    const seen: { label?: string; pair?: string } = {};
+    const spy: SymbolDetailSource = async (account, pair) => {
+      seen.label = account.label;
+      seen.pair = pair;
+      return { ok: true, value: SYMBOL_FILTERS, at: VENUE_ANSWERED_AT };
+    };
+    const bundle = await gatherCandidateData(ports(), candidate({ pair: "ETHUSD" }), REQUEST);
+
+    await gatherDeriveContext(derivePorts({ getSymbolDetails: spy }), bundle);
+
+    expect(seen.label).toBe("gemini-main");
+    expect(seen.pair).toBe("ETHUSD");
+  });
+
+  it("records a failed filter read WITHOUT losing the capital figure", async () => {
+    await seedLedger();
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+
+    const derived = await gatherDeriveContext(
+      derivePorts({ getSymbolDetails: symbolDetailsDown }),
+      bundle,
+    );
+
+    expect(derived.filters.outcome).toBe("failed");
+    if (derived.filters.outcome !== "failed") throw new Error("unreachable");
+    // The venue's OWN words, not a second vocabulary describing them.
+    expect(derived.filters.error.message).toContain("transport");
+    expect(derived.filters.error.message).toContain("ETIMEDOUT");
+    // Isolation, in the direction that matters.
+    expect(derived.capital.outcome).toBe("ok");
+  });
+
+  it("records a failed capital read WITHOUT losing the filters", async () => {
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+    const brokenLedger = {
+      ...db,
+      capitalLedger: {
+        findMany: async () => {
+          throw new Error("D1_ERROR: Network connection lost");
+        },
+      },
+    } as unknown as Database;
+
+    const derived = await gatherDeriveContext(derivePorts({ db: brokenLedger }), bundle);
+
+    expect(derived.capital.outcome).toBe("failed");
+    if (derived.capital.outcome !== "failed") throw new Error("unreachable");
+    expect(derived.capital.error.code).toBe("ledger_unreadable");
+    expect(derived.filters.outcome).toBe("ok");
+  });
+
+  it("never throws, whatever both reads do", async () => {
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+    const brokenLedger = {
+      ...db,
+      capitalLedger: {
+        findMany: async () => {
+          throw new Error("everything is on fire");
+        },
+      },
+    } as unknown as Database;
+
+    const derived = await gatherDeriveContext(
+      derivePorts({ db: brokenLedger, getSymbolDetails: symbolDetailsDown }),
+      bundle,
+    );
+
+    expect(derived.capital.outcome).toBe("failed");
+    expect(derived.filters.outcome).toBe("failed");
+    // And the bundle it was given survives untouched.
+    expect(derived.bundle).toBe(bundle);
+  });
+
+  it("reports an account with no ledger row as a successful read, not a failure", async () => {
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+    const derived = await gatherDeriveContext(derivePorts(), bundle);
+
+    expect(derived.capital.outcome).toBe("ok");
+    if (derived.capital.outcome !== "ok") throw new Error("unreachable");
+    expect(derived.capital.value.assets).toEqual([]);
+  });
+
+  it("keeps its own gather time separate from either read's", async () => {
+    await seedLedger();
+    const bundle = await gatherCandidateData(ports(), candidate(), REQUEST);
+    const derived = await gatherDeriveContext(derivePorts(), bundle);
+
+    if (derived.capital.outcome !== "ok" || derived.filters.outcome !== "ok") {
+      throw new Error("unreachable");
+    }
+    // `gatheredAt` is when assembly ran; the ledger read has its own instant and
+    // the venue answered at its own. Three distinct times, none manufactured
+    // from another (21.5 requirement 4).
+    expect(derived.gatheredAt).not.toBe(derived.capital.value.readAt);
+    expect(derived.filters.value.fetchedAt).toBe(VENUE_ANSWERED_AT);
+  });
+
+  it("does NOT read symbol details during the ordinary Stage 1 gather", async () => {
+    // The cost argument on `DeriveContext`: a per-symbol uncached request must
+    // not be spent on every Assess run. A port that throws if touched proves it.
+    let touched = 0;
+    const tripwire: SymbolDetailSource = async () => {
+      touched += 1;
+      return { ok: true, value: SYMBOL_FILTERS, at: VENUE_ANSWERED_AT };
+    };
+    await gatherCandidateData({ ...ports(), getSymbolDetails: tripwire } as never, candidate(), REQUEST);
+    expect(touched).toBe(0);
+  });
+});

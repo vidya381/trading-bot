@@ -33,6 +33,7 @@ import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpe
 import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
 import type { AssessModel } from "../research/assess";
+import type { DeriveModel } from "../research/derive";
 import type { Candle, SymbolFilters } from "../shared/exchange-client";
 
 const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
@@ -128,6 +129,8 @@ interface ApiCall {
   readonly symbolDetailLister?: SymbolDetailLister;
   /** Inject the assess endpoint's model, so NO test ever reaches a paid vendor. */
   readonly assessModel?: AssessModel;
+  /** Inject the derive probe's model, for the same reason. ⚠ TEMPORARY, with the probe. */
+  readonly deriveModel?: DeriveModel;
   /** Inject a Database, to drive a read failure the real one cannot be made to produce. */
   readonly db?: Database;
 }
@@ -161,6 +164,7 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
       ? { symbolDetailLister: call.symbolDetailLister }
       : {}),
     ...(call.assessModel !== undefined ? { assessModel: call.assessModel } : {}),
+    ...(call.deriveModel !== undefined ? { deriveModel: call.deriveModel } : {}),
     ...(call.db !== undefined ? { db: call.db } : {}),
   });
   return { status: response.status, body: await response.json() };
@@ -4374,6 +4378,406 @@ describe("assess endpoint (section 21.4 Stage 2)", () => {
   it("is Access-gated like every other route", async () => {
     const label = await account("as-auth");
     const res = await api("GET", assessPath(label, { pair: "BTCUSD", interval: "1m" }), { token: null });
+    expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ⚠⚠⚠  TEMPORARY -- DELETE THIS BLOCK WITH THE PROBE.  ⚠⚠⚠
+// ---------------------------------------------------------------------------
+
+/**
+ * The Stage 3 derive probe: temporary scaffolding, tested anyway.
+ *
+ * NO TEST HERE REACHES A MODEL. Both stages are driven by injected fakes, and
+ * two tests assert positively that the Derive model was called ZERO times --
+ * `news.ts`'s mutation lesson (decision log 30), where a passing test that
+ * asserted the right conclusion for the wrong reason would, under mutation,
+ * point the suite at a live vendor.
+ *
+ * Four properties. They are deliberately about the PROBE's contract rather than
+ * about Derive's logic, which `src/research/derive*.test.ts` already covers:
+ *
+ *  1. THE CHAIN RUNS IN ORDER AND REPORTS BOTH STAGES SEPARATELY. Two latencies,
+ *     two envelopes, so Stage 3's cost can be told from Stage 2's -- which is
+ *     the whole reason the probe exists.
+ *  2. A REFUSAL IS A RESULT, NOT AN ERROR. A parse or validation refusal comes
+ *     back at 200 carrying its REAL code, because "the validator refused with
+ *     strategy_validator/validator_rejected" is exactly what a probe is for and
+ *     a 502 would lose it.
+ *  3. IT NEVER PRODUCES A PARTIAL PROPOSAL. `derive.outcome` is "proposed" or a
+ *     named failure; a refusal carries no `proposal` key at all.
+ *  4. IT WRITES NOTHING. Asserted by counting rows before and after.
+ */
+describe("derive probe (TEMPORARY, section 21.4 Stage 3)", () => {
+  const MINUTE = 60_000;
+  const VENUE_ANSWERED_AT = 1_960_000_000_000;
+
+  const catalogue: SymbolLister = async () => ({ ok: true, value: ["BTCUSD", "ETHUSD"], at: T0 });
+
+  const venue: CandleLister = async (_account, query) => ({
+    ok: true,
+    value: [0, 1, 2].map((i) => ({
+      pair: query.pair,
+      openTime: T0 - (3 - i) * MINUTE,
+      closeTime: T0 - (3 - i) * MINUTE + MINUTE,
+      open: 100_000_000n,
+      high: 108_000_000n,
+      low: 96_000_000n,
+      close: 102_000_000n,
+      volume: 400_000_000n,
+      closed: true,
+    })),
+    at: VENUE_ANSWERED_AT,
+  });
+
+  /** Gemini's real shape: a quantity floor, and NO notional floor. */
+  const details: SymbolDetailLister = async (_account, pair) => ({
+    ok: true,
+    value: {
+      pair,
+      baseAsset: "BTC",
+      quoteAsset: "USD",
+      status: "TRADING",
+      tickSize: 1_000_000n,
+      minPrice: 0n,
+      maxPrice: 0n,
+      stepSize: 100_000n,
+      minQuantity: 100_000n,
+      maxQuantity: 0n,
+      minNotional: 0n,
+      maxNotional: 0n,
+      instrument: "spot",
+      fetchedAt: VENUE_ANSWERED_AT,
+    },
+    at: VENUE_ANSWERED_AT,
+  });
+
+  async function probeAccount(prefix: string) {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await seedPlaceholderTotalBalance(
+      db,
+      { accountLabel: label, asset: "USD", totalBalance: m("10000"), note: "probe fixture" },
+      { actor: HUMAN, now: T0 },
+    );
+    return label;
+  }
+
+  const assessAnswer = {
+    response: {
+      strategy: "grid",
+      claims: [{ statement: "The range is wide relative to the close.", citations: ["candles.range_pct"] }],
+    },
+  };
+
+  const cited = (value: unknown, id = "candles.last_close") => ({ value, citations: [id] });
+
+  const deriveAnswer = (overrides: Record<string, unknown> = {}) => ({
+    response: {
+      strategy: "grid",
+      parameters: {
+        upperBound: cited("1.08000000", "candles.high"),
+        lowerBound: cited("0.96000000", "candles.low"),
+        gridLines: cited(5, "candles.range_pct"),
+        spacing: cited("arithmetic", "candles.range_pct"),
+        orderSize: cited("50.00000000", "capital.row.01.available"),
+        stopLossPct: cited("5.00000000", "candles.range_pct"),
+        breakoutTakeProfit: cited(true, "assessment.strategy"),
+        breakoutThresholdPct: cited(null, "candles.range_pct"),
+        takeProfitAmount: cited(null, "capital.row.01.available"),
+      },
+      allocatedCapital: cited("400.00000000", "capital.row.01.available"),
+      capitalAsset: cited("USD", "capital.row.01.asset"),
+      notes: [{ statement: "The observed range sets the bounds.", citations: ["candles.range_pct"] }],
+      ...overrides,
+    },
+  });
+
+  function fakes(assess: unknown, derive: unknown) {
+    const assessCalls: string[] = [];
+    const deriveCalls: { prompt: string; strategy: string }[] = [];
+    const assessModel: AssessModel = async (request) => {
+      assessCalls.push(request.prompt);
+      return { text: assess, raw: assess };
+    };
+    const deriveModel: DeriveModel = async (request) => {
+      deriveCalls.push({ prompt: request.prompt, strategy: request.strategy });
+      return { text: derive, raw: derive };
+    };
+    return { assessModel, deriveModel, assessCalls, deriveCalls };
+  }
+
+  const probePath = (query: Record<string, string>) =>
+    `/api/debug/derive-probe?${new URLSearchParams(query).toString()}`;
+
+  // -- Property 1: the whole chain, both stages reported separately ----------
+
+  it("runs gather -> context -> assess -> derive and reports each stage", async () => {
+    const label = await probeAccount("dp-ok");
+    const f = fakes(assessAnswer, deriveAnswer());
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(res.status).toBe(200);
+    expect(f.assessCalls, "assess was not called exactly once").toHaveLength(1);
+    expect(f.deriveCalls, "derive was not called exactly once").toHaveLength(1);
+
+    const { assess, derive, capital, filters } = res.body.data;
+
+    // The real capital-ledger read reached the probe's output.
+    expect(capital.outcome).toBe("ok");
+    expect(capital.assets[0].asset).toBe("USD");
+    expect(capital.assets[0].available).toBe("10000.00000000");
+
+    // The real filters read did too, with the floor Gemini actually publishes.
+    expect(filters.outcome).toBe("ok");
+    expect(filters.minQuantity).toBe("0.00100000");
+    expect(filters.minNotional).toBe("0.00000000");
+
+    expect(assess.outcome).toBe("assessed");
+    expect(assess.strategy).toBe("grid");
+    expect(typeof assess.latencyMs).toBe("number");
+
+    expect(derive.outcome).toBe("proposed");
+    expect(derive.strategy).toBe("grid");
+    expect(derive.promptVersion).toBe("derive/1");
+    expect(typeof derive.latencyMs).toBe("number");
+    // Two separately reported latencies is the point of the probe.
+    expect(derive.latencyMs).not.toBe(undefined);
+    expect(assess.latencyMs).not.toBe(undefined);
+  });
+
+  it("passes Stage 2's REAL strategy to Stage 3, never a re-derived one", async () => {
+    const label = await probeAccount("dp-strat");
+    const f = fakes(assessAnswer, deriveAnswer());
+
+    await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(f.deriveCalls[0]!.strategy).toBe("grid");
+    expect(f.deriveCalls[0]!.prompt).toContain('THE STRATEGY IS ALREADY DECIDED AND IT IS "grid"');
+    // And Stage 2's own claims travel into Stage 3's prompt as citable evidence.
+    expect(f.deriveCalls[0]!.prompt).toContain("The range is wide relative to the close.");
+  });
+
+  it("returns the proposal with every number beside the ids it rests on", async () => {
+    const label = await probeAccount("dp-cites");
+    const f = fakes(assessAnswer, deriveAnswer());
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    const proposal = res.body.data.derive.proposal;
+    expect(proposal.params.strategy).toBe("grid");
+    expect(proposal.params.upperBound).toBe("1.08000000");
+    expect(proposal.params.gridLines).toBe(5);
+    expect(proposal.allocatedCapital).toBe("400.00000000");
+    expect(proposal.capitalAsset).toBe("USD");
+    expect(proposal.availableAtProposal).toBe("10000.00000000");
+    // Gemini publishes a quantity floor only, and the probe says so.
+    expect(proposal.minimumOrderCheck).toBe("quantity");
+    // Every field carries its citations.
+    expect(proposal.citations.upperBound).toEqual(["candles.high"]);
+    expect(proposal.citations.orderSize).toEqual(["capital.row.01.available"]);
+    expect(proposal.notes[0].citations).toEqual(["candles.range_pct"]);
+  });
+
+  // -- Property 2: a refusal is a RESULT -------------------------------------
+
+  it("reports a parse refusal at 200 with its real code, not as a 502", async () => {
+    const label = await probeAccount("dp-parse");
+    const f = fakes(assessAnswer, deriveAnswer({ notes: [] }));
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.derive.outcome).toBe("refused");
+    expect(res.body.data.derive.error.kind).toBe("DeriveParseError");
+    expect(res.body.data.derive.error.code).toBe("notes_empty");
+    // Exactly one call: a refusal is never resampled.
+    expect(f.deriveCalls).toHaveLength(1);
+  });
+
+  it("reports a VALIDATION refusal with the layer that refused", async () => {
+    const label = await probeAccount("dp-valid");
+    const answer = deriveAnswer();
+    // An inverted range: refused by the REAL buildLevels inside validateGridParams.
+    (answer.response.parameters as Record<string, unknown>)["upperBound"] = cited("0.10000000", "candles.low");
+    const f = fakes(assessAnswer, answer);
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.derive.error.kind).toBe("DeriveValidationError");
+    expect(res.body.data.derive.error.code).toBe("strategy_validator/validator_rejected");
+    expect(res.body.data.derive.error.message).toContain("validateGridParams");
+  });
+
+  it("reports an invented citation as a refusal, so ungrounded numbers never appear", async () => {
+    const label = await probeAccount("dp-cite");
+    const answer = deriveAnswer();
+    (answer.response.parameters as Record<string, unknown>)["orderSize"] = cited("50.00000000", "candles.rsi_14");
+    const f = fakes(assessAnswer, answer);
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(res.body.data.derive.error.code).toBe("citation_unknown");
+  });
+
+  // -- Property 3: never a partial proposal ----------------------------------
+
+  it("carries NO proposal key at all when it refuses", async () => {
+    const label = await probeAccount("dp-partial");
+    const f = fakes(assessAnswer, deriveAnswer({ notes: [] }));
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    const derive = res.body.data.derive;
+    expect(derive.outcome).toBe("refused");
+    // Positively: no half-filled parameter set under any key.
+    expect(derive.proposal).toBeUndefined();
+    expect(derive.strategy).toBeUndefined();
+  });
+
+  it("does not attempt Stage 3 at all when Stage 2 failed", async () => {
+    const label = await probeAccount("dp-noassess");
+    const f = fakes({ response: "I'd suggest a grid here." }, deriveAnswer());
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.assess.outcome).toBe("failed");
+    expect(res.body.data.assess.error.code).toBe("not_json");
+    expect(res.body.data.derive.outcome).toBe("not_attempted");
+    // THE ASSERTION THAT MATTERS: no second paid inference was spent.
+    expect(f.deriveCalls, "Stage 3 ran after Stage 2 failed").toHaveLength(0);
+  });
+
+  it("refuses before EITHER model call when the account has no ledger row", async () => {
+    const label = `dp-nocap-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    const f = fakes(assessAnswer, deriveAnswer());
+
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.derive.error.kind).toBe("DeriveError");
+    expect(res.body.data.derive.error.code).toBe("no_capital_headroom");
+    // Assess still ran -- it does not need capital. Derive did not.
+    expect(f.assessCalls).toHaveLength(1);
+    expect(f.deriveCalls, "Stage 3 called the model with no headroom").toHaveLength(0);
+  });
+
+  // -- Property 4: it writes nothing -----------------------------------------
+
+  it("writes NOTHING: no bot, no audit row, no capital movement", async () => {
+    const label = await probeAccount("dp-nowrite");
+    const before = {
+      bots: await db.botInstances.count(),
+      audit: await db.auditLog.count(),
+      ledger: (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!,
+    };
+    const f = fakes(assessAnswer, deriveAnswer());
+
+    await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    });
+
+    expect(await db.botInstances.count()).toBe(before.bots);
+    expect(await db.auditLog.count()).toBe(before.audit);
+    const after = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
+    // The proposal suggested 400; total_allocated must be untouched (21.1).
+    expect(after.total_allocated).toBe(before.ledger.total_allocated);
+    expect(after.total_balance).toBe(before.ledger.total_balance);
+  });
+
+  // -- Parameter handling ----------------------------------------------------
+
+  it("requires accountLabel, pair and interval, with no defaults", async () => {
+    const label = await probeAccount("dp-params");
+    const f = fakes(assessAnswer, deriveAnswer());
+    const opts = {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      assessModel: f.assessModel,
+      deriveModel: f.deriveModel,
+    };
+
+    expect((await api("GET", probePath({ pair: "BTCUSD", interval: "1m" }), opts)).status).toBe(400);
+    expect((await api("GET", probePath({ accountLabel: label, interval: "1m" }), opts)).status).toBe(400);
+    expect((await api("GET", probePath({ accountLabel: label, pair: "BTCUSD" }), opts)).status).toBe(400);
+    // And an interval outside the union is refused rather than coerced.
+    expect(
+      (await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "2m" }), opts)).status,
+    ).toBe(400);
+    // No model was reached by any of those.
+    expect(f.assessCalls).toHaveLength(0);
+    expect(f.deriveCalls).toHaveLength(0);
+  });
+
+  it("is Access-gated like every other route", async () => {
+    const label = await probeAccount("dp-auth");
+    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
+      token: null,
+    });
     expect(res.status).toBe(401);
   });
 });

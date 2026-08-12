@@ -94,6 +94,20 @@
  * on the field so nothing downstream times a proposal from it (21.5 requirement
  * 4 wants the fetch time, not the render time).
  *
+ * ── A SECOND, LATER GATHER FOR STAGE 3 ──
+ *
+ * `gatherDeriveContext` is a separate entry point that reads two more real
+ * things -- the account's `capital_ledger` headroom (section 8.5) and the pair's
+ * real trading filters -- for the candidate a human is actually deriving
+ * parameters for. It is deliberately NOT folded into the bundle above; the
+ * reasons (a per-symbol uncached request, reading a stale-by-construction money
+ * figure as late as possible, and not changing the type Stage 2 is built on) are
+ * argued on `DeriveContext`.
+ *
+ * The capital figure it carries is a PREFILL for a human to confirm and is never
+ * a reservation. `capital.ts` states that at length, and the real check remains
+ * `createBotInstanceWithCapital`'s, at creation, unchanged.
+ *
  * ── What this module deliberately does NOT do ──
  *
  *   * NO persistence and NO endpoint. The audit record 21.5 requirement 5 wants
@@ -106,7 +120,7 @@
  *     operator-stated quote assets are read off `CandidateSet.trending`.
  */
 
-import type { CandleInterval, Timestamp } from "../shared/exchange-client";
+import type { CandleInterval, SymbolFilters, Timestamp } from "../shared/exchange-client";
 import {
   CandleWindowError,
   fetchCandleWindow,
@@ -114,6 +128,11 @@ import {
   type CandleWindowPorts,
 } from "./candles";
 import type { Candidate, CandidateSet } from "./candidates";
+import {
+  ResearchCapitalError,
+  readAccountCapital,
+  type AccountCapital,
+} from "./capital";
 import {
   ConcentrationError,
   assessConcentration,
@@ -123,6 +142,7 @@ import {
   type ConcentrationPorts,
   type ConcentrationResult,
 } from "./concentration";
+import type { SymbolDetailSource } from "./tradability";
 
 // ---------------------------------------------------------------------------
 // The envelope
@@ -483,6 +503,135 @@ export async function gatherCandidateData(
 ): Promise<CandidateGatherBundle> {
   const exposure = await readExposure(ports, candidate.accountLabel);
   return gatherAgainstExposure(ports, candidate, request, exposure);
+}
+
+// ---------------------------------------------------------------------------
+// The Stage 3 context: two more real reads, gathered separately and on purpose
+// ---------------------------------------------------------------------------
+
+/**
+ * The account's real `capital_ledger` headroom (section 8.5). See `capital.ts`
+ * for why the figure inside is a PREFILL and never a reservation.
+ */
+export type CapitalInput = GatheredInput<AccountCapital, ResearchCapitalError>;
+
+/**
+ * The pair's real trading filters, for the minimum-order floor 21.5 requirement
+ * 3 asks for.
+ *
+ * `ExchangeOutcome` is a result type rather than a throw, so a refusal from the
+ * venue arrives as `ok: false` and is converted to this envelope's `failed` arm
+ * carrying a real `Error` built from the outcome's own `kind` and `message` --
+ * the venue's words, not a second vocabulary describing them.
+ */
+export type SymbolFiltersInput = GatheredInput<SymbolFilters, Error>;
+
+/**
+ * Everything Stage 3 needs that Stage 1's bundle does not already carry.
+ *
+ * ── WHY THIS IS A SECOND FUNCTION AND NOT TWO MORE FIELDS ON THE BUNDLE ──
+ *
+ * Both reads are real, and both are genuinely new: nothing in this repository
+ * read `capital_ledger` for research before, and `getSymbolFilters` was reached
+ * only by the order path and the bot-creation gate. They are added here, beside
+ * the bundle rather than inside it, for three reasons that are all about not
+ * charging Stage 2 for Stage 3's needs:
+ *
+ *  1. **COST.** A symbol-details read is ONE UNCACHED PER-SYMBOL REQUEST --
+ *     `tradability.ts` says so explicitly and warns that
+ *     `selectGeneralCandidates` checks up to fifteen coins per run. Putting it
+ *     in `gatherCandidateData` would spend that request on every candidate of
+ *     every Assess run, including the ones Assess is about to reason over and
+ *     nobody ever derives parameters for.
+ *  2. **ORDER.** Derive runs only after Assess has chosen, and only for a
+ *     candidate someone is actually deriving. Reading late means reading a
+ *     ledger figure closer to the moment a human sees it, which is the right
+ *     direction for a number 21.5 requirement 4 calls stale by construction.
+ *  3. **BLAST RADIUS.** `CandidateGatherBundle` is what Stage 2's prompt, its
+ *     tests and the live-verified `/assess` endpoint are all built on. Two new
+ *     required fields on it would change every one of those for a stage none of
+ *     them run.
+ *
+ * What is NOT different is the discipline. Both slots are the same
+ * `GatheredInput` envelope, both carry the producing layer's own failure, and
+ * neither one's failure erases the other's result -- exactly as the bundle's
+ * three inputs behave, and for the reasons the module header argues.
+ */
+export interface DeriveContext {
+  readonly bundle: CandidateGatherBundle;
+  readonly capital: CapitalInput;
+  readonly filters: SymbolFiltersInput;
+  /** When this second gather ran. NOT a fetch time -- see `CandidateGatherBundle.assembledAt`. */
+  readonly gatheredAt: Timestamp;
+}
+
+/**
+ * `GatherPorts` plus the one-symbol details read.
+ *
+ * `SymbolDetailSource` is `tradability.ts`'s existing port -- the same one
+ * `checkSpotInstrument` and the bot-creation gate already use, reached through
+ * the same wiring. A second port for "the same symbol's details" would be a
+ * second thing to keep pointed at the same venue.
+ */
+export interface DeriveContextPorts extends GatherPorts {
+  readonly getSymbolDetails: SymbolDetailSource;
+}
+
+/**
+ * An `ExchangeOutcome` failure, as an `Error` that keeps the venue's own words.
+ *
+ * Named rather than inlined so the conversion is one place: an outcome is
+ * `{ok: false, kind, message}` and the envelope's `failed` arm wants an `Error`.
+ * The `kind` is preserved on the error so a reader can tell an unreachable venue
+ * from a refused symbol, which is section 5.6's whole distinction.
+ */
+export class SymbolFiltersUnavailableError extends Error {
+  readonly kind: string;
+  constructor(kind: string, message: string) {
+    super(`symbol filters unavailable (${kind}): ${message}`);
+    this.name = "SymbolFiltersUnavailableError";
+    this.kind = kind;
+  }
+}
+
+/**
+ * Stage 3's extra reads for ONE already-gathered candidate.
+ *
+ * Never throws, for `gatherCandidateData`'s reason: each read lands in its own
+ * slot carrying its own failure, and one failing does not remove the other. The
+ * decision about whether a failed slot is fatal belongs to `deriveParameters`,
+ * which argues each one -- and both ARE fatal there, which is a different
+ * statement from being fatal here. Recording honestly and refusing loudly are
+ * two jobs, and this folder keeps them in two places.
+ */
+export async function gatherDeriveContext(
+  ports: DeriveContextPorts,
+  bundle: CandidateGatherBundle,
+): Promise<DeriveContext> {
+  const gatheredAt = ports.now();
+
+  const capital = await runInput<AccountCapital, ResearchCapitalError>(
+    () => readAccountCapital(ports.db, bundle.candidate.accountLabel, ports.now),
+    (error): error is ResearchCapitalError => error instanceof ResearchCapitalError,
+    ports.now,
+  );
+
+  const filters = await runInput<SymbolFilters, Error>(
+    async () => {
+      const outcome = await ports.getSymbolDetails(
+        { label: bundle.candidate.accountLabel, exchange: bundle.candidate.exchange },
+        bundle.candidate.pair,
+      );
+      if (!outcome.ok) {
+        throw new SymbolFiltersUnavailableError(outcome.kind, outcome.message);
+      }
+      return outcome.value;
+    },
+    (error): error is Error => error instanceof Error,
+    ports.now,
+  );
+
+  return { bundle, capital, filters, gatheredAt };
 }
 
 /**

@@ -12,6 +12,22 @@
  * those inputs into one bundle per candidate, and -- new, and the reason the
  * banner above is now qualified -- 21.4 STAGE 2'S PROMPT AND ITS PARSER.
  *
+ * Stage 3 (Derive) now exists on the same terms: `derive-prompt.ts` builds TWO
+ * strategy-conditional prompts from the SAME evidence, grounding and
+ * injection-defence machinery Stage 2 uses; `derive-parse.ts` reads a proposed
+ * parameter set strictly and validates it through the REAL create-bot decoders
+ * and the REAL strategy validators before adding only the checks neither of
+ * those makes; and `derive.ts` holds the `DeriveModel` port -- also with NOTHING
+ * BEHIND IT -- and a runner that calls a model exactly once and refuses four
+ * ways before spending anything.
+ *
+ * ⚠ DERIVE CANNOT DETECT A BAD UPSTREAM JUDGEMENT. Decision log 40 found that
+ * thin or frozen sandbox data produces a confident-LOOKING Assess judgement that
+ * is financially meaningless; Derive would turn such a judgement into concrete
+ * numbers that look equally plausible and pass every check here, because every
+ * check answers "is this internally consistent and grounded?" and none answers
+ * "was the input worth reasoning about?". Tracked, not solved -- see the README.
+ *
  * Stage 2 exists as three pure pieces and an unimplemented port:
  * `assess-prompt.ts` turns a bundle into the exact text a model would receive,
  * `assess-parse.ts` reads a model's raw answer or refuses it fail-closed, and
@@ -108,26 +124,36 @@ export {
 export {
   gatherCandidateData,
   gatherCandidateSetData,
+  gatherDeriveContext,
+  SymbolFiltersUnavailableError,
   NEWS_NOT_YET_AVAILABLE,
   type CandidateGatherBundle,
   type CandidateSetGatherBundle,
   type CandleInput,
+  type CapitalInput,
   type ConcentrationInput,
+  type DeriveContext,
+  type DeriveContextPorts,
   type ExposureInput,
   type GatherPorts,
   type GatherRequest,
   type GatheredInput,
   type NewsInput,
   type NewsNotYetAvailable,
+  type SymbolFiltersInput,
 } from "./gather";
 
 export {
   ASSESS_PROMPT_VERSION,
   ASSESS_STRATEGIES,
   CANDLE_BUCKET_COUNT,
+  SHARED_GROUNDING_RULES,
   UNTRUSTED_TEXT_TOKEN,
+  EvidenceCollector,
   bucketCandles,
   buildAssessPrompt,
+  collectBundleEvidence,
+  numberedRules,
   wrapUntrusted,
   type AssessPrompt,
   type CandleBucket,
@@ -139,12 +165,18 @@ export {
   AssessParseError,
   findDuplicateKey,
   parseAssessResponse,
+  readModelAnswer,
+  requireExactFields,
+  resolveCitations,
   unwrapModelEnvelope,
   type AssessEnvelopeShape,
   type AssessParseErrorCode,
   type CitedClaim,
   type DuplicateKeyCheck,
+  type ModelAnswer,
+  type ParseRefusal,
   type ParsedAssessment,
+  type SharedParseCode,
   type UnwrappedAnswer,
 } from "./assess-parse";
 
@@ -161,6 +193,56 @@ export {
   type AssessModelSettings,
   type AssessResult,
 } from "./assess";
+
+export {
+  readAccountCapital,
+  headroomFor,
+  hasAnyHeadroom,
+  ResearchCapitalError,
+  type AccountCapital,
+  type AssetHeadroom,
+  type ResearchCapitalErrorCode,
+} from "./capital";
+
+export {
+  DCA_DERIVE_FIELDS,
+  DERIVE_CAPITAL_FIELDS,
+  DERIVE_PROMPT_VERSION,
+  GRID_DERIVE_FIELDS,
+  buildDerivePrompt,
+  deriveFieldsFor,
+  type DerivePrompt,
+} from "./derive-prompt";
+
+export {
+  DeriveParseError,
+  DeriveValidationError,
+  checkDeriveSanityBounds,
+  deriveResponseSchema,
+  parseDeriveResponse,
+  plannedSpendOf,
+  validateProposal,
+  type CitedValue,
+  type DeriveParseErrorCode,
+  type DeriveValidationErrorCode,
+  type MinimumOrderCheck,
+  type ParsedProposal,
+  type ValidatedProposal,
+} from "./derive-parse";
+
+export {
+  DERIVE_MODEL,
+  DERIVE_MODEL_CONTEXT_TOKENS,
+  DERIVE_MODEL_SETTINGS,
+  DeriveError,
+  deriveParameters,
+  type DeriveErrorCode,
+  type DeriveModel,
+  type DeriveModelRequest,
+  type DeriveModelResponse,
+  type DeriveModelSettings,
+  type DeriveResult,
+} from "./derive";
 
 export {
   fetchCandleWindow,

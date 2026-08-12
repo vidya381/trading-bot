@@ -170,6 +170,82 @@ export class AssessParseError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// The checks every stage shares
+// ---------------------------------------------------------------------------
+
+/**
+ * The failures that belong to no single stage.
+ *
+ * ── WHY THESE ARE SHARED CODE AND NOT A SHARED CONVENTION ──
+ *
+ * Three things in this file are facts about the TRANSPORT and about 21.5's
+ * grounding rule, not about the Assess question: how an answer is dug out of
+ * Workers AI's envelope, what an exactly-this-field-set object is, and whether a
+ * citation names an id this run really emitted. Stage 3 (`derive-parse.ts`) has
+ * to do all three, identically.
+ *
+ * A second implementation would be the thing 21.5 requirement 3 warns about one
+ * layer up: "a second implementation of a risk check drifts from the first, and
+ * the copy that drifts is the one nobody is watching". The citation check in
+ * particular IS the grounding mechanism -- if Derive's copy of it were one edit
+ * looser than Assess's, a Derive proposal could cite an id no prompt emitted and
+ * only Assess's tests would notice.
+ *
+ * So the LOGIC is written once and the VOCABULARY is injected. Each stage passes
+ * a `ParseRefusal` that maps these shared codes onto its own error class and its
+ * own code names, so `derive-parse.ts` never throws an error called
+ * `AssessParseError` and `assess-parse.ts` keeps every code name it had before
+ * this was extracted.
+ */
+export type SharedParseCode =
+  /** The transport returned neither answer text nor a recognised envelope. */
+  | "envelope_unrecognised"
+  /** `{response: ...}` was present but held neither text nor an object. */
+  | "envelope_response_unusable"
+  /** The request was queued as a batch job rather than answered. */
+  | "async_batch_envelope"
+  /** Empty, or nothing but whitespace. */
+  | "empty_response"
+  /** Wrapped in a markdown code fence. Deliberately not unwrapped. */
+  | "fenced_response"
+  /** `JSON.parse` refused it. */
+  | "not_json"
+  /** Valid JSON, but not a single object. */
+  | "not_an_object"
+  /** The same key twice in one object. */
+  | "duplicate_key"
+  /** A required field is absent. */
+  | "missing_field"
+  /** A field the contract does not define is present. */
+  | "unexpected_field"
+  /** A `citations` value is absent, not an array, or empty. */
+  | "citations_invalid"
+  /** A citation is not a string. */
+  | "citation_not_a_string"
+  /** A citation names an evidence id this run's prompt never emitted. */
+  | "citation_unknown";
+
+/**
+ * How a stage turns a shared failure into its own error.
+ *
+ * Returns the error rather than throwing it, so the shared code can `throw
+ * refuse(...)` and TypeScript still sees the throw. A refusal that returned a
+ * non-Error would be a stage's own bug and is not defended against here.
+ */
+export type ParseRefusal = (code: SharedParseCode, message: string, received: unknown) => Error;
+
+/** Assess's mapping. Every code name it had before the extraction, unchanged. */
+const refuseAsAssess: ParseRefusal = (code, message, received) =>
+  new AssessParseError(
+    // The one rename: Assess has always called this `claim_citations_invalid`,
+    // because in Assess a citation list only ever hangs off a claim. In Derive
+    // it also hangs off a parameter, so the shared name drops "claim".
+    code === "citations_invalid" ? "claim_citations_invalid" : code,
+    message,
+    received,
+  );
+
+// ---------------------------------------------------------------------------
 // The result
 // ---------------------------------------------------------------------------
 
@@ -395,12 +471,17 @@ export interface UnwrappedAnswer {
  * by `parseAnswerText`.
  */
 export function unwrapModelEnvelope(raw: unknown): UnwrappedAnswer {
+  return unwrapWith(raw, refuseAsAssess);
+}
+
+/** The envelope logic itself. See `SharedParseCode` for why the vocabulary is injected. */
+export function unwrapWith(raw: unknown, refuse: ParseRefusal): UnwrappedAnswer {
   if (typeof raw === "string") {
     return { shape: "bare_string", answer: raw, sourceText: raw };
   }
 
   if (!isPlainObject(raw)) {
-    throw new AssessParseError(
+    throw refuse(
       "envelope_unrecognised",
       `the model transport returned ${raw === null ? "null" : Array.isArray(raw) ? "an array" : typeof raw}, which is neither an answer string nor a recognised Workers AI envelope`,
       raw,
@@ -412,7 +493,7 @@ export function unwrapModelEnvelope(raw: unknown): UnwrappedAnswer {
     // folded into a generic refusal: it means the request was QUEUED, not
     // answered, so "the model gave a bad answer" would be the wrong sentence.
     if (Object.prototype.hasOwnProperty.call(raw, "request_id")) {
-      throw new AssessParseError(
+      throw refuse(
         "async_batch_envelope",
         `the transport returned an async batch envelope (request_id ${JSON.stringify(raw["request_id"])}), not an answer. This stage runs one synchronous call; queueRequest must not be set.`,
         raw,
@@ -431,11 +512,49 @@ export function unwrapModelEnvelope(raw: unknown): UnwrappedAnswer {
     return { shape: "envelope_object", answer: response, sourceText: null };
   }
 
-  throw new AssessParseError(
+  throw refuse(
     "envelope_response_unusable",
     `the transport envelope's "response" field is ${response === null ? "null" : Array.isArray(response) ? "an array" : typeof response}, which is neither answer text nor an answer object`,
     response,
   );
+}
+
+/**
+ * The whole transport layer, once: envelope out, text parsed, duplicates
+ * scanned, an object in hand.
+ *
+ * Everything a stage does AFTER this is about what the answer says; everything
+ * before it is about how Workers AI wrapped it. `parseAssessResponse` and
+ * `parseDeriveResponse` both start here, so the observed `envelope_object`
+ * shape, the refusal to strip a code fence, and the duplicate-key reporting are
+ * one implementation rather than two that agree today.
+ */
+export interface ModelAnswer {
+  readonly answer: Record<string, unknown>;
+  readonly envelope: AssessEnvelopeShape;
+  readonly duplicateKeyCheck: DuplicateKeyCheck;
+}
+
+export function readModelAnswer(raw: unknown, refuse: ParseRefusal): ModelAnswer {
+  const unwrapped = unwrapWith(raw, refuse);
+
+  if (unwrapped.sourceText !== null) {
+    // The TEXT path. Every byte the model produced is in hand, so every check
+    // this module has is available -- including the duplicate-key scan.
+    return {
+      answer: parseAnswerText(unwrapped.sourceText, refuse),
+      envelope: unwrapped.shape,
+      duplicateKeyCheck: "performed",
+    };
+  }
+
+  // The OBJECT path. See `DuplicateKeyCheck` for what is lost and why it is
+  // reported rather than faked.
+  return {
+    answer: unwrapped.answer as Record<string, unknown>,
+    envelope: unwrapped.shape,
+    duplicateKeyCheck: "unavailable_transport_parsed",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -453,10 +572,15 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
  * question. Reported with the real key names so the failure is diagnosable from
  * the log alone.
  */
-function requireExactFields(value: Record<string, unknown>, allowed: readonly string[], where: string): void {
+export function requireExactFields(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  where: string,
+  refuse: ParseRefusal,
+): void {
   for (const field of allowed) {
     if (!Object.prototype.hasOwnProperty.call(value, field)) {
-      throw new AssessParseError(
+      throw refuse(
         "missing_field",
         `${where} is missing the required field ${JSON.stringify(field)}; the response contract has exactly the fields ${allowed.map((f) => JSON.stringify(f)).join(", ")}`,
         Object.keys(value),
@@ -465,7 +589,7 @@ function requireExactFields(value: Record<string, unknown>, allowed: readonly st
   }
   for (const key of Object.keys(value)) {
     if (!allowed.includes(key)) {
-      throw new AssessParseError(
+      throw refuse(
         "unexpected_field",
         `${where} carries the field ${JSON.stringify(key)}, which the response contract does not define. It is refused rather than ignored: a response answering a question that was not asked has not answered the one that was.`,
         key,
@@ -474,12 +598,62 @@ function requireExactFields(value: Record<string, unknown>, allowed: readonly st
   }
 }
 
+/**
+ * THE GROUNDING CHECK, and the only implementation of it in this repository.
+ *
+ * A citation list must be a non-empty array of strings, and every one of those
+ * strings must name an `EvidenceItem` THIS RUN's prompt actually emitted. That
+ * is what turns 21.5 requirement 1 from a judgement into a set-membership test,
+ * and it is why an unknown id is fatal for the whole response rather than
+ * skipped: an invented id is direct evidence the response was not derived from
+ * the data provided, and one such citation makes the rest untrustworthy.
+ *
+ * Shared by Assess (a claim's citations) and Derive (a claim's AND a proposed
+ * parameter's). See `SharedParseCode` for why there is exactly one copy.
+ */
+export function resolveCitations(
+  raw: unknown,
+  where: string,
+  evidenceById: ReadonlyMap<string, EvidenceItem>,
+  refuse: ParseRefusal,
+): readonly [EvidenceItem, ...EvidenceItem[]] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw refuse(
+      "citations_invalid",
+      `${where}.citations must be a non-empty array of evidence ids. A value with no citation is exactly the ungrounded prose 21.5 requirement 1 forbids, so it is refused rather than kept.`,
+      raw,
+    );
+  }
+
+  const resolved: EvidenceItem[] = [];
+  for (const [citationIndex, citation] of raw.entries()) {
+    if (typeof citation !== "string") {
+      throw refuse(
+        "citation_not_a_string",
+        `${where}.citations[${citationIndex}] is not a string`,
+        citation,
+      );
+    }
+    const item = evidenceById.get(citation);
+    if (item === undefined) {
+      throw refuse(
+        "citation_unknown",
+        `${where}.citations[${citationIndex}] cites ${JSON.stringify(citation)}, which this run's prompt never emitted. An invented citation is direct evidence that the response was not derived from the data provided (21.5 requirement 1), so the whole response is refused rather than this citation dropped.`,
+        citation,
+      );
+    }
+    resolved.push(item);
+  }
+
+  return resolved as [EvidenceItem, ...EvidenceItem[]];
+}
+
 function parseClaim(raw: unknown, position: number, evidenceById: ReadonlyMap<string, EvidenceItem>): CitedClaim {
   const where = `claims[${position}]`;
   if (!isPlainObject(raw)) {
     throw new AssessParseError("claim_not_an_object", `${where} is not an object`, raw);
   }
-  requireExactFields(raw, ["statement", "citations"], where);
+  requireExactFields(raw, ["statement", "citations"], where, refuseAsAssess);
 
   const statement = raw["statement"];
   if (typeof statement !== "string" || statement.trim() === "") {
@@ -490,36 +664,10 @@ function parseClaim(raw: unknown, position: number, evidenceById: ReadonlyMap<st
     );
   }
 
-  const citations = raw["citations"];
-  if (!Array.isArray(citations) || citations.length === 0) {
-    throw new AssessParseError(
-      "claim_citations_invalid",
-      `${where}.citations must be a non-empty array of evidence ids. A claim with no citation is exactly the ungrounded prose 21.5 requirement 1 forbids, so it is refused rather than kept.`,
-      citations,
-    );
-  }
-
-  const resolved: EvidenceItem[] = [];
-  for (const [citationIndex, citation] of citations.entries()) {
-    if (typeof citation !== "string") {
-      throw new AssessParseError(
-        "citation_not_a_string",
-        `${where}.citations[${citationIndex}] is not a string`,
-        citation,
-      );
-    }
-    const item = evidenceById.get(citation);
-    if (item === undefined) {
-      throw new AssessParseError(
-        "citation_unknown",
-        `${where}.citations[${citationIndex}] cites ${JSON.stringify(citation)}, which this run's prompt never emitted. An invented citation is direct evidence that the response was not derived from the data provided (21.5 requirement 1), so the whole response is refused rather than this citation dropped.`,
-        citation,
-      );
-    }
-    resolved.push(item);
-  }
-
-  return { statement, citations: resolved as [EvidenceItem, ...EvidenceItem[]] };
+  return {
+    statement,
+    citations: resolveCitations(raw["citations"], where, evidenceById, refuseAsAssess),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -544,26 +692,9 @@ function parseClaim(raw: unknown, position: number, evidenceById: ReadonlyMap<st
  *         grounded answer. Never returns a default.
  */
 export function parseAssessResponse(raw: unknown, prompt: AssessPrompt): ParsedAssessment {
-  const unwrapped = unwrapModelEnvelope(raw);
-
-  let answer: Record<string, unknown>;
-  let duplicateKeyCheck: DuplicateKeyCheck;
-
-  if (unwrapped.sourceText !== null) {
-    // The TEXT path. Every byte the model produced is in hand, so every check
-    // this module has is available -- including the duplicate-key scan.
-    answer = parseAnswerText(unwrapped.sourceText);
-    duplicateKeyCheck = "performed";
-  } else {
-    // The OBJECT path. See `DuplicateKeyCheck` for what is lost and why it is
-    // reported rather than faked.
-    answer = unwrapped.answer as Record<string, unknown>;
-    duplicateKeyCheck = "unavailable_transport_parsed";
-  }
-
+  const { answer, envelope, duplicateKeyCheck } = readModelAnswer(raw, refuseAsAssess);
   const { strategy, claims } = validateAnswerObject(answer, prompt);
-
-  return { strategy, claims, envelope: unwrapped.shape, duplicateKeyCheck };
+  return { strategy, claims, envelope, duplicateKeyCheck };
 }
 
 /**
@@ -574,14 +705,14 @@ export function parseAssessResponse(raw: unknown, prompt: AssessPrompt): ParsedA
  * it is. Empty, fenced, prose-wrapped, truncated and duplicate-keyed responses
  * all fail here exactly as they always did.
  */
-function parseAnswerText(raw: string): Record<string, unknown> {
+function parseAnswerText(raw: string, refuse: ParseRefusal): Record<string, unknown> {
   const trimmed = raw.trim();
   if (trimmed === "") {
-    throw new AssessParseError("empty_response", "the model returned an empty response", raw);
+    throw refuse("empty_response", "the model returned an empty response", raw);
   }
 
   if (trimmed.startsWith("```")) {
-    throw new AssessParseError(
+    throw refuse(
       "fenced_response",
       "the model wrapped its answer in a markdown code fence, which the prompt forbade. The fence is deliberately NOT stripped: every unwrapping rule added here is a rule about text the model was told not to produce, and unwrapping is the first step toward extracting JSON out of prose.",
       raw,
@@ -592,7 +723,7 @@ function parseAnswerText(raw: string): Record<string, unknown> {
   try {
     parsed = JSON.parse(trimmed);
   } catch (error) {
-    throw new AssessParseError(
+    throw refuse(
       "not_json",
       `the model response is not valid JSON (${error instanceof Error ? error.message : String(error)}). No attempt is made to locate JSON inside surrounding prose.`,
       raw,
@@ -601,7 +732,7 @@ function parseAnswerText(raw: string): Record<string, unknown> {
 
   const duplicate = findDuplicateKey(trimmed);
   if (duplicate !== null) {
-    throw new AssessParseError(
+    throw refuse(
       "duplicate_key",
       `the model response repeats the key ${JSON.stringify(duplicate)} in one object. JSON.parse keeps the last value silently, so a self-contradictory response would otherwise look clean.`,
       duplicate,
@@ -609,7 +740,7 @@ function parseAnswerText(raw: string): Record<string, unknown> {
   }
 
   if (!isPlainObject(parsed)) {
-    throw new AssessParseError(
+    throw refuse(
       "not_an_object",
       `the model response is valid JSON but not a single object (received ${Array.isArray(parsed) ? "an array" : parsed === null ? "null" : typeof parsed})`,
       parsed,
@@ -632,7 +763,7 @@ function validateAnswerObject(
   answer: Record<string, unknown>,
   prompt: AssessPrompt,
 ): { strategy: StrategyType; claims: readonly [CitedClaim, ...CitedClaim[]] } {
-  requireExactFields(answer, ["strategy", "claims"], "the response");
+  requireExactFields(answer, ["strategy", "claims"], "the response", refuseAsAssess);
 
   const strategy = answer["strategy"];
   if (typeof strategy !== "string") {
