@@ -122,6 +122,17 @@ export function Dashboard() {
           >
             Alerts
           </Link>
+          {/*
+           * Spec 21.4 stage 4. Read-only and inert — it renders two responses
+           * the operator already holds and calls nothing, so it sits with the
+           * other navigation rather than with the actions.
+           */}
+          <Link
+            to="/proposal"
+            className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"
+          >
+            Proposal
+          </Link>
           <Link
             to="/manual-adjustments"
             className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"

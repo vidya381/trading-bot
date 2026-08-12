@@ -21,5 +21,20 @@
 
     "types": ["vite/client"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  "//exclude": [
+    "Test files are excluded from the APP build because they are not app code and",
+    "are not compiled by this toolchain. They run under the ROOT vitest suite (see",
+    "vitest.config.ts), whose default include glob reaches dashboard/src, and",
+    "src/citations.test.ts imports the backend's real prompt builders on purpose --",
+    "a rule about EvidenceItem.source is only worth testing against the strings the",
+    "backend really emits. Compiling those imports HERE fails, and the reason is the",
+    "one src/derive.ts already records: this project runs a deliberate TypeScript",
+    "5.7 / 7 split, and the dashboard sets noUnusedLocals where the Worker does not",
+    "and declares no Workers types. That is a property of the two toolchains, not a",
+    "fault in either tree, and excluding a test file is the correct place to absorb",
+    "it -- widening the dashboard's options or editing backend source to satisfy a",
+    "dashboard build would both be worse."
+  ],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

@@ -16,6 +16,9 @@
  *   /alerts       the cross-bot alert feed (every alert, filterable)
  *   /kill-switch  the global kill switch control (status, trigger, reset)
  *   /manual-adjustments  log a manual deposit/withdrawal (spec 8.6)
+ *   /proposal     an LLM bot proposal, assembled for review (spec 21.4 stage 4).
+ *                 Read-only and inert: it renders two real responses the operator
+ *                 already holds, calls nothing, and stores nothing.
  *   *             anything else redirects home
  */
 
@@ -28,6 +31,7 @@ import { BotDetail } from "./pages/BotDetail";
 import { Alerts } from "./pages/Alerts";
 import { KillSwitchPage } from "./pages/KillSwitchPage";
 import { ManualAdjustment } from "./pages/ManualAdjustment";
+import { Proposal } from "./pages/Proposal";
 
 export function App() {
   return (
@@ -42,6 +46,7 @@ export function App() {
           <Route path="/alerts" element={<Alerts />} />
           <Route path="/kill-switch" element={<KillSwitchPage />} />
           <Route path="/manual-adjustments" element={<ManualAdjustment />} />
+          <Route path="/proposal" element={<Proposal />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
