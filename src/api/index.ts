@@ -37,9 +37,7 @@ import {
 } from "../workers/symbols";
 import { envCandleLister, type CandleLister } from "../workers/candles";
 import type { AssessModel } from "../research/assess";
-// ⚠ TEMPORARY, with the route block below. See `debug-derive-probe.ts`.
 import type { DeriveModel } from "../research/derive";
-import { getDeriveProbe } from "./debug-derive-probe";
 
 const ROUTES: readonly Route[] = [
   route("GET", "/api/bots", handlers.listBots),
@@ -69,20 +67,15 @@ const ROUTES: readonly Route[] = [
   // 10.5-20.3 s per assessment a multi-candidate synchronous request is a
   // different design problem, not a parameter on this one.
   route("GET", "/api/accounts/:label/assess", handlers.getAccountAssess),
-  // =====================================================================
-  // ⚠⚠⚠  TEMPORARY DIAGNOSTIC -- DELETE THIS BLOCK AFTER THE PROBE.  ⚠⚠⚠
-  //
-  // Not a feature and not the Derive endpoint. One-shot scaffolding that
-  // answers what no test can, because every test here drives a stub: does
-  // this model fill NINE cited numeric fields under a strategy-conditional
-  // schema, what does Stage 3 really cost in latency, and do the real
-  // decoders and validators accept what it produces?
-  //
-  // TWO paid inferences per request. Writes NOTHING. Delete this line, the
-  // import above, `debug-derive-probe.ts`, the `deriveModel` fields on
-  // `ApiOptions`/`ApiContext`, and the probe tests, together.
-  // =====================================================================
-  route("GET", "/api/debug/derive-probe", getDeriveProbe),
+  // Section 21.4 Stage 3 (Derive). Takes the strategy and claims a PREVIOUS,
+  // SEPARATE /assess call returned, gathers its OWN fresh evidence, and refuses
+  // the resubmission unless every citation in it still resolves against that
+  // fresh evidence. Two endpoints rather than one chained request: a two-model
+  // chain has been observed at ~88 s for one candidate (decision log 41), and
+  // the human in 21.1 reads Stage 2's answer before Stage 3 is worth spending.
+  // NOTHING BRIDGES THE TWO CALLS -- no D1, no KV, no cache; the client holds
+  // the assessment. See `getAccountDerive` for why that is deliberate.
+  route("GET", "/api/accounts/:label/derive", handlers.getAccountDerive),
   // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
   // dashboard control for these is deliberately a later step; today they are the
   // curl-callable surface that replaces editing the table by hand.
@@ -123,10 +116,8 @@ export interface ApiOptions {
    */
   readonly assessModel?: AssessModel;
   /**
-   * Injected by tests so the derive probe makes NO live model call.
-   *
-   * ⚠ TEMPORARY, with the probe. Absent in the Worker, where the probe builds
-   * the real one from `env.AI`.
+   * Injected by tests so the derive endpoint makes NO live model call. Absent
+   * in the Worker, where `getAccountDerive` builds the real one from `env.AI`.
    */
   readonly deriveModel?: DeriveModel;
   /**
@@ -211,7 +202,6 @@ export async function handleApiRequest(
       symbolLister: options.symbolLister ?? envSymbolLister,
       candleLister: options.candleLister ?? envCandleLister,
       ...(options.assessModel === undefined ? {} : { assessModel: options.assessModel }),
-      // ⚠ TEMPORARY, with the probe route.
       ...(options.deriveModel === undefined ? {} : { deriveModel: options.deriveModel }),
       symbolDetailLister: options.symbolDetailLister ?? envSymbolDetailLister,
       now: options.now ?? (() => Date.now()),

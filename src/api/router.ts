@@ -58,9 +58,10 @@ export interface ApiContext {
    * The Stage 3 model, injected for exactly `assessModel`'s reason: **no test in
    * this repository may fall through to a paid vendor.**
    *
-   * ⚠ TEMPORARY. Today its only reader is `/api/debug/derive-probe`, which is
-   * itself temporary scaffolding. When the probe is deleted this field goes with
-   * it unless a real Derive endpoint has landed by then.
+   * Its reader is `/api/accounts/:label/derive`, and `api.test.ts` asserts the
+   * stub is called exactly once per successful request -- and ZERO times on
+   * every refusal, which is the assertion that keeps a rejected resubmission
+   * from silently costing an inference.
    */
   readonly deriveModel?: DeriveModel;
   /**

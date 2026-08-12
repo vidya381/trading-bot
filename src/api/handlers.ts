@@ -28,6 +28,9 @@ import {
   manualAdjustmentView,
   watchlistEntryView,
   assessResultView,
+  deriveContextView,
+  deriveResultView,
+  resubmittedAssessmentView,
   type BotFees,
 } from "./serialize";
 import {
@@ -42,11 +45,20 @@ import {
   assessCandidate,
   AssessError,
   AssessParseError,
+  AssessResubmitError,
+  DeriveError,
+  DeriveParseError,
+  DeriveValidationError,
+  deriveParameters,
+  gatherDeriveContext,
+  parseResubmittedAssessment,
   selectNamedCandidate,
   selectWatchlistCandidates,
   type AssessResult,
   type CandidateEntryPoint,
   type CandleSource,
+  type DeriveContextPorts,
+  type DeriveResult,
   type GatherPorts,
   type GatherRequest,
   type SymbolDetailSource,
@@ -71,6 +83,7 @@ import {
   type SymbolCacheStore,
 } from "../workers/symbols";
 import { envAssessModel } from "../workers/assess";
+import { envDeriveModel } from "../workers/derive";
 import type { Asset, CandleInterval, Pair } from "../shared/exchange-client";
 import { fromDecimalString, toDecimalString, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
@@ -1837,6 +1850,284 @@ export async function getAccountAssess(ctx: ApiContext): Promise<Response> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Section 21.4 Stage 3 (Derive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage 3's ports: `gatherPorts` plus the one-symbol details read.
+ *
+ * COMPOSED from the real wiring rather than rebuilt. `gatherPorts` supplies the
+ * cached `tradablePairsFor` and the uncached `candleSourceFor` that `/gather`,
+ * `/candles` and `/assess` all go through, and `symbolDetailsFor` is the same
+ * `SymbolDetailSource` bot creation's spot-instrument gate uses. So a derivation
+ * cannot reach a different venue, a different cache or a different account
+ * resolution than the assessment it is derived from did.
+ *
+ * The deleted Stage 3 probe rebuilt these three adapters locally, which was
+ * correct FOR A PROBE -- it meant deleting the probe left nothing behind, since
+ * exporting `handlers.ts`'s private adapters for a temporary file would have
+ * been a permanent widening. A real endpoint has the opposite requirement and
+ * uses the real thing.
+ */
+function deriveContextPortsFor(ctx: ApiContext): DeriveContextPorts {
+  return { ...gatherPorts(ctx), getSymbolDetails: symbolDetailsFor(ctx) };
+}
+
+/**
+ * GET /api/accounts/:label/derive -- derive parameters for a PREVIOUSLY-RETURNED
+ * Stage 2 result, re-verified against evidence gathered now.
+ *
+ * ── THE ONE THING THIS ENDPOINT DOES THAT NOTHING ELSE HAS ──
+ *
+ * Every earlier exercise of Stage 3 fed Assess's output into Derive INSIDE ONE
+ * REQUEST: step 41's probe made a real Assess call and passed the resulting
+ * object straight down the call stack. This endpoint accepts an assessment that
+ * came from an EARLIER, SEPARATE HTTP CALL -- the client held it, real time
+ * passed, and it arrives as untrusted text. That is the whole of the new
+ * surface; the prompt building, the citation machinery, the real decoders, the
+ * real validators and the venue-floor check are all step 41's, unchanged.
+ *
+ * ── IT DOES NOT TRUST THE RESUBMISSION, AND IT DOES NOT PERSIST TO AVOID IT ──
+ *
+ * There are two ways to stop a caller inventing an assessment. One is to have
+ * stored it, so the resubmission is only an id. The other is to re-verify it
+ * against reality. **THIS ENDPOINT DOES THE SECOND, AND THE CHOICE IS
+ * DELIBERATE.**
+ *
+ * `parseResubmittedAssessment` resolves every citation in the submitted claims
+ * against the evidence set THIS run's freshly-gathered bundle emits -- not
+ * against whatever existed when `/assess` ran. An id that was real then and is
+ * not real now is refused exactly as a fabricated one is, because the guarantee
+ * being offered is about the evidence a human will read on this screen, not
+ * about the caller's honesty. The strategy is likewise re-checked against the
+ * two literals `dca` and `grid` rather than trusted to be one of them.
+ *
+ * ── WHY NO PERSISTENCE, STATED HERE BECAUSE THIS IS WHERE IT WOULD BE ADDED ──
+ *
+ * **NO D1 ROW, NO KV KEY, NO CACHE, NO TEMPORARY STORE OF ANY KIND bridges the
+ * two calls.** The client holds the Stage 2 result and hands it back.
+ *
+ * That is not an omission and it is not laziness about the trust problem, which
+ * the re-verification above already answers. It is that 21.5 requirement 5
+ * specifies a REAL, PERSISTENT PROPOSAL RECORD -- prompt text, settings, model
+ * id, raw responses, both upstream inputs, an audit trail a human can return to
+ * -- and that record belongs to Stage 4's pipeline assembly, which does not
+ * exist. A throwaway bridge invented here would be storage with a different
+ * shape, a different lifetime and a different owner than the thing that is
+ * actually coming, written to solve a problem (trust) that is solved without it,
+ * and it would almost certainly be deleted when requirement 5 lands. The
+ * decision is to carry the constraint in the open rather than build storage
+ * twice.
+ *
+ * SO: NOTHING IS PERSISTED. No proposal record, no audit row, no D1 write.
+ * 21.5 requirement 5 is NOT satisfied, NOT partially satisfied and NOT begun.
+ *
+ * ── WRITES NOTHING, ALLOCATES NOTHING (21.1) ──
+ *
+ * `allocatedCapital` in the response is a PREFILL a human confirms. No capital
+ * is reserved, `total_allocated` is untouched, no bot is created and no Durable
+ * Object is brought into existence. The binding capital check is
+ * `createBotInstanceWithCapital`'s, against the ledger as it stands at creation.
+ *
+ * ── THE PARAMETERS ──
+ *
+ *   `pair`, `interval`   required, no defaults, exactly as `/assess` -- a wrong
+ *                        interval returns correctly-shaped candles of a
+ *                        DIFFERENT duration that no reader downstream can
+ *                        detect, and here it would reach a model as fact.
+ *   `since`, `quoteAssets` optional, parsed by the same strict rules.
+ *   `assessment`         REQUIRED. The URL-encoded JSON object a previous
+ *                        `/assess` returned, carrying exactly `strategy`,
+ *                        `claims`, `envelope` and `duplicateKeyCheck`, where
+ *                        each claim's `citations` is an array of evidence id
+ *                        STRINGS. See `parseResubmittedAssessment` for why ids
+ *                        rather than the whole `EvidenceItem`s `/assess`
+ *                        publishes: their rendered values are stale by
+ *                        definition and this stage must ignore them, and a field
+ *                        accepted and ignored reads exactly like one that was
+ *                        used.
+ *
+ * ── WHAT FAILS THE REQUEST ──
+ *
+ *   A BAD OR STALE RESUBMISSION -> 400, or 409 for `citation_unknown`. 409
+ *   because that submission was well formed and conflicts with CURRENT state,
+ *   which is `duplicate_bot_instance`'s and `cap_exceeded`'s shape exactly: the
+ *   caller fixes it by running `/assess` again, not by rephrasing.
+ *
+ *   A MODEL THAT ANSWERS BADLY -> 502 with the parser's or the validator's OWN
+ *   code, never a degraded success. A `DeriveValidationError` reports
+ *   `<layer>/<code>` so "the real decoder rejected this" stays distinguishable
+ *   from "the real strategy validator rejected this" from "this stage's own
+ *   bound rejected this" -- the same distinction `DeriveValidationError.layer`
+ *   exists to preserve.
+ *
+ *   A MISSING PRECONDITION -> `DeriveError`'s own code and status: no candle
+ *   window, an unreadable ledger, no headroom at all, unreadable venue filters.
+ *   All four refuse BEFORE the paid inference.
+ *
+ * A failed CONCENTRATION read does NOT fail the request, exactly as in
+ * `/assess`: it is stated to the model as missing and returned verbatim in
+ * `bundle.concentration`.
+ *
+ * ⚠ DERIVE CANNOT DETECT A BAD UPSTREAM JUDGEMENT. A proposal that passes every
+ * check here can still be financially meaningless, because the checks answer
+ * "is this consistent and grounded?" and none answers "was the data worth
+ * reasoning about?" (decision logs 40, 41). The human in 21.1 is the only part
+ * of the loop that can tell the two apart.
+ */
+export async function getAccountDerive(ctx: ApiContext): Promise<Response> {
+  const label = ctx.params.label!;
+
+  const pair = ctx.url.searchParams.get("pair");
+  if (pair === null || pair.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "pair" is required and must be the venue's own symbol, exactly as ` +
+        `GET /api/accounts/${label}/symbols reports it -- and it must be the SAME pair the ` +
+        `resubmitted assessment was made about.`,
+    );
+  }
+
+  const interval = ctx.url.searchParams.get("interval");
+  if (interval === null || interval.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "interval" is required and must be one of ${CANDLE_INTERVALS.join(", ")}. ` +
+        `There is no default: a wrong interval returns correctly-shaped candles of a DIFFERENT ` +
+        `duration, which passes every type check and which no downstream reader can detect.`,
+    );
+  }
+  if (!CANDLE_INTERVALS.includes(interval as CandleInterval)) {
+    throw badRequest(
+      "invalid_filter",
+      `interval must be one of ${CANDLE_INTERVALS.join(", ")}, not ${JSON.stringify(interval)}`,
+    );
+  }
+
+  const sinceParam = ctx.url.searchParams.get("since");
+  let since: number | undefined;
+  if (sinceParam !== null) {
+    const parsed = Number(sinceParam);
+    if (sinceParam.trim() === "" || !Number.isInteger(parsed) || parsed < 0) {
+      throw badRequest(
+        "invalid_field",
+        `query parameter "since", if given, must be a non-negative integer of ` +
+          `epoch milliseconds, not ${JSON.stringify(sinceParam)}`,
+      );
+    }
+    since = parsed;
+  }
+
+  // Read BEFORE any venue or model work, so a caller who forgot it is told so
+  // without this endpoint having spent a candle request first. It is NOT parsed
+  // here: parsing needs the fresh bundle's evidence, which does not exist yet.
+  const assessmentParam = ctx.url.searchParams.get("assessment");
+  if (assessmentParam === null || assessmentParam.trim() === "") {
+    throw badRequest(
+      "missing_field",
+      `query parameter "assessment" is required: it is the JSON object a previous ` +
+        `GET /api/accounts/${label}/assess returned, carrying exactly "strategy", "claims", ` +
+        `"envelope" and "duplicateKeyCheck", with each claim's "citations" as an array of ` +
+        `evidence id strings. This endpoint derives parameters FOR an assessment and never ` +
+        `makes one: it has no Stage 2 call in it, and there is no stored proposal to name by ` +
+        `id (21.5 requirement 5's proposal record is future work). Every citation in it is ` +
+        `re-resolved against the evidence gathered by THIS request, so an assessment whose ` +
+        `data has aged out is refused rather than derived from.`,
+    );
+  }
+
+  const request: GatherRequest = {
+    interval: interval as CandleInterval,
+    ...(since === undefined ? {} : { since }),
+    ...(() => {
+      const quoteAssets = optionalCsv(ctx, "quoteAssets");
+      return quoteAssets === undefined ? {} : { quoteAssets };
+    })(),
+  };
+
+  const ports = deriveContextPortsFor(ctx);
+  const set = await selectNamedCandidate(ports, {
+    accountLabel: label,
+    pair,
+    // The layer's standing rule: the actor is the email VERIFIED off the Access
+    // token, never a caller-supplied string (21.5 requirement 2).
+    requestedBy: ctx.actor,
+  });
+  const bundle = await gatherCandidateData(ports, set.candidates[0]!, request);
+  const context = await gatherDeriveContext(ports, bundle);
+
+  // THE RE-VERIFICATION, and the only genuinely new boundary in this endpoint.
+  // It runs AFTER the fresh gather because it is checked AGAINST the fresh
+  // gather, and BEFORE the model call because a stale assessment must never
+  // reach a paid inference -- or a human -- dressed as reasoning about data this
+  // run has.
+  let assessment;
+  try {
+    assessment = parseResubmittedAssessment(assessmentParam, bundle);
+  } catch (error) {
+    if (error instanceof AssessResubmitError) {
+      // 409 for the stale/unknown citation, 400 for everything else. See the
+      // docblock: one is a conflict with current state that re-running /assess
+      // fixes, the rest are malformed input the caller rewrites.
+      throw new ApiError(error.code === "citation_unknown" ? 409 : 400, error.code, error.message);
+    }
+    throw error;
+  }
+
+  const model = ctx.deriveModel ?? envDeriveModel(ctx.env);
+
+  const startedAt = ctx.now();
+  let result: DeriveResult;
+  try {
+    result = await deriveParameters(model, context, assessment);
+  } catch (error) {
+    // The parser's and the validators' own codes travel on the wire, for
+    // `getAccountAssess`'s reason: a second vocabulary restating them would
+    // drift. 502 because the model answered and its answer was unusable.
+    if (error instanceof DeriveParseError) {
+      throw new ApiError(502, error.code, error.message);
+    }
+    if (error instanceof DeriveValidationError) {
+      // `<layer>/<code>`, so "the real decoder refused" stays distinguishable
+      // from "the real strategy validator refused" from "this stage's own bound
+      // refused" -- the distinction `DeriveValidationError.layer` exists for.
+      throw new ApiError(502, `${error.layer}/${error.code}`, error.message);
+    }
+    // `deriveParameters` refuses a context with no usable candle window, and its
+    // code says only THAT. Here the candle slot is in hand carrying the
+    // producing module's own error, so the real cause is surfaced with the
+    // precondition itself UNCHANGED and unbypassed -- exactly as `/assess` does.
+    if (
+      error instanceof DeriveError &&
+      error.code === "no_price_history" &&
+      bundle.candles.outcome === "failed"
+    ) {
+      const cause = bundle.candles.error;
+      throw new ApiError(
+        statusForCode(cause.code, 502),
+        cause.code,
+        `${cause.message} -- so no parameters were derived for ${bundle.candidate.pair}: ${error.message}`,
+      );
+    }
+    throw error;
+  }
+  const latencyMs = ctx.now() - startedAt;
+
+  return ok({
+    entryPoint: "named" as const,
+    selectedAt: set.selectedAt,
+    // Stage 1's bundle and Stage 3's own two reads travel WITH the proposal,
+    // never instead of it: every input's real state, including any that failed,
+    // beside the numbers drawn from them (21.5 requirement 2).
+    bundle: candidateGatherBundleView(bundle),
+    context: deriveContextView(context),
+    // Labelled `client_resubmitted`, with the claims rendered against the
+    // CURRENT evidence they were just re-verified against.
+    assessment: resubmittedAssessmentView(assessment),
+    derive: deriveResultView(result, latencyMs),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Alerts

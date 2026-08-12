@@ -129,7 +129,7 @@ interface ApiCall {
   readonly symbolDetailLister?: SymbolDetailLister;
   /** Inject the assess endpoint's model, so NO test ever reaches a paid vendor. */
   readonly assessModel?: AssessModel;
-  /** Inject the derive probe's model, for the same reason. ⚠ TEMPORARY, with the probe. */
+  /** Inject the derive endpoint's model, for the same reason. */
   readonly deriveModel?: DeriveModel;
   /** Inject a Database, to drive a read failure the real one cannot be made to produce. */
   readonly db?: Database;
@@ -4382,53 +4382,76 @@ describe("assess endpoint (section 21.4 Stage 2)", () => {
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// ⚠⚠⚠  TEMPORARY -- DELETE THIS BLOCK WITH THE PROBE.  ⚠⚠⚠
+// Section 21.4 Stage 3 (Derive)
 // ---------------------------------------------------------------------------
 
 /**
- * The Stage 3 derive probe: temporary scaffolding, tested anyway.
+ * `GET /api/accounts/:label/derive`, driven as the TWO SEPARATE CALLS it is.
+ *
+ * ── WHAT IS GENUINELY NEW HERE, AND WHAT IS PORTED ──
+ *
+ * Everything about building the prompt, reading the answer and validating the
+ * parameters was proven live in step 41 and is covered by
+ * `src/research/derive*.test.ts`. The ONE thing no test in this repository has
+ * ever exercised is the boundary this endpoint introduces: **an assessment that
+ * arrived from an earlier, separate HTTP call, re-verified against evidence
+ * gathered later.** The deleted probe called Assess fresh inside the same
+ * request, so the assessment and the evidence were the same objects and drift
+ * was impossible by construction.
+ *
+ * So the tests below do the real thing: they call `/assess`, take its REAL
+ * response body, project the citations to ids exactly as a client would, MOVE
+ * THE VENUE ON, and then call `/derive` as a second request. Three of them then
+ * make that second call fail in the three ways only a second call can.
+ *
+ * The probe's own four properties are ported rather than assumed, and ONE
+ * CHANGES DELIBERATELY: the probe reported a refusal at 200 because a refusal
+ * was its RESULT. A real endpoint refuses with a status, and the assertions say
+ * which -- 502 with the parser's or validator's own code for a bad model answer,
+ * 409 for a stale resubmission, 400 for a malformed one.
  *
  * NO TEST HERE REACHES A MODEL. Both stages are driven by injected fakes, and
- * two tests assert positively that the Derive model was called ZERO times --
- * `news.ts`'s mutation lesson (decision log 30), where a passing test that
- * asserted the right conclusion for the wrong reason would, under mutation,
- * point the suite at a live vendor.
- *
- * Four properties. They are deliberately about the PROBE's contract rather than
- * about Derive's logic, which `src/research/derive*.test.ts` already covers:
- *
- *  1. THE CHAIN RUNS IN ORDER AND REPORTS BOTH STAGES SEPARATELY. Two latencies,
- *     two envelopes, so Stage 3's cost can be told from Stage 2's -- which is
- *     the whole reason the probe exists.
- *  2. A REFUSAL IS A RESULT, NOT AN ERROR. A parse or validation refusal comes
- *     back at 200 carrying its REAL code, because "the validator refused with
- *     strategy_validator/validator_rejected" is exactly what a probe is for and
- *     a 502 would lose it.
- *  3. IT NEVER PRODUCES A PARTIAL PROPOSAL. `derive.outcome` is "proposed" or a
- *     named failure; a refusal carries no `proposal` key at all.
- *  4. IT WRITES NOTHING. Asserted by counting rows before and after.
+ * every refusal test asserts positively that the Derive model was called ZERO
+ * times -- `news.ts`'s mutation lesson (decision log 30), and here it also means
+ * a rejected resubmission never costs a paid inference.
  */
-describe("derive probe (TEMPORARY, section 21.4 Stage 3)", () => {
+describe("derive endpoint (section 21.4 Stage 3)", () => {
   const MINUTE = 60_000;
   const VENUE_ANSWERED_AT = 1_960_000_000_000;
 
   const catalogue: SymbolLister = async () => ({ ok: true, value: ["BTCUSD", "ETHUSD"], at: T0 });
 
+  /**
+   * A venue whose window this test can MOVE, which is what makes the two calls
+   * genuinely separate rather than two reads of one frozen fixture.
+   *
+   * `count` sets how deep the window is (and therefore how many
+   * `candles.bucket.NN` ids exist); `shift` moves both the times and the prices,
+   * so a later window is different DATA and not the same numbers restamped.
+   */
+  let venueCount = 40;
+  let venueShift = 0;
+
   const venue: CandleLister = async (_account, query) => ({
     ok: true,
-    value: [0, 1, 2].map((i) => ({
-      pair: query.pair,
-      openTime: T0 - (3 - i) * MINUTE,
-      closeTime: T0 - (3 - i) * MINUTE + MINUTE,
-      open: 100_000_000n,
-      high: 108_000_000n,
-      low: 96_000_000n,
-      close: 102_000_000n,
-      volume: 400_000_000n,
-      closed: true,
-    })),
-    at: VENUE_ANSWERED_AT,
+    value: Array.from({ length: venueCount }, (_, i) => {
+      const step = venueShift + i;
+      const close = BigInt(100 + (step % 7)) * 1_000_000n;
+      return {
+        pair: query.pair,
+        openTime: T0 - (venueCount - i) * MINUTE + venueShift * MINUTE,
+        closeTime: T0 - (venueCount - i) * MINUTE + venueShift * MINUTE + MINUTE,
+        open: close - 1_000_000n,
+        high: close + 8_000_000n,
+        low: close - 4_000_000n,
+        close,
+        volume: 400_000_000n,
+        closed: true,
+      };
+    }),
+    at: VENUE_ANSWERED_AT + venueShift * MINUTE,
   });
 
   /** Gemini's real shape: a quantity floor, and NO notional floor. */
@@ -4453,23 +4476,29 @@ describe("derive probe (TEMPORARY, section 21.4 Stage 3)", () => {
     at: VENUE_ANSWERED_AT,
   });
 
-  async function probeAccount(prefix: string) {
+  beforeEach(() => {
+    venueCount = 40;
+    venueShift = 0;
+  });
+
+  async function deriveAccount(prefix: string) {
     const label = `${prefix}-${suffix}`;
     await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
     await seedPlaceholderTotalBalance(
       db,
-      { accountLabel: label, asset: "USD", totalBalance: m("10000"), note: "probe fixture" },
+      { accountLabel: label, asset: "USD", totalBalance: m("10000"), note: "derive fixture" },
       { actor: HUMAN, now: T0 },
     );
     return label;
   }
 
-  const assessAnswer = {
+  /** What the Assess model says. `citations` is the id list under test. */
+  const assessAnswer = (citations: string[] = ["candles.range_pct"]) => ({
     response: {
       strategy: "grid",
-      claims: [{ statement: "The range is wide relative to the close.", citations: ["candles.range_pct"] }],
+      claims: [{ statement: "The range is wide relative to the close.", citations }],
     },
-  };
+  });
 
   const cited = (value: unknown, id = "candles.last_close") => ({ value, citations: [id] });
 
@@ -4477,8 +4506,8 @@ describe("derive probe (TEMPORARY, section 21.4 Stage 3)", () => {
     response: {
       strategy: "grid",
       parameters: {
-        upperBound: cited("1.08000000", "candles.high"),
-        lowerBound: cited("0.96000000", "candles.low"),
+        upperBound: cited("108.00000000", "candles.high"),
+        lowerBound: cited("96.00000000", "candles.low"),
         gridLines: cited(5, "candles.range_pct"),
         spacing: cited("arithmetic", "candles.range_pct"),
         orderSize: cited("50.00000000", "capital.row.01.available"),
@@ -4508,276 +4537,549 @@ describe("derive probe (TEMPORARY, section 21.4 Stage 3)", () => {
     return { assessModel, deriveModel, assessCalls, deriveCalls };
   }
 
-  const probePath = (query: Record<string, string>) =>
-    `/api/debug/derive-probe?${new URLSearchParams(query).toString()}`;
+  const derivePath = (label: string, query: Record<string, string>) =>
+    `/api/accounts/${label}/derive?${new URLSearchParams(query).toString()}`;
 
-  // -- Property 1: the whole chain, both stages reported separately ----------
-
-  it("runs gather -> context -> assess -> derive and reports each stage", async () => {
-    const label = await probeAccount("dp-ok");
-    const f = fakes(assessAnswer, deriveAnswer());
-
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
+  /**
+   * THE CLIENT'S WHOLE JOB, written out rather than hidden in a helper.
+   *
+   * `/assess` publishes each citation as a whole `EvidenceItem`; `/derive` takes
+   * evidence ID STRINGS, because the submitted `label`/`value`/`source` are a
+   * rendering of data as it stood at the ORIGINAL call and this stage must
+   * ignore them. That is the one projection a caller performs, and it is four
+   * lines of `jq`.
+   */
+  function resubmissionFrom(assess: any): string {
+    return JSON.stringify({
+      strategy: assess.strategy,
+      claims: assess.claims.map((claim: any) => ({
+        statement: claim.statement,
+        citations: claim.citations.map((item: any) => item.id),
+      })),
+      envelope: assess.envelope,
+      duplicateKeyCheck: assess.duplicateKeyCheck,
     });
+  }
 
-    expect(res.status).toBe(200);
-    expect(f.assessCalls, "assess was not called exactly once").toHaveLength(1);
-    expect(f.deriveCalls, "derive was not called exactly once").toHaveLength(1);
+  /** Call `/assess` for real and hand back its REAL response body. */
+  async function realAssess(label: string, assessModel: AssessModel) {
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/assess?${new URLSearchParams({ pair: "BTCUSD", interval: "1m" }).toString()}`,
+      { symbolLister: catalogue, candleLister: venue, symbolDetailLister: details, assessModel },
+    );
+    expect(res.status, "the /assess call this test builds on did not succeed").toBe(200);
+    return res.body.data.assess;
+  }
 
-    const { assess, derive, capital, filters } = res.body.data;
+  // -- Requirement 1: /assess's response already supports resubmission --------
 
-    // The real capital-ledger read reached the probe's output.
-    expect(capital.outcome).toBe("ok");
-    expect(capital.assets[0].asset).toBe("USD");
-    expect(capital.assets[0].available).toBe("10000.00000000");
+  it("returns from /assess everything a client needs to resubmit, with nothing missing", async () => {
+    const label = await deriveAccount("dv-shape");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
 
-    // The real filters read did too, with the floor Gemini actually publishes.
-    expect(filters.outcome).toBe("ok");
-    expect(filters.minQuantity).toBe("0.00100000");
-    expect(filters.minNotional).toBe("0.00000000");
-
-    expect(assess.outcome).toBe("assessed");
+    // The exact strategy string, unmodified.
     expect(assess.strategy).toBe("grid");
-    expect(typeof assess.latencyMs).toBe("number");
+    // The exact claims, with their exact citations, each carrying its id.
+    expect(assess.claims).toHaveLength(1);
+    expect(assess.claims[0].statement).toBe("The range is wide relative to the close.");
+    expect(assess.claims[0].citations[0].id).toBe("candles.range_pct");
+    // The two audit fields the resubmission contract requires.
+    expect(assess.envelope).toBe("envelope_object");
+    expect(assess.duplicateKeyCheck).toBe("unavailable_transport_parsed");
 
-    expect(derive.outcome).toBe("proposed");
-    expect(derive.strategy).toBe("grid");
-    expect(derive.promptVersion).toBe("derive/1");
-    expect(typeof derive.latencyMs).toBe("number");
-    // Two separately reported latencies is the point of the probe.
-    expect(derive.latencyMs).not.toBe(undefined);
-    expect(assess.latencyMs).not.toBe(undefined);
+    // And the projection really is total: every field the contract needs is
+    // present and non-undefined on the real body.
+    const submission = JSON.parse(resubmissionFrom(assess));
+    expect(Object.keys(submission).sort()).toEqual([
+      "claims",
+      "duplicateKeyCheck",
+      "envelope",
+      "strategy",
+    ]);
+    expect(submission.claims[0].citations).toEqual(["candles.range_pct"]);
   });
 
-  it("passes Stage 2's REAL strategy to Stage 3, never a re-derived one", async () => {
-    const label = await probeAccount("dp-strat");
-    const f = fakes(assessAnswer, deriveAnswer());
+  // -- THE NEW BOUNDARY: a real second call, against time-shifted evidence ----
 
-    await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+  it("derives from an assessment resubmitted after the venue MOVED", async () => {
+    const label = await deriveAccount("dv-shift");
+    const f = fakes(assessAnswer(), deriveAnswer());
 
+    // CALL 1.
+    const assess = await realAssess(label, f.assessModel);
+    const submission = resubmissionFrom(assess);
+
+    // Real time passes: the venue now answers with a later, differently-priced
+    // window. Same ids, different data -- the ordinary case.
+    venueShift = 600;
+
+    // CALL 2, a genuinely separate request.
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: submission }),
+      {
+        symbolLister: catalogue,
+        candleLister: venue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+
+    expect(res.status).toBe(200);
+    // ONE assess call (the first request) and ONE derive call. The second
+    // request did NOT re-run Stage 2.
+    expect(f.assessCalls, "/derive made its own Assess call").toHaveLength(1);
+    expect(f.deriveCalls).toHaveLength(1);
+
+    const body = res.body.data;
+    expect(body.assessment.source).toBe("client_resubmitted");
+    expect(body.assessment.citationsReverified).toBe(true);
+    expect(body.assessment.strategy).toBe("grid");
+
+    // THE ASSERTION THAT MAKES RE-VERIFICATION VISIBLE: the citation came back
+    // resolved against the SECOND call's evidence, not the first's.
+    const fresh = body.assessment.claims[0].citations[0];
+    const offered = body.derive.evidence.find((e: { id: string }) => e.id === "candles.range_pct");
+    expect(fresh.id).toBe("candles.range_pct");
+    expect(fresh.value).toBe(offered.value);
+    // And that really is a different window than /assess saw.
+    const first = assess.evidence.find((e: { id: string }) => e.id === "candles.last_close");
+    const second = body.derive.evidence.find((e: { id: string }) => e.id === "candles.last_close");
+    expect(second.value).not.toBe(first.value);
+
+    // A real, fully validated proposal.
+    expect(body.derive.strategy).toBe("grid");
+    expect(body.derive.promptVersion).toBe("derive/1");
+    expect(body.derive.proposal.params.strategy).toBe("grid");
+    expect(body.derive.proposal.params.upperBound).toBe("108.00000000");
+    expect(body.derive.proposal.params.gridLines).toBe(5);
+    expect(body.derive.proposal.allocatedCapital).toBe("400.00000000");
+    expect(body.derive.proposal.capitalAsset).toBe("USD");
+    expect(body.derive.proposal.availableAtProposal).toBe("10000.00000000");
+    // Gemini publishes a quantity floor only, and the response says so.
+    expect(body.derive.proposal.minimumOrderCheck).toBe("quantity");
+    // Every number beside the ids it rests on, as whole evidence items.
+    expect(body.derive.proposal.citations.upperBound[0].id).toBe("candles.high");
+    expect(body.derive.proposal.citations.orderSize[0].id).toBe("capital.row.01.available");
+    expect(body.derive.notes[0].citations[0].id).toBe("candles.range_pct");
+
+    // Stage 2's own claims reached Stage 3's prompt as citable evidence.
     expect(f.deriveCalls[0]!.strategy).toBe("grid");
     expect(f.deriveCalls[0]!.prompt).toContain('THE STRATEGY IS ALREADY DECIDED AND IT IS "grid"');
-    // And Stage 2's own claims travel into Stage 3's prompt as citable evidence.
     expect(f.deriveCalls[0]!.prompt).toContain("The range is wide relative to the close.");
+
+    // The unverifiable audit facts are carried, and LABELLED as unverifiable.
+    expect(body.assessment.unverifiedOriginalCall.envelope).toBe("envelope_object");
+    expect(body.assessment.unverifiedOriginalCall.duplicateKeyCheck).toBe(
+      "unavailable_transport_parsed",
+    );
   });
 
-  it("returns the proposal with every number beside the ids it rests on", async () => {
-    const label = await probeAccount("dp-cites");
-    const f = fakes(assessAnswer, deriveAnswer());
+  it("REFUSES a resubmission whose citation no longer resolves, without calling the model", async () => {
+    // THE TEST THAT PROVES RE-VERIFICATION IS REAL RATHER THAN DECORATIVE.
+    //
+    // The first call sees a 40-candle window, so the Assess model can and does
+    // cite `candles.bucket.19`. The venue then answers with 8 candles -- a
+    // shallower window, which is an ordinary thing to happen -- and only buckets
+    // 01..08 exist. Nobody fabricated anything; the id aged out.
+    const label = await deriveAccount("dv-stale");
+    const f = fakes(assessAnswer(["candles.bucket.19"]), deriveAnswer());
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+    const assess = await realAssess(label, f.assessModel);
+    expect(assess.claims[0].citations[0].id).toBe("candles.bucket.19");
 
-    const proposal = res.body.data.derive.proposal;
-    expect(proposal.params.strategy).toBe("grid");
-    expect(proposal.params.upperBound).toBe("1.08000000");
-    expect(proposal.params.gridLines).toBe(5);
-    expect(proposal.allocatedCapital).toBe("400.00000000");
-    expect(proposal.capitalAsset).toBe("USD");
-    expect(proposal.availableAtProposal).toBe("10000.00000000");
-    // Gemini publishes a quantity floor only, and the probe says so.
-    expect(proposal.minimumOrderCheck).toBe("quantity");
-    // Every field carries its citations.
-    expect(proposal.citations.upperBound).toEqual(["candles.high"]);
-    expect(proposal.citations.orderSize).toEqual(["capital.row.01.available"]);
-    expect(proposal.notes[0].citations).toEqual(["candles.range_pct"]);
+    venueCount = 8;
+
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: resubmissionFrom(assess) }),
+      {
+        symbolLister: catalogue,
+        candleLister: venue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("citation_unknown");
+    expect(res.body.error.message).toContain("candles.bucket.19");
+    // THE ASSERTION THAT MATTERS: no paid inference was spent on a stale
+    // assessment, and no proposal was produced from one.
+    expect(f.deriveCalls, "the model was called with a stale assessment").toHaveLength(0);
+    expect(res.body.data).toBe(null);
   });
 
-  // -- Property 2: a refusal is a RESULT -------------------------------------
+  it("REFUSES a fabricated citation the same way, so honesty is not what is being checked", async () => {
+    const label = await deriveAccount("dv-fake");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
 
-  it("reports a parse refusal at 200 with its real code, not as a 502", async () => {
-    const label = await probeAccount("dp-parse");
-    const f = fakes(assessAnswer, deriveAnswer({ notes: [] }));
+    const submission = JSON.parse(resubmissionFrom(assess));
+    submission.claims[0].citations = ["candles.rsi_14"];
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: JSON.stringify(submission) }),
+      {
+        symbolLister: catalogue,
+        candleLister: venue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("citation_unknown");
+    expect(f.deriveCalls).toHaveLength(0);
+  });
+
+  it("REFUSES every price citation when the candle fetch fails on the second call", async () => {
+    const label = await deriveAccount("dv-nocandles");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
+
+    const brokenVenue: CandleLister = async () => ({
+      ok: false,
+      kind: "transport",
+      message: "gemini did not answer the candle request",
+      retryable: true,
+      at: VENUE_ANSWERED_AT,
     });
 
-    expect(res.status).toBe(200);
-    expect(res.body.data.derive.outcome).toBe("refused");
-    expect(res.body.data.derive.error.kind).toBe("DeriveParseError");
-    expect(res.body.data.derive.error.code).toBe("notes_empty");
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: resubmissionFrom(assess) }),
+      {
+        symbolLister: catalogue,
+        candleLister: brokenVenue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+
+    // The re-verification fires FIRST -- before `deriveParameters`' own
+    // no-price-history precondition -- because the assessment is checked against
+    // the fresh bundle as soon as it exists.
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("citation_unknown");
+    expect(f.deriveCalls).toHaveLength(0);
+  });
+
+  it("REFUSES a strategy that is not exactly dca or grid", async () => {
+    const label = await deriveAccount("dv-strat");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
+
+    for (const strategy of ["GRID", "Dca", " grid", "momentum", "dca or grid"]) {
+      const submission = JSON.parse(resubmissionFrom(assess));
+      submission.strategy = strategy;
+      const res = await api(
+        "GET",
+        derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: JSON.stringify(submission) }),
+        {
+          symbolLister: catalogue,
+          candleLister: venue,
+          symbolDetailLister: details,
+          deriveModel: f.deriveModel,
+        },
+      );
+      expect(res.status, `${strategy} was not refused`).toBe(400);
+      expect(res.body.error.code).toBe("strategy_not_recognised");
+    }
+    expect(f.deriveCalls, "a model was called for an unrecognised strategy").toHaveLength(0);
+  });
+
+  it("refuses a self-contradictory resubmission that JSON.parse would silently resolve", async () => {
+    // The duplicate-key scan runs here and cannot run on either model path,
+    // because this endpoint holds the caller's own bytes.
+    const label = await deriveAccount("dv-dupe");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
+
+    const inner = resubmissionFrom(assess).replace('{"strategy":"grid"', '{"strategy":"dca","strategy":"grid"');
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: inner }),
+      {
+        symbolLister: catalogue,
+        candleLister: venue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("duplicate_key");
+    expect(f.deriveCalls).toHaveLength(0);
+  });
+
+  // -- Ported from the probe: the model-answer refusals, now with statuses ----
+
+  /** The two-call flow, collapsed for the tests that are about Stage 3's answer. */
+  async function deriveAfterAssess(
+    label: string,
+    f: ReturnType<typeof fakes>,
+  ): Promise<{ status: number; body: any }> {
+    const assess = await realAssess(label, f.assessModel);
+    return await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: resubmissionFrom(assess) }),
+      {
+        symbolLister: catalogue,
+        candleLister: venue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+  }
+
+  it("refuses a PARSE failure at 502 with the parser's own code", async () => {
+    const label = await deriveAccount("dv-parse");
+    const f = fakes(assessAnswer(), deriveAnswer({ notes: [] }));
+
+    const res = await deriveAfterAssess(label, f);
+
+    // The probe reported this at 200 because a refusal was its RESULT. A real
+    // endpoint refuses with a status; the CODE is preserved either way.
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("notes_empty");
+    expect(res.body.data).toBe(null);
     // Exactly one call: a refusal is never resampled.
     expect(f.deriveCalls).toHaveLength(1);
   });
 
-  it("reports a VALIDATION refusal with the layer that refused", async () => {
-    const label = await probeAccount("dp-valid");
+  it("refuses a VALIDATION failure at 502, naming the LAYER that refused", async () => {
+    const label = await deriveAccount("dv-valid");
     const answer = deriveAnswer();
     // An inverted range: refused by the REAL buildLevels inside validateGridParams.
-    (answer.response.parameters as Record<string, unknown>)["upperBound"] = cited("0.10000000", "candles.low");
-    const f = fakes(assessAnswer, answer);
+    (answer.response.parameters as Record<string, unknown>)["upperBound"] = cited("10.00000000", "candles.low");
+    const f = fakes(assessAnswer(), answer);
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+    const res = await deriveAfterAssess(label, f);
 
-    expect(res.status).toBe(200);
-    expect(res.body.data.derive.error.kind).toBe("DeriveValidationError");
-    expect(res.body.data.derive.error.code).toBe("strategy_validator/validator_rejected");
-    expect(res.body.data.derive.error.message).toContain("validateGridParams");
+    expect(res.status).toBe(502);
+    // `<layer>/<code>`, so "the real strategy validator refused" stays
+    // distinguishable from "the real decoder refused" and from this stage's own
+    // bounds. A test that only asserted "it refuses" would still pass the day
+    // someone dropped validateGridParams from the chain.
+    expect(res.body.error.code).toBe("strategy_validator/validator_rejected");
+    expect(res.body.error.message).toContain("validateGridParams");
   });
 
-  it("reports an invented citation as a refusal, so ungrounded numbers never appear", async () => {
-    const label = await probeAccount("dp-cite");
+  it("refuses a DECODER failure at 502, naming the decoder layer", async () => {
+    const label = await deriveAccount("dv-decode");
+    const answer = deriveAnswer();
+    // A JSON number where the decoder requires a decimal string.
+    (answer.response.parameters as Record<string, unknown>)["orderSize"] = cited(50, "candles.high");
+    const f = fakes(assessAnswer(), answer);
+
+    const res = await deriveAfterAssess(label, f);
+
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("decoder/decoder_rejected");
+    expect(res.body.error.message).toContain("decodeGridParams");
+  });
+
+  it("refuses an INVENTED citation in the model's own answer, so ungrounded numbers never appear", async () => {
+    const label = await deriveAccount("dv-cite");
     const answer = deriveAnswer();
     (answer.response.parameters as Record<string, unknown>)["orderSize"] = cited("50.00000000", "candles.rsi_14");
-    const f = fakes(assessAnswer, answer);
+    const f = fakes(assessAnswer(), answer);
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+    const res = await deriveAfterAssess(label, f);
 
-    expect(res.body.data.derive.error.code).toBe("citation_unknown");
+    // 502, not 409: this is the MODEL inventing an id, not a caller resubmitting
+    // a stale one. Same code, different owner, different status.
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("citation_unknown");
   });
 
-  // -- Property 3: never a partial proposal ----------------------------------
+  it("refuses a strategy DISAGREEMENT between the two stages", async () => {
+    const label = await deriveAccount("dv-disagree");
+    const f = fakes(assessAnswer(), deriveAnswer({ strategy: "dca" }));
 
-  it("carries NO proposal key at all when it refuses", async () => {
-    const label = await probeAccount("dp-partial");
-    const f = fakes(assessAnswer, deriveAnswer({ notes: [] }));
+    const res = await deriveAfterAssess(label, f);
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
-
-    const derive = res.body.data.derive;
-    expect(derive.outcome).toBe("refused");
-    // Positively: no half-filled parameter set under any key.
-    expect(derive.proposal).toBeUndefined();
-    expect(derive.strategy).toBeUndefined();
+    expect(res.status).toBe(502);
+    expect(res.body.error.code).toBe("strategy_disagreement");
   });
 
-  it("does not attempt Stage 3 at all when Stage 2 failed", async () => {
-    const label = await probeAccount("dp-noassess");
-    const f = fakes({ response: "I'd suggest a grid here." }, deriveAnswer());
+  it("never returns a partial proposal: a refusal carries no data at all", async () => {
+    const label = await deriveAccount("dv-partial");
+    const f = fakes(assessAnswer(), deriveAnswer({ notes: [] }));
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+    const res = await deriveAfterAssess(label, f);
 
-    expect(res.status).toBe(200);
-    expect(res.body.data.assess.outcome).toBe("failed");
-    expect(res.body.data.assess.error.code).toBe("not_json");
-    expect(res.body.data.derive.outcome).toBe("not_attempted");
-    // THE ASSERTION THAT MATTERS: no second paid inference was spent.
-    expect(f.deriveCalls, "Stage 3 ran after Stage 2 failed").toHaveLength(0);
+    expect(res.body.data).toBe(null);
+    expect(res.body.error.code).toBe("notes_empty");
   });
 
-  it("refuses before EITHER model call when the account has no ledger row", async () => {
-    const label = `dp-nocap-${suffix}`;
+  it("refuses before the model call when the account has no ledger row", async () => {
+    const label = `dv-nocap-${suffix}`;
     await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
-    const f = fakes(assessAnswer, deriveAnswer());
+    const f = fakes(assessAnswer(), deriveAnswer());
 
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+    const res = await deriveAfterAssess(label, f);
 
-    expect(res.status).toBe(200);
-    expect(res.body.data.derive.error.kind).toBe("DeriveError");
-    expect(res.body.data.derive.error.code).toBe("no_capital_headroom");
-    // Assess still ran -- it does not need capital. Derive did not.
+    // 409, not 503: the ledger READ SUCCEEDED and found nothing fundable. That
+    // is a conflict with current state, fixed by funding the account, never by
+    // retrying -- reporting it as 503 would send an operator hunting an outage.
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("no_capital_headroom");
+    // Assess still ran in the FIRST call -- it does not need capital. Derive did
+    // not spend an inference in the second.
     expect(f.assessCalls).toHaveLength(1);
     expect(f.deriveCalls, "Stage 3 called the model with no headroom").toHaveLength(0);
   });
 
-  // -- Property 4: it writes nothing -----------------------------------------
+  // -- The bundle and the second gather travel with the proposal -------------
+
+  it("returns the fresh bundle and Stage 3's own two reads beside the proposal", async () => {
+    const label = await deriveAccount("dv-context");
+    const f = fakes(assessAnswer(), deriveAnswer());
+
+    const res = await deriveAfterAssess(label, f);
+    const body = res.body.data;
+
+    expect(res.status).toBe(200);
+    // Stage 1's bundle, with every slot's own outcome.
+    expect(body.bundle.candles.outcome).toBe("ok");
+    expect(body.bundle.news.outcome).toBe("not_yet_available");
+    expect(body.bundle.candidate.pair).toBe("BTCUSD");
+    // Stage 3's two extra reads, in the same envelope shape.
+    expect(body.context.capital.outcome).toBe("ok");
+    expect(body.context.capital.value.assets[0].asset).toBe("USD");
+    expect(body.context.capital.value.assets[0].available).toBe("10000.00000000");
+    expect(body.context.filters.outcome).toBe("ok");
+    expect(body.context.filters.value.minQuantity).toBe("0.00100000");
+    expect(body.context.filters.value.minNotional).toBe("0.00000000");
+    expect(typeof body.context.gatheredAt).toBe("number");
+    // The money bigints all rendered rather than throwing JSON.stringify.
+    expect(body.bundle.concentration.value.policy.assetCapitalShareFlagAtPct).toBe("40.00000000");
+  });
+
+  it("gathers ONCE, so the evidence verified against is the evidence derived from", async () => {
+    // THE PROPERTY, NOT THE VALUES. A second gather inside one request would
+    // return identical data under these deterministic stubs, so no assertion
+    // comparing numbers could ever notice it -- and yet the assessment would
+    // then have been checked against one evidence set while the human is shown
+    // another. Counting the venue calls pins the property directly.
+    const label = await deriveAccount("dv-onegather");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
+
+    let candleCalls = 0;
+    const countingVenue: CandleLister = async (account, query, env, now) => {
+      candleCalls += 1;
+      return await venue(account, query, env, now);
+    };
+
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: resubmissionFrom(assess) }),
+      {
+        symbolLister: catalogue,
+        candleLister: countingVenue,
+        symbolDetailLister: details,
+        deriveModel: f.deriveModel,
+      },
+    );
+
+    expect(res.status).toBe(200);
+    expect(candleCalls, "the derive request fetched candles more than once").toBe(1);
+  });
+
+  // -- It writes nothing -----------------------------------------------------
 
   it("writes NOTHING: no bot, no audit row, no capital movement", async () => {
-    const label = await probeAccount("dp-nowrite");
+    const label = await deriveAccount("dv-nowrite");
     const before = {
       bots: await db.botInstances.count(),
       audit: await db.auditLog.count(),
       ledger: (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!,
     };
-    const f = fakes(assessAnswer, deriveAnswer());
+    const f = fakes(assessAnswer(), deriveAnswer());
 
-    await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      symbolLister: catalogue,
-      candleLister: venue,
-      symbolDetailLister: details,
-      assessModel: f.assessModel,
-      deriveModel: f.deriveModel,
-    });
+    const res = await deriveAfterAssess(label, f);
+    expect(res.status).toBe(200);
 
     expect(await db.botInstances.count()).toBe(before.bots);
     expect(await db.auditLog.count()).toBe(before.audit);
     const after = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
-    // The proposal suggested 400; total_allocated must be untouched (21.1).
+    // The proposal suggested 400; `total_allocated` must be untouched (21.1).
     expect(after.total_allocated).toBe(before.ledger.total_allocated);
     expect(after.total_balance).toBe(before.ledger.total_balance);
   });
 
   // -- Parameter handling ----------------------------------------------------
 
-  it("requires accountLabel, pair and interval, with no defaults", async () => {
-    const label = await probeAccount("dp-params");
-    const f = fakes(assessAnswer, deriveAnswer());
+  it("requires pair, interval and assessment, with no defaults", async () => {
+    const label = await deriveAccount("dv-params");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assess = await realAssess(label, f.assessModel);
+    const assessment = resubmissionFrom(assess);
     const opts = {
       symbolLister: catalogue,
       candleLister: venue,
       symbolDetailLister: details,
-      assessModel: f.assessModel,
       deriveModel: f.deriveModel,
     };
 
-    expect((await api("GET", probePath({ pair: "BTCUSD", interval: "1m" }), opts)).status).toBe(400);
-    expect((await api("GET", probePath({ accountLabel: label, interval: "1m" }), opts)).status).toBe(400);
-    expect((await api("GET", probePath({ accountLabel: label, pair: "BTCUSD" }), opts)).status).toBe(400);
-    // And an interval outside the union is refused rather than coerced.
+    expect((await api("GET", derivePath(label, { interval: "1m", assessment }), opts)).status).toBe(400);
+    expect((await api("GET", derivePath(label, { pair: "BTCUSD", assessment }), opts)).status).toBe(400);
+
+    const noAssessment = await api("GET", derivePath(label, { pair: "BTCUSD", interval: "1m" }), opts);
+    expect(noAssessment.status).toBe(400);
+    expect(noAssessment.body.error.code).toBe("missing_field");
+    expect(noAssessment.body.error.message).toContain("assessment");
+
+    // An interval outside the union is refused rather than coerced.
     expect(
-      (await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "2m" }), opts)).status,
+      (await api("GET", derivePath(label, { pair: "BTCUSD", interval: "2m", assessment }), opts)).status,
     ).toBe(400);
-    // No model was reached by any of those.
-    expect(f.assessCalls).toHaveLength(0);
+
+    // No DERIVE model was reached by any of those. (Assess ran once, in the
+    // setup call above, and never again.)
+    expect(f.deriveCalls).toHaveLength(0);
+    expect(f.assessCalls).toHaveLength(1);
+  });
+
+  it("refuses a malformed assessment before spending anything", async () => {
+    const label = await deriveAccount("dv-malformed");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const opts = {
+      symbolLister: catalogue,
+      candleLister: venue,
+      symbolDetailLister: details,
+      deriveModel: f.deriveModel,
+    };
+
+    for (const [assessment, code] of [
+      ["not json", "not_json"],
+      ["[]", "not_an_object"],
+      ['{"strategy":"grid"}', "missing_field"],
+    ] as const) {
+      const res = await api(
+        "GET",
+        derivePath(label, { pair: "BTCUSD", interval: "1m", assessment }),
+        opts,
+      );
+      expect(res.status, `${assessment} was not refused`).toBe(400);
+      expect(res.body.error.code).toBe(code);
+    }
     expect(f.deriveCalls).toHaveLength(0);
   });
 
   it("is Access-gated like every other route", async () => {
-    const label = await probeAccount("dp-auth");
-    const res = await api("GET", probePath({ accountLabel: label, pair: "BTCUSD", interval: "1m" }), {
-      token: null,
-    });
+    const label = await deriveAccount("dv-auth");
+    const res = await api(
+      "GET",
+      derivePath(label, { pair: "BTCUSD", interval: "1m", assessment: "{}" }),
+      { token: null },
+    );
     expect(res.status).toBe(401);
   });
 });

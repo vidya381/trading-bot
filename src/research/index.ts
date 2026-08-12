@@ -181,6 +181,14 @@ export {
 } from "./assess-parse";
 
 export {
+  AssessResubmitError,
+  RESUBMITTED_ASSESSMENT_FIELDS,
+  assessEvidenceOf,
+  parseResubmittedAssessment,
+  type AssessResubmitErrorCode,
+} from "./assess-resubmit";
+
+export {
   ASSESS_MODEL,
   ASSESS_MODEL_CONTEXT_TOKENS,
   ASSESS_MODEL_SETTINGS,

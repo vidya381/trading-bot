@@ -50,9 +50,12 @@ import type {
   CandleWindow,
   CitedClaim,
   ConcentrationResult,
+  DeriveContext,
+  DeriveResult,
   EvidenceItem,
   GatheredInput,
   NewsInput,
+  ParsedAssessment,
   WatchlistEntry,
 } from "../research";
 import type { Candle } from "../shared/exchange-client";
@@ -754,6 +757,216 @@ export function assessResultView(result: AssessResult, latencyMs: number) {
   return {
     strategy: result.strategy,
     claims: result.claims.map(citedClaimView),
+    evidence: result.evidence.map(evidenceItemView),
+    promptVersion: result.promptVersion,
+    promptChars: result.promptText.length,
+    model: result.model,
+    settings: jsonSafe(result.settings),
+    envelope: result.envelope,
+    duplicateKeyCheck: result.duplicateKeyCheck,
+    latencyMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Section 21.4 Stage 3 (Derive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stage 3's two extra real reads, over the wire.
+ *
+ * The SAME `gatheredInputView` the bundle's slots use, so a failed capital read
+ * and a failed candle fetch are reported in one shape with one discriminant, and
+ * a caller does not have to learn a second convention for a second gather.
+ *
+ * `jsonSafe` on each value for `accountExposureView`'s reason: `AccountCapital`
+ * carries three raw `Money` bigints per asset row and `SymbolFilters` carries
+ * eight, and a hand-written view is a list that the producing modules can
+ * silently outgrow. `gatheredAt` is published beside them and is NOT a fetch
+ * time -- `capital.value.readAt` and `filters.value.fetchedAt` are (21.5
+ * requirement 4).
+ */
+export function deriveContextView(context: DeriveContext) {
+  return {
+    capital: gatheredInputView(context.capital, jsonSafe),
+    filters: symbolFiltersInputView(context.filters),
+    gatheredAt: context.gatheredAt,
+  };
+}
+
+/**
+ * The filters slot, which cannot go through `gatheredInputView` and must not be
+ * forced to.
+ *
+ * `SymbolFiltersInput` is `GatheredInput<SymbolFilters, Error>` -- a PLAIN
+ * `Error`, not a coded one -- because the venue's own refusal arrives as an
+ * `ExchangeOutcome` and `gatherDeriveContext` turns it into a
+ * `SymbolFiltersUnavailableError` carrying the outcome's `kind` rather than a
+ * `code`. That is `gather.ts`'s standing rule working correctly: it invents no
+ * error vocabulary, so it does not mint a `code` the producing layer never
+ * spoke.
+ *
+ * So the `failed` arm is rendered with `thrownErrorView` (name + message), the
+ * same reporter the `threw_unexpectedly` arm uses everywhere. WIDENING
+ * `gatheredInputView`'s constraint to accept an uncoded error would have been
+ * the tempting fix and is the wrong one: it would let a genuinely coded slot --
+ * candles, concentration, capital -- silently start publishing `{}` for `error`
+ * the day someone passed it something without a `code`, which is exactly the
+ * "coded and mute" failure `moduleErrorView` exists to prevent.
+ *
+ * `failedAt` still rides on both failure arms and not on `ok`, mirroring the
+ * type exactly, as it does in `gatheredInputView`.
+ */
+export function symbolFiltersInputView(input: DeriveContext["filters"]) {
+  if (input.outcome === "ok") {
+    return { outcome: "ok" as const, value: jsonSafe(input.value) };
+  }
+  return {
+    outcome: input.outcome,
+    error: thrownErrorView(input.error),
+    failedAt: input.failedAt,
+  };
+}
+
+/**
+ * A resubmitted Stage 2 result, echoed back with its provenance stated.
+ *
+ * `source: "client_resubmitted"` IS THE POINT OF THIS VIEW and is not decoration.
+ * `/derive` takes its assessment from an earlier, separate HTTP call that this
+ * system stores nothing about, so the value looks in every other respect exactly
+ * like one `/assess` produced a moment ago. A reader who cannot tell those apart
+ * cannot weigh the proposal, and 21.5 requirement 5 wants a proposal traceable
+ * to its exact cause.
+ *
+ * `citationsReverified: true` says what this system DID check: every id below
+ * resolved against the evidence THIS run gathered, not against whatever existed
+ * when the assessment was made (`parseResubmittedAssessment`). The claims are
+ * therefore rendered with the CURRENT `EvidenceItem`s -- current label, current
+ * value -- and not with the ones the caller sent, which is why `citedClaimView`
+ * is reused unchanged.
+ *
+ * `envelope` and `duplicateKeyCheck` are flagged UNVERIFIED because they are:
+ * they describe the original model call, which this system did not witness. They
+ * are carried rather than dropped so the audit trail is not silently shortened,
+ * and labelled rather than published bare so nothing downstream reads a
+ * client-asserted fact as an observed one.
+ */
+export function resubmittedAssessmentView(assessment: ParsedAssessment) {
+  return {
+    source: "client_resubmitted" as const,
+    citationsReverified: true as const,
+    strategy: assessment.strategy,
+    claims: assessment.claims.map(citedClaimView),
+    /** The ORIGINAL call's audit facts, taken on the caller's word. */
+    unverifiedOriginalCall: {
+      envelope: assessment.envelope,
+      duplicateKeyCheck: assessment.duplicateKeyCheck,
+    },
+  };
+}
+
+/**
+ * The validated parameter set, rendered so every number sits beside the ids it
+ * was drawn from.
+ *
+ * A discriminated union on `strategy`, mirroring `ValidatedProposal.params`
+ * rather than flattening it: a DCA proposal must not be able to carry an
+ * `upperBound` key at all, which is the same reason `derive-prompt.ts` builds
+ * two prompts instead of one with optional fields.
+ *
+ * `citations` is keyed by field name and holds whole `EvidenceItem`s, NOT bare
+ * ids. A human approving `orderSize: "50.00"` reads the datum it rests on in the
+ * same object, which is 21.5 requirement 2's actual ask -- a list of ids would
+ * leave them to look each one up, which is the same as not shipping them.
+ */
+export function validatedProposalView(result: DeriveResult) {
+  const params =
+    result.proposal.params.strategy === "grid"
+      ? {
+          strategy: "grid" as const,
+          upperBound: money(result.proposal.params.value.upperBound),
+          lowerBound: money(result.proposal.params.value.lowerBound),
+          gridLines: result.proposal.params.value.gridLines,
+          spacing: result.proposal.params.value.spacing,
+          orderSize: money(result.proposal.params.value.orderSize),
+          stopLossPct: money(result.proposal.params.value.stopLossPct),
+          breakoutTakeProfit: result.proposal.params.value.breakoutTakeProfit,
+          breakoutThresholdPct: moneyOrNull(result.proposal.params.value.breakoutThresholdPct),
+          takeProfitAmount: moneyOrNull(result.proposal.params.value.takeProfitAmount),
+        }
+      : {
+          strategy: "dca" as const,
+          baseOrderSize: money(result.proposal.params.value.baseOrderSize),
+          additionalOrderSize: money(result.proposal.params.value.additionalOrderSize),
+          stepMultiplier: money(result.proposal.params.value.stepMultiplier),
+          dropPct: money(result.proposal.params.value.dropPct),
+          maxAdditionalBuys: result.proposal.params.value.maxAdditionalBuys,
+          takeProfitPct: money(result.proposal.params.value.takeProfitPct),
+          stopLossPct: money(result.proposal.params.value.stopLossPct),
+          autoRestart: result.proposal.params.value.autoRestart,
+          sellOnStopLoss: result.proposal.params.value.sellOnStopLoss,
+        };
+
+  return {
+    params,
+    allocatedCapital: money(result.proposal.allocatedCapital),
+    capitalAsset: result.proposal.capitalAsset,
+    /**
+     * The account's headroom AS READ, and a PREFILL rather than a reservation:
+     * nothing was allocated, and the binding check is
+     * `createBotInstanceWithCapital`'s against the ledger at creation time
+     * (`capital.ts`). It may be out of date by the time a human acts on it.
+     */
+    availableAtProposal: money(result.proposal.availableAtProposal),
+    referencePrice: money(result.proposal.referencePrice),
+    /** WHICH venue floor actually existed to check. `none_published` is honest, not a pass. */
+    minimumOrderCheck: result.minimumOrderCheck,
+    citations: Object.fromEntries(
+      Object.entries(result.citations.parameters).map(([field, cited]) => [
+        field,
+        cited.citations.map(evidenceItemView),
+      ]),
+    ),
+    allocatedCapitalCitations: result.citations.allocatedCapital.citations.map(evidenceItemView),
+    capitalAssetCitations: result.citations.capitalAsset.citations.map(evidenceItemView),
+  };
+}
+
+/**
+ * A whole derivation, over the wire. The shape step 41's probe proved live.
+ *
+ * WHAT IS DELIBERATELY HERE, on `assessResultView`'s own reasoning:
+ *
+ *   * `evidence` is EVERYTHING the model was offered, not only what it cited.
+ *     What Stage 3 IGNORED is only visible from the difference between this and
+ *     the per-field citations, and step 41 found the model citing an ABSENCE
+ *     marker (`news.status`) as grounds for a null parameter -- a pattern nobody
+ *     designed for and which is only noticeable because the full set ships.
+ *   * `envelope` and `duplicateKeyCheck` say WHICH GUARANTEES ACTUALLY HELD for
+ *     this particular answer. Seven live observations now show this model
+ *     answering on the object path, where the duplicate-key scan is structurally
+ *     impossible; a response that hid that would claim a check it never ran.
+ *   * `settings` is echoed whole, per-strategy `response_format` schema included,
+ *     so the determinism stance a given answer was produced under is
+ *     reconstructable rather than assumed from today's constants.
+ *
+ * WHAT IS DELIBERATELY ABSENT: `promptText`, which is larger here than Stage 2's
+ * ~16KB. For the one job a reader needs it for -- checking a number against the
+ * datum it cites -- `evidence` carries the same values in a comparable form.
+ * `promptChars` is published so the size stays visible.
+ *
+ * ⚠ A WELL-FORMED PROPOSAL IS NOT A GOOD ONE, and nothing in this object can
+ * tell a reader which it has. Every check behind these fields answers "is this
+ * internally consistent, grounded in the fetched data, and acceptable to the
+ * real create-bot validators?" and not one answers "was the data worth reasoning
+ * about?" (decision logs 40 and 41). The human is the only part of the loop that
+ * can tell those apart.
+ */
+export function deriveResultView(result: DeriveResult, latencyMs: number) {
+  return {
+    strategy: result.strategy,
+    proposal: validatedProposalView(result),
+    notes: result.notes.map(citedClaimView),
     evidence: result.evidence.map(evidenceItemView),
     promptVersion: result.promptVersion,
     promptChars: result.promptText.length,

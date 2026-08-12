@@ -273,6 +273,65 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   no_price_history: 503,
   no_ai_binding: 503,
   trending_unavailable: 503,
+
+  // Section 21.4 Stage 3 (Derive, /src/research/derive.ts). `no_price_history`
+  // and `no_ai_binding` are NOT repeated -- Stage 3 throws the same two spellings
+  // for the same two reasons, and one code must have one status.
+  //
+  //   capital_unreadable        503, with `no_price_history`. The request is well
+  //                             formed and an UPSTREAM read failed, so the real
+  //                             headroom is unknown. `deriveParameters` refuses
+  //                             rather than proposing an allocation figure
+  //                             anyway (section 5.6: a failed read is never
+  //                             data). Retrying when D1 answers is the right
+  //                             response, which is what 503 says and 400 does not.
+  //   symbol_filters_unreadable 503, for the same reason one row up: the venue's
+  //                             minimum order size could not be read, so the one
+  //                             check 21.5 requirement 3 names that nothing else
+  //                             in this system performs before an order is placed
+  //                             cannot run at all.
+  //   no_capital_headroom       409, and deliberately NOT 503. THE READ
+  //                             SUCCEEDED. The account genuinely has no asset
+  //                             with a positive balance minus allocation, so
+  //                             there is no allocation any proposal could suggest
+  //                             that could become a bot. That is a well-formed
+  //                             request conflicting with current state --
+  //                             `duplicate_bot_instance`'s and `cap_exceeded`'s
+  //                             shape -- and it is fixed by funding the account
+  //                             or stopping a bot, never by retrying. Reporting
+  //                             it as 503 would send an operator to look for an
+  //                             outage that is not happening.
+  capital_unreadable: 503,
+  symbol_filters_unreadable: 503,
+  no_capital_headroom: 409,
+
+  // ── `citation_unknown` IS DELIBERATELY ABSENT FROM THIS TABLE ──
+  //
+  // It is the one code in this system carried by THREE different error classes
+  // whose correct statuses genuinely differ, so there is no single row that is
+  // right:
+  //
+  //   AssessParseError.citation_unknown     502 -- the Assess MODEL invented an
+  //                                         id. The vendor answered and its
+  //                                         answer was unusable.
+  //   DeriveParseError.citation_unknown     502 -- the Derive MODEL did.
+  //   AssessResubmitError.citation_unknown  409 -- the CALLER resubmitted a
+  //                                         Stage 2 result whose citation no
+  //                                         longer resolves against the evidence
+  //                                         this request just gathered (the
+  //                                         window shrank, the candle fetch
+  //                                         failed, a concentration flag
+  //                                         cleared). Well formed, conflicting
+  //                                         with CURRENT state, exactly like
+  //                                         `already_watched` -- fixed by
+  //                                         running /assess again, never by
+  //                                         rephrasing, and never the vendor's
+  //                                         fault.
+  //
+  // All three handlers therefore raise an `ApiError` carrying the status
+  // explicitly, which never consults this table. A row here would silently make
+  // one of the three wrong, and the wrong one would be whichever handler someone
+  // later simplified into a bare `throw`.
 };
 
 /**
