@@ -34,6 +34,7 @@ import type {
   TriggerKillSwitchResponse,
   UnarchiveResponse,
 } from "./types";
+import type { AssessResponse, DeriveResponse } from "./research-types";
 
 /** An API failure, carrying the backend's typed error code. */
 export class ApiError extends Error {
@@ -416,6 +417,102 @@ export function triggerKillSwitch(reason: string, signal?: AbortSignal): Promise
     signal,
     body: { reason },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Section 21.4 research pipeline -- the NAMED entry point only (spec 21.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠ THE TWO CALLS BELOW EACH COST A REAL, PAID WORKERS AI INFERENCE, and each
+ * blocks for tens of seconds (`MEASURED_LATENCY` in `research/proposalRun.ts`
+ * carries the real samples). They are the only functions in this file with that
+ * property, and it is why they are grouped and labelled rather than filed
+ * alphabetically among the free reads above.
+ *
+ * They also each write a permanent, undeletable proposal record on success
+ * (migration 0009, 21.5 requirement 5). There is no dry run.
+ *
+ * `research-types.ts` used to state that nothing in it was fetched by the
+ * dashboard. That is no longer true, and its header says so.
+ */
+
+/** Shared by both: the parameters the two endpoints take identically. */
+interface ResearchQuery {
+  readonly pair: string;
+  readonly interval: string;
+  readonly since?: number;
+  readonly quoteAssets?: readonly string[];
+}
+
+/**
+ * Build the query both endpoints share.
+ *
+ * An absent `since` or `quoteAssets` is OMITTED, never sent empty. Both
+ * endpoints parse strictly -- an empty `since` is `invalid_field` and an empty
+ * `quoteAssets` is not the same request as no filter at all -- so "omit or send a
+ * real value" is the only correct handling, and doing it in one place means the
+ * two calls cannot disagree about it.
+ */
+function researchParams(query: ResearchQuery): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set("pair", query.pair);
+  params.set("interval", query.interval);
+  if (query.since !== undefined) params.set("since", String(query.since));
+  if (query.quoteAssets !== undefined && query.quoteAssets.length > 0) {
+    params.set("quoteAssets", query.quoteAssets.join(","));
+  }
+  return params;
+}
+
+/**
+ * Stage 2 (`GET /api/accounts/:label/assess`) -- gather one named candidate and
+ * ask a model which strategy fits.
+ *
+ * Its refusals are the ones `describeRunFailure` (`research/runErrors.ts`)
+ * enumerates. Note that `missing_field`, `unexpected_field`, `duplicate_key`,
+ * `strategy_not_recognised` and `citation_unknown` each arrive with TWO possible
+ * meanings separated only by the status: 4xx is a bad REQUEST, 502 is the MODEL's
+ * answer being unusable. A caller that branches on the code alone will report the
+ * second as the first.
+ */
+export function fetchAssess(
+  accountLabel: string,
+  query: ResearchQuery,
+  signal?: AbortSignal,
+): Promise<AssessResponse> {
+  const path = `/api/accounts/${encodeURIComponent(accountLabel)}/assess?${researchParams(query)}`;
+  return requestJson<AssessResponse>(path, "GET", { signal });
+}
+
+/**
+ * Stage 3 (`GET /api/accounts/:label/derive`) -- derive real parameters for an
+ * assessment a PREVIOUS `/assess` call returned.
+ *
+ * `assessment` is the exact JSON text `encodeResubmission` produced. It goes in a
+ * query parameter because the endpoint is a GET with a nested `claims` array
+ * (decision log 42's transport note), and `URLSearchParams` percent-encodes it.
+ *
+ * ⚠ NO LENGTH GUARD EXISTS ON EITHER SIDE. Entry 42 measured a real submission at
+ * ~1-2 KB (~2-3 KB encoded) and recorded that a very long claim list could
+ * approach a URL cap. That limitation is unchanged by this dashboard calling the
+ * endpoint instead of `curl`, and inventing a client-side cap here would be this
+ * layer deciding a limit the endpoint has not stated.
+ *
+ * Its distinctive refusal is `citation_unknown` at 409: the resubmitted
+ * assessment cited evidence THIS run's own fresh gather does not emit. That is
+ * ordinary drift between two independent gathers, not a fault.
+ */
+export function fetchDerive(
+  accountLabel: string,
+  query: ResearchQuery,
+  assessment: string,
+  signal?: AbortSignal,
+): Promise<DeriveResponse> {
+  const params = researchParams(query);
+  params.set("assessment", assessment);
+  const path = `/api/accounts/${encodeURIComponent(accountLabel)}/derive?${params}`;
+  return requestJson<DeriveResponse>(path, "GET", { signal });
 }
 
 /**

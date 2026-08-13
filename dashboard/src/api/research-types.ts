@@ -15,12 +15,27 @@
  *     the way out; nothing here parses one back into a float.
  *   - Every timestamp is epoch milliseconds as a number.
  *
- * ⚠ NOTHING IN THIS FILE IS FETCHED BY THE DASHBOARD TODAY. There is no
- * `fetchAssess`/`fetchDerive` in `api/client.ts`, on purpose: both endpoints are
- * curl-only (decision log 42, "no dashboard control"), each `/derive` call costs
- * a real paid inference, and putting a button on one is a TRIGGER decision
- * (spec 21.6) rather than the RENDERING decision this stage is. These types
- * exist so the renderer is typed against the real wire shape rather than `any`.
+ * ⚠ THESE ARE NOW FETCHED, AND THE PREVIOUS PARAGRAPH HERE SAID THEY NEVER WERE.
+ * It read: "NOTHING IN THIS FILE IS FETCHED BY THE DASHBOARD TODAY. There is no
+ * `fetchAssess`/`fetchDerive` in `api/client.ts`, on purpose..." That was true
+ * through decision log 45 and is false now: `fetchAssess` and `fetchDerive` exist
+ * in `api/client.ts`, and `pages/ProposalRun.tsx` calls them for the NAMED entry
+ * point. The statement is corrected in place rather than deleted, because the
+ * reasoning it carried still holds and is now a live constraint rather than an
+ * argument for not building:
+ *
+ *   - Each run costs TWO real paid inferences and blocks for tens of seconds.
+ *   - Each writes a permanent, undeletable proposal record (migration 0009).
+ *   - Making the call was a TRIGGER decision (spec 21.6), taken deliberately and
+ *     separately from the RENDERING decision entry 44 made.
+ *
+ * The rendering path is unchanged: a successful run hands the same two responses
+ * to the same `ProposalView` a paste does. The paste page (`pages/Proposal.tsx`)
+ * still exists and still makes no network request of any kind.
+ *
+ * ⚠ ONLY THE NAMED ENTRY POINT IS TRIGGERABLE. `entryPoint=general` still 503s
+ * (no trending vendor -- entries 30, 31, 45), and the watchlist door has no
+ * dashboard control either.
  */
 
 // ---------------------------------------------------------------------------

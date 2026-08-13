@@ -133,6 +133,20 @@ export function Dashboard() {
           >
             Proposal
           </Link>
+          {/*
+           * Spec 21.6, the named-coin trigger. ⚠ UNLIKE EVERY OTHER LINK IN THIS
+           * ROW, what it leads to SPENDS MONEY — two paid inferences per press.
+           * It is styled as ordinary navigation rather than as a primary action
+           * for exactly that reason: the page it opens states the cost and asks
+           * for a deliberate press, and a prominent button here would be one
+           * click closer to spending than the thing deserves.
+           */}
+          <Link
+            to="/proposal/run"
+            className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"
+          >
+            Ask about a coin
+          </Link>
           <Link
             to="/manual-adjustments"
             className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"

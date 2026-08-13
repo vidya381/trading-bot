@@ -19,6 +19,13 @@
  *   /proposal     an LLM bot proposal, assembled for review (spec 21.4 stage 4).
  *                 Read-only and inert: it renders two real responses the operator
  *                 already holds, calls nothing, and stores nothing.
+ *   /proposal/run the NAMED-COIN trigger (spec 21.6). ⚠ THE ONE ROUTE IN THIS APP
+ *                 THAT SPENDS MONEY: it really calls /assess and /derive, which is
+ *                 two paid inferences and two permanent proposal records per press.
+ *                 Declared BEFORE /proposal is irrelevant here (they are distinct
+ *                 paths, not a static-vs-dynamic segment pair), but it is declared
+ *                 adjacent so the pair is read together. It renders its result
+ *                 through the same ProposalView /proposal uses.
  *   *             anything else redirects home
  */
 
@@ -32,6 +39,7 @@ import { Alerts } from "./pages/Alerts";
 import { KillSwitchPage } from "./pages/KillSwitchPage";
 import { ManualAdjustment } from "./pages/ManualAdjustment";
 import { Proposal } from "./pages/Proposal";
+import { ProposalRun } from "./pages/ProposalRun";
 
 export function App() {
   return (
@@ -47,6 +55,7 @@ export function App() {
           <Route path="/kill-switch" element={<KillSwitchPage />} />
           <Route path="/manual-adjustments" element={<ManualAdjustment />} />
           <Route path="/proposal" element={<Proposal />} />
+          <Route path="/proposal/run" element={<ProposalRun />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
