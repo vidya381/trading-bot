@@ -32,6 +32,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { EnvironmentBanner } from "./components/EnvironmentBanner";
 import { KillSwitchBanner } from "./components/KillSwitchBanner";
+import { KillSwitchStatusProvider } from "./api/killSwitchStatus";
 import { Dashboard } from "./pages/Dashboard";
 import { CreateBot } from "./pages/CreateBot";
 import { BotDetail } from "./pages/BotDetail";
@@ -43,22 +44,32 @@ import { ProposalRun } from "./pages/ProposalRun";
 
 export function App() {
   return (
-    <div className="flex min-h-full flex-col">
-      <EnvironmentBanner />
-      <KillSwitchBanner />
-      <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-6 lg:px-8">
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/bots/new" element={<CreateBot />} />
-          <Route path="/bots/:id" element={<BotDetail />} />
-          <Route path="/alerts" element={<Alerts />} />
-          <Route path="/kill-switch" element={<KillSwitchPage />} />
-          <Route path="/manual-adjustments" element={<ManualAdjustment />} />
-          <Route path="/proposal" element={<Proposal />} />
-          <Route path="/proposal/run" element={<ProposalRun />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </main>
-    </div>
+    /*
+     * ONE kill-switch poll for the whole app (step 47). The provider wraps both
+     * the banner and the routed area, so the banner, the dashboard's status tile
+     * and the kill-switch page all read a single shared subscription instead of
+     * each running its own 5s timer against the same singleton row. Outside
+     * <Routes> for the same reason the banner is: navigating must not restart
+     * the poll. See api/killSwitchStatus.tsx.
+     */
+    <KillSwitchStatusProvider>
+      <div className="flex min-h-full flex-col">
+        <EnvironmentBanner />
+        <KillSwitchBanner />
+        <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-6 lg:px-8">
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/bots/new" element={<CreateBot />} />
+            <Route path="/bots/:id" element={<BotDetail />} />
+            <Route path="/alerts" element={<Alerts />} />
+            <Route path="/kill-switch" element={<KillSwitchPage />} />
+            <Route path="/manual-adjustments" element={<ManualAdjustment />} />
+            <Route path="/proposal" element={<Proposal />} />
+            <Route path="/proposal/run" element={<ProposalRun />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </main>
+      </div>
+    </KillSwitchStatusProvider>
   );
 }

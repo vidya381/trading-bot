@@ -13,17 +13,25 @@
  *   2. The TRIGGER control (KillSwitchTrigger): type-to-confirm + a reason.
  *   3. The RESET control (KillSwitchReset): a distinct, separate action + a note.
  *
- * Status comes from `GET /api/kill-switch`, polled every 5s (keeping last-good
- * data through a blip, like the rest of the dashboard) and re-read immediately
- * after any trigger/reset attempt via `poll.refetch`, so the card, the strip and
- * the banner all reflect the real state at once. Honest load states: a
- * not-yet-provisioned environment (`no_schema`) and an expired session are shown
- * as themselves rather than a blank page.
+ * Status comes from the app's ONE shared kill-switch poll (`useKillSwitchStatus`,
+ * step 47) -- every 5s, keeping last-good data through a blip, like the rest of
+ * the dashboard -- and is re-read immediately after any trigger/reset attempt via
+ * `poll.refetch`, so the card, the strip and the banner all reflect the real
+ * state at once.
+ *
+ * That last clause only became TRUE at step 47. This page used to run its own
+ * `usePolling(fetchKillSwitch)` alongside the banner's, so `refetch` refreshed
+ * this card while the banner kept showing its own stale copy for up to a full
+ * interval after a pull. One shared subscription is what makes the sentence
+ * above describe the actual behaviour.
+ *
+ * Honest load states: a not-yet-provisioned environment (`no_schema`) and an
+ * expired session are shown as themselves rather than a blank page.
  */
 
 import { Link } from "react-router-dom";
-import { ApiError, fetchKillSwitch } from "../api/client";
-import { usePolling } from "../api/usePolling";
+import { ApiError } from "../api/client";
+import { useKillSwitchStatus } from "../api/killSwitchStatus";
 import type { KillSwitchStatus } from "../api/types";
 import { KillSwitchTrigger } from "../components/KillSwitchTrigger";
 import { KillSwitchReset } from "../components/KillSwitchReset";
@@ -128,7 +136,7 @@ function LoadState({ error }: { error: Error }) {
 }
 
 export function KillSwitchPage() {
-  const poll = usePolling<KillSwitchStatus>(fetchKillSwitch);
+  const poll = useKillSwitchStatus();
   const status = poll.data;
   const firstLoad = poll.loading && status === null;
   const hardError = poll.error !== null && status === null;

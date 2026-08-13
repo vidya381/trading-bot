@@ -7,9 +7,10 @@
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { fetchAlerts, fetchBots, fetchKillSwitch } from "../api/client";
+import { fetchAlerts, fetchBots } from "../api/client";
 import { usePolling } from "../api/usePolling";
-import type { Alert, Bot, KillSwitchStatus } from "../api/types";
+import { useKillSwitchStatus } from "../api/killSwitchStatus";
+import type { Alert, Bot } from "../api/types";
 import { StatusStrip } from "../components/StatusStrip";
 import { BotList } from "../components/BotList";
 import { formatTime } from "../format";
@@ -76,9 +77,16 @@ export function Dashboard() {
   // Unfiltered: the status strip derives its unresolved-alert count from this
   // list. The cross-bot feed (/alerts) does its own filtered poll.
   const alertsPoll = usePolling<Alert[]>((signal) => fetchAlerts({}, signal));
-  // The kill-switch state is polled independently (like bots and alerts), so it
-  // keeps last-good through a blip and one endpoint failing never blanks another.
-  const killSwitchPoll = usePolling<KillSwitchStatus>(fetchKillSwitch);
+  /*
+   * The kill-switch state comes from the app's ONE shared poll (step 47), not a
+   * second kill-switch timer of this page's own. It used to be `usePolling(fetchKillSwitch)`
+   * here, duplicating the poll `KillSwitchBanner` already runs above the router
+   * -- both read the same singleton row, so `/` polled the endpoint twice per
+   * interval for one answer. Still independent of `bots` and `alerts` in the way
+   * that matters: it keeps last-good through a blip, and one endpoint failing
+   * never blanks another.
+   */
+  const killSwitchPoll = useKillSwitchStatus();
 
   const [showArchived, setShowArchived] = useState(false);
 

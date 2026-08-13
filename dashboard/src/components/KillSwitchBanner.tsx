@@ -8,11 +8,15 @@
  * is mounted in `App.tsx` OUTSIDE the routed area, alongside the environment
  * banner, and therefore renders on every page including each bot's detail view.
  *
- * It polls `GET /api/kill-switch` on the same 5s cadence as the rest of the
- * dashboard and keeps last-good data through a transient blip (usePolling), so a
- * failed poll never makes a real tripped state silently vanish. When the switch
- * is armed -- the normal case -- it renders nothing, so it adds no chrome and
- * cannot flash on first load (data is null until the first poll resolves).
+ * It reads the app's ONE shared kill-switch poll (`useKillSwitchStatus`, step
+ * 47) rather than running its own. It used to call `usePolling(fetchKillSwitch)`
+ * directly, which meant that on `/` and on `/kill-switch` -- where a second
+ * consumer is also mounted -- the endpoint was polled twice per interval for the
+ * same singleton row. The shared poll keeps last-good data through a transient
+ * blip exactly as before, so a failed poll never makes a real tripped state
+ * silently vanish. When the switch is armed -- the normal case -- it renders
+ * nothing, so it adds no chrome and cannot flash on first load (data is null
+ * until the first poll resolves).
  *
  * It is deliberately loud (solid red, full width) and links straight to the
  * control page so the switch can be inspected or reset from wherever the reader
@@ -20,13 +24,11 @@
  */
 
 import { Link } from "react-router-dom";
-import { fetchKillSwitch } from "../api/client";
-import { usePolling } from "../api/usePolling";
-import type { KillSwitchStatus } from "../api/types";
+import { useKillSwitchStatus } from "../api/killSwitchStatus";
 import { formatDateTime } from "../format";
 
 export function KillSwitchBanner() {
-  const poll = usePolling<KillSwitchStatus>(fetchKillSwitch);
+  const poll = useKillSwitchStatus();
   const status = poll.data;
 
   // Armed (or not yet loaded): render nothing. Only a genuinely tripped switch
