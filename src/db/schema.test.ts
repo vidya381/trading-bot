@@ -128,6 +128,12 @@ describe("the schema as a whole", () => {
       "global_kill_switch",
       "manual_adjustments",
       "orders",
+      // Not in section 8.2. Added by migration 0009: spec 21.5 requirement 5's
+      // permanent proposal record. Section 8.2 names `audit_log` as the audit
+      // practice this mirrors, and the migration's header argues at length why a
+      // proposal cannot BE an `audit_log` row -- an audit entry is an immutable
+      // event, a proposal has a lifecycle whose outcome arrives later.
+      "proposals",
       "trades",
       // Not in section 8.2. Added by migration 0008: the section 21.3 fixed
       // watchlist, moved out of code/config so the research pipeline's
@@ -174,6 +180,19 @@ describe("the schema as a whole", () => {
       // 10 entries -- is a ROW COUNT, not a monetary amount, and lives in
       // /src/research/watchlist.ts.
       watchlist: [],
+      // NO MONEY COLUMN, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT
+      // (migration 0009). A proposal certainly contains monetary values -- the
+      // proposed `allocatedCapital`, `orderSize`, the bounds, the headroom read --
+      // but every one of them lives inside `reasoning_json` / `inputs_json`,
+      // rendered by the SAME `serialize.ts` views that put them on the wire, as
+      // exact decimal strings.
+      //
+      // Hoisting one into a column would create a SECOND copy of a figure whose
+      // first copy is the audit record itself, and the copy that drifts is the one
+      // nobody is watching. There is also nothing to hoist it FOR: no query needs
+      // to sum or filter proposals by amount, and 21.5's own measurement is a
+      // count of unresolved rows.
+      proposals: [],
     };
 
     for (const spec of Object.values(ALL_TABLES)) {

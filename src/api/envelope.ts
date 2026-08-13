@@ -305,6 +305,43 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   symbol_filters_unreadable: 503,
   no_capital_headroom: 409,
 
+  // Section 21.5 requirement 5's proposal record (`/src/research/proposal-log.ts`,
+  // migration 0009). Same rule as every block above: reuse the status an existing
+  // code with the same SHAPE of refusal already carries.
+  //
+  //   unknown_proposal          404, like `unknown_bot_instance` and
+  //                             `not_watched` -- the thing the caller named is not
+  //                             there to act on. Section 8.7 means it was never
+  //                             deleted either, so a 404 here really does mean the
+  //                             id was never issued.
+  //   proposal_already_resolved 409, with `already_watched` and
+  //                             `duplicate_bot_instance`: a well-formed request
+  //                             conflicting with CURRENT state. Nothing overwrites
+  //                             a recorded human decision, so it is not fixable by
+  //                             rephrasing -- which is exactly what 409 says.
+  //   proposal_not_derivable    400, with `pair_not_tradable` and
+  //                             `invalid_parameter`: the caller named the wrong
+  //                             KIND of record and fixes it by naming the derive
+  //                             proposal instead. Deliberately not 409 -- nothing
+  //                             about current state is in conflict; an assessment
+  //                             will never become approvable however long you wait.
+  //   proposal_account_mismatch 400, for the same reason: a field value this
+  //                             system will not act on, fixed by naming the right
+  //                             proposal or the right account.
+  //   no_fetch_time             500, and it is the ONE row here that is not a
+  //                             caller's fault. It is unreachable through the
+  //                             pipeline -- both stages refuse with
+  //                             `no_price_history` before the model call -- so
+  //                             reaching it means a precondition was removed,
+  //                             which is an internal fault and not something a
+  //                             caller can rephrase. It must NOT take the table's
+  //                             400 default and read as a bad request.
+  unknown_proposal: 404,
+  proposal_already_resolved: 409,
+  proposal_not_derivable: 400,
+  proposal_account_mismatch: 400,
+  no_fetch_time: 500,
+
   // ── `citation_unknown` IS DELIBERATELY ABSENT FROM THIS TABLE ──
   //
   // It is the one code in this system carried by THREE different error classes

@@ -28,8 +28,13 @@ import {
   manualAdjustmentView,
   watchlistEntryView,
   assessResultView,
+  assessProposalInputsView,
+  assessProposalReasoningView,
   deriveContextView,
+  deriveProposalInputsView,
+  deriveProposalReasoningView,
   deriveResultView,
+  proposalRecordView,
   resubmittedAssessmentView,
   type BotFees,
 } from "./serialize";
@@ -54,6 +59,11 @@ import {
   parseResubmittedAssessment,
   selectNamedCandidate,
   selectWatchlistCandidates,
+  checkProposalCanTakeOutcome,
+  logAssessProposal,
+  logDeriveProposal,
+  recordProposalApproval,
+  rejectProposal,
   type AssessResult,
   type CandidateEntryPoint,
   type CandleSource,
@@ -61,6 +71,7 @@ import {
   type DeriveResult,
   type GatherPorts,
   type GatherRequest,
+  type ProposalLogPorts,
   type SymbolDetailSource,
   type TradablePairSource,
   type VenueAccount,
@@ -478,6 +489,57 @@ async function assertBotPairIsSpotTradable(
   }
 }
 
+/**
+ * `POST /api/bots` -- create a bot, optionally recording which proposal suggested it.
+ *
+ * ── THE `proposalId` FIELD (21.5 requirement 5's outcome half) ──
+ *
+ * OPTIONAL, and every existing caller is unaffected: a request without it behaves
+ * exactly as it did before, and the dashboard's create-bot form does not send one.
+ *
+ * It exists because before it, **nothing connected a real create-bot action back
+ * to the proposal that suggested it** -- so `proposals.outcome` could only ever
+ * hold `rejected` and NULL, and "the system kept proposing things nobody wanted"
+ * would have had no way to distinguish a proposal nobody wanted from one that
+ * became a real, profitable bot. A permanent record whose outcome column can never
+ * say `approved` is permanently incomplete for its own stated purpose.
+ *
+ * ── IT IS NOT A NEW PATH TO A BOT, AND 21.1 IS UNTOUCHED ──
+ *
+ * This is worth stating precisely, because a field connecting a proposal to a bot
+ * creation is exactly the shape 21.1 is suspicious of. `proposalId` changes
+ * NOTHING about how the bot is created: every parameter still arrives in the body,
+ * typed or confirmed by a human; every decoder, the mandatory stop-loss, the
+ * tradability gate, the spot-instrument check and the ledger's binding capital
+ * compare-and-swap all run unchanged and unweakened. NOTHING is read out of the
+ * proposal record and used as an input -- the record is written to, never read
+ * from, except to check it can take an outcome.
+ *
+ * A field that PREFILLED the form from a stored proposal would be the one-click
+ * bridge 21.1 forbids. This one only records, after the fact, that a human did the
+ * work themselves. The proposal cannot supply a value, so it cannot supply a wrong
+ * one.
+ *
+ * ── EVERY CHECK ON IT RUNS BEFORE THE BOT EXISTS ──
+ *
+ * `checkProposalCanTakeOutcome` runs with the other free checks, before the
+ * tradability gate and long before `create` -- `createBot`'s own "FREE CHECKS
+ * FIRST, NETWORK LAST" rule. An unknown id, an already-resolved proposal, an
+ * `assess` record (nothing to build from), or one belonging to a different account
+ * therefore refuses the request while **nothing has happened**: no capital
+ * reserved, no row written, no Durable Object brought into existence.
+ *
+ * ⚠ THE ONE FAILURE THAT CANNOT BE MOVED EARLIER, AND WHAT HAPPENS THEN. The
+ * outcome WRITE can only run after `create` returns, because
+ * `outcome_bot_instance_id` is a foreign key and `approval_names_a_bot` requires
+ * it -- a link to a bot that does not exist yet is the fabricated audit fact this
+ * project refuses to manufacture. If that last write fails, the bot IS created and
+ * this endpoint still returns 201, with `proposalLink.recorded: false` and the real
+ * error in the body. Failing the response instead would tell an operator that
+ * creation failed when it did not, and the recovery they would attempt -- creating
+ * it again -- is the worst available action. `undoReservation`
+ * (`capital/ledger.ts`) treats a post-commit failure the same way.
+ */
 export async function createBot(ctx: ApiContext): Promise<Response> {
   const body = await readJsonObject(ctx.request);
 
@@ -525,11 +587,47 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
     throw badRequest("invalid_strategy", `strategy must be "dca" or "grid", got ${JSON.stringify(strategy)}`);
   }
 
+  // 21.5 requirement 5's outcome link, checked HERE -- with the free checks,
+  // before the venue calls and long before anything is created. Every refusal
+  // this can raise therefore leaves the request having done nothing at all. The
+  // row is held rather than re-read after creation, so the checks and the write
+  // are about the same row. See this handler's docblock.
+  const proposalId = optionalString(body, "proposalId");
+  const proposal =
+    proposalId === undefined
+      ? null
+      : await checkProposalCanTakeOutcome(proposalLogPorts(ctx), proposalId, {
+          accountLabel,
+          forApproval: true,
+        });
+
   // The gate. Throws before any capital is reserved and before `botStub` brings
   // a Durable Object into existence -- see `assertBotPairIsSpotTradable`.
   await assertBotPairIsSpotTradable(ctx, { label: accountLabel, exchange }, pair);
 
   await create(botStub(ctx, botInstanceId));
+
+  // ⚠ PAST THE POINT OF NO RETURN. A real bot now exists and capital is reserved,
+  // so nothing below may fail this request -- see the docblock's last paragraph.
+  let proposalLink: { readonly proposalId: string; readonly recorded: boolean; readonly error: string | null } | null =
+    null;
+  if (proposal !== null) {
+    try {
+      await recordProposalApproval(proposalLogPorts(ctx), proposal, ctx.actor, botInstanceId);
+      proposalLink = { proposalId: proposal.id, recorded: true, error: null };
+    } catch (error) {
+      // Reported, never swallowed and never rethrown. The operator needs to know
+      // the link is missing -- it is the only thing that will ever connect this
+      // bot back to the reasoning behind it -- and the bot's own creation is a
+      // completed fact that this must not misreport.
+      console.error("failed to record proposal approval", { proposalId: proposal.id, botInstanceId, error });
+      proposalLink = {
+        proposalId: proposal.id,
+        recorded: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
 
   // Return the created bot so the frontend reflects it without a second fetch.
   const row = await ctx.db.botInstances.findOne({ id: botInstanceId });
@@ -537,7 +635,10 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
   // `NO_FEES` for the same reason the three histories are empty literals: a bot
   // that came into existence in this request has no orders, no trades and no
   // alerts, so there is nothing to query for.
-  return ok(botDetail(row!, snapshot, [], [], [], NO_FEES), 201);
+  const detail = botDetail(row!, snapshot, [], [], [], NO_FEES);
+  // ABSENT rather than null when no proposal was named, so an ordinary creation's
+  // response shape is byte-identical to what it was before this field existed.
+  return ok(proposalLink === null ? detail : { ...detail, proposalLink }, 201);
 }
 
 /**
@@ -1439,6 +1540,18 @@ function gatherPorts(ctx: ApiContext): GatherPorts {
 }
 
 /**
+ * The ports the permanent proposal record needs (21.5 requirement 5).
+ *
+ * `ctx.newId` and `ctx.now` -- the same injected clock and id source
+ * `watchlistPorts` uses, so a test drives a deterministic proposal id and
+ * timestamp exactly as it drives a watchlist entry's. Nothing here reaches for
+ * `crypto.randomUUID` or `Date.now` directly.
+ */
+function proposalLogPorts(ctx: ApiContext): ProposalLogPorts {
+  return { db: ctx.db, now: ctx.now, newId: ctx.newId };
+}
+
+/**
  * A comma-separated query parameter as a list, or undefined when absent.
  *
  * Blank entries are dropped rather than refused: `?quoteAssets=USD,` is a shell
@@ -1731,12 +1844,28 @@ export async function getAccountGather(ctx: ApiContext): Promise<Response> {
  * its answer was unusable -- exactly what `candles_unavailable` means one stage
  * earlier.
  *
- * ── IT PERSISTS NOTHING ──
+ * ── IT LOGS EVERY SUCCESSFUL CALL, AUTOMATICALLY (21.5 requirement 5) ──
  *
- * No proposal record, no audit row, no D1 write of any kind. 21.5 requirement
- * 5's full audit logging belongs to pipeline assembly (Stage 4) and is NOT
- * satisfied, partially satisfied, or begun here. This endpoint returns a live
- * result and forgets it.
+ * A real proposal record is written to `proposals` (migration 0009) with the FULL
+ * gather bundle as its inputs and the prompt, settings, raw model response and
+ * parsed answer as its reasoning, plus an `audit_log` entry, in one atomic batch.
+ * There is no flag to turn it off and no separate action to invoke: the signal
+ * 21.5 wants is a RATE over proposals GENERATED, and an opt-in denominator is a
+ * biased one. `proposal-log.ts`'s header argues that in full.
+ *
+ * `proposalId` is on the response so a human can name this proposal later -- and,
+ * for a `/derive` proposal, hand it to `POST /api/bots` as the outcome link.
+ *
+ * ⚠ A FAILED RECORD WRITE FAILS THIS REQUEST, and the model call has already been
+ * paid for by then. That is requirement 6's terms applied to requirement 5:
+ * returning a proposal that is not in the permanent record, to a human with no way
+ * to tell, is a degraded result indistinguishable from a good one. The cost is
+ * real and is stated rather than traded away.
+ *
+ * WHAT IS STILL NOT PERSISTED: nothing about a FAILED run. A parse refusal, a
+ * missing precondition or an unusable answer writes no row, because 21.5 logs
+ * every proposal GENERATED and a refusal generated none -- so the REFUSAL RATE is
+ * not measurable from this table. See `proposal-log.ts`.
  */
 export async function getAccountAssess(ctx: ApiContext): Promise<Response> {
   const label = ctx.params.label!;
@@ -1839,13 +1968,29 @@ export async function getAccountAssess(ctx: ApiContext): Promise<Response> {
   }
   const latencyMs = ctx.now() - startedAt;
 
+  // ONE rendering, used for BOTH the record and the response, so what was stored
+  // and what the human is shown cannot differ. See `assessProposalInputsView`.
+  const inputs = assessProposalInputsView(result, set.selectedAt);
+  const reasoning = assessProposalReasoningView(result, latencyMs);
+
+  // 21.5 requirement 5. Automatic, unconditional, and fail-closed: a write that
+  // throws fails this request rather than returning an unrecorded proposal.
+  const record = await logAssessProposal(proposalLogPorts(ctx), result, {
+    entryPoint: "named",
+    actor: ctx.actor,
+    inputs,
+    reasoning,
+  });
+
   return ok({
     entryPoint: "named" as const,
     selectedAt: set.selectedAt,
+    /** The permanent record's id (21.5 requirement 5). Name it to reject this proposal. */
+    proposalId: record.id,
     // The bundle travels WITH the assessment, never instead of it: every input's
     // real state, including any that failed, beside the answer drawn from them
     // (21.5 requirement 2's "display the actual raw data it used").
-    bundle: candidateGatherBundleView(bundle),
+    bundle: inputs.bundle,
     assess: assessResultView(result, latencyMs),
   });
 }
@@ -1903,25 +2048,42 @@ function deriveContextPortsFor(ctx: ApiContext): DeriveContextPorts {
  * about the caller's honesty. The strategy is likewise re-checked against the
  * two literals `dca` and `grid` rather than trusted to be one of them.
  *
- * ── WHY NO PERSISTENCE, STATED HERE BECAUSE THIS IS WHERE IT WOULD BE ADDED ──
+ * ── THE RECORD NOW EXISTS, AND IT STILL DOES NOT BRIDGE THE TWO CALLS ──
  *
- * **NO D1 ROW, NO KV KEY, NO CACHE, NO TEMPORARY STORE OF ANY KIND bridges the
- * two calls.** The client holds the Stage 2 result and hands it back.
+ * 21.5 requirement 5's permanent proposal record is built (migration 0009,
+ * `proposal-log.ts`), and this endpoint writes one row per successful call: the
+ * full bundle, Stage 3's capital and filter reads, and the re-verified
+ * resubmitted assessment as its INPUTS; the prompt, settings, raw response and
+ * validated parameter set as its REASONING. Plus an `audit_log` entry, in one
+ * atomic batch. `proposalId` comes back on the response, and it is what
+ * `POST /api/bots` takes as its optional `proposalId` to record an approval.
  *
- * That is not an omission and it is not laziness about the trust problem, which
- * the re-verification above already answers. It is that 21.5 requirement 5
- * specifies a REAL, PERSISTENT PROPOSAL RECORD -- prompt text, settings, model
- * id, raw responses, both upstream inputs, an audit trail a human can return to
- * -- and that record belongs to Stage 4's pipeline assembly, which does not
- * exist. A throwaway bridge invented here would be storage with a different
- * shape, a different lifetime and a different owner than the thing that is
- * actually coming, written to solve a problem (trust) that is solved without it,
- * and it would almost certainly be deleted when requirement 5 lands. The
- * decision is to carry the constraint in the open rather than build storage
- * twice.
+ * **AND STILL NO D1 ROW, NO KV KEY AND NO CACHE BRIDGES THE TWO CALLS.** The
+ * client holds the Stage 2 result and hands it back, exactly as before. The
+ * record is written AFTER the work, as an audit trail; it is not an input to the
+ * next request, and there is deliberately no `?proposalId=` alternative to
+ * `?assessment=` here.
  *
- * SO: NOTHING IS PERSISTED. No proposal record, no audit row, no D1 write.
- * 21.5 requirement 5 is NOT satisfied, NOT partially satisfied and NOT begun.
+ * That is unchanged because the reason was never "the record does not exist yet".
+ * There are two ways to stop a caller inventing an assessment -- store it so the
+ * resubmission is only an id, or re-verify it against reality -- and this endpoint
+ * does the second, so storage never answered a question this endpoint had.
+ * Accepting a `proposalId` here would ALSO be strictly weaker: a stored
+ * assessment's citations still have to be re-resolved against the evidence
+ * gathered NOW (decision log 42, check 7 -- a real citation aged out of a real
+ * shallower window, live and unprompted), so the id would replace an untrusted
+ * payload with an untrusted pointer and change nothing about what must be checked.
+ *
+ * ⚠ WHAT IS NOT LINKED: the derive record does not carry the id of the assess
+ * record it derives from, because nothing in the request carries that link and an
+ * `assessProposalId` taken from the caller would be a client-asserted claim this
+ * system cannot verify -- the same class as `envelope` and `duplicateKeyCheck`.
+ * Each row is independently complete, so a trace never needs the join. Recorded in
+ * migration 0009's header as a stated limitation rather than a gap discovered later.
+ *
+ * ⚠ A FAILED RECORD WRITE FAILS THIS REQUEST, after the inference is paid for.
+ * See `getAccountAssess` and `proposal-log.ts` for why that is requirement 6's
+ * terms rather than a harsh default.
  *
  * ── WRITES NOTHING, ALLOCATES NOTHING (21.1) ──
  *
@@ -2114,19 +2276,81 @@ export async function getAccountDerive(ctx: ApiContext): Promise<Response> {
   }
   const latencyMs = ctx.now() - startedAt;
 
+  // ONE rendering for both the record and the response. See `deriveProposalInputsView`.
+  const inputs = deriveProposalInputsView(result, set.selectedAt);
+  const reasoning = deriveProposalReasoningView(result, latencyMs);
+
+  // 21.5 requirement 5, automatic and fail-closed. THIS is the row a human can
+  // approve, by handing `proposalId` to POST /api/bots.
+  const record = await logDeriveProposal(proposalLogPorts(ctx), result, {
+    entryPoint: "named",
+    actor: ctx.actor,
+    inputs,
+    reasoning,
+  });
+
   return ok({
     entryPoint: "named" as const,
     selectedAt: set.selectedAt,
+    /**
+     * The permanent record's id (21.5 requirement 5). Pass it as `proposalId` to
+     * `POST /api/bots` to record that this proposal became a real bot, or to
+     * `POST /api/proposals/:id/reject` to record that it did not.
+     */
+    proposalId: record.id,
     // Stage 1's bundle and Stage 3's own two reads travel WITH the proposal,
     // never instead of it: every input's real state, including any that failed,
     // beside the numbers drawn from them (21.5 requirement 2).
-    bundle: candidateGatherBundleView(bundle),
-    context: deriveContextView(context),
+    bundle: inputs.bundle,
+    context: inputs.context,
     // Labelled `client_resubmitted`, with the claims rendered against the
     // CURRENT evidence they were just re-verified against.
-    assessment: resubmittedAssessmentView(assessment),
+    assessment: inputs.assessment,
     derive: deriveResultView(result, latencyMs),
   });
+}
+
+/**
+ * `POST /api/proposals/:id/reject` -- record that a human read a proposal and
+ * decided against it (21.5 requirement 5's `rejected`).
+ *
+ * Curl-only, like every other section 21 surface (`/candles`, `/gather`,
+ * `/assess`, `/derive`, all three watchlist endpoints). It exists NOW, with no
+ * dashboard control, for a schema reason argued in `rejectProposal`: the
+ * `outcome` CHECK constraint had to name its values at migration time because
+ * SQLite cannot alter a CHECK without rebuilding the table, and a value nothing
+ * could ever write would be the check-that-cannot-fire this project has already
+ * refused twice.
+ *
+ * EITHER STAGE MAY BE REJECTED. Rejecting an `assess` record is the point of
+ * keeping Stage 2 rows at all: it records that a human read a strategy judgement
+ * and chose not to spend a Derive inference on it. Only an approval is restricted
+ * to `derive` records, and that restriction is a database constraint.
+ *
+ * `note` is optional in the body; an absent note is recorded as absent, exactly as
+ * `removeFromWatchlist` treats its own.
+ *
+ * IT WRITES NO OUTCOME TWICE. `outcome IS NULL` is in the UPDATE's WHERE clause,
+ * so a second decision changes nothing and is refused with
+ * `proposal_already_resolved` (409) rather than overwriting the first -- section
+ * 8.7 keeps this data, and rewriting a recorded human decision is the one thing
+ * that would make the record untrustworthy.
+ */
+export async function rejectProposalEntry(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  // A body is optional here: a rejection with no note is complete on its own. The
+  // GET-shaped `ctx.request.body === null` case is what `readJsonObject` would
+  // refuse, so it is checked rather than required.
+  const raw = ctx.request.headers.get("content-type");
+  const body =
+    raw !== null && raw.includes("application/json") ? await readJsonObject(ctx.request) : {};
+
+  const record = await rejectProposal(proposalLogPorts(ctx), id, {
+    // The layer's standing rule: the verified Access email, never a body field.
+    actor: ctx.actor,
+    note: optionalString(body, "note"),
+  });
+  return ok({ proposal: proposalRecordView(record) });
 }
 
 // ---------------------------------------------------------------------------

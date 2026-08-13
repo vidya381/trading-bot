@@ -16,14 +16,26 @@
  * shown too, beside these. The difference is that these cannot be forgotten by a
  * model having an off run.
  *
- * ── ⚠ SCOPE: NOTHING HERE IS PERSISTED ──
+ * ── ⚠ SCOPE: THIS MODULE STILL PERSISTS NOTHING, BUT THE PROPOSAL IS LOGGED ──
  *
- * Spec 21.5 requirement 5 (full audit logging of every proposal, its inputs, its
- * reasoning and its outcome) is NOT satisfied, NOT partially satisfied and NOT
- * begun by this module or anything that calls it. There is no storage, no D1
- * write and no `audit_log` entry anywhere in this stage -- it is a deliberately
- * separate, later step. See `components/ProposalView.tsx` for the same statement
- * where the assembly happens.
+ * Spec 21.5 requirement 5 IS now satisfied, and NOT by anything here: the backend
+ * writes a permanent `proposals` row (migration 0009,
+ * `src/research/proposal-log.ts`) on every real `/assess` and `/derive` call,
+ * carrying the full bundle, the full prompt and the raw model response. The
+ * response this module reads carries that record's `proposalId`.
+ *
+ * Nothing in the DASHBOARD writes, caches or stores any of it -- no D1 write, no
+ * `audit_log` entry, no `localStorage`. Reloading this page still loses the pasted
+ * responses; the record it describes is in D1 and survives.
+ *
+ * ── REQUIREMENT 4 IS NOW WHOLE, AND THE THRESHOLDS ARE NOT DEFINED HERE ──
+ *
+ * The timestamp half was step 44's. The flagging half is `stalenessFor` below,
+ * which composes the BACKEND's `stalenessOf` over the four thresholds in
+ * `DEFAULT_STALENESS_POLICY`. This layer still invents no policy -- decision log
+ * 44's objection was to a rendering layer choosing a risk number, and the number is
+ * now chosen in one named place with its reasoning attached, which is a different
+ * thing from a constant in a component.
  */
 
 import type {
@@ -32,6 +44,14 @@ import type {
   DeriveResponse,
   EvidenceItem,
 } from "./api/research-types";
+import {
+  DEFAULT_STALENESS_POLICY,
+  priceThresholdFor,
+  stalenessOf,
+  type InputStaleness,
+  type ProposalStaleness,
+  type StalenessInput,
+} from "../../src/research/staleness";
 
 // ---------------------------------------------------------------------------
 // Freshness (21.5 requirement 4)
@@ -77,6 +97,14 @@ export interface Freshness {
   /** Every real fetch time, in the order a reviewer should weigh them. */
   readonly fetches: readonly FetchTimestamp[];
   /**
+   * Which staleness threshold applies to each `fetches` entry, keyed by the same
+   * `key`. Carried on the freshness result rather than recomputed by the component
+   * so the mapping from input to threshold happens once, where the inputs are
+   * built -- a component that paired them itself could pair the capital ledger's
+   * age against the price window's threshold and look entirely correct.
+   */
+  readonly thresholds: readonly StalenessInput[];
+  /**
    * The price-history fetch, called out because it is the one that decides
    * whether a proposal is worth reading at all.
    */
@@ -116,6 +144,22 @@ export interface Freshness {
  *
  * `oldest` is then computed across all four, because whichever of them is
  * stalest is the real age of the proposal as a whole.
+ *
+ * ── AND `oldest` IS NOT THE STALENESS ANSWER, THOUGH IT LOOKS LIKE IT ──
+ *
+ * `thresholds` pairs each of the four with its OWN limit from
+ * `DEFAULT_STALENESS_POLICY`, because the four limits span 15 minutes to 7 days
+ * and comparing the single oldest fetch against a single number would get two
+ * ordinary cases exactly backwards: a two-hour-old venue-rules fetch is very
+ * likely the oldest and is nowhere near stale, while a 20-minute-old price fetch
+ * on a grid proposal is stale and is almost certainly not the oldest.
+ * `src/research/staleness.ts` argues that in full and both cases are tested.
+ *
+ * The price threshold is looked up by the strategy the PROPOSAL is for
+ * (`response.derive.strategy`), not by the resubmitted assessment's -- they are the
+ * same value by construction, since `derive-parse.ts` refuses a disagreement
+ * outright, and taking it from the derivation means the threshold matches the
+ * parameters it is about.
  */
 export function freshnessOf(response: DeriveResponse): Freshness {
   const { bundle, context } = response;
@@ -195,7 +239,65 @@ export function freshnessOf(response: DeriveResponse): Freshness {
     },
   ];
 
-  return { fetches, priceFetch, oldest, assembly };
+  // Each input beside its OWN threshold. Built here, from the same four objects,
+  // so the pairing cannot drift from the ages it is about. See the docblock.
+  const thresholds: readonly StalenessInput[] = [
+    {
+      key: priceFetch.key,
+      at: priceFetch.at,
+      thresholdMs: priceThresholdFor(response.derive.strategy),
+    },
+    { key: "capital", at: capital.outcome === "ok" ? capital.value.readAt : null, thresholdMs: DEFAULT_STALENESS_POLICY.capitalLedger },
+    {
+      key: "concentration",
+      at: concentration.outcome === "ok" ? concentration.value.readAt : null,
+      thresholdMs: DEFAULT_STALENESS_POLICY.botList,
+    },
+    { key: "filters", at: filters.outcome === "ok" ? filters.value.fetchedAt : null, thresholdMs: DEFAULT_STALENESS_POLICY.venueRules },
+  ];
+
+  return { fetches, thresholds, priceFetch, oldest, assembly };
+}
+
+/**
+ * This proposal's staleness verdict (21.5 requirement 4's second half).
+ *
+ * A thin composition over the BACKEND's `stalenessOf`, imported directly rather
+ * than mirrored: `src/research/staleness.ts` has no imports precisely so it can
+ * cross this seam, and a second copy of a threshold comparison would be the silent
+ * divergence `dca-dashboard-parity.test.ts` exists to catch. Nothing about the
+ * policy or the comparison is decided in this file.
+ */
+export function stalenessFor(freshness: Freshness, now: number): ProposalStaleness {
+  return stalenessOf(freshness.thresholds, now);
+}
+
+/**
+ * What a reviewer should DO about a stale input -- requirement 4 asks the UI to
+ * "prompt a refresh", and a flag with no instruction is half of that.
+ *
+ * The instruction differs by input, because refreshing them is a different action:
+ * the price window and the venue rules are re-fetched by re-running the pipeline,
+ * while the capital ledger and the bot list change through ordinary operation and
+ * a re-run simply reads them again. Both routes end in the same two calls, which is
+ * why the text says so plainly rather than implying there is a refresh button
+ * (there is not -- every research endpoint is curl-only, decision logs 42 and 44).
+ */
+export function refreshAdvice(input: InputStaleness): string {
+  const rerun =
+    "Re-run GET /assess and then GET /derive for this pair; the new run gathers its own fresh data and re-verifies every citation against it.";
+  switch (input.key) {
+    case "candles":
+      return `The price window behind every bound, order size and reference price is older than the ${formatAge(input.thresholdMs)} this strategy allows. ${rerun}`;
+    case "capital":
+      return `The headroom this allocation was sized against was read more than ${formatAge(input.thresholdMs)} ago and another bot may have taken it since. The create-bot flow re-checks the ledger itself and will refuse if it has, so this is a form that may fail rather than a bad bot -- but ${rerun.toLowerCase()}`;
+    case "concentration":
+      return `The account's bot list is more than ${formatAge(input.thresholdMs)} old, so the over-concentration flag above may no longer describe this account. ${rerun}`;
+    case "filters":
+      return `The venue's trading rules were fetched more than ${formatAge(input.thresholdMs)} ago. The real filter check happens at order time regardless, so this is the least urgent of the four. ${rerun}`;
+    default:
+      return rerun;
+  }
 }
 
 /**

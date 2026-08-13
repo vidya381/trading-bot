@@ -1,9 +1,26 @@
 /**
  * Groundwork for spec section 21's LLM-assisted research pipeline.
  *
- * Section 21 is PLANNED, NOT YET BUILT, and that is still true where it counts:
- * there is NO WORKERS AI CALL, no model binding, no proposal record and no
- * pipeline anywhere in this folder or in `wrangler.jsonc`. What exists is the
+ * ⚠ THE FOLDER'S OLD BANNER IS RETIRED HERE. Section 21 was "PLANNED, NOT YET
+ * BUILT" through step 36; it is not any more. There IS a Workers AI binding, there
+ * ARE two live model-calling endpoints (steps 40, 42), Stage 4's rendering exists
+ * (step 44), and 21.5 REQUIREMENT 5'S PERMANENT PROPOSAL RECORD NOW EXISTS --
+ * `proposal-log.ts` over migration 0009's `proposals` table, written automatically
+ * on every real `/assess` and `/derive` call, with the full inputs, the full prompt
+ * and the raw model response, retained indefinitely per section 8.7.
+ *
+ * ⚠ SOME MODULE HEADERS IN THIS FOLDER STILL CARRY THE OLD BANNER, and they were
+ * already stale before this step (they say "no Assess stage", which stopped being
+ * true at step 37). They are not swept here; read them as "as of the step that
+ * wrote them", and read THIS file and the README as current.
+ *
+ * What still does NOT exist: no trending vendor, so `entryPoint=general` 503s
+ * (steps 30, 31); no news vendor, so every bundle's news slot is
+ * `not_yet_available`; no batch or watchlist entry point to either model stage; no
+ * scheduled or reactive trigger (21.6); and no record of a FAILED run, so the
+ * refusal rate is not measurable from the proposal table (see `proposal-log.ts`).
+ *
+ * What exists is the
  * storage for 21.3's fixed watchlist -- the deliberate, human-chosen half of
  * candidate selection -- the read path a later stage will consume, 21.4 Stage
  * 1's candle fetch for arbitrary tradable pairs, 21.4 Stage 1's
@@ -251,6 +268,48 @@ export {
   type DeriveModelSettings,
   type DeriveResult,
 } from "./derive";
+
+export {
+  ProposalLogError,
+  checkProposalCanTakeOutcome,
+  logAssessProposal,
+  logDeriveProposal,
+  proposalRecordOf,
+  recordProposalApproval,
+  rejectProposal,
+  type LogProposalRequest,
+  type ProposalLogErrorCode,
+  type ProposalLogPorts,
+  type ProposalPayload,
+  type ProposalRecord,
+  type RejectProposalRequest,
+} from "./proposal-log";
+
+export {
+  DCA_PROPOSAL_FIELDS,
+  GRID_PROPOSAL_FIELDS,
+  PROPOSAL_STRATEGIES,
+  checkParamsShape,
+  isProposalStrategy,
+  proposalFieldsFor,
+  type ParamsShapeCheck,
+  type ParamsShapeErrorCode,
+  type ProposalStrategy,
+} from "./proposal-shape";
+
+export {
+  DEFAULT_STALENESS_POLICY,
+  priceThresholdFor,
+  stalenessOf,
+  verdictFor,
+  worstVerdict,
+  type InputStaleness,
+  type ProposalStaleness,
+  type StalenessInput,
+  type StalenessPolicy,
+  type StalenessStrategy,
+  type StalenessVerdict,
+} from "./staleness";
 
 export {
   fetchCandleWindow,

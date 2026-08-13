@@ -30,19 +30,28 @@
  * envelope from `curl` is accepted as-is, and so is a bare `data` object if you
  * have already run it through `jq '.data'`.
  *
- * ── ⚠ NOTHING IS SENT, AND NOTHING IS STORED ──
+ * ── ⚠ NOTHING IS SENT, AND THIS PAGE STORES NOTHING ──
  *
- * This page makes no network request of any kind, and it writes nothing —
- * no D1 row, no `audit_log` entry, no KV key, no `localStorage`. Spec 21.5
- * requirement 5's permanent proposal record is a separate, later step and is not
- * satisfied, partially satisfied or begun here. Reloading this page loses the
- * pasted responses, which is the honest consequence of that and not an oversight
- * to work around with a quiet cache.
+ * This page makes no network request of any kind, and it writes nothing — no D1
+ * row, no `audit_log` entry, no KV key, no `localStorage`. Reloading it loses the
+ * pasted responses.
+ *
+ * ⚠ THAT IS NO LONGER THE SAME AS THE PROPOSAL BEING LOST. Spec 21.5 requirement
+ * 5's permanent record now EXISTS and the BACKEND wrote it when the two calls ran
+ * (migration 0009, `src/research/proposal-log.ts`): the full bundle, the full
+ * prompt, the raw model response, retained indefinitely per section 8.7. Both
+ * pasted responses carry the `proposalId` of the row holding theirs, and the
+ * rendered footer shows both ids so a reviewer can act on them
+ * (`POST /api/bots` with `proposalId`, or `POST /api/proposals/:id/reject`).
+ *
+ * The distinction is worth keeping straight: this page is a VIEWER over data that
+ * is already recorded elsewhere, not the only copy of it.
  */
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { AssessResponse, DeriveResponse } from "../api/research-types";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { ProposalView } from "../components/ProposalView";
 
 /**
@@ -246,7 +255,21 @@ export function Proposal() {
             : "The derive response could not be read — see the message above."}
         </div>
       ) : (
-        <ProposalView derive={derive} assess={assess} />
+        /*
+         * ⚠ THE OUTER BOUNDARY. `ProposalView` wraps its parameters and evidence
+         * sections individually, so a failure in either is contained to that block;
+         * this one catches anything OUTSIDE them — the header, the concentration
+         * banner, the limits panel, the freshness verdict, or `freshnessOf` and
+         * `dataLimits` themselves, which run before any of it renders.
+         *
+         * It is deliberately OUTSIDE the textareas rather than around the whole page,
+         * so a crashing paste never takes away the inputs needed to fix it. That was
+         * the practical problem with the blank screen: the operator could not even
+         * re-paste without reloading and losing both bodies.
+         */
+        <ErrorBoundary where="The proposal">
+          <ProposalView derive={derive} assess={assess} />
+        </ErrorBoundary>
       )}
     </div>
   );

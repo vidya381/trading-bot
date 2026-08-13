@@ -4992,13 +4992,26 @@ describe("derive endpoint (section 21.4 Stage 3)", () => {
     expect(candleCalls, "the derive request fetched candles more than once").toBe(1);
   });
 
-  // -- It writes nothing -----------------------------------------------------
+  // -- What it writes, and what it still must not ----------------------------
 
-  it("writes NOTHING: no bot, no audit row, no capital movement", async () => {
+  /**
+   * ⚠ THIS TEST'S CLAIM CHANGED AT THE STEP THAT BUILT THE PROPOSAL RECORD, and
+   * it is restated rather than loosened.
+   *
+   * It used to assert "writes NOTHING: no bot, no audit row, no capital movement",
+   * which was true while 21.5 requirement 5 was unbuilt (decision log 42). Now
+   * every real `/assess` and `/derive` call writes a `proposals` row and an
+   * `audit_log` entry, deliberately and unconditionally.
+   *
+   * The part that MUST NOT change is the 21.1 guarantee, and it is asserted more
+   * specifically than before rather than less: no bot, no Durable Object, no
+   * capital movement, and the ONLY audit entries are the two proposal records --
+   * named individually, so a future write of any other kind fails here.
+   */
+  it("writes ONLY the proposal record: no bot, no capital movement (21.1)", async () => {
     const label = await deriveAccount("dv-nowrite");
     const before = {
       bots: await db.botInstances.count(),
-      audit: await db.auditLog.count(),
       ledger: (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!,
     };
     const f = fakes(assessAnswer(), deriveAnswer());
@@ -5006,12 +5019,25 @@ describe("derive endpoint (section 21.4 Stage 3)", () => {
     const res = await deriveAfterAssess(label, f);
     expect(res.status).toBe(200);
 
+    // 21.1: the pipeline has NO write path to a bot.
     expect(await db.botInstances.count()).toBe(before.bots);
-    expect(await db.auditLog.count()).toBe(before.audit);
     const after = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
     // The proposal suggested 400; `total_allocated` must be untouched (21.1).
     expect(after.total_allocated).toBe(before.ledger.total_allocated);
     expect(after.total_balance).toBe(before.ledger.total_balance);
+
+    // The two rows this chain SHOULD have written, and nothing else. `dv-nowrite`
+    // seeds a placeholder balance, so its own audit entry is expected too --
+    // listed by name for the same reason: an unnamed count would absorb a new
+    // write silently.
+    const actions = (await db.auditLog.findMany({ orderBy: [{ column: "created_at", direction: "asc" }] }))
+      .map((row) => row.action)
+      .sort();
+    expect(actions).toEqual(["capital.placeholder_balance_seeded", "proposal.assessed", "proposal.derived"]);
+    // And both records exist, unresolved: nobody has acted on them.
+    const proposals = await db.proposals.findMany({});
+    expect(proposals).toHaveLength(2);
+    expect(proposals.every((row) => row.outcome === null)).toBe(true);
   });
 
   // -- Parameter handling ----------------------------------------------------
@@ -5081,5 +5107,799 @@ describe("derive endpoint (section 21.4 Stage 3)", () => {
       { token: null },
     );
     expect(res.status).toBe(401);
+  });
+});
+
+/**
+ * The permanent proposal record, end to end (spec 21.5 requirement 5).
+ *
+ * Real D1, real endpoints, real Access verification; only the exchange and the
+ * two models are injected. NO TEST HERE REACHES A MODEL.
+ *
+ * Six properties, each one this feature would look correct without:
+ *
+ *  1. A REAL /assess CALL PRODUCES A REAL ROW WITH THE FULL INPUTS. Not a
+ *     summary: the whole bundle, every candle, and the prompt text the WIRE
+ *     deliberately omits.
+ *  2. SAME FOR /derive, plus Stage 3's own two reads and the re-verified
+ *     resubmitted assessment -- both upstream inputs, on the row.
+ *  3. WHAT WAS STORED IS WHAT THE HUMAN WAS SHOWN. Asserted by comparing the
+ *     stored payload against the response body, which is the only place the
+ *     "one rendering, two uses" design can be checked.
+ *  4. A FAILED RUN WRITES NOTHING. A parse refusal spends a model call and leaves
+ *     no row -- 21.5 logs proposals, and a refusal produced none.
+ *  5. THE OUTCOME LINK IS REAL. `POST /api/bots` with a `proposalId` records an
+ *     approval naming the bot it created, every refusal happens BEFORE the bot
+ *     exists, and a request without the field behaves exactly as it always did.
+ *  6. NOTHING IS EVER DELETED OR OVERWRITTEN (section 8.7).
+ */
+describe("proposal record (section 21.5 requirement 5)", () => {
+  const MINUTE = 60_000;
+  const VENUE_ANSWERED_AT = 1_960_000_000_000;
+
+  const catalogue: SymbolLister = async () => ({ ok: true, value: ["BTCUSD", "ETHUSD"], at: T0 });
+
+  let venueCount = 40;
+
+  const venue: CandleLister = async (_account, query) => ({
+    ok: true,
+    value: Array.from({ length: venueCount }, (_, i) => {
+      const close = BigInt(100 + (i % 7)) * 1_000_000n;
+      return {
+        pair: query.pair,
+        openTime: T0 - (venueCount - i) * MINUTE,
+        closeTime: T0 - (venueCount - i) * MINUTE + MINUTE,
+        open: close - 1_000_000n,
+        high: close + 8_000_000n,
+        low: close - 4_000_000n,
+        close,
+        volume: 400_000_000n,
+        closed: true,
+      };
+    }),
+    at: VENUE_ANSWERED_AT,
+  });
+
+  const deadVenue: CandleLister = async () => ({
+    ok: false,
+    kind: "transport",
+    message: "connect ETIMEDOUT",
+    retryable: true,
+    at: VENUE_ANSWERED_AT,
+  });
+
+  const details: SymbolDetailLister = async (_account, pair) => ({
+    ok: true,
+    value: {
+      pair,
+      baseAsset: "BTC",
+      quoteAsset: "USD",
+      status: "TRADING",
+      tickSize: 1_000_000n,
+      minPrice: 0n,
+      maxPrice: 0n,
+      stepSize: 100_000n,
+      minQuantity: 100_000n,
+      maxQuantity: 0n,
+      minNotional: 0n,
+      maxNotional: 0n,
+      instrument: "spot",
+      fetchedAt: VENUE_ANSWERED_AT,
+    },
+    at: VENUE_ANSWERED_AT,
+  });
+
+  beforeEach(() => {
+    venueCount = 40;
+  });
+
+  async function proposalAccount(prefix: string) {
+    const label = `${prefix}-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await seedPlaceholderTotalBalance(
+      db,
+      { accountLabel: label, asset: "USD", totalBalance: m("10000"), note: "proposal fixture" },
+      { actor: HUMAN, now: T0 },
+    );
+    return label;
+  }
+
+  const assessAnswer = (citations: string[] = ["candles.range_pct"]) => ({
+    response: {
+      strategy: "grid",
+      claims: [{ statement: "The range is wide relative to the close.", citations }],
+    },
+  });
+
+  const cited = (value: unknown, id = "candles.last_close") => ({ value, citations: [id] });
+
+  const deriveAnswer = () => ({
+    response: {
+      strategy: "grid",
+      parameters: {
+        upperBound: cited("108.00000000", "candles.high"),
+        lowerBound: cited("96.00000000", "candles.low"),
+        gridLines: cited(5, "candles.range_pct"),
+        spacing: cited("arithmetic", "candles.range_pct"),
+        orderSize: cited("50.00000000", "capital.row.01.available"),
+        stopLossPct: cited("5.00000000", "candles.range_pct"),
+        breakoutTakeProfit: cited(true, "assessment.strategy"),
+        breakoutThresholdPct: cited(null, "candles.range_pct"),
+        takeProfitAmount: cited(null, "capital.row.01.available"),
+      },
+      allocatedCapital: cited("400.00000000", "capital.row.01.available"),
+      capitalAsset: cited("USD", "capital.row.01.asset"),
+      notes: [{ statement: "The observed range sets the bounds.", citations: ["candles.range_pct"] }],
+    },
+  });
+
+  function fakes(assess: unknown, derive: unknown) {
+    const assessCalls: string[] = [];
+    const deriveCalls: string[] = [];
+    const assessModel: AssessModel = async (request) => {
+      assessCalls.push(request.prompt);
+      return { text: assess, raw: assess };
+    };
+    const deriveModel: DeriveModel = async (request) => {
+      deriveCalls.push(request.prompt);
+      return { text: derive, raw: derive };
+    };
+    return { assessModel, deriveModel, assessCalls, deriveCalls };
+  }
+
+  /** Call `/assess` for real; returns the whole response body's `data`. */
+  async function realAssess(label: string, assessModel: AssessModel) {
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/assess?${new URLSearchParams({ pair: "BTCUSD", interval: "1m" }).toString()}`,
+      { symbolLister: catalogue, candleLister: venue, symbolDetailLister: details, assessModel },
+    );
+    expect(res.status, "the /assess call this test builds on did not succeed").toBe(200);
+    return res.body.data;
+  }
+
+  /** The client's one projection: whole `EvidenceItem`s down to bare ids. */
+  function resubmissionFrom(assess: any): string {
+    return JSON.stringify({
+      strategy: assess.strategy,
+      claims: assess.claims.map((claim: any) => ({
+        statement: claim.statement,
+        citations: claim.citations.map((item: any) => item.id),
+      })),
+      envelope: assess.envelope,
+      duplicateKeyCheck: assess.duplicateKeyCheck,
+    });
+  }
+
+  async function realDerive(label: string, submission: string, deriveModel: DeriveModel) {
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/derive?${new URLSearchParams({ pair: "BTCUSD", interval: "1m", assessment: submission }).toString()}`,
+      { symbolLister: catalogue, candleLister: venue, symbolDetailLister: details, deriveModel },
+    );
+    expect(res.status, "the /derive call this test builds on did not succeed").toBe(200);
+    return res.body.data;
+  }
+
+  // -- Property 1: /assess writes a real row with the full inputs -------------
+
+  it("a real /assess call produces a real logged row with the FULL inputs", async () => {
+    const label = await proposalAccount("pr-assess");
+    const f = fakes(assessAnswer(), deriveAnswer());
+
+    expect(await db.proposals.count(), "the table was not empty before the call").toBe(0);
+
+    const data = await realAssess(label, f.assessModel);
+
+    // The id is on the response, so a human can name this proposal later.
+    expect(typeof data.proposalId).toBe("string");
+    expect(data.proposalId).not.toBe("");
+
+    const rows = await db.proposals.findMany({});
+    expect(rows, "exactly one row per successful call").toHaveLength(1);
+    const row = rows[0]!;
+
+    expect(row.id).toBe(data.proposalId);
+    expect(row.stage).toBe("assess");
+    expect(row.account_label).toBe(label);
+    expect(row.pair).toBe("BTCUSD");
+    expect(row.entry_point).toBe("named");
+    expect(row.strategy_type).toBe("grid");
+    // The VERIFIED Access email, not a caller-supplied string.
+    expect(row.actor).toBe(HUMAN);
+    expect(row.model).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+    expect(row.prompt_version).toBe("assess/1");
+    // 21.5 requirement 4: the venue's own answer time, NOT the write time.
+    expect(row.data_fetched_at).toBe(VENUE_ANSWERED_AT);
+    expect(row.outcome).toBeNull();
+
+    // ── THE FULL INPUTS, not a summary ──
+    const inputs = row.inputs_json as any;
+    expect(inputs.bundle.candidate.pair).toBe("BTCUSD");
+    expect(inputs.bundle.candidate.accountLabel).toBe(label);
+    // Every candle the venue returned, individually. A summarised bundle would
+    // carry a count and pass every shape assertion.
+    expect(inputs.bundle.candles.value.candles).toHaveLength(40);
+    expect(inputs.bundle.candles.value.count).toBe(40);
+    expect(typeof inputs.bundle.candles.value.candles[0].close).toBe("string");
+    // The real provenance: who asked, as what, and when.
+    expect(inputs.bundle.candidate.sources[0].kind).toBe("named");
+    expect(inputs.bundle.candidate.sources[0].requestedBy).toBe(HUMAN);
+    // The paused news slot travels too -- an absent input recorded as absent.
+    expect(inputs.bundle.news.outcome).toBe("not_yet_available");
+
+    // ── THE REASONING, including the prompt the WIRE omits ──
+    const reasoning = row.reasoning_json as any;
+    expect(reasoning.promptText).toBe(f.assessCalls[0]);
+    expect(reasoning.promptText.length).toBeGreaterThan(1_000);
+    expect(reasoning.promptVersion).toBe("assess/1");
+    expect(reasoning.strategy).toBe("grid");
+    expect(reasoning.claims[0].statement).toBe("The range is wide relative to the close.");
+    // Citations RESOLVED to whole evidence items, and everything OFFERED.
+    expect(reasoning.claims[0].citations[0].id).toBe("candles.range_pct");
+    expect(reasoning.evidence.length).toBeGreaterThan(reasoning.claims[0].citations.length);
+    // The determinism stance this answer was produced under.
+    expect(reasoning.settings.temperature).toBe(0);
+    expect(reasoning.settings.seed).toBe(20260811);
+    // The raw transport response BY IDENTITY, both what it narrowed from and to.
+    expect(reasoning.response.raw).toEqual({ response: { strategy: "grid", claims: [{ statement: "The range is wide relative to the close.", citations: ["candles.range_pct"] }] } });
+
+    // ⚠ THE PROMPT IS ON THE ROW AND NOT ON THE WIRE. Both halves asserted, since
+    // the whole point of storing it is that the response does not.
+    expect(data.assess.promptText).toBeUndefined();
+    expect(data.assess.promptChars).toBe(reasoning.promptText.length);
+  });
+
+  it("writes the audit entry in the same call, as a POINTER not a copy", async () => {
+    const label = await proposalAccount("pr-audit");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const data = await realAssess(label, f.assessModel);
+
+    const audits = await db.auditLog.findMany({ where: { action: "proposal.assessed" } });
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.actor).toBe(HUMAN);
+    expect(audits[0]!.target_bot_instance_id).toBeNull();
+    const details_ = audits[0]!.details_json as any;
+    expect(details_.proposal_id).toBe(data.proposalId);
+    // NOT a second copy of the payload -- see migration 0009's third reason.
+    expect(JSON.stringify(details_).length).toBeLessThan(600);
+  });
+
+  // -- Property 2: /derive writes a row with BOTH upstream inputs -------------
+
+  it("a real /derive call produces a real logged row with both upstream inputs", async () => {
+    const label = await proposalAccount("pr-derive");
+    const f = fakes(assessAnswer(), deriveAnswer());
+
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    // TWO rows now: one per stage, because the two calls gathered independently.
+    const rows = await db.proposals.findMany({ orderBy: [{ column: "created_at", direction: "asc" }] });
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.stage)).toEqual(["assess", "derive"]);
+
+    const row = rows[1]!;
+    expect(row.id).toBe(data.proposalId);
+    expect(row.id).not.toBe(assessData.proposalId);
+    expect(row.prompt_version).toBe("derive/1");
+    expect(row.strategy_type).toBe("grid");
+    expect(row.data_fetched_at).toBe(VENUE_ANSWERED_AT);
+
+    const inputs = row.inputs_json as any;
+    // Stage 1's bundle...
+    expect(inputs.bundle.candles.value.candles).toHaveLength(40);
+    // ...Stage 3's own two extra reads...
+    expect(inputs.context.capital.outcome).toBe("ok");
+    expect(inputs.context.capital.value.assets.length).toBeGreaterThan(0);
+    expect(inputs.context.filters.outcome).toBe("ok");
+    expect(inputs.context.filters.value.pair).toBe("BTCUSD");
+    // ...and the RESUBMITTED assessment, labelled as what it is.
+    expect(inputs.assessment.source).toBe("client_resubmitted");
+    expect(inputs.assessment.citationsReverified).toBe(true);
+    expect(inputs.assessment.claims[0].citations[0].id).toBe("candles.range_pct");
+    // Its two unverifiable audit facts are stored LABELLED as unverifiable, never
+    // flattened into observations.
+    expect(inputs.assessment.unverifiedOriginalCall.envelope).toBe("envelope_object");
+
+    const reasoning = row.reasoning_json as any;
+    expect(reasoning.promptText).toBe(f.deriveCalls[0]);
+    // The validated parameter set, with each number beside the ids it rests on.
+    expect(reasoning.proposal.params.upperBound).toBe("108.00000000");
+    expect(reasoning.proposal.allocatedCapital).toBe("400.00000000");
+    expect(reasoning.proposal.minimumOrderCheck).toBe("quantity");
+    expect(reasoning.proposal.citations.upperBound[0].id).toBe("candles.high");
+    expect(data.derive.promptText).toBeUndefined();
+  });
+
+  // -- Property 3: stored == shown -------------------------------------------
+
+  it("⚠ stores EXACTLY what the response showed the human", async () => {
+    // The only place the "one rendering, two uses" design can be checked. A second
+    // rendering for storage -- even a faithful one -- is a copy that drifts, and
+    // 21.5 requirement 2 is about checking reasoning against the real source.
+    const label = await proposalAccount("pr-same");
+    const f = fakes(assessAnswer(), deriveAnswer());
+
+    const assessData = await realAssess(label, f.assessModel);
+    const assessRow = (await db.proposals.findOne({ stage: "assess" }))!;
+    expect((assessRow.inputs_json as any).bundle).toEqual(assessData.bundle);
+    expect((assessRow.inputs_json as any).selectedAt).toBe(assessData.selectedAt);
+
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+    const deriveRow = (await db.proposals.findOne({ stage: "derive" }))!;
+    const inputs = deriveRow.inputs_json as any;
+    expect(inputs.bundle).toEqual(data.bundle);
+    expect(inputs.context).toEqual(data.context);
+    expect(inputs.assessment).toEqual(data.assessment);
+    // And the reasoning is the wire view PLUS the two fields it omits -- so every
+    // field the response published is byte-identical on the row.
+    const reasoning = deriveRow.reasoning_json as any;
+    for (const key of Object.keys(data.derive)) {
+      expect(reasoning[key], `stored ${key} differs from the response`).toEqual(data.derive[key]);
+    }
+  });
+
+  // -- Property 4: a failed run writes nothing -------------------------------
+
+  it("writes NO row when the model answers unusably", async () => {
+    const label = await proposalAccount("pr-badmodel");
+    // A real model call that returns something the parser refuses.
+    const f = fakes({ response: { strategy: "bicycle", claims: [] } }, deriveAnswer());
+
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/assess?${new URLSearchParams({ pair: "BTCUSD", interval: "1m" }).toString()}`,
+      { symbolLister: catalogue, candleLister: venue, assessModel: f.assessModel },
+    );
+    expect(res.status).toBe(502);
+    // The model WAS called and the refusal is real, so this is not a precondition
+    // short-circuit dressed as a parse failure.
+    expect(f.assessCalls).toHaveLength(1);
+    expect(await db.proposals.count()).toBe(0);
+    expect(await db.auditLog.findMany({ where: { action: "proposal.assessed" } })).toHaveLength(0);
+  });
+
+  it("⚠ FAILS THE REQUEST when the record write itself fails, rather than returning an unrecorded proposal", async () => {
+    // THE FAIL-CLOSED RULE, and the test a mutation run found missing: without it,
+    // a `catch` around the log call left every other assertion green while
+    // `/assess` quietly returned proposals that are not in the permanent record --
+    // a degraded result indistinguishable from a good one, which is exactly what
+    // 21.5 requirement 6 forbids.
+    //
+    // The cost is real and is the reason this needs stating rather than assuming:
+    // the model call has already happened, so the discarded inference is paid for.
+    // The alternative is worse.
+    const label = await proposalAccount("pr-writefail");
+    const f = fakes(assessAnswer(), deriveAnswer());
+
+    // Bound to the TARGET for the reason the concentration test above documents:
+    // `Database` uses private fields, and a private read through a Proxy receiver
+    // throws for an unrelated reason before the handler is reached.
+    const brokenProposals = new Proxy(db.proposals, {
+      get(target, prop) {
+        if (prop === "insertStatement") {
+          return () => {
+            throw new Error("D1 refused the proposal insert");
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const broken = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "proposals") return brokenProposals;
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as Database;
+
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/assess?${new URLSearchParams({ pair: "BTCUSD", interval: "1m" }).toString()}`,
+      { symbolLister: catalogue, candleLister: venue, assessModel: f.assessModel, db: broken },
+    );
+
+    // NOT a 200 with a warning, and not a 200 at all.
+    expect(res.status).toBe(500);
+    expect(res.body.data).toBeNull();
+    // The assessment DID happen -- so this is genuinely the write failing, not a
+    // precondition short-circuit wearing the same status.
+    expect(f.assessCalls).toHaveLength(1);
+    // And nothing partial was left behind: no row, and no audit entry claiming one.
+    expect(await db.proposals.count()).toBe(0);
+    expect(await db.auditLog.findMany({ where: { action: "proposal.assessed" } })).toHaveLength(0);
+  });
+
+  it("writes NO row when a precondition refuses before the model", async () => {
+    const label = await proposalAccount("pr-nohistory");
+    const f = fakes(assessAnswer(), deriveAnswer());
+
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/assess?${new URLSearchParams({ pair: "BTCUSD", interval: "1m" }).toString()}`,
+      { symbolLister: catalogue, candleLister: deadVenue, assessModel: f.assessModel },
+    );
+    expect(res.status).toBe(502);
+    expect(f.assessCalls, "a refusal must cost no inference").toHaveLength(0);
+    expect(await db.proposals.count()).toBe(0);
+  });
+
+  it("writes NO row when a resubmission is stale", async () => {
+    const label = await proposalAccount("pr-stale");
+    const f = fakes(assessAnswer(["candles.bucket.19"]), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    expect(await db.proposals.count()).toBe(1);
+
+    // The window shrinks: bucket 19 no longer exists (decision log 42, check 7).
+    venueCount = 8;
+    const res = await api(
+      "GET",
+      `/api/accounts/${label}/derive?${new URLSearchParams({ pair: "BTCUSD", interval: "1m", assessment: resubmissionFrom(assessData.assess) }).toString()}`,
+      { symbolLister: catalogue, candleLister: venue, symbolDetailLister: details, deriveModel: f.deriveModel },
+    );
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("citation_unknown");
+    expect(f.deriveCalls).toHaveLength(0);
+    // Still just the assess row. No derive row for a derivation that never happened.
+    expect(await db.proposals.count()).toBe(1);
+    expect(await db.proposals.findOne({ stage: "derive" })).toBeNull();
+  });
+
+  // -- Property 5: the outcome link ------------------------------------------
+
+  it("⚠ POST /api/bots with a proposalId records a real approval naming the bot", async () => {
+    const label = await proposalAccount("pr-approve");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    const botId = `pr-bot-${suffix}`;
+    clock = T0 + 7 * MINUTE;
+    const created = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: label,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "400",
+        strategy: "grid",
+        params: {
+          upperBound: "108",
+          lowerBound: "96",
+          gridLines: 5,
+          spacing: "arithmetic",
+          orderSize: "50",
+          stopLossPct: "5",
+          breakoutTakeProfit: true,
+        },
+        // THE LINK. Optional, and the only thing that ever connects this bot back
+        // to the reasoning behind it.
+        proposalId: data.proposalId,
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.body.data.proposalLink).toEqual({
+      proposalId: data.proposalId,
+      recorded: true,
+      error: null,
+    });
+
+    const row = (await db.proposals.findOne({ id: data.proposalId }))!;
+    expect(row.outcome).toBe("approved");
+    expect(row.outcome_bot_instance_id).toBe(botId);
+    expect(row.outcome_actor).toBe(HUMAN);
+    expect(row.outcome_at).toBe(T0 + 7 * MINUTE);
+
+    // The bot really exists, and the audit trail names both.
+    expect(await db.botInstances.findOne({ id: botId })).not.toBeNull();
+    const audits = await db.auditLog.findMany({ where: { action: "proposal.approved" } });
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.target_bot_instance_id).toBe(botId);
+    expect((audits[0]!.details_json as any).pending_ms).toBe(7 * MINUTE);
+
+    // ⚠ AND THE ASSESS ROW IS STILL UNRESOLVED. Approving the derivation does not
+    // resolve the assessment it came from -- nothing links them, by design.
+    expect((await db.proposals.findOne({ stage: "assess" }))!.outcome).toBeNull();
+  });
+
+  it("behaves exactly as before when no proposalId is given", async () => {
+    const botId = `pr-plain-${suffix}`;
+    const label = await proposalAccount("pr-plain");
+    const created = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: label,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "400",
+        strategy: "grid",
+        params: { upperBound: "108", lowerBound: "96", gridLines: 5, spacing: "arithmetic", orderSize: "50", stopLossPct: "5", breakoutTakeProfit: true },
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+    expect(created.status).toBe(201);
+    // ABSENT, not null: an ordinary creation's response shape is unchanged.
+    expect("proposalLink" in created.body.data).toBe(false);
+    expect(await db.proposals.count()).toBe(0);
+  });
+
+  it("⚠ refuses a bad proposalId BEFORE the bot exists", async () => {
+    // The property that matters is not "creation is refused" but "NOTHING
+    // HAPPENED" -- the same standard `assertBotPairIsSpotTradable` is held to.
+    const label = await proposalAccount("pr-badlink");
+    const botId = `pr-nobot-${suffix}`;
+    const res = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: label,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "400",
+        strategy: "grid",
+        params: { upperBound: "108", lowerBound: "96", gridLines: 5, spacing: "arithmetic", orderSize: "50", stopLossPct: "5", breakoutTakeProfit: true },
+        proposalId: "no-such-proposal",
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_proposal");
+    // No bot row, and no capital reserved.
+    expect(await db.botInstances.findOne({ id: botId })).toBeNull();
+    const ledger = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
+    expect(toDecimalString(ledger.total_allocated)).toBe("0.00000000");
+  });
+
+  it("refuses to approve an ASSESS proposal, before the bot exists", async () => {
+    const label = await proposalAccount("pr-assessonly");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const botId = `pr-noassess-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: label,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "400",
+        strategy: "grid",
+        params: { upperBound: "108", lowerBound: "96", gridLines: 5, spacing: "arithmetic", orderSize: "50", stopLossPct: "5", breakoutTakeProfit: true },
+        proposalId: assessData.proposalId,
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("proposal_not_derivable");
+    expect(await db.botInstances.findOne({ id: botId })).toBeNull();
+  });
+
+  it("refuses a proposal belonging to a DIFFERENT account, before the bot exists", async () => {
+    const label = await proposalAccount("pr-acct-a");
+    const other = await proposalAccount("pr-acct-b");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+    const botId = `pr-xacct-${suffix}`;
+
+    const res = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: other,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "400",
+        strategy: "grid",
+        params: { upperBound: "108", lowerBound: "96", gridLines: 5, spacing: "arithmetic", orderSize: "50", stopLossPct: "5", breakoutTakeProfit: true },
+        proposalId: data.proposalId,
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("proposal_account_mismatch");
+    expect(await db.botInstances.findOne({ id: botId })).toBeNull();
+  });
+
+  it("⚠ the proposal supplies NO input to the bot (21.1)", async () => {
+    // The parameters in the body are what the bot is built from, full stop. A body
+    // that deliberately DISAGREES with the proposal still produces the body's bot,
+    // which is what makes `proposalId` a record rather than a one-click bridge.
+    const label = await proposalAccount("pr-noinput");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+    // The proposal says grid 96..108, orderSize 50, allocated 400.
+    expect(data.derive.proposal.params.upperBound).toBe("108.00000000");
+
+    const botId = `pr-diff-${suffix}`;
+    const created = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: label,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "250",
+        strategy: "grid",
+        params: { upperBound: "200", lowerBound: "150", gridLines: 4, spacing: "arithmetic", orderSize: "60", stopLossPct: "9", breakoutTakeProfit: false },
+        proposalId: data.proposalId,
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+    expect(created.status).toBe(201);
+    const bot = (await db.botInstances.findOne({ id: botId }))!;
+    // The BODY's numbers, not the proposal's.
+    expect(toDecimalString(bot.allocated_capital)).toBe("250.00000000");
+    expect((bot.strategy_params_json as any).upperBound).toBe("200.00000000");
+    // And the record still says a human approved it, which is the honest statement:
+    // they acted on it. What they typed is on the bot.
+    expect((await db.proposals.findOne({ id: data.proposalId }))!.outcome).toBe("approved");
+  });
+
+  // -- The reject endpoint ---------------------------------------------------
+
+  it("POST /api/proposals/:id/reject records a rejection, with and without a note", async () => {
+    const label = await proposalAccount("pr-reject");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    clock = T0 + 3 * MINUTE;
+    const res = await api("POST", `/api/proposals/${data.proposalId}/reject`, {
+      body: { note: "bounds too tight for this pair" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.data.proposal.outcome).toBe("rejected");
+    expect(res.body.data.proposal.outcomeNote).toBe("bounds too tight for this pair");
+    expect(res.body.data.proposal.outcomeActor).toBe(HUMAN);
+    expect(res.body.data.proposal.pendingMs).toBe(3 * MINUTE);
+    // The two large payloads are NOT on this response -- their absence is the point.
+    expect("inputs" in res.body.data.proposal).toBe(false);
+    expect("reasoning" in res.body.data.proposal).toBe(false);
+
+    // AN ASSESSMENT MAY ALSO BE REJECTED, and that is why Stage 2 rows are kept.
+    const second = await api("POST", `/api/proposals/${assessData.proposalId}/reject`, {});
+    expect(second.status).toBe(200);
+    expect(second.body.data.proposal.stage).toBe("assess");
+    expect(second.body.data.proposal.outcomeNote).toBeNull();
+  });
+
+  it("⚠ records the VERIFIED Access email, never an actor from the body", async () => {
+    // The layer's standing rule (21.5 requirement 2), and a mutation run found it
+    // untested: a body-supplied actor would let a caller attribute a human decision
+    // to someone else in a permanent, undeleteable record. `addWatchlistEntry`
+    // refuses one outright for the same reason.
+    const label = await proposalAccount("pr-actor");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+
+    const res = await api("POST", `/api/proposals/${assessData.proposalId}/reject`, {
+      body: { note: "not pursuing", actor: "impostor@example.com" },
+      email: HUMAN,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.data.proposal.outcomeActor).toBe(HUMAN);
+    const row = (await db.proposals.findOne({ id: assessData.proposalId }))!;
+    expect(row.outcome_actor).toBe(HUMAN);
+    // And the audit entry names the same verified human.
+    const audit = (await db.auditLog.findMany({ where: { action: "proposal.rejected" } }))[0]!;
+    expect(audit.actor).toBe(HUMAN);
+  });
+
+  it("⚠ still returns 201 when the outcome LINK write fails, and says the link is missing", async () => {
+    // The one place the fail-closed rule is deliberately REVERSED, and a mutation
+    // run found it untested. By this point a real bot exists and capital is
+    // reserved; failing the response would tell an operator that creation failed
+    // when it did not, and the recovery they would attempt -- creating it again --
+    // is the worst available action.
+    const label = await proposalAccount("pr-linkfail");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    // `findOne` still works, so the pre-creation checks pass; only the UPDATE
+    // fails, which is the only failure that cannot be moved before `create`.
+    const brokenProposals = new Proxy(db.proposals, {
+      get(target, prop) {
+        if (prop === "update") {
+          return async () => {
+            throw new Error("D1 refused the outcome update");
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const broken = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "proposals") return brokenProposals;
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as Database;
+
+    const botId = `pr-linkfail-bot-${suffix}`;
+    const created = await api("POST", "/api/bots", {
+      body: {
+        botInstanceId: botId,
+        accountLabel: label,
+        pair: "BTCUSD",
+        capitalAsset: "USD",
+        allocatedCapital: "400",
+        strategy: "grid",
+        params: { upperBound: "108", lowerBound: "96", gridLines: 5, spacing: "arithmetic", orderSize: "50", stopLossPct: "5", breakoutTakeProfit: true },
+        proposalId: data.proposalId,
+      },
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+      db: broken,
+    });
+
+    // The creation SUCCEEDED and is reported as such.
+    expect(created.status).toBe(201);
+    expect(created.body.data.id).toBe(botId);
+    expect(await db.botInstances.findOne({ id: botId })).not.toBeNull();
+    // And the missing link is REPORTED rather than swallowed: it is the only thing
+    // that will ever connect this bot back to the reasoning behind it.
+    expect(created.body.data.proposalLink.proposalId).toBe(data.proposalId);
+    expect(created.body.data.proposalLink.recorded).toBe(false);
+    expect(created.body.data.proposalLink.error).toContain("D1 refused the outcome update");
+    // The proposal is genuinely still unresolved -- no half-written outcome.
+    expect((await db.proposals.findOne({ id: data.proposalId }))!.outcome).toBeNull();
+  });
+
+  it("refuses a second decision rather than overwriting the first", async () => {
+    const label = await proposalAccount("pr-twice");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    await api("POST", `/api/proposals/${assessData.proposalId}/reject`, { body: { note: "first" } });
+
+    const again = await api("POST", `/api/proposals/${assessData.proposalId}/reject`, {
+      body: { note: "second" },
+      email: "someone@else.com",
+    });
+    expect(again.status).toBe(409);
+    expect(again.body.error.code).toBe("proposal_already_resolved");
+
+    const row = (await db.proposals.findOne({ id: assessData.proposalId }))!;
+    expect(row.outcome_note).toBe("first");
+    expect(row.outcome_actor).toBe(HUMAN);
+  });
+
+  it("refuses to reject an unknown proposal, and is Access-gated", async () => {
+    const missing = await api("POST", "/api/proposals/nope/reject", {});
+    expect(missing.status).toBe(404);
+    expect(missing.body.error.code).toBe("unknown_proposal");
+
+    const unauthenticated = await api("POST", "/api/proposals/nope/reject", { token: null });
+    expect(unauthenticated.status).toBe(401);
+  });
+
+  // -- Property 6: retention -------------------------------------------------
+
+  it("⚠ retains every proposal, resolved or not, with no way to delete one", async () => {
+    const label = await proposalAccount("pr-retain");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+    await api("POST", `/api/proposals/${assessData.proposalId}/reject`, {});
+
+    // Both rows still there: one resolved, one not.
+    expect(await db.proposals.count()).toBe(2);
+    // There is no route that could remove one. Checked against the real router
+    // rather than by inspection -- the method map is what an operator can reach.
+    for (const method of ["DELETE", "PUT", "PATCH"]) {
+      const res = await api(method, `/api/proposals/${assessData.proposalId}`, {});
+      expect([404, 405], `${method} on a proposal is reachable`).toContain(res.status);
+    }
+    expect(await db.proposals.count()).toBe(2);
   });
 });

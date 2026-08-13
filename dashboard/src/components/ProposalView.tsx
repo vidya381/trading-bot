@@ -24,15 +24,20 @@
  * implementation of a risk check drifts from the first, and the copy that drifts
  * is the one nobody is watching.
  *
- * ── ⚠ SCOPE: 21.5 REQUIREMENT 5 (AUDIT LOGGING) IS NOT SATISFIED HERE ──
+ * ── ⚠ SCOPE: THE PROPOSAL IS LOGGED, AND NOT BY THIS COMPONENT ──
  *
- * THIS COMPONENT PERSISTS NOTHING. No proposal record, no D1 write, no
- * `audit_log` entry, no KV key, no local storage. Requirement 5 wants every
- * proposal permanently logged with its full inputs, its reasoning and its
- * outcome — approved, rejected or ignored — and that record belongs to a
- * deliberately separate, later step. Nothing on this page should be read as
- * requirement 5 being begun, partially met, or bridged. The same statement is in
- * `src/proposal.ts` and in the page that mounts this.
+ * THIS COMPONENT STILL PERSISTS NOTHING — no D1 write, no `audit_log` entry, no
+ * KV key, no local storage. What changed is upstream: 21.5 requirement 5's
+ * permanent record now exists, and the BACKEND wrote it when `/assess` and
+ * `/derive` ran (migration 0009, `src/research/proposal-log.ts`). Both responses
+ * carry the `proposalId` of the row that holds their full inputs, their full
+ * prompt and the raw model response.
+ *
+ * So "if you close this tab, this proposal is gone" is no longer true of the
+ * RECORD, only of this rendering — and the footer says which is which. The
+ * distinction matters: a reviewer who believes the record is in the page will
+ * screenshot it, and one who believes the page is the record will not know an id
+ * exists to reject or approve by.
  *
  * ── ⚠ 21.1: THIS IS A PROPOSAL, AND THE BOUNDARY IS NOT NEGOTIABLE ──
  *
@@ -45,6 +50,7 @@
 import type { AssessResponse, DeriveResponse } from "../api/research-types";
 import { citedIds, dataLimits, freshnessOf } from "../proposal";
 import { formatDateTime } from "../format";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { CitationLegend } from "./ProposalCitations";
 import { ProposalConcentration } from "./ProposalConcentration";
 import { ProposalEvidence } from "./ProposalEvidence";
@@ -175,13 +181,30 @@ export function ProposalView({
 
       <CitationLegend />
       <ProposalStrategy assessment={derive.assessment} deriveStrategy={derive.derive.strategy} />
-      <ProposalParameters derive={derive.derive} />
-      <ProposalEvidence
-        derive={derive}
-        deriveCited={deriveCited}
-        assess={assessResponse}
-        assessCited={assessCited}
-      />
+      {/*
+       * ⚠ EACH SECTION IN ITS OWN BOUNDARY, and the parameters one is not there
+       * because it is suspect — it is there because it is where a real crash
+       * happened, and because a boundary per section is what makes a failure
+       * CONTAINED rather than total. React's default on an uncaught render error is
+       * to unmount the whole tree, which is what turned a single TypeError into a
+       * blank black page during operator verification.
+       *
+       * `checkParamsShape` fixes that specific crash at its cause; these catch the
+       * next shape nobody anticipated. A reviewer who loses the parameters block
+       * still has the concentration flag, the limits, the freshness verdict and the
+       * evidence — and can see, in place, exactly which part failed.
+       */}
+      <ErrorBoundary where="The parameters section">
+        <ProposalParameters derive={derive.derive} />
+      </ErrorBoundary>
+      <ErrorBoundary where="The evidence section">
+        <ProposalEvidence
+          derive={derive}
+          deriveCited={deriveCited}
+          assess={assessResponse}
+          assessCited={assessCited}
+        />
+      </ErrorBoundary>
 
       <footer className="space-y-2 rounded-lg border border-zinc-800 bg-zinc-900/20 px-4 py-3 text-xs text-zinc-500">
         <p>
@@ -192,10 +215,29 @@ export function ProposalView({
           meaningless. You are the only part of this loop that can tell the two apart.
         </p>
         <p>
-          <strong className="text-zinc-400">Nothing on this page was logged.</strong> Spec 21.5
-          requirement 5 — a permanent audit record of every proposal, its inputs, its reasoning and
-          whether anyone acted on it — is a separate, later step and is not satisfied, partially
-          satisfied or begun here. If you close this tab, this proposal is gone.
+          <strong className="text-zinc-400">This proposal is permanently logged.</strong> The
+          backend wrote a record when <code>/assess</code> and <code>/derive</code> ran, holding
+          the full inputs, the full prompt and the raw model response (spec 21.5 requirement 5).
+          Its id is{" "}
+          <code className="tabular text-zinc-300">{derive.proposalId}</code>
+          {assessResponse !== null && (
+            <>
+              {" "}
+              and the assessment&rsquo;s is{" "}
+              <code className="tabular text-zinc-300">{assessResponse.proposalId}</code>
+            </>
+          )}
+          . Nothing is retained indefinitely by accident — section 8.7 keeps it on purpose, and
+          there is no delete path.
+        </p>
+        <p>
+          <strong className="text-zinc-400">The outcome is still unrecorded.</strong> If you create
+          a bot from this, pass <code>proposalId</code> in the <code>POST /api/bots</code> body so
+          the record says a human acted on it; if you decide against it, post to{" "}
+          <code>/api/proposals/{derive.proposalId}/reject</code>. A proposal nobody records a
+          decision on counts as ignored, which is exactly the signal requirement 5 exists to
+          measure. <strong className="text-zinc-400">This page itself stores nothing</strong> — if
+          you close the tab this rendering is gone, though the record is not.
         </p>
       </footer>
     </article>

@@ -124,6 +124,83 @@ export const watchlist = defineTable("watchlist", {
   removed_at: nullable(integer()),
 });
 
+/**
+ * Section 21.4's four pipeline stages, as the two that produce a persisted
+ * proposal record. Stage 1 (gather) deliberately produces none -- see
+ * `/src/research/proposal-log.ts` on why a gather is not a proposal.
+ */
+export type ProposalStage = "assess" | "derive";
+
+/**
+ * The outcomes a human DECISION produces (21.5 requirement 5). `ignored` is
+ * deliberately absent: it is an absence, represented by `outcome` staying NULL,
+ * and nothing observes a human failing to act. See migration 0009's header.
+ */
+export type ProposalOutcome = "approved" | "rejected";
+
+/**
+ * Which door a proposal's candidate came through (21.2's two entry points, with
+ * `watchlist` and `general` as the two halves of the second).
+ *
+ * This union is the `proposals.entry_point` CHECK constraint's shadow in SQL,
+ * exactly as `ExchangeId` shadows `accounts.exchange` -- /src/db may not import
+ * from /src/research, so it cannot BE `CandidateEntryPoint`. It is pinned to that
+ * type by a compile-time assertion in `/src/research/proposal-log.ts` (both
+ * directions, so neither side can gain a value the other lacks) and by a runtime
+ * list-parity test, rather than by this comment.
+ */
+export type ProposalEntryPoint = "named" | "general" | "watchlist";
+
+export const PROPOSAL_ENTRY_POINTS: readonly ProposalEntryPoint[] = [
+  "named",
+  "general",
+  "watchlist",
+];
+
+export const PROPOSAL_OUTCOMES: readonly ProposalOutcome[] = ["approved", "rejected"];
+
+export const PROPOSAL_STAGES: readonly ProposalStage[] = ["assess", "derive"];
+
+/**
+ * The permanent proposal record (migration 0009, spec 21.5 requirement 5). Every
+ * real `/assess` and `/derive` call writes one row here, with its full inputs,
+ * its full reasoning, and -- later, if a human acts -- its outcome.
+ *
+ * There is no delete method and no soft-delete column, per section 8.7. The one
+ * mutation this table permits is NULL -> an outcome, once, and
+ * `recordProposalOutcome` writes it with `outcome IS NULL` in the WHERE clause so
+ * no stored fact is ever overwritten. `/src/research/proposal-log.ts` is the only
+ * writer.
+ */
+export const proposals = defineTable("proposals", {
+  id: text(),
+  stage: text<ProposalStage>(),
+  account_label: text(),
+  pair: text(),
+  entry_point: text<ProposalEntryPoint>(),
+  strategy_type: text<StrategyType>(),
+  actor: text(),
+  model: text(),
+  prompt_version: text(),
+  /** 21.5 requirement 4: the price-history FETCH time, not the render time. */
+  data_fetched_at: integer(),
+  /**
+   * Deliberately `unknown`, exactly as `bot_instances.strategy_params_json` is:
+   * the stored shape is whatever `candidateGatherBundleView` and
+   * `deriveContextView` render, those views are `/src/api/serialize.ts`'s to
+   * define, and typing it as a hand-written interface here would mean a stored
+   * row could claim a shape nothing validated.
+   */
+  inputs_json: json<unknown>(),
+  reasoning_json: json<unknown>(),
+  created_at: integer(),
+  outcome: nullable(text<ProposalOutcome>()),
+  outcome_bot_instance_id: nullable(text()),
+  outcome_actor: nullable(text()),
+  outcome_at: nullable(integer()),
+  outcome_note: nullable(text()),
+});
+
 export const capitalLedger = defineTable("capital_ledger", {
   id: text(),
   account_label: text(),
@@ -262,6 +339,7 @@ export type TradeRow = Row<typeof trades.columns>;
 export type BalanceSnapshotRow = Row<typeof balanceSnapshots.columns>;
 export type ManualAdjustmentRow = Row<typeof manualAdjustments.columns>;
 export type AuditLogRow = Row<typeof auditLog.columns>;
+export type ProposalRow = Row<typeof proposals.columns>;
 export type AlertRow = Row<typeof alerts.columns>;
 export type CircuitBreakerRow = Row<typeof circuitBreakers.columns>;
 export type GlobalKillSwitchRow = Row<typeof globalKillSwitch.columns>;
@@ -280,4 +358,5 @@ export const ALL_TABLES = {
   alerts,
   circuitBreakers,
   globalKillSwitch,
+  proposals,
 } as const;

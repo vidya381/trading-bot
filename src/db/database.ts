@@ -24,6 +24,7 @@ import {
   globalKillSwitch,
   manualAdjustments,
   orders,
+  proposals,
   trades,
   watchlist,
 } from "./schema";
@@ -43,6 +44,8 @@ export class Database {
   readonly alerts: Repository<typeof alerts.columns>;
   readonly circuitBreakers: Repository<typeof circuitBreakers.columns>;
   readonly globalKillSwitch: Repository<typeof globalKillSwitch.columns>;
+  /** The permanent proposal record (migration 0009, spec 21.5 requirement 5). */
+  readonly proposals: Repository<typeof proposals.columns>;
 
   constructor(d1: D1Database) {
     this.#d1 = d1;
@@ -58,6 +61,7 @@ export class Database {
     this.alerts = new Repository(d1, alerts);
     this.circuitBreakers = new Repository(d1, circuitBreakers);
     this.globalKillSwitch = new Repository(d1, globalKillSwitch);
+    this.proposals = new Repository(d1, proposals);
   }
 
   /**

@@ -76,6 +76,12 @@ const ROUTES: readonly Route[] = [
   // NOTHING BRIDGES THE TWO CALLS -- no D1, no KV, no cache; the client holds
   // the assessment. See `getAccountDerive` for why that is deliberate.
   route("GET", "/api/accounts/:label/derive", handlers.getAccountDerive),
+  // Section 21.5 requirement 5's outcome half. `approved` is recorded by
+  // `POST /api/bots` itself (its optional `proposalId`), because an approval IS a
+  // real bot having been created and there is deliberately no way to claim one
+  // without creating it. This route records the other decision a human makes.
+  // Curl-only, like every other section 21 surface.
+  route("POST", "/api/proposals/:id/reject", handlers.rejectProposalEntry),
   // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
   // dashboard control for these is deliberately a later step; today they are the
   // curl-callable surface that replaces editing the table by hand.

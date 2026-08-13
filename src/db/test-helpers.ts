@@ -19,6 +19,7 @@ import type {
   CircuitBreakerRow,
   ManualAdjustmentRow,
   OrderRow,
+  ProposalRow,
   TradeRow,
   WatchlistRow,
 } from "./schema";
@@ -26,6 +27,10 @@ import type {
 // Children before parents, so the deletes do not trip the foreign keys that D1
 // enforces by default.
 const TABLES_CHILDREN_FIRST = [
+  // Migration 0009. First in the list because it is the only table with TWO
+  // parents -- `account_label` REFERENCES accounts and `outcome_bot_instance_id`
+  // REFERENCES bot_instances -- so it must go before either of them.
+  "proposals",
   "trades",
   "orders",
   "alerts",
@@ -218,6 +223,40 @@ export function auditLogRow(overrides: Partial<AuditLogRow> = {}): AuditLogRow {
     target_bot_instance_id: null,
     details_json: null,
     created_at: T0,
+    ...overrides,
+  };
+}
+
+/**
+ * A proposal record (migration 0009, spec 21.5 requirement 5).
+ *
+ * Defaults to an UNRESOLVED `derive` row -- `outcome` and its four companions
+ * NULL -- because that is what every real write produces and what 21.5's own
+ * measurement ("the proposals nobody acted on") counts. A test that wants an
+ * outcome must set all of `outcome`, `outcome_actor`, `outcome_at` and (for an
+ * approval) `outcome_bot_instance_id`, which is `outcome_is_recorded_whole`
+ * refusing a half-recorded decision rather than this helper hiding one.
+ */
+export function proposalRow(overrides: Partial<ProposalRow> = {}): ProposalRow {
+  return {
+    id: "prop-1",
+    stage: "derive",
+    account_label: "main",
+    pair: "BTCUSD",
+    entry_point: "named",
+    strategy_type: "grid",
+    actor: "owner@example.com",
+    model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    prompt_version: "derive/1",
+    data_fetched_at: T0,
+    inputs_json: { bundle: { candidate: { pair: "BTCUSD" } } },
+    reasoning_json: { promptText: "PROMPT", strategy: "grid" },
+    created_at: T0,
+    outcome: null,
+    outcome_bot_instance_id: null,
+    outcome_actor: null,
+    outcome_at: null,
+    outcome_note: null,
     ...overrides,
   };
 }

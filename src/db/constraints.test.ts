@@ -16,6 +16,7 @@ import {
   capitalLedgerRow,
   freshDatabase,
   orderRow,
+  proposalRow,
   rawD1,
   tradeRow,
   watchlistRow,
@@ -371,5 +372,160 @@ describe("STRICT tables", () => {
         .bind("1234.50000000")
         .run(),
     ).rejects.toThrow(/cannot store REAL value/);
+  });
+});
+
+/**
+ * The proposal record's constraints (migration 0009, spec 21.5 requirement 5).
+ *
+ * These live HERE rather than beside `proposal-log.ts`'s own tests, and the reason
+ * is the guarantee they are about: each one must hold **even if a future bug let a
+ * bad value past the repository**, which is only demonstrable by writing past the
+ * repository. `no-raw-d1.test.ts` fails the build on `.prepare(` outside /src/db,
+ * so /src/db is the one place that write can be made — the same reason every other
+ * raw-SQL assertion in this file is in this file.
+ *
+ * The code paths that ALSO refuse these cases are tested in
+ * `/src/research/proposal-log.test.ts`. Both halves are needed: without the code
+ * test a refusal could come only from the database and produce an unhelpful error;
+ * without these, deleting the code check would leave every test green.
+ */
+describe("proposals (migration 0009)", () => {
+  const T = 1_760_000_000_000;
+
+  async function seed(overrides: Record<string, unknown> = {}) {
+    await db.accounts.insert(accountRow({ account_label: "main" }));
+    await db.proposals.insert(proposalRow({ account_label: "main", ...overrides }));
+  }
+
+  async function seedBot(id: string) {
+    await db.botInstances.insert(botInstanceRow({ id, account_label: "main" }));
+  }
+
+  /** A raw UPDATE, deliberately past the layer. See this block's docblock. */
+  function rawUpdate(sql: string, ...binds: unknown[]) {
+    return rawD1().prepare(sql).bind(...binds).run();
+  }
+
+  it("⚠ refuses to mark an ASSESS record approved: only a derivation can be", async () => {
+    // An assessment carries a strategy word and its reasons, not the parameters a
+    // bot needs, so no bot could have been created from one. Without this
+    // constraint a mis-wired caller could record an approval naming a parameter set
+    // that never existed.
+    await seed({ id: "p-assess", stage: "assess", prompt_version: "assess/1" });
+    await seedBot("bot-a");
+    await expect(
+      rawUpdate(
+        `UPDATE proposals SET outcome = 'approved', outcome_actor = ?, outcome_at = ?,
+           outcome_bot_instance_id = ? WHERE id = 'p-assess'`,
+        "owner@example.com",
+        T,
+        "bot-a",
+      ),
+    ).rejects.toThrow(/CHECK/);
+  });
+
+  it("refuses an approval that names no bot, and a rejection that names one", async () => {
+    await seed({ id: "p-1" });
+    await expect(
+      rawUpdate(
+        `UPDATE proposals SET outcome = 'approved', outcome_actor = ?, outcome_at = ? WHERE id = 'p-1'`,
+        "owner@example.com",
+        T,
+      ),
+    ).rejects.toThrow(/CHECK/);
+
+    await seedBot("bot-b");
+    await expect(
+      rawUpdate(
+        `UPDATE proposals SET outcome = 'rejected', outcome_actor = ?, outcome_at = ?,
+           outcome_bot_instance_id = ? WHERE id = 'p-1'`,
+        "owner@example.com",
+        T,
+        "bot-b",
+      ),
+    ).rejects.toThrow(/CHECK/);
+  });
+
+  it("refuses a HALF-RECORDED decision, the shape halt_requires_reason already uses", async () => {
+    await seed({ id: "p-2" });
+    // An actor with no verdict.
+    await expect(
+      rawUpdate(`UPDATE proposals SET outcome_actor = ? WHERE id = 'p-2'`, "owner@example.com"),
+    ).rejects.toThrow(/CHECK/);
+    // A verdict with no time.
+    await expect(
+      rawUpdate(
+        `UPDATE proposals SET outcome = 'rejected', outcome_actor = ? WHERE id = 'p-2'`,
+        "owner@example.com",
+      ),
+    ).rejects.toThrow(/CHECK/);
+    // A note with no decision at all.
+    await expect(
+      rawUpdate(`UPDATE proposals SET outcome_note = ? WHERE id = 'p-2'`, "changed my mind"),
+    ).rejects.toThrow(/CHECK/);
+  });
+
+  it("refuses an outcome word that is neither approved nor rejected", async () => {
+    // `ignored` in particular: it is an ABSENCE (outcome IS NULL), never a stored
+    // value, because nothing observes a human failing to act. See migration 0009.
+    await seed({ id: "p-3" });
+    for (const word of ["ignored", "pending", "APPROVED", ""]) {
+      await expect(
+        rawUpdate(
+          `UPDATE proposals SET outcome = ?, outcome_actor = ?, outcome_at = ? WHERE id = 'p-3'`,
+          word,
+          "owner@example.com",
+          T,
+        ),
+        `${JSON.stringify(word)} was accepted as an outcome`,
+      ).rejects.toThrow(/CHECK/);
+    }
+  });
+
+  it("refuses an unknown stage, entry point or strategy", async () => {
+    await db.accounts.insert(accountRow({ account_label: "main" }));
+    await expect(db.proposals.insert(proposalRow({ account_label: "main", stage: "gather" as never }))).rejects.toThrow(/CHECK/);
+    await expect(
+      db.proposals.insert(proposalRow({ id: "p-e", account_label: "main", entry_point: "trending" as never })),
+    ).rejects.toThrow(/CHECK/);
+    await expect(
+      db.proposals.insert(proposalRow({ id: "p-s", account_label: "main", strategy_type: "martingale" as never })),
+    ).rejects.toThrow(/CHECK/);
+  });
+
+  it("accepts 'general' as an entry point, though nothing can produce one yet", async () => {
+    // The CHECK names all three doors deliberately: `entryPoint=general` 503s today
+    // (no trending vendor, logs 30/31), and in SQLite a CHECK cannot be widened
+    // without rebuilding the table -- which for the permanent record would mean
+    // rebuilding the thing it exists to keep.
+    await db.accounts.insert(accountRow({ account_label: "main" }));
+    await db.proposals.insert(proposalRow({ account_label: "main", entry_point: "general" }));
+    expect((await db.proposals.findOne({ id: "prop-1" }))!.entry_point).toBe("general");
+  });
+
+  it("requires a registered account, and a real bot for an approval", async () => {
+    // The FK to `accounts` -- the second one, after watchlist's.
+    await expect(db.proposals.insert(proposalRow({ account_label: "ghost" }))).rejects.toThrow(
+      /FOREIGN KEY/,
+    );
+    // And the FK to `bot_instances`: an approval cannot name a bot that does not
+    // exist, which is what makes "approved" a fact rather than a claim.
+    await seed({ id: "p-fk" });
+    await expect(
+      rawUpdate(
+        `UPDATE proposals SET outcome = 'approved', outcome_actor = ?, outcome_at = ?,
+           outcome_bot_instance_id = 'no-such-bot' WHERE id = 'p-fk'`,
+        "owner@example.com",
+        T,
+      ),
+    ).rejects.toThrow(/FOREIGN KEY/);
+  });
+
+  it("requires a fetch time: 21.5 requirement 4 has nothing to hold without one", async () => {
+    await db.accounts.insert(accountRow({ account_label: "main" }));
+    await expect(
+      db.proposals.insert(proposalRow({ account_label: "main", data_fetched_at: null as never })),
+    ).rejects.toThrow(/NOT NULL/);
   });
 });

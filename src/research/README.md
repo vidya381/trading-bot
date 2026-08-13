@@ -1,11 +1,23 @@
 # `/src/research` — groundwork for section 21
 
-Section 21 (LLM-assisted research and bot proposals) is **PLANNED, NOT YET
-BUILT**, and the part of that banner which matters still holds exactly: **there
-is no Workers AI call, no model binding, no proposal record and no pipeline** in
-this folder or in `wrangler.jsonc`. What has changed is that **there is now a
-prompt** — see the Stage 2 section below, which is the reason the banner is
-qualified rather than repeated unchanged.
+> ⚠ **THE "PLANNED, NOT YET BUILT" BANNER IS RETIRED.** It held through step 36
+> and is now false in every part: there is a real `ai` binding, two live
+> model-calling endpoints (`GET /assess`, `GET /derive`, steps 40 and 42), a
+> rendered human-facing proposal (step 44), and — as of the step this paragraph
+> was written — **21.5 requirement 5's permanent proposal record**, written
+> automatically on every real call to either endpoint and retained indefinitely
+> per section 8.7. See *The proposal record* below.
+>
+> ⚠ Several module headers in this folder still carry the old banner. They were
+> already stale before this step (they say "no Assess stage", untrue since step
+> 37) and are **not** swept here — read them as "as of the step that wrote them",
+> and read this README and `index.ts` as current.
+
+**What still does not exist:** no trending vendor, so `entryPoint=general` 503s
+(logs 30, 31); no news vendor, so every bundle's news slot is
+`not_yet_available`; no batch or watchlist entry point to either model stage; no
+scheduled or reactive trigger (21.6); and **no record of a FAILED run**, so the
+refusal rate is not measurable from the proposal table.
 
 What exists is the storage for **21.3's fixed watchlist**, **all three of 21.4
 Stage 1's reads**, **candidate selection for 21.2's entry points and one deliberate third door**,
@@ -703,8 +715,9 @@ recorded about proposals nobody acted on.
 - **A trending vendor, and any transport for one.** `TrendingSource` is a port
   and nothing implements it. No trending API has been called from this
   repository, and the vendor research is in decision log 31.
-- **Everything LLM-shaped** — Assess, Derive, proposal assembly, the proposal
-  record, the audit table. Stage 1 assembly now HAS an endpoint
+- ~~**Everything LLM-shaped** — Assess, Derive, proposal assembly, the proposal
+  record, the audit table.~~ **All of these now exist** (steps 37–44 and the
+  proposal-record step). Stage 1 assembly has an endpoint
   (`GET /api/accounts/:label/gather`), built so decision log 35's rate-budget
   open question has a real caller to measure; candidate selection and the
   concentration flag still have none of their own, and are reachable only
@@ -883,3 +896,189 @@ one guarantee that survives is the migration's unique partial index on
 hidden; it is the strongest argument for building the dashboard control, and the
 reason the SQL commands in the decision log write the paired `audit_log` row by
 hand.
+
+---
+
+## The proposal record (21.5 requirement 5)
+
+Every step of the section 21 arc from log 30 to log 44 closed with the same line —
+requirement 5 is "NOT satisfied, NOT partially satisfied and NOT begun" — and logs
+42 and 44 each **declined to invent a throwaway store**, on the stated grounds that
+the real record was coming and would have a different shape, lifetime and owner.
+This is that record.
+
+`proposal-log.ts` writes it. `migrations/0009_proposals.sql` carries the full
+storage-shape argument. `Database.proposals` has exactly one writer.
+
+### Why a dedicated table and not rows in `audit_log`
+
+21.5 names `audit_log` as the practice this mirrors, so the obvious reading is a
+fat `details_json`. Traced through the real code, that does not work — four
+reasons, in descending weight:
+
+1. **A proposal has a LIFECYCLE; an audit entry is an EVENT.** The outcome is only
+   knowable later, so recording it means UPDATING. **Nothing in this system has
+   ever updated `audit_log`** — every writer only INSERTs, and that append-only
+   property is what makes the log trustworthy.
+2. **`Repository` cannot filter on a JSON column, by design** (`unsupported_filter`,
+   see `/src/db/table.ts`). `audit_log` has no `account_label`, `pair` or `stage`,
+   so *"every proposal nobody acted on"* — the specific measurement 21.5 exists to
+   enable — would be unaskable.
+3. **Every read of `audit_log` would pay for the payload.** `findMany` always
+   selects the full column list; there is no projection. The measured worst-case
+   proposal payload is **290,459 bytes**, so proposals in `details_json` would mean
+   `listReconciliationRuns` dragging that per unrelated read.
+4. **The outcome link needs something to point at.** `POST /api/bots` takes an
+   optional `proposalId`; a foreign key into `audit_log` would point at a table
+   where any row of any action could be named.
+
+So: a dedicated table for the **record**, plus an `audit_log` row for the
+**event**, in ONE `Database.batch` — the shape migration 0008 set for the
+watchlist. The audit entry carries a **pointer**, never a second copy.
+
+### Two rows per pipeline run, and one link that is deliberately absent
+
+`/assess` and `/derive` each perform their **own** fresh gather (log 42's decisive
+check: the same evidence id resolved to 63775.31 and 63757.71 ten minutes apart),
+so `stage` distinguishes two independently-complete rows rather than one row
+picking a gather and discarding the other.
+
+⚠ **A derive row does NOT carry the id of the assess row it derives from**, because
+nothing in the request carries that link and an `assessProposalId` taken from the
+caller would be a client-asserted claim this system cannot verify — the same class
+as `envelope` and `duplicateKeyCheck`. Each row is independently traceable, so
+nothing needs the join.
+
+### `ignored` is not a stored value
+
+Only `approved` and `rejected` are decisions a human makes and a system can
+witness. **`outcome IS NULL` is 21.5's "ignored"**, read after the fact — no
+threshold and no cron sweep, because the signal the requirement asks for is
+"nobody acted", and a NULL that stays NULL *is* that.
+`idx_proposals_unresolved` is the index for counting it.
+
+⚠ A proposal made thirty seconds ago also has a NULL outcome, so the count is only
+meaningful over rows old enough that a human would have acted, and **no threshold
+is invented for that**. Counts are also only meaningful **grouped by `stage`**:
+only a derivation can be approved.
+
+### `/gather` writes no row, and that is the measurement working
+
+A DEVIATION from the brief, recorded as one. A gather has no reasoning, no
+strategy and nothing a human could approve or reject. Gather rows could never be
+acted on, so they would inflate the "nobody acted" numerator without bound.
+**Nothing is lost**: every logged row carries the full gather bundle, because both
+endpoints gather and store it.
+
+### A failed run writes no row either
+
+`assessCandidate` and `deriveParameters` catch nothing, so a refusal throws before
+the write. That is 21.5's own wording — "every **proposal** generated" — and a
+refusal generated none.
+
+⚠ **The consequence: the refusal rate is not measurable from this table.** How
+often the model answers unusably, or a resubmission arrives stale, is invisible
+here. Those are real signals and recording them is a later step, because a failure
+record has different columns and would be a different table.
+
+### A failed write fails the request
+
+The model call has already happened by then, so a failed write **discards a paid
+inference**. It is still right on requirement 6's terms: the alternative is
+returning a proposal that is not in the record, to a human with no way to tell.
+**The one place this is reversed** is the create-bot outcome link, which runs after
+a real bot exists — there the failure is reported in the response body, because
+failing the response would misreport a completed, irreversible action.
+
+---
+
+## The staleness thresholds (21.5 requirement 4)
+
+`staleness.ts`. Spec 21.7 open question 4 — *"what 'a meaningful delay' is … is
+unset, and should probably differ by strategy"* — answered with four numbers:
+
+| input | threshold | why |
+| --- | --- | --- |
+| price history, **grid** | **15 min** | bounds are ABSOLUTE prices; once price leaves the ladder the bot created is not the one reviewed |
+| price history, **dca** | **60 min** | every behavioural DCA parameter is RELATIVE to the fill price; nothing names an absolute price |
+| capital ledger | **1 hour** | a PREFILL; the binding check is the ledger's compare-and-swap at creation, so staleness is a nuisance not a risk |
+| bot list | **24 hours** | changes only when a human starts or stops a bot |
+| venue rules | **7 days** | slowest-moving; the real filter check happens at order time regardless |
+
+⚠ **These are POLICY CHOICES with no backtest, no volatility model and no market
+data behind them** — the same category as `DEFAULT_CONCENTRATION_POLICY`. What the
+reasoning supports is the **ordering** and the rough **ratio**; the absolute values
+it does not.
+
+**Four thresholds and not one**, because `oldest` is not the answer: a 2-hour-old
+venue-rules fetch is usually the oldest and is nowhere near stale, while a
+20-minute-old price fetch on a grid proposal is stale and usually is not the
+oldest. Both cases are pinned by tests, in the policy module and again through the
+dashboard's rendering path.
+
+**Three states, not two.** An input that produced no value has no age to compare and
+is `unknown` — not fresh (section 5.6). `stale` outranks `unknown` outranks `fresh`.
+
+`staleness.ts` **has no imports**, deliberately: the dashboard imports it directly,
+the third file to cross that seam after `shared/alert-types.ts` and `shared/money.ts`.
+A mirror is what fails silently here, so there is not one.
+
+---
+
+## The params shape check (`proposal-shape.ts`) — a crash fix
+
+**Found during operator verification, from a hand-edited test file rather than a real
+response.** A file carrying `strategy: "dca"` over GRID-shaped params reached
+`ProposalParameters`, which read `params.baseOrderSize` (absent), handed `undefined`
+to `formatMoney`, and threw `TypeError: undefined is not an object (evaluating
+'value.startsWith')` out of `roundDecimal`. React unmounted the tree and **the whole
+page went blank and black with no visible error** — indistinguishable from a page
+that had not loaded, a routing bug, or a backend outage.
+
+`checkParamsShape` now runs before any field is read, and a mismatch renders the same
+red warning `ProposalStrategy` already renders for a Stage 2 / Stage 3 strategy
+disagreement. **Both are the same category of fault** — pasted input whose parts do
+not agree — and only the manifestation differs.
+
+⚠ **A real backend response cannot produce this**, in three independent places: the
+per-strategy JSON schema, `requireExactFields`, and `validatedProposalView`'s
+discriminated union. That is not a reason to skip the check: the proposal page's
+input is PASTED by design (log 44), so it is untrusted text in exactly the sense a
+resubmitted assessment is — and `parseResubmittedAssessment` does not skip validating
+a resubmission because a well-behaved client would have sent a good one.
+
+### Two rules worth knowing
+
+- **`null` is present; `undefined` is missing.** The view emits `null` for an unset
+  optional (`takeProfitAmount`, `breakoutThresholdPct`) and never omits the key. A
+  rule that accepted "absent or null" would let the original crash straight through.
+- **The field set is EXACT** — `requireExactFields`' own rule. Extra is a fault too.
+  The first version measured extras against *both* strategies' lists, and its own
+  test caught the hole: an object carrying grid AND dca fields (what merging two
+  responses produces) passed, and would have rendered as a grid bot while silently
+  dropping a complete DCA description.
+
+### The field lists are pinned two ways, not mirrored
+
+`proposal-shape.ts` **has no imports**, so the dashboard imports it directly — fourth
+file across that seam after `alert-types.ts`, `money.ts` and `staleness.ts`. A mirror
+would not fail to compile and would not throw; it would refuse a good proposal or
+pass a bad one. Instead: pinned against `GRID_DERIVE_FIELDS`/`DCA_DERIVE_FIELDS`
+(spec 21.4's own quotation), and against the real key set `validatedProposalView`
+emits when driven over a real `DeriveResult`. **The second pin is the one that
+matters** — the component reads the view's output, not the prompt's field list.
+
+### Defence in depth, and the mutant that shaped it
+
+`ErrorBoundary` wraps the parameters section, the evidence section, and the whole
+proposal — so any FUTURE unexpected shape is a visible, contained block instead of a
+blank page. Its pure half lives in `dashboard/src/renderError.ts` and **must never
+throw**: it runs where nothing is left to catch a second failure, and `throw` accepts
+any value (`String(Object.create(null))` throws, a bug this project hit once already).
+
+⚠ **A mutation run found the guard's own CALL SITE unreachable by any test**: it lived
+in a `.tsx`, and React's CJS build does not resolve in the Workers runtime, so a test
+importing it collects *zero* tests. A guard nothing can check is most of the way to no
+guard — so the decision moved to `dashboard/src/proposalFields.ts`, which returns the
+check and the field list **together**, making "refused but rendered" unrepresentable.
+What remains eye-verified is the JSX alone.

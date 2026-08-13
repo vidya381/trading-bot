@@ -110,8 +110,12 @@
  *
  * ── What this module deliberately does NOT do ──
  *
- *   * NO persistence and NO endpoint. The audit record 21.5 requirement 5 wants
- *     belongs to the proposal, which does not exist.
+ *   * NO persistence of its own. 21.5 requirement 5's record now EXISTS
+ *     (migration 0009, `proposal-log.ts`) and it stores this bundle whole -- but
+ *     it is written by the endpoints that produce a proposal, and a gather is not
+ *     one: it has no reasoning and no outcome a human could record. Nothing here
+ *     writes a row, and `/gather` deliberately writes none either. See
+ *     `proposal-log.ts` on why that omission is the measurement working.
  *   * NO judgement. Nothing here decides a bundle is too degraded to use, ranks
  *     candidates, or filters any of them out. A flagged candidate and a
  *     candidate whose candles failed both come back, in their own position.

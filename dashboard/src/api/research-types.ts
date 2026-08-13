@@ -238,6 +238,11 @@ export interface AssessResult {
 export interface AssessResponse {
   readonly entryPoint: "named";
   readonly selectedAt: number;
+  /**
+   * The permanent proposal record's id (spec 21.5 requirement 5, migration 0009).
+   * Every real call writes a row; this names it.
+   */
+  readonly proposalId: string;
   readonly bundle: CandidateGatherBundle;
   readonly assess: AssessResult;
 }
@@ -384,6 +389,15 @@ export interface DeriveResult {
 export interface DeriveResponse {
   readonly entryPoint: "named";
   readonly selectedAt: number;
+  /**
+   * The permanent proposal record's id (spec 21.5 requirement 5, migration 0009).
+   *
+   * THIS is the id a human hands to `POST /api/bots` as its optional `proposalId`
+   * to record that this proposal became a real bot -- the only thing that will ever
+   * connect a bot back to the reasoning behind it. It is a record, never an input:
+   * nothing is read out of the proposal to build the bot (21.1).
+   */
+  readonly proposalId: string;
   /**
    * The bundle THIS request gathered -- a second, independent gather, not a
    * replay of the one `/assess` used. It is the newer of the two and is the one

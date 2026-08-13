@@ -84,10 +84,16 @@
  *     vendor decision can land on it. Step 30's lesson, applied early rather
  *     than re-learned: designing the parse against the only vendor it has ever
  *     seen is how the wrong seam gets set in concrete.
- *   * NO persistence. Nothing here writes a row. The audit record 21.5
- *     requirement 5 wants belongs to the proposal, which does not exist yet --
- *     and every trending vendor surveyed so far has a data-storage clause that
- *     has to be read before raw vendor payloads are stored anywhere.
+ *   * NO persistence. Nothing here writes a row. 21.5 requirement 5's record now
+ *     exists (migration 0009) and stores the candidate's full provenance inside
+ *     every logged proposal, written by `/assess` and `/derive` rather than here.
+ *     ⚠ THE VENDOR CLAUSE IS NOW LIVE RATHER THAN HYPOTHETICAL: every trending
+ *     vendor surveyed so far has a data-storage clause that must be read before
+ *     raw vendor payloads are stored anywhere, and `TrendingCoin.raw` -- the
+ *     vendor's own item, carried by identity -- would land in `inputs_json`
+ *     permanently and undeleteably the moment a trending candidate reaches either
+ *     endpoint. That is a real precondition on choosing a vendor, not a
+ *     consideration for later.
  *   * NO re-validation of watchlist entries. A watchlist pair was checked
  *     against the venue when it was added and is not checked again here. That
  *     is a deviation and is recorded as one: step 28 already logged that

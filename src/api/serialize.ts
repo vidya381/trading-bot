@@ -56,6 +56,7 @@ import type {
   GatheredInput,
   NewsInput,
   ParsedAssessment,
+  ProposalRecord,
   WatchlistEntry,
 } from "../research";
 import type { Candle } from "../shared/exchange-client";
@@ -975,5 +976,122 @@ export function deriveResultView(result: DeriveResult, latencyMs: number) {
     envelope: result.envelope,
     duplicateKeyCheck: result.duplicateKeyCheck,
     latencyMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Section 21.5 requirement 5: the permanent proposal record
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT GETS STORED, AND WHY IT IS BUILT HERE RATHER THAN IN /src/research.
+ *
+ * `proposal-log.ts` writes the row but does NOT render these payloads: /src/api
+ * imports /src/research, never the reverse, so the views live here and travel as
+ * parameters. That is the stronger arrangement rather than a compromise, and the
+ * reason is one property it makes true by construction --
+ *
+ *   **THE HANDLER STORES THE VERY OBJECT IT PUTS IN THE RESPONSE.**
+ *
+ * `candidateGatherBundleView`, `deriveContextView`, `resubmittedAssessmentView`,
+ * `assessResultView` and `deriveResultView` below are the SAME functions, called
+ * once, with the result used for both the wire and the record. So "what was stored
+ * differs from what the human was shown" is not a bug that can be introduced
+ * here; it would take deleting a parameter. A second rendering for storage -- even
+ * a faithful one -- is a copy that drifts, and 21.5 requirement 2 is precisely
+ * about being able to check reasoning against the real source.
+ *
+ * ⚠ THE TWO FIELDS THE RECORD HAS THAT THE WIRE DELIBERATELY LACKS:
+ *
+ *   * `promptText`, in full. `assessResultView` and `deriveResultView` omit it
+ *     (~16KB and ~23KB, decision log 41) because for a READER's job -- checking a
+ *     claim against the datum it cites -- `evidence` carries the same values in a
+ *     comparable form. That trade is right for a response and wrong for a record:
+ *     reconstructing what produced a given answer is the row's entire job, and
+ *     21.7's open question 3 (which model, how deterministic) cannot be settled
+ *     without the bytes.
+ *   * `response`, the transport's answer BY IDENTITY -- both `text` and `raw`.
+ *     Two fields rather than one for `AssessModelResponse`'s own stated reason:
+ *     the narrowing from Workers AI's output union to a string is a decision an
+ *     implementation makes, and the record should hold the thing it narrowed FROM
+ *     as well as the thing it narrowed TO. `jsonSafe` for the bigint reason
+ *     everything else here uses it.
+ */
+export function assessProposalInputsView(result: AssessResult, selectedAt: number) {
+  return {
+    /** NOT a fetch time -- see `candidateGatherBundleView`. The fetch times are in the slots. */
+    selectedAt,
+    bundle: candidateGatherBundleView(result.bundle),
+  };
+}
+
+export function assessProposalReasoningView(result: AssessResult, latencyMs: number) {
+  return {
+    ...assessResultView(result, latencyMs),
+    promptText: result.promptText,
+    response: { text: jsonSafe(result.response.text), raw: jsonSafe(result.response.raw) },
+  };
+}
+
+/**
+ * Stage 3's inputs: BOTH upstream inputs, and Stage 3's own two extra reads.
+ *
+ * The resubmitted assessment is an INPUT here, not reasoning, and that placement
+ * is the point: it is what Stage 3 was given (via a client, re-verified against
+ * this run's evidence -- decision log 42), exactly as the bundle is. It is stored
+ * rendered against the CURRENT evidence it was re-verified against, because that
+ * is what `resubmittedAssessmentView` publishes and what the human was shown.
+ */
+export function deriveProposalInputsView(result: DeriveResult, selectedAt: number) {
+  return {
+    selectedAt,
+    bundle: candidateGatherBundleView(result.context.bundle),
+    context: deriveContextView(result.context),
+    assessment: resubmittedAssessmentView(result.assessment),
+  };
+}
+
+export function deriveProposalReasoningView(result: DeriveResult, latencyMs: number) {
+  return {
+    ...deriveResultView(result, latencyMs),
+    promptText: result.promptText,
+    response: { text: jsonSafe(result.response.text), raw: jsonSafe(result.response.raw) },
+  };
+}
+
+/**
+ * A proposal record over the wire, WITHOUT its two large payloads.
+ *
+ * `inputs` and `reasoning` are deliberately absent and their sizes published
+ * instead -- `promptChars`' precedent one section up. A `derive` record's inputs
+ * carry every candle of the window; returning them from an endpoint whose job is
+ * to report an outcome would make a small acknowledgement a large download. The
+ * payloads are in D1 and are read from there.
+ *
+ * `outcome: null` is published as null rather than omitted, and it is 21.5's
+ * "ignored" read after the fact: nothing ever writes that word (see migration
+ * 0009). `pendingMs` is only present once a decision exists, because "how long it
+ * sat" is not a finished quantity while it is still sitting.
+ */
+export function proposalRecordView(record: ProposalRecord) {
+  return {
+    id: record.id,
+    stage: record.stage,
+    accountLabel: record.accountLabel,
+    pair: record.pair,
+    entryPoint: record.entryPoint,
+    strategy: record.strategy,
+    actor: record.actor,
+    model: record.model,
+    promptVersion: record.promptVersion,
+    /** 21.5 requirement 4: when the price window was FETCHED, not when this was rendered. */
+    dataFetchedAt: record.dataFetchedAt,
+    createdAt: record.createdAt,
+    outcome: record.outcome,
+    outcomeBotInstanceId: record.outcomeBotInstanceId,
+    outcomeActor: record.outcomeActor,
+    outcomeAt: record.outcomeAt,
+    outcomeNote: record.outcomeNote,
+    pendingMs: record.outcomeAt === null ? null : record.outcomeAt - record.createdAt,
   };
 }
