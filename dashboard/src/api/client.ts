@@ -24,6 +24,7 @@ import type {
   BotDetail,
   CheckOpenOrdersResponse,
   CreateBotRequest,
+  CreateBotResponse,
   HaltResponse,
   KillSwitchStatus,
   LiquidateResponse,
@@ -358,8 +359,15 @@ export function checkOpenOrders(id: string, signal?: AbortSignal): Promise<Check
  * Creation does NOT touch the exchange (config is saved, no orders placed), so
  * unlike liquidate it never returns `not_attached`.
  */
-export function createBot(request: CreateBotRequest, signal?: AbortSignal): Promise<BotDetail> {
-  return requestJson<BotDetail>("/api/bots", "POST", { signal, body: request });
+export function createBot(
+  request: CreateBotRequest,
+  signal?: AbortSignal,
+): Promise<CreateBotResponse> {
+  // `CreateBotResponse` rather than `BotDetail`: the 201 additionally carries
+  // `proposalLink` when the body named a proposal, and `recorded: false` on it is
+  // a real outcome the form must report (decision log 45's soft failure). Typing
+  // it as a plain BotDetail would make that field invisible to every caller.
+  return requestJson<CreateBotResponse>("/api/bots", "POST", { signal, body: request });
 }
 
 // ---------------------------------------------------------------------------

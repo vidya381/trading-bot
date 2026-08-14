@@ -93,6 +93,29 @@ export interface AssemblyTimestamp {
   readonly note: string;
 }
 
+/**
+ * What each fetch key is CALLED, in one place.
+ *
+ * Hoisted out of `freshnessOf` because a second reader appeared: the create-bot
+ * form's prefill banner renders the same four staleness verdicts, and it holds
+ * the `{key, at, thresholdMs}` triples rather than a whole `Freshness`, so it has
+ * the keys and not the labels. A hand-copied label table there would be the
+ * mirror `staleness.ts`'s header argues against — it would not fail to compile
+ * and would not throw; it would simply name the wrong input on the screen where
+ * capital is committed. One map, two readers.
+ */
+export const FETCH_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  candles: "Price history fetched",
+  capital: "Capital ledger read",
+  concentration: "Account bot list read",
+  filters: "Venue trading rules fetched",
+});
+
+/** The label for a fetch key, falling back to the key itself for an unknown one. */
+export function fetchLabel(key: string): string {
+  return FETCH_LABELS[key] ?? key;
+}
+
 export interface Freshness {
   /** Every real fetch time, in the order a reviewer should weigh them. */
   readonly fetches: readonly FetchTimestamp[];
@@ -167,7 +190,7 @@ export function freshnessOf(response: DeriveResponse): Freshness {
   const candles = bundle.candles;
   const priceFetch: FetchTimestamp = {
     key: "candles",
-    label: "Price history fetched",
+    label: fetchLabel("candles"),
     at: candles.outcome === "ok" ? candles.value.fetchedAt : null,
     observedAt: candles.outcome === "ok" ? null : candles.failedAt,
     why: "Every proposed price, bound and order size is denominated against this window. It is the fastest-moving input and the one most likely to have moved since.",
@@ -185,7 +208,7 @@ export function freshnessOf(response: DeriveResponse): Freshness {
     priceFetch,
     {
       key: "capital",
-      label: "Capital ledger read",
+      label: fetchLabel("capital"),
       at: capital.outcome === "ok" ? capital.value.readAt : null,
       observedAt: capital.outcome === "ok" ? null : capital.failedAt,
       why: "The headroom the proposed allocation was sized against. It is a PREFILL a human confirms, and the real check runs against the ledger again at creation.",
@@ -193,7 +216,7 @@ export function freshnessOf(response: DeriveResponse): Freshness {
     },
     {
       key: "concentration",
-      label: "Account bot list read",
+      label: fetchLabel("concentration"),
       at: concentration.outcome === "ok" ? concentration.value.readAt : null,
       observedAt: concentration.outcome === "ok" ? null : concentration.failedAt,
       why: "What the over-concentration flag above rests on. It changes only when a bot is started or stopped, so it ages slowly.",
@@ -204,7 +227,7 @@ export function freshnessOf(response: DeriveResponse): Freshness {
     },
     {
       key: "filters",
-      label: "Venue trading rules fetched",
+      label: fetchLabel("filters"),
       at: filters.outcome === "ok" ? filters.value.fetchedAt : null,
       observedAt: filters.outcome === "ok" ? null : filters.failedAt,
       why: "Tick size, step size and the minimum-order floor the proposal was checked against. The slowest-moving of the four.",

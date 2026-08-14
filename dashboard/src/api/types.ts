@@ -393,12 +393,57 @@ interface CreateBotBase {
   readonly pair: string;
   readonly capitalAsset: string;
   readonly allocatedCapital: string;
+  /**
+   * The permanent proposal record this creation came from (spec 21.5 requirement
+   * 5, migration 0009). OPTIONAL, and OMITTED rather than null when absent.
+   *
+   * ── ⚠ WHAT IT IS AND WHAT IT IS NOT ──
+   *
+   * It is a RECORD, written after the fact: `POST /api/bots` reads nothing out of
+   * the proposal row to build the bot, and refuses to before anything exists if
+   * the row cannot take an outcome. Every parameter above still arrives in this
+   * body, typed or confirmed by a human, and every decoder, the mandatory
+   * stop-loss, the tradability gate, the spot-instrument check and the ledger's
+   * binding compare-and-swap run unchanged (`createBot` in src/api/handlers.ts).
+   * An `api.test.ts` test submits a body deliberately DISAGREEING with the
+   * proposal and asserts the bot gets the BODY's numbers.
+   *
+   * ⚠ ABSENT, NOT NULL. `optionalString` distinguishes them, and decision log 45's
+   * whole response-shape design turns on an ordinary creation being byte-identical
+   * to what it was before this field existed. `withProposalId`
+   * (`research/proposalPrefill.ts`) is the only thing in this dashboard that sets
+   * it, and it sets it only inside the create-bot form's submit handler.
+   */
+  readonly proposalId?: string;
+}
+
+/**
+ * Whether the proposal named by `proposalId` really took the outcome.
+ *
+ * Present on the 201 ONLY when a `proposalId` was sent. `recorded: false` means
+ * decision log 45's deliberate soft failure: the bot exists and the capital is
+ * reserved, and the outcome write afterwards failed. It is reported rather than
+ * raised because failing the response would tell an operator that creation failed
+ * when it did not.
+ */
+export interface ProposalLink {
+  readonly proposalId: string;
+  readonly recorded: boolean;
+  readonly error: string | null;
 }
 
 /** The discriminated body of `POST /api/bots`. */
 export type CreateBotRequest =
   | (CreateBotBase & { readonly strategy: "dca"; readonly params: DcaParamsInput })
   | (CreateBotBase & { readonly strategy: "grid"; readonly params: GridParamsInput });
+
+/**
+ * The 201 body of `POST /api/bots`: the created bot's full detail, plus
+ * `proposalLink` when — and only when — the request named a proposal. Absent on
+ * an ordinary creation, which is why it is optional here rather than on
+ * `BotDetail`: no other endpoint that returns a `BotDetail` can carry it.
+ */
+export type CreateBotResponse = BotDetail & { readonly proposalLink?: ProposalLink };
 
 // ---------------------------------------------------------------------------
 // Liquidation (`POST /api/bots/:id/liquidate`, `liquidateBot` handler)

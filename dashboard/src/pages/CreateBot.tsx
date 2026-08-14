@@ -69,6 +69,39 @@
  * fields, non-numeric input, and stop-loss/drop percentages outside a sensible
  * 0-100% (the same `<100%` rule the backend enforces, checked with the existing
  * `compareDecimal` so no float is ever built and the two cannot disagree).
+ *
+ * ── ⚠ IT CAN OPEN PRE-FILLED FROM A PROPOSAL, AND IT IS STILL THIS FORM ──
+ *
+ * `/bots/new` accepts a query string describing an LLM proposal
+ * (`research/proposalPrefill.ts`, spec 21.1, decision logs 44-46). What arrives is
+ * DIFFERENT DEFAULT VALUES for the `useState` calls below and one banner. That is
+ * the whole of it, and the things it deliberately is NOT are the point:
+ *
+ *   * NO SECOND COMPONENT AND NO SECOND ROUTE. `/bots/new` mounts this file for a
+ *     manual creation and for a pre-filled one, and there is no `mode` prop, no
+ *     variant and no branch anywhere below on "did this come from a proposal".
+ *     A parallel simplified form is exactly what 21.1 forbids, and the cheapest way
+ *     to be sure this one runs every check it always runs is for there to be only
+ *     one of it.
+ *   * NO FIELD IS LOCKED, READ-ONLY OR SPECIAL. The prefill seeds ordinary state
+ *     and then has nothing more to do with it: every input is the same input with
+ *     the same `onChange`, `validate()` is unchanged and unaware, and `buildRequest`
+ *     reads the same state it always read. Editing a pre-filled field and editing a
+ *     hand-typed one are the same operation.
+ *   * NO CHECK IS SKIPPED OR PRE-SATISFIED. Every validation below runs, and every
+ *     server-side check runs on submit against the account's state RIGHT NOW. A
+ *     proposal can sit for hours -- decision log 45 measured a real 7.8-hour gap
+ *     between a proposal and the decision on it -- so a capital figure or a pair
+ *     that was fine when it was derived can fail here. That refusal is the check
+ *     working, and it arrives through the same `describeError` paths as always.
+ *   * NOTHING IS RECORDED BY ARRIVING. The proposal's `outcome` is written by
+ *     exactly one thing: a real, completed `POST /api/bots` carrying `proposalId`,
+ *     attached in `onSubmit` by `withProposalId` and nowhere else. Opening this
+ *     page, editing it, and abandoning it leave the proposal pending.
+ *
+ * The URL is read ONCE, at mount, and never written back -- so a reload restores
+ * the PROPOSAL's numbers and drops edits, exactly as a reload of a half-typed
+ * manual form drops those. `proposalPrefill.ts` argues that trade in full.
  */
 
 import {
@@ -80,7 +113,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ApiError,
   createBot,
@@ -88,8 +121,10 @@ import {
   fetchAccountSymbols,
   fetchBots,
 } from "../api/client";
-import type { Account, Bot, CreateBotRequest, Strategy } from "../api/types";
+import type { Account, Bot, CreateBotRequest, ProposalLink, Strategy } from "../api/types";
 import { compareDecimal } from "../format";
+import { ProposalPrefillBanner } from "../components/ProposalPrefillBanner";
+import { readProposalPrefill, withProposalId } from "../research/proposalPrefill";
 
 // ---------------------------------------------------------------------------
 // Validation helpers -- pure string checks, no float ever constructed. The
@@ -596,7 +631,13 @@ function PairCombobox({
   disabled: boolean;
   fieldError?: string;
 }) {
-  const [query, setQuery] = useState("");
+  /*
+   * The search text starts as whatever pair is already committed, so a form that
+   * opens with a pair (a proposal prefill) shows it in the box instead of an empty
+   * field over a hidden value. For a manual creation `value` is `""` and this is
+   * exactly what it always was. Read once: `onInput` owns it from then on.
+   */
+  const [query, setQuery] = useState(value);
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -744,42 +785,86 @@ function PairCombobox({
 
 export function CreateBot() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
-  const [strategy, setStrategy] = useState<Strategy>("dca");
+  /*
+   * ── THE PREFILL, READ ONCE AND NEVER AGAIN ──
+   *
+   * `useState` with an initialiser rather than `useMemo`, because "once, at mount"
+   * is exactly the semantics wanted and is the semantics `useState` guarantees --
+   * `useMemo` is a cache with no such promise. Every use below is a DEFAULT VALUE
+   * for another piece of state, so from the first render onwards this form holds
+   * ordinary state and the URL is history.
+   *
+   * `null` for an ordinary manual visit, and `readProposalPrefill` returns null for
+   * anything lacking a real proposal id and a recognised strategy -- so prefilled
+   * values can never appear without the banner that explains them.
+   */
+  const [prefill] = useState(() => readProposalPrefill(searchParams));
+  const gridPrefill = prefill?.fields.strategy === "grid" ? prefill.fields : null;
+  const dcaPrefill = prefill?.fields.strategy === "dca" ? prefill.fields : null;
+
+  const [strategy, setStrategy] = useState<Strategy>(() => prefill?.strategy ?? "dca");
 
   // Shared fields.
   const [botInstanceId, setBotInstanceId] = useState(generatedId);
-  const [accountLabel, setAccountLabel] = useState("");
+  const [accountLabel, setAccountLabel] = useState(() => prefill?.accountLabel ?? "");
   // Read-only, derived from the selected account (step 11); never an input, never sent.
   const [exchange, setExchange] = useState("");
-  const [pair, setPair] = useState("");
-  const [capitalAsset, setCapitalAsset] = useState("USDT");
-  const [allocatedCapital, setAllocatedCapital] = useState("");
+  const [pair, setPair] = useState(() => prefill?.pair ?? "");
+  const [capitalAsset, setCapitalAsset] = useState(() => prefill?.capitalAsset ?? "USDT");
+  const [allocatedCapital, setAllocatedCapital] = useState(() => prefill?.allocatedCapital ?? "");
 
-  // DCA fields.
-  const [baseOrderSize, setBaseOrderSize] = useState("");
-  const [additionalOrderSize, setAdditionalOrderSize] = useState("");
-  const [stepMultiplier, setStepMultiplier] = useState("1");
-  const [dropPct, setDropPct] = useState("");
-  const [maxAdditionalBuys, setMaxAdditionalBuys] = useState("0");
-  const [dcaTakeProfitPct, setDcaTakeProfitPct] = useState("");
-  const [dcaStopLossPct, setDcaStopLossPct] = useState("");
-  const [autoRestart, setAutoRestart] = useState(false);
+  // DCA fields. Each falls back to EXACTLY the default it had before the prefill
+  // existed, so a manual visit is byte-identical to what it always was.
+  const [baseOrderSize, setBaseOrderSize] = useState(() => dcaPrefill?.baseOrderSize ?? "");
+  const [additionalOrderSize, setAdditionalOrderSize] = useState(
+    () => dcaPrefill?.additionalOrderSize ?? "",
+  );
+  const [stepMultiplier, setStepMultiplier] = useState(() => dcaPrefill?.stepMultiplier ?? "1");
+  const [dropPct, setDropPct] = useState(() => dcaPrefill?.dropPct ?? "");
+  const [maxAdditionalBuys, setMaxAdditionalBuys] = useState(
+    () => dcaPrefill?.maxAdditionalBuys ?? "0",
+  );
+  const [dcaTakeProfitPct, setDcaTakeProfitPct] = useState(() => dcaPrefill?.dcaTakeProfitPct ?? "");
+  const [dcaStopLossPct, setDcaStopLossPct] = useState(() => dcaPrefill?.dcaStopLossPct ?? "");
+  const [autoRestart, setAutoRestart] = useState(() => dcaPrefill?.autoRestart ?? false);
 
   // Grid fields.
-  const [upperBound, setUpperBound] = useState("");
-  const [lowerBound, setLowerBound] = useState("");
-  const [gridLines, setGridLines] = useState("");
-  const [spacing, setSpacing] = useState<"arithmetic" | "geometric">("arithmetic");
-  const [orderSize, setOrderSize] = useState("");
-  const [gridStopLossPct, setGridStopLossPct] = useState("");
-  const [breakoutTakeProfit, setBreakoutTakeProfit] = useState(true);
-  const [breakoutThresholdPct, setBreakoutThresholdPct] = useState("");
-  const [takeProfitAmount, setTakeProfitAmount] = useState("");
+  const [upperBound, setUpperBound] = useState(() => gridPrefill?.upperBound ?? "");
+  const [lowerBound, setLowerBound] = useState(() => gridPrefill?.lowerBound ?? "");
+  const [gridLines, setGridLines] = useState(() => gridPrefill?.gridLines ?? "");
+  const [spacing, setSpacing] = useState<"arithmetic" | "geometric">(
+    () => gridPrefill?.spacing ?? "arithmetic",
+  );
+  const [orderSize, setOrderSize] = useState(() => gridPrefill?.orderSize ?? "");
+  const [gridStopLossPct, setGridStopLossPct] = useState(() => gridPrefill?.gridStopLossPct ?? "");
+  const [breakoutTakeProfit, setBreakoutTakeProfit] = useState(
+    () => gridPrefill?.breakoutTakeProfit ?? true,
+  );
+  const [breakoutThresholdPct, setBreakoutThresholdPct] = useState(
+    () => gridPrefill?.breakoutThresholdPct ?? "",
+  );
+  const [takeProfitAmount, setTakeProfitAmount] = useState(() => gridPrefill?.takeProfitAmount ?? "");
 
   const [fieldErrors, setFieldErrors] = useState<Errors>({});
   const [submitting, setSubmitting] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  /*
+   * ⚠ THE ONE SUCCESS THAT MUST NOT NAVIGATE AWAY. `POST /api/bots` answers 201
+   * with `proposalLink.recorded: false` when the bot WAS created but the outcome
+   * write afterwards failed -- decision log 45's deliberate soft failure, which
+   * exists because failing the response would tell an operator creation failed
+   * when it did not, and the recovery they would attempt (creating it again) is
+   * the worst available action. That branch has been unreachable from this
+   * dashboard until now, because this form never sent a `proposalId`. Sending one
+   * makes it reachable, so it is handled: the bot is real and is linked to, the
+   * missing record is stated, and the submit control is gone so it cannot be
+   * pressed twice.
+   */
+  const [createdWithoutLink, setCreatedWithoutLink] = useState<
+    { readonly botId: string; readonly link: ProposalLink } | null
+  >(null);
 
   // Account registry (step 11): the real list the account dropdown reads. First
   // of two sequential real calls; `accountsReload` bumps to retry after a failure.
@@ -834,6 +919,43 @@ export function CreateBot() {
       });
     return () => controller.abort();
   }, [accountsReload]);
+
+  /*
+   * Reconcile a selected account against the registry once the list is in hand.
+   *
+   * `onSelectAccount` already does this for a click, and a click can only pick an
+   * account that is in the list. A PRE-FILLED account label arrives before the
+   * list does and was chosen by something else entirely -- a proposal made
+   * possibly hours ago (decision log 45 measured a real 7.8-hour gap) -- so both
+   * halves have to be handled here rather than assumed:
+   *
+   *   * STILL REGISTERED: fill in the read-only exchange from the same response
+   *     the dropdown reads, so the venue box is not blank beside a chosen account.
+   *   * NO LONGER REGISTERED: clear it and say so. Leaving it would put a value in
+   *     the <select> that has no <option>, which renders as though a different
+   *     account were chosen -- a wrong account displayed on the screen that
+   *     commits capital. This is the account half of "real state may have changed
+   *     since the proposal was generated", surfaced as a real, current validation
+   *     failure rather than carried silently to the server.
+   *
+   * Inert for a manual creation: the label always matches a row, so this only ever
+   * re-sets `exchange` to the value `onSelectAccount` already set.
+   */
+  useEffect(() => {
+    if (accountLabel === "" || accounts.length === 0) return;
+    const account = accounts.find((a) => a.accountLabel === accountLabel);
+    if (account === undefined) {
+      setAccountLabel("");
+      setExchange("");
+      setPair("");
+      setFieldErrors((prev) => ({
+        ...prev,
+        accountLabel: `“${accountLabel}” is not a registered account any more. Pick one.`,
+      }));
+      return;
+    }
+    setExchange(account.exchange);
+  }, [accounts, accountLabel]);
 
   // Whenever the selected account changes (or an explicit retry), fetch THAT
   // account's live tradable pairs -- the second sequential real call (brief items
@@ -1011,7 +1133,27 @@ export function CreateBot() {
     setOutcome(null);
     setSubmitting(true);
     try {
-      const bot = await createBot(buildRequest());
+      /*
+       * ⚠ THE ONLY PLACE IN THIS DASHBOARD THAT EVER SENDS A `proposalId`, and it
+       * is inside the submit handler by construction: this line runs when a human
+       * has pressed Create and validation has passed, and at no other moment.
+       * Navigating to a pre-filled form, editing it, and leaving send nothing at
+       * all -- there is no request to send. That is the whole of the
+       * "navigation is not approval" guarantee on this side, and
+       * `prefill-does-not-approve.test.ts` enforces the "only place" half over
+       * source, since nothing else can see it.
+       *
+       * `withProposalId` omits the field entirely when there is no prefill, so a
+       * manual creation's body is byte-identical to what it always was.
+       */
+      const bot = await createBot(withProposalId(buildRequest(), prefill?.proposalId ?? null));
+      if (bot.proposalLink !== undefined && !bot.proposalLink.recorded) {
+        // The bot IS created. Stay put and say so rather than navigating away from
+        // the one place this failure can be reported. See `createdWithoutLink`.
+        setCreatedWithoutLink({ botId: bot.id, link: bot.proposalLink });
+        setSubmitting(false);
+        return;
+      }
       // Success: go straight to the created bot's detail page (brief item 6). The
       // component unmounts on navigation, so no post-success state reset is needed.
       navigate(`/bots/${encodeURIComponent(bot.id)}`);
@@ -1042,6 +1184,15 @@ export function CreateBot() {
           the bot, and the server checks the capital against this account’s live ledger.
         </p>
       </div>
+
+      {/*
+       * ⚠ ABOVE THE FORM, NOT BESIDE A FIELD. If these values came from a
+       * proposal, that is a fact about EVERY box below, and it has to be read
+       * before any of them rather than found while scrolling. Absent entirely on a
+       * manual creation -- `prefill` is null and this renders nothing, which is
+       * why nothing else on this page needed a branch.
+       */}
+      {prefill !== null && <ProposalPrefillBanner prefill={prefill} currentStrategy={strategy} />}
 
       {/* Suggestion list for the capital-asset field only (best effort). Account
           and pair are now driven by the registry, not scraped from existing bots. */}
@@ -1413,24 +1564,57 @@ export function CreateBot() {
           </div>
         )}
 
-        <div className="flex items-center gap-3">
-          <button
-            type="submit"
-            disabled={submitting}
-            className="inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60"
+        {createdWithoutLink !== null ? (
+          /*
+           * ⚠ CREATED, BUT NOT LINKED. Both halves stated, because reporting only
+           * one of them is how an operator either re-submits a bot that already
+           * exists or believes a proposal was recorded when it was not. No submit
+           * control here at all -- the action that would repeat the creation is
+           * simply not on the screen.
+           */
+          <div
+            role="alert"
+            className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-100"
           >
-            {submitting && (
-              <span
-                className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white"
-                aria-hidden
-              />
-            )}
-            {submitting ? "Creating…" : "Create bot"}
-          </button>
-          <Link to="/" className="text-sm font-medium text-zinc-400 hover:text-zinc-200">
-            Cancel
-          </Link>
-        </div>
+            <div className="font-semibold">
+              The bot was created. The link back to its proposal was not recorded.
+            </div>
+            <p className="mt-0.5 text-[0.8125rem] leading-snug opacity-90">
+              “{createdWithoutLink.botId}” exists and its capital is reserved —{" "}
+              <strong>do not submit this form again</strong>. What failed afterwards was the write
+              recording that proposal{" "}
+              <code className="tabular">{createdWithoutLink.link.proposalId}</code> was approved, so
+              that proposal still reads as pending and nothing now connects this bot back to the
+              reasoning behind it. The server said:{" "}
+              <span className="font-mono">{createdWithoutLink.link.error ?? "(no message)"}</span>
+            </p>
+            <Link
+              to={`/bots/${encodeURIComponent(createdWithoutLink.botId)}`}
+              className="mt-1.5 inline-block text-[0.8125rem] font-medium underline underline-offset-2"
+            >
+              Go to the bot →
+            </Link>
+          </div>
+        ) : (
+          <div className="flex items-center gap-3">
+            <button
+              type="submit"
+              disabled={submitting}
+              className="inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {submitting && (
+                <span
+                  className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white"
+                  aria-hidden
+                />
+              )}
+              {submitting ? "Creating…" : "Create bot"}
+            </button>
+            <Link to="/" className="text-sm font-medium text-zinc-400 hover:text-zinc-200">
+              Cancel
+            </Link>
+          </div>
+        )}
       </form>
     </div>
   );

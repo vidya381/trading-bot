@@ -42,9 +42,22 @@
  * ── ⚠ 21.1: THIS IS A PROPOSAL, AND THE BOUNDARY IS NOT NEGOTIABLE ──
  *
  * Nothing on this page creates, starts or modifies a bot. There is no approve
- * button and no prefilled create-bot link, on purpose: the only way this output
- * becomes a bot is a human reading it and going to the create-bot form, which
- * runs every check it runs today, unchanged and unweakened.
+ * button: the only way this output becomes a bot is a human reading it and going
+ * to the create-bot form, which runs every check it runs today, unchanged and
+ * unweakened.
+ *
+ * ⚠ THERE IS NOW A PREFILLED CREATE-BOT LINK, AND THIS PARAGRAPH USED TO SAY
+ * THERE WAS NOT. Corrected in place rather than deleted, because the sentence it
+ * replaces was true when written and the reasoning behind it did not stop being
+ * right — decision log 44 refused to build a link at all, and decision log 46
+ * settled the four constraints under which one is not the "one-click bridge" 21.1
+ * forbids. `ProposalCreateBotLink` is built to those constraints and argues them
+ * in its own header. What it does is NAVIGATE, carrying these values as a form's
+ * starting numbers; the form is the same component, runs the same checks, keeps
+ * every field editable, and this proposal's `outcome` stays null unless a real bot
+ * is really created. Spec 21.1's own wording allows exactly this and no more:
+ * *"a human reading it and filling in (or confirming a prefilled) create-bot
+ * form"*.
  */
 
 import type { AssessResponse, DeriveResponse } from "../api/research-types";
@@ -53,6 +66,7 @@ import { formatDateTime } from "../format";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { CitationLegend } from "./ProposalCitations";
 import { ProposalConcentration } from "./ProposalConcentration";
+import { ProposalCreateBotLink } from "./ProposalCreateBotLink";
 import { ProposalEvidence } from "./ProposalEvidence";
 import { ProposalFreshness } from "./ProposalFreshness";
 import { ProposalLimits } from "./ProposalLimits";
@@ -153,8 +167,10 @@ export function ProposalView({
         <p className="mt-3 border-t border-zinc-800 pt-3 text-xs text-zinc-400">
           <strong className="text-zinc-200">This is a proposal, not a bot.</strong> Nothing here has
           created, started or modified anything, and no capital has been reserved. To act on it, go
-          to the create-bot form and fill it in yourself — it runs every check it always runs. There
-          is deliberately no approve button on this page (spec 21.1).
+          to the create-bot form — it runs every check it always runs. The link at the bottom of
+          this page opens that form with these values already in it; it is a starting point you can
+          edit, not an approval, and there is deliberately no approve button anywhere on this page
+          (spec 21.1).
         </p>
       </header>
 
@@ -231,14 +247,26 @@ export function ProposalView({
           there is no delete path.
         </p>
         <p>
-          <strong className="text-zinc-400">The outcome is still unrecorded.</strong> If you create
-          a bot from this, pass <code>proposalId</code> in the <code>POST /api/bots</code> body so
-          the record says a human acted on it; if you decide against it, post to{" "}
+          <strong className="text-zinc-400">The outcome is still unrecorded.</strong> Creating a bot
+          through the link below carries <code>proposalId</code> in the{" "}
+          <code>POST /api/bots</code> body for you, so the record says a human acted on it — but
+          only on a real, completed creation. If you decide against it, post to{" "}
           <code>/api/proposals/{derive.proposalId}/reject</code>. A proposal nobody records a
           decision on counts as ignored, which is exactly the signal requirement 5 exists to
           measure. <strong className="text-zinc-400">This page itself stores nothing</strong> — if
           you close the tab this rendering is gone, though the record is not.
         </p>
+        {/*
+         * ⚠ LAST, DELIBERATELY. The one control that leads out of this page sits
+         * below the concentration flag, the data limits, the freshness verdict,
+         * the reasoning, the parameters and the evidence — after everything a
+         * reviewer is meant to have read, not above it. Position is prominence,
+         * which is the argument `ProposalView` already makes for putting the
+         * concentration banner FIRST; the same argument puts this one last.
+         */}
+        <ErrorBoundary where="The create-bot link">
+          <ProposalCreateBotLink derive={derive} />
+        </ErrorBoundary>
       </footer>
     </article>
   );

@@ -35,6 +35,31 @@ import type { CandleLister } from "../workers/candles";
 import type { AssessModel } from "../research/assess";
 import type { DeriveModel } from "../research/derive";
 import type { Candle, SymbolFilters } from "../shared/exchange-client";
+/*
+ * ⚠ THE DASHBOARD'S PREFILL MODULE, IMPORTED INTO A WORKER TEST ON PURPOSE.
+ *
+ * The two prefill tests in the property-5 block below check what happens to a real
+ * `proposals` row when a human clicks through to a pre-filled form and then does,
+ * or does not, submit it. That question is only answerable here, against real D1
+ * and the real endpoint -- so the module under test comes to the harness rather
+ * than the harness being rebuilt beside the module.
+ *
+ * The import is safe across this project's deliberate TypeScript 5.7 / 7 split for
+ * the same reason `staleness.ts` can go the other way (decision log 45):
+ * `proposalPrefill.ts` reaches only dependency-free files -- `api/research-types.ts`
+ * (types, zero imports), `src/research/staleness.ts` and
+ * `src/research/proposal-shape.ts` (both zero imports by contract) -- plus
+ * `dashboard/src/proposal.ts`, which imports only those. No React, no DOM, no
+ * `vite/client`. Both typechecks are run and both are clean; if that ever stops
+ * being true it fails at the build rather than silently.
+ */
+import {
+  createBotHref,
+  readProposalPrefill,
+  withProposalId,
+  type GridPrefillFields,
+} from "../../dashboard/src/research/proposalPrefill";
+import type { DeriveResponse } from "../../dashboard/src/api/research-types";
 
 const T0 = 1_900_000_000_000; // future: an armed alarm must not already be overdue (step 20)
 const HUMAN = "owner@example.com";
@@ -5605,6 +5630,147 @@ describe("proposal record (section 21.5 requirement 5)", () => {
     // ⚠ AND THE ASSESS ROW IS STILL UNRESOLVED. Approving the derivation does not
     // resolve the assessment it came from -- nothing links them, by design.
     expect((await db.proposals.findOne({ stage: "assess" }))!.outcome).toBeNull();
+  });
+
+  /*
+   * ── THE PREFILL FLOW, AGAINST THE REAL ENDPOINT AND THE REAL TABLE ──
+   *
+   * These two drive the DASHBOARD's prefill module (`dashboard/src/research/
+   * proposalPrefill.ts`) over a REAL `/derive` response and then act — or
+   * deliberately do not act — against the real `POST /api/bots` and the real
+   * `proposals` row. They live here rather than beside the module because the
+   * property being checked is not about encoding: it is about what happens to a
+   * row in D1, and this is the file that can ask.
+   *
+   * ⚠ THE ONE LINK THEY CANNOT DRIVE, STATED SO THE PAIR IS NOT READ AS MORE THAN
+   * IT IS: `buildRequest` lives inside `pages/CreateBot.tsx` and no test in this
+   * repository can import a `.tsx` (React's CJS build does not resolve in the
+   * Workers pool — a test that imports one collects ZERO tests rather than
+   * failing). So the body below is assembled from the prefill's form-field values
+   * the way that function assembles it from the identically-named state, and the
+   * one hop between them is covered by a source assertion in
+   * `prefill-does-not-approve.test.ts` and by the operator's eyes. That hop is
+   * pre-existing code this step did not change.
+   */
+  it("⚠ navigating to the pre-filled form and NOT submitting leaves the proposal PENDING", async () => {
+    const label = await proposalAccount("pr-nav");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    // The whole of what pressing "Open the create-bot form, pre-filled" does: build
+    // a link, and read it back on the other page. Every line the dashboard executes
+    // between reading a proposal and looking at a filled-in form is in these two
+    // calls, and neither can reach the network -- the module imports no client.
+    const href = createBotHref(data as DeriveResponse);
+    expect(href, "a valid derivation should offer a link").not.toBeNull();
+    const prefill = readProposalPrefill(new URLSearchParams(href!.split("?")[1]!));
+    expect(prefill, "the link should decode into a prefill").not.toBeNull();
+
+    // It really did carry the proposal, so this is not vacuous.
+    expect(prefill!.proposalId).toBe(data.proposalId);
+    expect(prefill!.accountLabel).toBe(label);
+    expect(prefill!.strategy).toBe("grid");
+
+    // ⚠ AND NOW THE ASSERTION. Checked against the real row rather than against
+    // "we did not call the endpoint", which would only restate the test's own
+    // setup. The human then closes the tab: that is the absence of any further
+    // call, which is what the rest of this test's silence represents.
+    const row = (await db.proposals.findOne({ id: data.proposalId }))!;
+    expect(row.outcome).toBeNull();
+    expect(row.outcome_bot_instance_id).toBeNull();
+    expect(row.outcome_actor).toBeNull();
+    expect(row.outcome_at).toBeNull();
+
+    // Nothing else moved either: no bot, no capital reserved, and no audit entry
+    // beyond the two the two model calls themselves wrote.
+    expect(await db.botInstances.count()).toBe(0);
+    const ledger = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
+    expect(toDecimalString(ledger.total_allocated)).toBe("0.00000000");
+    const actions = (await db.auditLog.findMany({})).map((entry) => entry.action).sort();
+    expect(actions).not.toContain("proposal.approved");
+    expect(actions).not.toContain("proposal.rejected");
+    expect(actions).not.toContain("bot.created");
+  });
+
+  it("⚠ a real submission from a pre-filled form records the approval, with the PROPOSAL's numbers", async () => {
+    const label = await proposalAccount("pr-prefill");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const data = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    const prefill = readProposalPrefill(
+      new URLSearchParams(createBotHref(data as DeriveResponse)!.split("?")[1]!),
+    )!;
+    expect(prefill.fields.strategy).toBe("grid");
+    const fields = prefill.fields as GridPrefillFields;
+
+    // The body the create-bot form builds out of exactly these values. Note the
+    // mapping under test: the form's `gridStopLossPct` is the request's
+    // `params.stopLossPct`, and `exchange` is deliberately never sent.
+    const botId = `pr-prefilled-${suffix}`;
+    clock = T0 + 11 * MINUTE;
+    const created = await api("POST", "/api/bots", {
+      body: withProposalId(
+        {
+          botInstanceId: botId,
+          accountLabel: prefill.accountLabel,
+          pair: prefill.pair,
+          capitalAsset: prefill.capitalAsset,
+          allocatedCapital: prefill.allocatedCapital,
+          strategy: "grid",
+          params: {
+            upperBound: fields.upperBound,
+            lowerBound: fields.lowerBound,
+            gridLines: Number(fields.gridLines),
+            spacing: fields.spacing,
+            orderSize: fields.orderSize,
+            stopLossPct: fields.gridStopLossPct,
+            breakoutTakeProfit: fields.breakoutTakeProfit,
+            breakoutThresholdPct: fields.breakoutThresholdPct === "" ? null : fields.breakoutThresholdPct,
+            takeProfitAmount: fields.takeProfitAmount === "" ? null : fields.takeProfitAmount,
+          },
+        },
+        prefill.proposalId,
+      ),
+      symbolLister: catalogue,
+      symbolDetailLister: details,
+    });
+
+    // Step 45's contract, unchanged and unweakened -- same 201, same link shape.
+    expect(created.status).toBe(201);
+    expect(created.body.data.proposalLink).toEqual({
+      proposalId: data.proposalId,
+      recorded: true,
+      error: null,
+    });
+
+    const row = (await db.proposals.findOne({ id: data.proposalId }))!;
+    expect(row.outcome).toBe("approved");
+    expect(row.outcome_bot_instance_id).toBe(botId);
+    expect(row.outcome_actor).toBe(HUMAN);
+
+    /*
+     * ⚠ AND THE BOT REALLY HAS THE PROPOSAL'S PARAMETERS, read back off the stored
+     * config rather than off the response. This is what makes the mapping test an
+     * end-to-end statement rather than a claim about a URL: the numbers the model
+     * derived survived the encode, the decode, the form's field names, the request
+     * body and the real `decodeGridParams`, and came out the other side unchanged.
+     */
+    const bot = (await db.botInstances.findOne({ id: botId }))!;
+    const params = bot.strategy_params_json as any;
+    expect(bot.strategy_type).toBe("grid");
+    expect(params.upperBound).toBe("108.00000000");
+    expect(params.lowerBound).toBe("96.00000000");
+    expect(params.gridLines).toBe(5);
+    expect(params.spacing).toBe("arithmetic");
+    expect(params.orderSize).toBe("50.00000000");
+    // The one a wrong mapping would get wrong while everything else looked right.
+    expect(params.stopLossPct).toBe("5.00000000");
+    expect(toDecimalString(bot.stop_loss_pct)).toBe("5.00000000");
+    expect(toDecimalString(bot.allocated_capital)).toBe("400.00000000");
+    expect(bot.capital_asset).toBe("USD");
+    expect(bot.pair).toBe("BTCUSD");
   });
 
   it("behaves exactly as before when no proposalId is given", async () => {
