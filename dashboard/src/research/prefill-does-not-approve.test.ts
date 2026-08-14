@@ -82,6 +82,21 @@ const NAVIGATION_PATH: readonly string[] = [
   "/dashboard/src/components/ProposalCreateBotLink.tsx",
   "/dashboard/src/components/ProposalPrefillBanner.tsx",
   "/dashboard/src/components/ProposalView.tsx",
+  /*
+   * ⚠ ADDED WHEN THE LINK MOVED INTO THE SUMMARY CARD.
+   *
+   * The card is now the component that RENDERS the create-bot link, which puts it
+   * squarely on the navigation path this guard exists to police — and it is the
+   * one file on that path that also runs an interval timer and reads a clock, so
+   * it is the most plausible future home for an effect that fetches something.
+   *
+   * A relocation that quietly dropped the destination out of the guarded set
+   * would have moved the button out from under the guarantee while every
+   * assertion below kept passing. That is the exact failure this list exists to
+   * prevent, so the list grew with the move.
+   */
+  "/dashboard/src/components/ProposalSummaryCard.tsx",
+  "/dashboard/src/proposalSummary.ts",
 ];
 
 /**

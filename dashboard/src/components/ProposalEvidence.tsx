@@ -68,28 +68,54 @@ function EvidenceTable({
   const usedCount = evidence.filter((item) => cited.has(item.id)).length;
   return (
     <div className="space-y-2">
+      {/*
+       * ⚠ THE COUNTS STAY VISIBLE. THE TABLE COLLAPSES. That split is the whole
+       * reconciliation with decision log 44, which refused to put this table behind
+       * a toggle at all.
+       *
+       * Entry 44's argument is specific and it is about a NUMBER, not about the
+       * rows: *"`evidence` is everything the model was OFFERED, not only what it
+       * cited... what the model ignored is visible only from the DIFFERENCE
+       * between the two. That difference is only visible if something computes
+       * it."* Live it read 31 of 75 on Derive and 9 of 56 on Assess — two facts
+       * about two answers that no summary would have surfaced.
+       *
+       * That difference is computed here and printed here, unconditionally, above
+       * the toggle. A reviewer who never opens the table still sees that Stage 3
+       * left 44 of the 75 items it was handed untouched. What collapses is the
+       * per-row detail, which is a lookup surface — the place you go to check a
+       * specific evidence id against a citation — and not a fact that is lost by
+       * being one click away.
+       */}
       <p className="text-xs text-zinc-500">
         {evidence.length} item(s) offered · <span className="text-emerald-400">{usedCount} cited</span>{" "}
         · <span className="text-zinc-400">{evidence.length - usedCount} not cited</span>. What was
         ignored is only visible from this difference.
       </p>
-      <div className="overflow-x-auto rounded-lg border border-zinc-800">
-        <table className="w-full min-w-[40rem] text-left">
-          <thead className="bg-zinc-900/60 text-xs uppercase tracking-wide text-zinc-500">
-            <tr>
-              <th className="px-3 py-2 font-medium">Used</th>
-              <th className="px-3 py-2 font-medium">Kind</th>
-              <th className="px-3 py-2 font-medium">Evidence id</th>
-              <th className="px-3 py-2 font-medium">Value as the model read it</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-zinc-800">
-            {evidence.map((item) => (
-              <EvidenceRow key={item.id} item={item} cited={cited.has(item.id)} />
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <details className="group">
+        <summary className="cursor-pointer list-none text-xs text-zinc-500 hover:text-zinc-300">
+          <span className="group-open:hidden">▸ Show </span>
+          <span className="hidden group-open:inline">▾ Hide </span>
+          all {evidence.length} row(s), cited and uncited
+        </summary>
+        <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-800">
+          <table className="w-full min-w-[40rem] text-left">
+            <thead className="bg-zinc-900/60 text-xs uppercase tracking-wide text-zinc-500">
+              <tr>
+                <th className="px-3 py-2 font-medium">Used</th>
+                <th className="px-3 py-2 font-medium">Kind</th>
+                <th className="px-3 py-2 font-medium">Evidence id</th>
+                <th className="px-3 py-2 font-medium">Value as the model read it</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-800">
+              {evidence.map((item) => (
+                <EvidenceRow key={item.id} item={item} cited={cited.has(item.id)} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
   );
 }

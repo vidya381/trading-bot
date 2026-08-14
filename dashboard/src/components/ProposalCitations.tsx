@@ -94,6 +94,21 @@ export function CitationList({ citations }: { citations: readonly EvidenceItem[]
 
   return (
     <div className="space-y-2">
+      {/*
+       * ⚠ OUTSIDE THE `<details>`, AND THAT IS THE POINT OF THE SPLIT.
+       *
+       * The rows below collapse; this warning never does. Decision log 44's live
+       * check 4 is the reason: on the first real proposal this layer ever
+       * rendered, three parameters at once rested on `assessment.strategy` and
+       * nothing else, and the operator identified all three IMMEDIATELY — from
+       * this field-level line, without reading badges one at a time. Entry 43
+       * named "hard to verify in practice" as a condition for reopening the whole
+       * citation decision, and entry 44 recorded this warning as the evidence
+       * that the condition was not met.
+       *
+       * Hiding it behind a closed toggle would re-create that condition exactly,
+       * while leaving every test and every badge untouched.
+       */}
       {restsOnNoFetchedData(citations) && (
         <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-200">
           <span className="font-semibold">⚠ {noFetchedDataWarning(citations)}</span>{" "}
@@ -103,11 +118,36 @@ export function CitationList({ citations }: { citations: readonly EvidenceItem[]
           </span>
         </div>
       )}
-      <ul className="space-y-1.5">
-        {citations.map((item) => (
-          <CitationRow key={item.id} item={item} />
-        ))}
-      </ul>
+      {/*
+       * ⚠ COLLAPSED BY DEFAULT — a `<details>` with NO `open` attribute.
+       *
+       * This is a reversal of a stated decision and is argued rather than slipped
+       * in. Decision log 44 put nothing behind a collapsed toggle on the grounds
+       * that *what the model ignored is visible only from the difference*, and
+       * that argument is about the EVIDENCE TABLES, where a hidden uncited item is
+       * a hidden fact. It does not apply here: these rows are the citations a
+       * field or claim actually carries, the count is printed on the summary line,
+       * and the field-level warning above already states the one thing about them
+       * that changes a decision.
+       *
+       * The mechanism is the browser's own `<details>`, already used by
+       * `ProposalFreshness`. No `useState`, no handler, no JS: "expands on click"
+       * is behaviour this project does not implement and therefore cannot break,
+       * and "defaults to collapsed" is the ABSENCE of an attribute — which is a
+       * property a source guard can check, and does.
+       */}
+      <details className="group">
+        <summary className="cursor-pointer list-none text-xs text-zinc-500 hover:text-zinc-300">
+          <span className="group-open:hidden">▸ Show </span>
+          <span className="hidden group-open:inline">▾ Hide </span>
+          {citations.length} citation{citations.length === 1 ? "" : "s"}
+        </summary>
+        <ul className="mt-2 space-y-1.5">
+          {citations.map((item) => (
+            <CitationRow key={item.id} item={item} />
+          ))}
+        </ul>
+      </details>
     </div>
   );
 }

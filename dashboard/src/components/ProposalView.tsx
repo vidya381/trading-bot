@@ -66,12 +66,12 @@ import { formatDateTime } from "../format";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { CitationLegend } from "./ProposalCitations";
 import { ProposalConcentration } from "./ProposalConcentration";
-import { ProposalCreateBotLink } from "./ProposalCreateBotLink";
 import { ProposalEvidence } from "./ProposalEvidence";
 import { ProposalFreshness } from "./ProposalFreshness";
 import { ProposalLimits } from "./ProposalLimits";
 import { ProposalParameters } from "./ProposalParameters";
 import { ProposalStrategy } from "./ProposalStrategy";
+import { ProposalSummaryCard } from "./ProposalSummaryCard";
 
 function ProvenanceLine({ derive }: { derive: DeriveResponse }) {
   return (
@@ -167,17 +167,52 @@ export function ProposalView({
         <p className="mt-3 border-t border-zinc-800 pt-3 text-xs text-zinc-400">
           <strong className="text-zinc-200">This is a proposal, not a bot.</strong> Nothing here has
           created, started or modified anything, and no capital has been reserved. To act on it, go
-          to the create-bot form — it runs every check it always runs. The link at the bottom of
-          this page opens that form with these values already in it; it is a starting point you can
+          to the create-bot form — it runs every check it always runs. The link in the summary card
+          below opens that form with these values already in it; it is a starting point you can
           edit, not an approval, and there is deliberately no approve button anywhere on this page
           (spec 21.1).
         </p>
       </header>
 
       {/*
-       * FIRST, and above everything a reader might scroll past: the
-       * over-concentration flag. Spec 21.4 requires it "presented prominently,
-       * not a silent filter", and prominence is a position as much as a colour.
+       * ⚠ FIRST AMONG THE PANELS: the summary card.
+       *
+       * This position is a change, and the argument it overrules is worth keeping
+       * visible rather than deleting. Until this step the concentration flag was
+       * first, on spec 21.4's requirement that it be "presented prominently, not a
+       * silent filter" — and prominence is a position as much as a colour.
+       *
+       * THAT REQUIREMENT IS NOT WEAKENED BY THIS, and the reason is mechanical
+       * rather than a matter of emphasis: the card carries the REAL concentration
+       * verdict as one of its two badges, computed by `concentrationVerdictOf` off
+       * the same `ConcentrationResult.assessment` the banner reads, with a flagged
+       * or unchecked result rendered as loudly as the banner renders it. So the
+       * flag is now the FIRST thing on the page rather than the second, and the
+       * banner below still carries every finding in full — the rule, the threshold,
+       * the observed breakdown — which is the part a card must not try to
+       * summarise.
+       *
+       * ⚠ AND THE CARD IS NOT ALLOWED TO BE THE ONLY PLACE IT APPEARS. If the card
+       * ever stops rendering the verdict, the banner below is still there and still
+       * first among the panels a reviewer scrolls to. The summary is a fast path,
+       * not a replacement, and nothing below it was removed or shortened.
+       */}
+      {/*
+       * ⚠ ITS OWN BOUNDARY, and this one is load-bearing rather than defensive.
+       * The card is now the FIRST thing rendered and it holds the only control that
+       * leads off this page. React's default on an uncaught render error is to
+       * unmount the whole tree — which is what turned a single TypeError into a
+       * blank black page during step 44's operator verification. A card that
+       * throws must cost a reviewer the card, not the proposal.
+       */}
+      <ErrorBoundary where="The summary card">
+        <ProposalSummaryCard derive={derive} />
+      </ErrorBoundary>
+
+      {/*
+       * The over-concentration flag in full: every finding, with its rule, its
+       * threshold and its observed breakdown. Spec 21.4's "presented prominently"
+       * requirement is carried by this AND by the card's badge above.
        */}
       <ProposalConcentration concentration={derive.bundle.concentration} />
 
@@ -248,7 +283,7 @@ export function ProposalView({
         </p>
         <p>
           <strong className="text-zinc-400">The outcome is still unrecorded.</strong> Creating a bot
-          through the link below carries <code>proposalId</code> in the{" "}
+          through the link in the summary card carries <code>proposalId</code> in the{" "}
           <code>POST /api/bots</code> body for you, so the record says a human acted on it — but
           only on a real, completed creation. If you decide against it, post to{" "}
           <code>/api/proposals/{derive.proposalId}/reject</code>. A proposal nobody records a
@@ -257,16 +292,24 @@ export function ProposalView({
           you close the tab this rendering is gone, though the record is not.
         </p>
         {/*
-         * ⚠ LAST, DELIBERATELY. The one control that leads out of this page sits
-         * below the concentration flag, the data limits, the freshness verdict,
-         * the reasoning, the parameters and the evidence — after everything a
-         * reviewer is meant to have read, not above it. Position is prominence,
-         * which is the argument `ProposalView` already makes for putting the
-         * concentration banner FIRST; the same argument puts this one last.
+         * ⚠ THE CREATE-BOT LINK USED TO BE HERE, LAST, AND IS NOW IN THE SUMMARY
+         * CARD AT THE TOP. The comment that stood here argued the old position:
+         * that the one control leading out of this page belonged below everything
+         * a reviewer is meant to have read, because position is prominence.
+         *
+         * It is recorded rather than deleted because the argument was sound and
+         * was not abandoned for convenience. What live use showed is that the
+         * premise had stopped holding: the page runs 30+ printed pages, and a
+         * reviewer who scrolls past all of it to reach a button has not read it
+         * either — the distance was buying nothing. The reading requirement is
+         * now carried by what the card DOES NOT show (no reasoning, no citations,
+         * no evidence, and a footer that says so) rather than by how far the
+         * button is from the top.
+         *
+         * ⚠ THERE IS EXACTLY ONE `ProposalCreateBotLink` ON THIS PAGE. Two would
+         * be two places for the copy about "this is not an approve button" to
+         * drift apart, and `proposal-summary-card.test.ts` pins the count.
          */}
-        <ErrorBoundary where="The create-bot link">
-          <ProposalCreateBotLink derive={derive} />
-        </ErrorBoundary>
       </footer>
     </article>
   );
