@@ -90,8 +90,18 @@ export function Dashboard() {
 
   const [showArchived, setShowArchived] = useState(false);
 
+  /*
+   * `?? []` for the TABLE's purposes only, and deliberately not for the strip's.
+   *
+   * Below this line an empty list and an unloaded one are genuinely
+   * interchangeable, because every use of `bots` down there sits inside the
+   * `firstLoad` / `hardError` ternary and therefore only runs once the fetch has
+   * actually succeeded. `StatusStrip` sits OUTSIDE that ternary -- always
+   * mounted, so the page does not reflow when data lands -- and for it the two
+   * cases are not interchangeable at all, so it is handed the raw nullable
+   * `data` and decides per tile. See its module note.
+   */
   const bots = botsPoll.data ?? [];
-  const alerts = alertsPoll.data ?? [];
   /*
    * The archived filter is applied HERE and to the TABLE ONLY (step 26).
    *
@@ -170,7 +180,11 @@ export function Dashboard() {
         </div>
       </div>
 
-      <StatusStrip bots={bots} alerts={alerts} killSwitch={killSwitchPoll.data} />
+      <StatusStrip
+        bots={botsPoll.data}
+        alerts={alertsPoll.data}
+        killSwitch={killSwitchPoll.data}
+      />
 
       {firstLoad ? (
         <div className="rounded-lg border border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">

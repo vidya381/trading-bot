@@ -21,21 +21,40 @@
  * interleaving a currency figure among count tiles that share a visual
  * treatment would invite reading one as the other. Same source array, same
  * poll, same one-source-of-truth rule as the counts above it.
+ *
+ * A NULL LIST IS NOT AN EMPTY FLEET
+ * ---------------------------------
+ * `bots` and `alerts` are nullable, and null means "no successful load yet".
+ * They were previously non-null, because the page coalesced each poll's `data`
+ * with `?? []` before passing it down -- so on first load, and for as long as a
+ * failed first load kept failing, this strip counted an empty array and
+ * reported a confident RUNNING 0 / HALTED 0 / UNRESOLVED ALERTS 0 for a fleet
+ * it knew nothing about. The money rollup below never had that bug: it renders
+ * nothing at all rather than "a strip of confident zeroes" (see
+ * `AccountSummary`), which is why only the top row was ever wrong.
+ *
+ * The rule the rest of this codebase already states -- "NULL IS NOT ZERO"
+ * (api/types.ts), "Null means UNKNOWN, never zero" (accountTotals.ts) -- now
+ * holds here too, and it holds through a FAILED poll and not merely a slow one.
+ * That distinction is the whole point: a `loading` flag goes false when the
+ * first fetch fails, so gating on it alone would have left an expired Access
+ * session showing a fleet-wide all-clear underneath the error box that admits
+ * the load failed.
+ *
+ * The rule itself lives in `statusCounts.ts`, which is where it is tested --
+ * this file places what that module produced and chooses a colour for it.
  */
 
 import { Link } from "react-router-dom";
 import { ENVIRONMENT } from "../env";
-import type { Alert, Bot, BotStatus, KillSwitchStatus } from "../api/types";
+import type { Alert, Bot, KillSwitchStatus } from "../api/types";
 import { accountTotals } from "../accountTotals";
+import { countValues, UNKNOWN } from "../statusCounts";
 import { AccountSummary } from "./AccountSummary";
-
-function countByStatus(bots: Bot[], status: BotStatus): number {
-  return bots.reduce((n, bot) => (bot.status === status ? n + 1 : n), 0);
-}
 
 interface TileProps {
   readonly label: string;
-  readonly value: number;
+  readonly value: string;
   readonly tone: "neutral" | "good" | "bad" | "warn";
   readonly muted?: boolean;
 }
@@ -48,13 +67,20 @@ const TONE_CLASS: Record<TileProps["tone"], string> = {
 };
 
 function Tile({ label, value, tone, muted }: TileProps) {
+  /*
+   * An unknown value is always muted, whatever the tone. RUNNING is the tile
+   * this matters for: it carries `tone="good"` and no `muted` flag, so before
+   * this gate existed its loading-state zero rendered in full emerald -- a
+   * healthy green 0 that looked exactly like a confirmed "nothing is running".
+   */
+  const unknown = value === UNKNOWN;
   return (
     <div className="flex flex-col rounded-lg border border-zinc-800 bg-zinc-900/60 px-4 py-3">
       <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">{label}</span>
       <span
         className={[
           "tabular mt-1 text-2xl font-semibold",
-          muted && value === 0 ? "text-zinc-600" : TONE_CLASS[tone],
+          unknown || (muted && value === "0") ? "text-zinc-600" : TONE_CLASS[tone],
         ].join(" ")}
       >
         {value}
@@ -69,7 +95,7 @@ function Tile({ label, value, tone, muted }: TileProps) {
  * count means (this session's brief item 6). Keeps the muted-when-zero treatment
  * of the plain count tiles.
  */
-function UnresolvedAlertsTile({ count }: { count: number }) {
+function UnresolvedAlertsTile({ count }: { count: string }) {
   return (
     <Link
       to="/alerts?resolved=false"
@@ -79,7 +105,14 @@ function UnresolvedAlertsTile({ count }: { count: number }) {
       <span
         className={[
           "tabular mt-1 text-2xl font-semibold",
-          count === 0 ? "text-zinc-600" : "text-amber-300",
+          /*
+           * `UNKNOWN` lands in the muted arm alongside a real zero, which is
+           * the correct colour for it but for a different reason -- and it is
+           * the reason the count itself now has to say which it is. A muted 0
+           * here reads as an all-clear, and this tile was showing one for an
+           * alert feed it had not loaded.
+           */
+          count === "0" || count === UNKNOWN ? "text-zinc-600" : "text-amber-300",
         ].join(" ")}
       >
         {count}
@@ -124,19 +157,23 @@ export function StatusStrip({
   alerts,
   killSwitch,
 }: {
-  bots: Bot[];
-  alerts: Alert[];
+  bots: Bot[] | null;
+  alerts: Alert[] | null;
   killSwitch: KillSwitchStatus | null;
 }) {
-  const running = countByStatus(bots, "running");
-  const halted = countByStatus(bots, "halted");
-  const stopped = countByStatus(bots, "stopped");
-  const created = countByStatus(bots, "created");
-  const unresolved = alerts.reduce((n, alert) => (alert.resolved ? n : n + 1), 0);
-  // Derived from the SAME `bots` array the count tiles above and the table
-  // below are built from -- one poll, one source of truth, so the money row
-  // can never describe a different fleet than the one on screen.
-  const totals = accountTotals(bots);
+  const counts = countValues(bots, alerts);
+  /*
+   * Derived from the SAME `bots` list the count tiles above and the table below
+   * are built from -- one poll, one source of truth, so the money row can never
+   * describe a different fleet than the one on screen.
+   *
+   * `?? []` is safe HERE and nowhere else on this page: `accountTotals([])`
+   * returns an empty array, and `AccountSummary` renders exactly nothing for
+   * it. So a not-yet-loaded fleet produces no money tiles rather than zeroed
+   * ones -- which is the behaviour this row already had, and the behaviour the
+   * count tiles above have just been given.
+   */
+  const totals = accountTotals(bots ?? []);
 
   return (
     <div className="space-y-4">
@@ -148,11 +185,11 @@ export function StatusStrip({
           </span>
         </div>
         <KillSwitchTile status={killSwitch} />
-        <Tile label="Running" value={running} tone="good" />
-        <Tile label="Halted" value={halted} tone="bad" muted />
-        <Tile label="Stopped" value={stopped} tone="neutral" muted />
-        <Tile label="Created" value={created} tone="neutral" muted />
-        <UnresolvedAlertsTile count={unresolved} />
+        <Tile label="Running" value={counts.running} tone="good" />
+        <Tile label="Halted" value={counts.halted} tone="bad" muted />
+        <Tile label="Stopped" value={counts.stopped} tone="neutral" muted />
+        <Tile label="Created" value={counts.created} tone="neutral" muted />
+        <UnresolvedAlertsTile count={counts.unresolved} />
       </section>
       <AccountSummary totals={totals} />
     </div>
