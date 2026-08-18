@@ -58,8 +58,22 @@ const CITATIONS = "/dashboard/src/components/ProposalCitations.tsx";
 const EVIDENCE = "/dashboard/src/components/ProposalEvidence.tsx";
 const SUMMARY_LOGIC = "/dashboard/src/proposalSummary.ts";
 
-/** The two pages that render a proposal. Neither may grow its own renderer. */
-const PAGES = ["/dashboard/src/pages/Proposal.tsx", "/dashboard/src/pages/ProposalRun.tsx"];
+/**
+ * Every page that renders a proposal. None may grow its own renderer.
+ *
+ * ⚠ `pages/ProposalRecord.tsx` JOINED THIS LIST when the proposal history view was
+ * built, and it is the reason the list is worth having: a history page that rendered
+ * a stored proposal its own way would be a second proposal renderer, and *"the copy
+ * that drifts is the one nobody is watching"* (decision log 46). It renders a
+ * historical `derive` record through the unchanged `ProposalView` — same card, same
+ * banner, same citation classification, same evidence tables — because the stored
+ * payload rebuilds into the exact wire shape that component already takes.
+ */
+const PAGES = [
+  "/dashboard/src/pages/Proposal.tsx",
+  "/dashboard/src/pages/ProposalRun.tsx",
+  "/dashboard/src/pages/ProposalRecord.tsx",
+];
 
 function raw(path: string): string {
   const module = SOURCES[path];
@@ -172,6 +186,40 @@ describe("the summary card is rendered, and rendered first", () => {
 });
 
 describe("the relocated create-bot link is the same link", () => {
+  it("⚠ the history view suppresses the link rather than growing a second one", () => {
+    /*
+     * THE HISTORY VIEW'S ONE DEVIATION FROM A LIVE PROPOSAL'S RENDERING, pinned so
+     * it stays a suppression rather than becoming a fork.
+     *
+     * A historical record is a thing that already happened. The path from a proposal
+     * to a bot exists ONCE, through a live proposal, built to decision log 46's four
+     * constraints — and a second entry point from a history page would be a second
+     * place the copy that stops a human mistaking a prefill for an approval lives
+     * and drifts. So the record page passes `offerCreateBot={false}` to the SAME
+     * `ProposalView`, rather than rendering a variant of it.
+     *
+     * ⚠ IT SUPPRESSES AN AFFORDANCE, NOT A GUARANTEE, and the two assertions below
+     * are the mechanical statement of that: the flag is passed exactly where it is
+     * expected, and it is the ONLY place in the dashboard that passes it — every
+     * other render of a proposal still offers the link.
+     */
+    const record = code("/dashboard/src/pages/ProposalRecord.tsx");
+    expect(record).toContain("offerCreateBot={false}");
+
+    const suppressors: string[] = [];
+    for (const [path, module] of Object.entries(SOURCES)) {
+      if (path.endsWith(".test.ts") || path.endsWith(".test.tsx")) continue;
+      if (/offerCreateBot=\{false\}/.test(module.default)) suppressors.push(path);
+    }
+    expect(suppressors).toEqual(["/dashboard/src/pages/ProposalRecord.tsx"]);
+
+    // And the live pages do NOT pass it, so they keep the link by default rather
+    // than by a flag someone has to remember.
+    for (const page of ["/dashboard/src/pages/Proposal.tsx", "/dashboard/src/pages/ProposalRun.tsx"]) {
+      expect(code(page)).not.toContain("offerCreateBot");
+    }
+  });
+
   it("⚠ is rendered in exactly ONE place in the whole dashboard, and that place is the card", () => {
     /*
      * THE RELOCATION REGRESSION. The failure this catches is not hypothetical: the

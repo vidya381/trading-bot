@@ -82,6 +82,16 @@ const ROUTES: readonly Route[] = [
   // without creating it. This route records the other decision a human makes.
   // Curl-only, like every other section 21 surface.
   route("POST", "/api/proposals/:id/reject", handlers.rejectProposalEntry),
+  // ⚠ THE FIRST READS OF THE PERMANENT RECORD, and the thing decision logs 46, 48
+  // and 49 each carried forward as "a missing READ, not a missing feature".
+  // Both are GET, both are read-only, and neither can reach `proposals.outcome` --
+  // which still moves off NULL in exactly two places, both above this line.
+  //
+  // The list NEVER reads `inputs_json` or `reasoning_json` (see `listProposals`);
+  // the single-record read returns them in full, because it is the one endpoint
+  // that exists to.
+  route("GET", "/api/proposals", handlers.listProposals),
+  route("GET", "/api/proposals/:id", handlers.getProposal),
   // Section 21.3's watchlist (migration 0008, /src/research/watchlist.ts). The
   // dashboard control for these is deliberately a later step; today they are the
   // curl-callable surface that replaces editing the table by hand.

@@ -35,7 +35,14 @@ import type {
   TriggerKillSwitchResponse,
   UnarchiveResponse,
 } from "./types";
-import type { AssessResponse, DeriveResponse } from "./research-types";
+import type {
+  AssessResponse,
+  DeriveResponse,
+  ProposalListResponse,
+  ProposalOutcomeFilter,
+  ProposalRecordResponse,
+  ProposalStage,
+} from "./research-types";
 
 /** An API failure, carrying the backend's typed error code. */
 export class ApiError extends Error {
@@ -521,6 +528,85 @@ export function fetchDerive(
   params.set("assessment", assessment);
   const path = `/api/accounts/${encodeURIComponent(accountLabel)}/derive?${params}`;
   return requestJson<DeriveResponse>(path, "GET", { signal });
+}
+
+// ---------------------------------------------------------------------------
+// Spec 21.5 requirement 5 -- reading the permanent proposal record
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠ THESE TWO ARE FREE, UNLIKE THE TWO ABOVE THEM. `fetchAssess` and `fetchDerive`
+ * each spend a paid inference and each write a permanent row; these read rows that
+ * already exist. They call no model, touch no venue, and write nothing -- the
+ * backend routes are `GET` and neither can reach `proposals.outcome`, which still
+ * moves off NULL in exactly two places (`POST /api/bots` and
+ * `POST /api/proposals/:id/reject`).
+ */
+
+/**
+ * The filters `GET /api/proposals` supports SERVER-SIDE. All optional; an omitted
+ * field is not sent, so the backend returns that dimension unfiltered.
+ *
+ * The backend validates each value and 400s an unrecognised one (`invalid_filter`),
+ * so callers send only values from the typed unions and never
+ * fetch-everything-then-filter -- `fetchAlerts`' rule, and it matters more here
+ * because this table has no delete path and grows by two rows per real run.
+ */
+export interface ProposalFilters {
+  readonly accountLabel?: string;
+  readonly stage?: ProposalStage;
+  /** `pending` means no decision has been recorded -- 21.5's "ignored". */
+  readonly outcome?: ProposalOutcomeFilter;
+  readonly limit?: number;
+  readonly offset?: number;
+}
+
+/**
+ * A page of proposal history (`GET /api/proposals`).
+ *
+ * ⚠ REAL PAGINATION, NOT A CAPPED LIST. The response carries `page.total` -- the
+ * count behind the filters across the whole table -- so a reader can be told "26–50
+ * of 312" rather than being handed a next button and a guess. The backend REFUSES a
+ * `limit` above its maximum rather than clamping it, so a caller cannot receive a
+ * silently shortened page and believe it is complete; that arrives as an
+ * `invalid_filter` 400.
+ */
+export function fetchProposals(
+  filters: ProposalFilters = {},
+  signal?: AbortSignal,
+): Promise<ProposalListResponse> {
+  const params = new URLSearchParams();
+  if (filters.accountLabel !== undefined) params.set("accountLabel", filters.accountLabel);
+  if (filters.stage !== undefined) params.set("stage", filters.stage);
+  if (filters.outcome !== undefined) params.set("outcome", filters.outcome);
+  if (filters.limit !== undefined) params.set("limit", String(filters.limit));
+  if (filters.offset !== undefined) params.set("offset", String(filters.offset));
+  const query = params.toString();
+  return requestJson<ProposalListResponse>(
+    `/api/proposals${query ? `?${query}` : ""}`,
+    "GET",
+    { signal },
+  );
+}
+
+/**
+ * One whole proposal record (`GET /api/proposals/:id`), rebuilt into the exact
+ * shape the live endpoint returned.
+ *
+ * ⚠ IT IS A LARGE RESPONSE, and it is the only one in this file that is. A derive
+ * record carries the full candle window plus the ~23 KB prompt and the raw model
+ * answer -- which is why it is fetched for ONE proposal, on purpose, and why
+ * `fetchProposals` exists so nothing pays that cost to browse.
+ *
+ * `unknown_proposal` (404) is its only refusal. Section 8.7 means no id was ever
+ * deleted, so a 404 really does mean the id was never issued.
+ */
+export function fetchProposal(id: string, signal?: AbortSignal): Promise<ProposalRecordResponse> {
+  return requestJson<ProposalRecordResponse>(
+    `/api/proposals/${encodeURIComponent(id)}`,
+    "GET",
+    { signal },
+  );
 }
 
 /**

@@ -152,6 +152,18 @@ export function Dashboard() {
             Proposal
           </Link>
           {/*
+           * Spec 21.5 requirement 5, the permanent record read back. Free and
+           * read-only — it calls no model, touches no venue and writes nothing —
+           * so it sits with the navigation beside the paste page rather than with
+           * the actions, and deliberately BEFORE the link that spends money.
+           */}
+          <Link
+            to="/proposals"
+            className="inline-flex items-center rounded-md border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 hover:border-zinc-600 hover:text-zinc-100"
+          >
+            History
+          </Link>
+          {/*
            * Spec 21.6, the named-coin trigger. ⚠ UNLIKE EVERY OTHER LINK IN THIS
            * ROW, what it leads to SPENDS MONEY — two paid inferences per press.
            * It is styled as ordinary navigation rather than as a primary action

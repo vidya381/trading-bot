@@ -393,6 +393,83 @@ export class Repository<TColumns extends ColumnMap> {
     return result.results.map((raw) => this.#decode(raw));
   }
 
+  /**
+   * `findMany`, but reading only the columns named.
+   *
+   * ── WHY A PROJECTION EXISTS AT ALL, HAVING DELIBERATELY NOT EXISTED ──
+   *
+   * Decision log 45 states as a fact about this layer that *"`Repository.findMany`
+   * always selects the full generated column list; there is no projection anywhere
+   * in the layer"*, and uses that fact as the THIRD of migration 0009's four
+   * arguments for giving proposals their own table: a fat `details_json` on
+   * `audit_log` would be dragged by every unrelated read, and the deepest payload
+   * this pipeline can build was measured at **290,459 bytes**.
+   *
+   * That argument does not stop applying to `proposals` itself. A list endpoint
+   * over this table is exactly the read whose job needs `pair`, `stage`, `outcome`
+   * and `created_at` and needs NEITHER `inputs_json` NOR `reasoning_json` -- and
+   * `SELECT *` for a page of 25 rows is up to ~7 MB of candle windows and prompts
+   * read, decoded and thrown away to render a table of short strings. Building the
+   * list endpoint on `findMany` would have contradicted the reasoning that produced
+   * the table.
+   *
+   * So the layer gains a projection rather than the endpoint gaining a workaround.
+   * It is additive: no existing call site changes, `findMany` is untouched, and the
+   * SELECT list is built from the SAME per-column `selectExpression` -- so a money
+   * column projected here still arrives through its `CAST(... AS TEXT)` and a JSON
+   * column still parses. The three properties that make this folder trustworthy --
+   * every identifier validated, every value encoded by its own codec, every read
+   * decoded by its own codec -- are shared code here rather than restated.
+   *
+   * ⚠ IT ADDS NO WAY TO WRITE AND NO WAY TO DELETE. `proposal-log.test.ts` asserts
+   * the absence of `delete`/`deleteMany`/`truncate`/`remove` on the real repository
+   * object precisely so a future widening of this layer fails where the section 8.7
+   * retention promise is written down. This widening is a narrower READ, which is
+   * the one direction that promise does not constrain.
+   *
+   * The return type is `Pick<Row, K>`, so a caller that projects three columns
+   * cannot read a fourth: omitting a column makes it a COMPILE error downstream
+   * rather than an `undefined` that renders as a blank cell.
+   */
+  async findManyProjected<K extends string & keyof TColumns>(
+    columns: readonly K[],
+    options: FindOptions<TColumns> = {},
+  ): Promise<Pick<Row<TColumns>, K>[]> {
+    if (columns.length === 0) {
+      // `SELECT FROM` is a syntax error, and a projection of nothing is always a
+      // caller bug rather than an intentional "give me empty rows".
+      throw new DatabaseError(
+        "unsupported_filter",
+        `a projected read of ${this.#spec.name} needs at least one column`,
+      );
+    }
+
+    const selectList = columns
+      .map((name) => {
+        const column = this.#column(name);
+        const quoted = quote(name);
+        const expression = column.selectExpression(quoted);
+        return expression === quoted ? quoted : `${expression} AS ${quoted}`;
+      })
+      .join(", ");
+
+    const filter = this.#where(options.where);
+    const tail = this.#tail(options);
+    const sql = `SELECT ${selectList} FROM ${quote(this.#spec.name)}${filter.sql}${tail.sql}`;
+    const result = await this.#db
+      .prepare(sql)
+      .bind(...filter.binds, ...tail.binds)
+      .all<Record<string, unknown>>();
+
+    return result.results.map((raw) => {
+      const decoded: Record<string, unknown> = {};
+      for (const name of columns) {
+        decoded[name] = this.#column(name).decode(raw[name], `${this.#spec.name}.${name}`);
+      }
+      return decoded as Pick<Row<TColumns>, K>;
+    });
+  }
+
   async findOne(where: Where<TColumns>): Promise<Row<TColumns> | null> {
     const rows = await this.findMany({ where, limit: 1 });
     return rows[0] ?? null;

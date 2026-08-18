@@ -10,6 +10,7 @@ import {
   botInstanceRow,
   freshDatabase,
   orderRow,
+  proposalRow,
   rawD1,
   tradeRow,
 } from "./test-helpers";
@@ -232,6 +233,128 @@ describe("update", () => {
     // Section 8.7 retains everything. There is nothing to call.
     expect("delete" in db.orders).toBe(false);
     expect("deleteWhere" in db.orders).toBe(false);
+  });
+});
+
+/**
+ * ⚠ THE PROJECTION, and the property it exists for.
+ *
+ * Added for `GET /api/proposals`, whose page of history must not read a candle
+ * window or a 23 KB prompt to render a table of short strings. Migration 0009's
+ * third argument for a dedicated proposals table was that `findMany` always selects
+ * the full column list, so every unrelated read pays for the payload -- and a list
+ * endpoint built on `findMany` would have reproduced that fault inside the table
+ * that exists because of it.
+ */
+describe("findManyProjected", () => {
+  beforeEach(async () => {
+    // `proposals.account_label` is a real foreign key into `accounts` (migration
+    // 0009): the account whose ledger, bot list and venue a proposal was built
+    // against has to exist.
+    await db.accounts.insert({
+      account_label: "main",
+      exchange: "gemini",
+      created_at: 1_000,
+      updated_at: 1_000,
+    });
+    await db.proposals.insert(proposalRow({ id: "prop-1", created_at: 1_000 }));
+    await db.proposals.insert(
+      proposalRow({ id: "prop-2", created_at: 2_000, outcome: "rejected", outcome_actor: "a@b.c", outcome_at: 3_000 }),
+    );
+  });
+
+  it("returns only the columns asked for", async () => {
+    const rows = await db.proposals.findManyProjected(["id", "stage", "pair"], {
+      orderBy: [{ column: "created_at", direction: "asc" }],
+    });
+    expect(rows).toEqual([
+      { id: "prop-1", stage: "derive", pair: "BTCUSD" },
+      { id: "prop-2", stage: "derive", pair: "BTCUSD" },
+    ]);
+  });
+
+  it("⚠ does not read the JSON payload columns at all", async () => {
+    /*
+     * THE WHOLE POINT, asserted on the returned object rather than on the SQL: an
+     * omitted column is not present as `undefined`, it is not a key. That is what
+     * makes `Pick<Row, K>` honest -- reading a column you did not project is a
+     * compile error rather than a blank cell.
+     */
+    const rows = await db.proposals.findManyProjected(["id"], {});
+    expect(Object.keys(rows[0]!)).toEqual(["id"]);
+    expect("inputs_json" in rows[0]!).toBe(false);
+    expect("reasoning_json" in rows[0]!).toBe(false);
+  });
+
+  it("still decodes each projected column through its own codec", async () => {
+    // The select list is built from the SAME per-column `selectExpression`, so a
+    // money column still arrives through its CAST and a nullable integer still
+    // comes back as null rather than as the string "null".
+    const rows = await db.proposals.findManyProjected(["id", "outcome", "outcome_at"], {
+      where: { id: "prop-1" },
+    });
+    expect(rows[0]).toEqual({ id: "prop-1", outcome: null, outcome_at: null });
+
+    const money = await db.capitalLedger.findManyProjected(["asset", "total_balance"], {});
+    void money; // an empty ledger here; the type is the assertion.
+  });
+
+  it("honours where, orderBy, limit and offset exactly as findMany does", async () => {
+    const filtered = await db.proposals.findManyProjected(["id"], {
+      where: { outcome: "rejected" },
+    });
+    expect(filtered).toEqual([{ id: "prop-2" }]);
+
+    const pending = await db.proposals.findManyProjected(["id"], { where: { outcome: null } });
+    expect(pending).toEqual([{ id: "prop-1" }]);
+
+    const page = await db.proposals.findManyProjected(["id"], {
+      orderBy: [{ column: "created_at", direction: "desc" }],
+      limit: 1,
+      offset: 1,
+    });
+    expect(page).toEqual([{ id: "prop-1" }]);
+  });
+
+  it("agrees with findMany on the columns they share", async () => {
+    // The two builders must not drift: one `where`, one `tail`, one set of codecs.
+    const full = await db.proposals.findMany({ orderBy: [{ column: "id", direction: "asc" }] });
+    const projected = await db.proposals.findManyProjected(["id", "account_label", "created_at"], {
+      orderBy: [{ column: "id", direction: "asc" }],
+    });
+    expect(projected).toEqual(
+      full.map((row) => ({
+        id: row.id,
+        account_label: row.account_label,
+        created_at: row.created_at,
+      })),
+    );
+  });
+
+  it("refuses a projection of no columns", async () => {
+    // `SELECT FROM` is a syntax error, and a projection of nothing is always a
+    // caller bug rather than an intentional "give me empty rows".
+    expect(await codeOf(() => db.proposals.findManyProjected([], {}))).toBe("unsupported_filter");
+  });
+
+  it("refuses a column the table does not have", async () => {
+    expect(
+      await codeOf(() =>
+        (db.proposals as unknown as {
+          findManyProjected: (columns: string[]) => Promise<unknown>;
+        }).findManyProjected(["not_a_column"]),
+      ),
+    ).toBe("unknown_column");
+  });
+
+  it("⚠ adds no way to write and no way to delete", () => {
+    // The widening is a narrower READ, which is the one direction section 8.7's
+    // retention promise does not constrain. `proposal-log.test.ts` asserts the same
+    // absence on the same object, where the promise is written down.
+    const repository = db.proposals as unknown as Record<string, unknown>;
+    expect(repository.delete).toBeUndefined();
+    expect(repository.deleteMany).toBeUndefined();
+    expect(repository.truncate).toBeUndefined();
   });
 });
 

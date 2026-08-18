@@ -26,6 +26,13 @@
  *                 paths, not a static-vs-dynamic segment pair), but it is declared
  *                 adjacent so the pair is read together. It renders its result
  *                 through the same ProposalView /proposal uses.
+ *   /proposals    the permanent proposal record, browsable (spec 21.5 req. 5).
+ *                 Read-only: filters and pages a GET endpoint, writes nothing, and
+ *                 has no create-bot or outcome control of any kind.
+ *   /proposals/:id one stored proposal, rebuilt into the exact shape the live
+ *                 endpoint returned and rendered through the SAME ProposalView.
+ *                 Declared AFTER /proposals for readability only — they differ by
+ *                 segment count, not by static-vs-dynamic, so order is irrelevant.
  *   *             anything else redirects home
  */
 
@@ -41,6 +48,8 @@ import { KillSwitchPage } from "./pages/KillSwitchPage";
 import { ManualAdjustment } from "./pages/ManualAdjustment";
 import { Proposal } from "./pages/Proposal";
 import { ProposalRun } from "./pages/ProposalRun";
+import { ProposalHistory } from "./pages/ProposalHistory";
+import { ProposalRecord } from "./pages/ProposalRecord";
 
 export function App() {
   return (
@@ -66,6 +75,8 @@ export function App() {
             <Route path="/manual-adjustments" element={<ManualAdjustment />} />
             <Route path="/proposal" element={<Proposal />} />
             <Route path="/proposal/run" element={<ProposalRun />} />
+            <Route path="/proposals" element={<ProposalHistory />} />
+            <Route path="/proposals/:id" element={<ProposalRecord />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>

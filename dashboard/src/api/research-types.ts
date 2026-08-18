@@ -423,3 +423,184 @@ export interface DeriveResponse {
   readonly assessment: ResubmittedAssessment;
   readonly derive: DeriveResult;
 }
+
+// ---------------------------------------------------------------------------
+// Spec 21.5 requirement 5 -- the permanent record, READ
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠ THESE TWO ENDPOINTS ARE FREE, UNLIKE EVERYTHING ABOVE THEM IN THIS FILE.
+ *
+ * `/assess` and `/derive` each cost a real paid inference and each WRITE a
+ * permanent row. `GET /api/proposals` and `GET /api/proposals/:id` call no model,
+ * touch no venue and write nothing at all -- they read rows that already exist.
+ * The distinction is worth stating here because the two surfaces now share a file
+ * and a reader skimming it should not have to work out which is which.
+ *
+ * They close what decision logs 46, 48 and 49 each carried forward, in entry 46's
+ * words: *"it reads like a missing feature and is actually a missing READ."*
+ */
+
+/** `assess` | `derive` -- which pipeline stage wrote the row (migration 0009). */
+export type ProposalStage = "assess" | "derive";
+
+/**
+ * The two outcomes a human decision can take.
+ *
+ * ⚠ THERE IS DELIBERATELY NO `"ignored"`. Spec 21.5 names three outcomes and this
+ * system stores two, because "ignored" is an ABSENCE and nothing observes a human
+ * failing to act. A record with `outcome: null` IS 21.5's "ignored", read after the
+ * fact -- see `ProposalOutcomeFilter` below for how it is asked for.
+ */
+export type ProposalOutcome = "approved" | "rejected";
+
+/**
+ * One proposal record, without its two large payloads.
+ *
+ * The SAME shape both endpoints publish: a list row and a single record's summary
+ * are the same fact seen from two places, and the backend builds both through one
+ * `proposalSummaryView` so `pendingMs` cannot mean one thing in a table and another
+ * on a detail page.
+ */
+export interface ProposalRecordSummary {
+  readonly id: string;
+  readonly stage: ProposalStage;
+  readonly accountLabel: string;
+  readonly pair: string;
+  readonly entryPoint: "named" | "watchlist" | "general";
+  readonly strategy: Strategy;
+  /** The email VERIFIED off the Access token when the proposal was generated. */
+  readonly actor: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  /** 21.5 requirement 4: when the price window was FETCHED, not when this rendered. */
+  readonly dataFetchedAt: number;
+  readonly createdAt: number;
+  /** `null` is 21.5's "ignored", read after the fact. Nothing ever writes that word. */
+  readonly outcome: ProposalOutcome | null;
+  readonly outcomeBotInstanceId: string | null;
+  readonly outcomeActor: string | null;
+  readonly outcomeAt: number | null;
+  readonly outcomeNote: string | null;
+  /**
+   * How long the proposal sat before anyone decided, or `null` while it is still
+   * sitting -- "how long it sat" is not a finished quantity while it is still
+   * sitting. Decision log 45 measured a real one at 28,013,070 ms (7h 46m).
+   */
+  readonly pendingMs: number | null;
+}
+
+/**
+ * How faithful a rebuilt proposal is, published as data rather than left to infer.
+ *
+ * ⚠ `exact` IS TRUE FOR EVERY ROW THIS PIPELINE HAS EVER WRITTEN, and that is a
+ * traced finding rather than a hope: the handler stores the very object it puts on
+ * the wire, so `envelope`, `duplicateKeyCheck`, `settings`, `latencyMs`,
+ * `promptChars` and `promptVersion` are all in the stored reasoning -- they were
+ * never wire-only. See `src/api/proposal-replay.ts` for the trace.
+ */
+export interface ProposalReplayFidelity {
+  readonly exact: boolean;
+  /** Fields the row carries that the CURRENT wire shape does not declare. */
+  readonly unexpectedStageFields: readonly string[];
+  /**
+   * ⚠ ALWAYS TRUE FOR A DERIVE RECORD. Nothing links a derive row to the assess
+   * row it derives from (migration 0009 records that as a decision), so Stage 2's
+   * own evidence table and the two-gather drift comparison cannot be rendered.
+   * `ProposalView` already supports that state -- `assess={null}` is what a
+   * reviewer holding only the derive response has always seen.
+   */
+  readonly assessResponseUnavailable: boolean;
+  /**
+   * ⚠ FALSE FOR AN ASSESS RECORD, and that is structural rather than a storage
+   * gap: `ProposalView` is built around a derivation's parameters, allocated
+   * capital and reference price, and an assessment has none of those. Its payload
+   * is rebuilt exactly; what cannot be reused is the renderer.
+   */
+  readonly renderableByProposalView: boolean;
+}
+
+/** What the record holds and no live response ever carried. */
+export interface ProposalRecordOnly {
+  /** The full prompt, ~16 KB at Stage 2 and ~23 KB at Stage 3. */
+  readonly promptText: unknown;
+  /** The transport's own answer, `text` and `raw`, by identity. */
+  readonly response: unknown;
+}
+
+/**
+ * A stored proposal rebuilt into the response the live endpoint returned.
+ *
+ * ⚠ `response` IS TYPED AS THE REAL `AssessResponse` / `DeriveResponse`, and that
+ * is the whole fidelity claim stated in this dashboard's own type system: a
+ * historical record is handed to the unchanged `ProposalView`, not to a
+ * history-shaped lookalike.
+ */
+export type ProposalReplay =
+  | {
+      readonly ok: true;
+      readonly stage: "assess";
+      readonly response: AssessResponse;
+      readonly recordOnly: ProposalRecordOnly;
+      readonly fidelity: ProposalReplayFidelity;
+    }
+  | {
+      readonly ok: true;
+      readonly stage: "derive";
+      readonly response: DeriveResponse;
+      readonly recordOnly: ProposalRecordOnly;
+      readonly fidelity: ProposalReplayFidelity;
+    }
+  | {
+      readonly ok: false;
+      readonly code: string;
+      readonly message: string;
+      /** The exact field names, so the page never says "something is missing". */
+      readonly fields: readonly string[];
+    };
+
+/** The whole `GET /api/proposals/:id` payload. */
+export interface ProposalRecordResponse {
+  readonly proposal: ProposalRecordSummary;
+  /**
+   * ⚠ A REFUSED REPLAY ARRIVES BESIDE A GOOD `proposal`, not instead of it. A row
+   * whose payload cannot be rebuilt is a real finding about a permanent record, and
+   * its id, actor, model, timestamps and outcome are all still true.
+   */
+  readonly replay: ProposalReplay;
+}
+
+/**
+ * `pending` is the one filter value the column cannot hold: it means
+ * `outcome IS NULL`, which is 21.5's "ignored" read after the fact and the reason
+ * `idx_proposals_unresolved` exists. A history view that could filter to `approved`
+ * and `rejected` but not to the rows in between would omit the one question the
+ * table was built to answer.
+ */
+export type ProposalOutcomeFilter = ProposalOutcome | "pending";
+
+/** The paging facts, computed by the backend so the page and the query agree. */
+export interface ProposalPageInfo {
+  readonly limit: number;
+  readonly offset: number;
+  /** Rows matching the filters across the WHOLE table, not just this page. */
+  readonly total: number;
+  readonly returned: number;
+  readonly hasMore: boolean;
+}
+
+/** The whole `GET /api/proposals` payload. */
+export interface ProposalListResponse {
+  readonly proposals: readonly ProposalRecordSummary[];
+  readonly page: ProposalPageInfo;
+  /**
+   * The filters ACTUALLY APPLIED, echoed by the backend. A page that renders its
+   * own URL's filters is describing what it asked for; this describes what was
+   * answered, which is the difference that shows up the day a parameter is dropped.
+   */
+  readonly filters: {
+    readonly accountLabel: string | null;
+    readonly stage: ProposalStage | null;
+    readonly outcome: ProposalOutcomeFilter | null;
+  };
+}

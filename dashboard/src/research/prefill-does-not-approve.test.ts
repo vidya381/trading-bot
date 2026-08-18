@@ -257,6 +257,30 @@ describe("navigating to a pre-filled form cannot approve a proposal", () => {
     expect(offenders, offenders.join("\n")).toEqual([]);
   });
 
+  it("⚠ the history pages call no state-changing endpoint at all", () => {
+    /*
+     * The stronger half of the rule above, for the two pages that legitimately hold
+     * the API client. They may read; they may not write. Checked against the same
+     * WRITERS list, so adding a writer to the client and a call to it from a history
+     * page is two edits away from failing here rather than one.
+     */
+    const offenders: string[] = [];
+    for (const path of [
+      "/dashboard/src/pages/ProposalRecord.tsx",
+      "/dashboard/src/pages/ProposalHistory.tsx",
+      "/dashboard/src/proposalHistory.ts",
+    ]) {
+      for (const { line, number } of code(path)) {
+        for (const writer of WRITERS) {
+          if (new RegExp(`\\b${writer}\\s*\\(`).test(line)) {
+            offenders.push(`${path}:${number}: calls ${writer} — ${line}`);
+          }
+        }
+      }
+    }
+    expect(offenders, offenders.join("\n")).toEqual([]);
+  });
+
   it("the prefill module makes no request of any kind, by any route", () => {
     const offenders: string[] = [];
     for (const { line, number } of code(PREFILL)) {
@@ -311,8 +335,22 @@ describe("navigating to a pre-filled form cannot approve a proposal", () => {
   });
 
   it("the proposal pages themselves neither create nor reject anything", () => {
-    // `/proposal` and `/proposal/run` render the link; neither may act on it.
-    const pages = ["/dashboard/src/pages/Proposal.tsx", "/dashboard/src/pages/ProposalRun.tsx"];
+    /*
+     * `/proposal` and `/proposal/run` render the link; neither may act on it.
+     *
+     * ⚠ `/proposals/:id` AND `/proposals` JOINED THIS LIST with the history view,
+     * and they are the two that most needed adding: unlike the other two they DO
+     * import `api/client`, because reading the permanent record is what they are
+     * for. That makes "they read and never write" a property nothing else checks —
+     * the navigation-path rule above cannot cover a page whose whole job is a fetch.
+     * Both call only `fetchProposals` / `fetchProposal`, which are GETs.
+     */
+    const pages = [
+      "/dashboard/src/pages/Proposal.tsx",
+      "/dashboard/src/pages/ProposalRun.tsx",
+      "/dashboard/src/pages/ProposalRecord.tsx",
+      "/dashboard/src/pages/ProposalHistory.tsx",
+    ];
     const offenders: string[] = [];
     for (const path of pages) {
       for (const { line, number } of code(path)) {

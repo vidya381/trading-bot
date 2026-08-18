@@ -38,6 +38,11 @@ import type {
   GlobalKillSwitchRow,
   ManualAdjustmentRow,
   OrderRow,
+  ProposalEntryPoint,
+  ProposalOutcome,
+  ProposalRow,
+  ProposalStage,
+  StrategyType,
   TradeRow,
 } from "../db/schema";
 import type { BotSnapshot } from "../durable-objects/bot-instance";
@@ -1060,20 +1065,53 @@ export function deriveProposalReasoningView(result: DeriveResult, latencyMs: num
 }
 
 /**
+ * Everything about a proposal EXCEPT its two large payloads.
+ *
+ * `ProposalRecord` satisfies this structurally (it additionally carries `inputs`
+ * and `reasoning`), and so does a projected row once its column names are mapped
+ * to camelCase -- which is how one view serves both the outcome endpoints and the
+ * history list without a second, drifting copy.
+ */
+interface ProposalSummaryFields {
+  readonly id: string;
+  readonly stage: ProposalStage;
+  readonly accountLabel: string;
+  readonly pair: string;
+  readonly entryPoint: ProposalEntryPoint;
+  readonly strategy: StrategyType;
+  readonly actor: string;
+  readonly model: string;
+  readonly promptVersion: string;
+  readonly dataFetchedAt: number;
+  readonly createdAt: number;
+  readonly outcome: ProposalOutcome | null;
+  readonly outcomeBotInstanceId: string | null;
+  readonly outcomeActor: string | null;
+  readonly outcomeAt: number | null;
+  readonly outcomeNote: string | null;
+}
+
+/**
  * A proposal record over the wire, WITHOUT its two large payloads.
  *
- * `inputs` and `reasoning` are deliberately absent and their sizes published
- * instead -- `promptChars`' precedent one section up. A `derive` record's inputs
- * carry every candle of the window; returning them from an endpoint whose job is
- * to report an outcome would make a small acknowledgement a large download. The
- * payloads are in D1 and are read from there.
+ * `inputs` and `reasoning` are deliberately absent. A `derive` record's inputs
+ * carry every candle of the window -- 290,459 bytes at the ceiling migration 0009
+ * measured -- and returning them from an endpoint whose job is to report an
+ * outcome, or to list a page of records, would make a small acknowledgement a
+ * large download. They are in D1 and are read from there, by
+ * `GET /api/proposals/:id`, which is the one endpoint that asks for them.
+ *
+ * ⚠ THE FIELD LIST IS WRITTEN OUT RATHER THAN SPREAD, and that is the mechanism
+ * rather than a style choice: `{ ...record }` over a `ProposalRecord` would put
+ * both payloads on the wire, silently, from an endpoint whose whole point is that
+ * it does not.
  *
  * `outcome: null` is published as null rather than omitted, and it is 21.5's
  * "ignored" read after the fact: nothing ever writes that word (see migration
  * 0009). `pendingMs` is only present once a decision exists, because "how long it
  * sat" is not a finished quantity while it is still sitting.
  */
-export function proposalRecordView(record: ProposalRecord) {
+function proposalSummaryView(record: ProposalSummaryFields) {
   return {
     id: record.id,
     stage: record.stage,
@@ -1094,4 +1132,78 @@ export function proposalRecordView(record: ProposalRecord) {
     outcomeNote: record.outcomeNote,
     pendingMs: record.outcomeAt === null ? null : record.outcomeAt - record.createdAt,
   };
+}
+
+export function proposalRecordView(record: ProposalRecord) {
+  return proposalSummaryView(record);
+}
+
+/**
+ * The columns `GET /api/proposals` reads, and the two it deliberately does not.
+ *
+ * ⚠ THIS LIST IS THE POINT OF THE LIST ENDPOINT'S DESIGN, not boilerplate. It is
+ * every column of `proposals` EXCEPT `inputs_json` and `reasoning_json`, handed to
+ * `Repository.findManyProjected` so a page of history never reads a candle window
+ * or a prompt. Migration 0009's third argument for a dedicated table was that
+ * `Repository.findMany` always selects the full column list and every unrelated
+ * read would therefore pay for the payload; a list endpoint over this table built
+ * on `findMany` would have reproduced that fault inside the table that exists
+ * because of it.
+ *
+ * `schema.test.ts`-style parity is asserted in `api.test.ts`: this list plus the
+ * two payload columns must equal the table's own column set, so a column added to
+ * `proposals` later fails there rather than silently never being listed.
+ */
+export const PROPOSAL_LIST_COLUMNS = [
+  "id",
+  "stage",
+  "account_label",
+  "pair",
+  "entry_point",
+  "strategy_type",
+  "actor",
+  "model",
+  "prompt_version",
+  "data_fetched_at",
+  "created_at",
+  "outcome",
+  "outcome_bot_instance_id",
+  "outcome_actor",
+  "outcome_at",
+  "outcome_note",
+] as const;
+
+/** The two columns `PROPOSAL_LIST_COLUMNS` exists to leave behind. */
+export const PROPOSAL_PAYLOAD_COLUMNS = ["inputs_json", "reasoning_json"] as const;
+
+export type ProposalListRow = Pick<ProposalRow, (typeof PROPOSAL_LIST_COLUMNS)[number]>;
+
+/**
+ * One row of proposal history, in the SAME shape `proposalRecordView` publishes.
+ *
+ * Same shape deliberately: a list row and a single record are the same fact seen
+ * from two endpoints, and two shapes would mean two dashboard types, two
+ * formatters and two places for "how long did it sit" to be computed differently.
+ * Both go through `proposalSummaryView`, so `pendingMs` cannot mean one thing in a
+ * table and another on a detail page.
+ */
+export function proposalListEntryView(row: ProposalListRow) {
+  return proposalSummaryView({
+    id: row.id,
+    stage: row.stage,
+    accountLabel: row.account_label,
+    pair: row.pair,
+    entryPoint: row.entry_point,
+    strategy: row.strategy_type,
+    actor: row.actor,
+    model: row.model,
+    promptVersion: row.prompt_version,
+    dataFetchedAt: row.data_fetched_at,
+    createdAt: row.created_at,
+    outcome: row.outcome,
+    outcomeBotInstanceId: row.outcome_bot_instance_id,
+    outcomeActor: row.outcome_actor,
+    outcomeAt: row.outcome_at,
+    outcomeNote: row.outcome_note,
+  });
 }

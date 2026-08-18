@@ -34,6 +34,8 @@ import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
 import type { AssessModel } from "../research/assess";
 import type { DeriveModel } from "../research/derive";
+import { proposals } from "../db/schema";
+import { PROPOSAL_LIST_COLUMNS, PROPOSAL_PAYLOAD_COLUMNS } from "./serialize";
 import type { Candle, SymbolFilters } from "../shared/exchange-client";
 /*
  * ⚠ THE DASHBOARD'S PREFILL MODULE, IMPORTED INTO A WORKER TEST ON PURPOSE.
@@ -6067,5 +6069,320 @@ describe("proposal record (section 21.5 requirement 5)", () => {
       expect([404, 405], `${method} on a proposal is reachable`).toContain(res.status);
     }
     expect(await db.proposals.count()).toBe(2);
+  });
+
+  // -- Property 7: READING the record (GET /api/proposals, GET /api/proposals/:id)
+
+  /**
+   * ⚠ THE PARITY TEST, AGAINST REAL D1 AND A REAL PIPELINE RUN.
+   *
+   * `proposal-replay.test.ts` proves the reconstruction against the serializer's own
+   * views. This proves it against the whole system: a real `/derive` call runs, its
+   * real response body is captured, the real row it wrote is read back through the
+   * real endpoint, and the two objects are compared. Every layer the payload passes
+   * through -- `JSON.stringify` into D1's TEXT column, SQLite, `JSON.parse` out,
+   * the handler, `JSON.stringify` onto the wire again -- is in the loop.
+   *
+   * If any of it were lossy, this is where it would show.
+   */
+  it("⚠ GET /api/proposals/:id rebuilds the EXACT body /derive returned", async () => {
+    const label = await proposalAccount("pr-replay");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const live = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    const res = await api("GET", `/api/proposals/${live.proposalId}`, {});
+    expect(res.status).toBe(200);
+    expect(res.body.data.replay.ok).toBe(true);
+    expect(res.body.data.replay.stage).toBe("derive");
+
+    // The whole response, field for field. Not a subset, not a spot check.
+    expect(res.body.data.replay.response).toEqual(live);
+
+    // And the two fields the brief suspected of not surviving storage, named.
+    expect(res.body.data.replay.response.derive.envelope).toBe(live.derive.envelope);
+    expect(res.body.data.replay.response.derive.duplicateKeyCheck).toBe(
+      live.derive.duplicateKeyCheck,
+    );
+  });
+
+  it("⚠ rebuilds the exact body /assess returned, too", async () => {
+    const label = await proposalAccount("pr-replay-a");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const live = await realAssess(label, f.assessModel);
+
+    const res = await api("GET", `/api/proposals/${live.proposalId}`, {});
+    expect(res.status).toBe(200);
+    expect(res.body.data.replay.stage).toBe("assess");
+    expect(res.body.data.replay.response).toEqual(live);
+    // ⚠ AND IT SAYS THE RENDERER CANNOT BE REUSED. The payload is exact; what is
+    // absent is a derivation for `ProposalView` to render, which an assessment
+    // structurally does not have.
+    expect(res.body.data.replay.fidelity.renderableByProposalView).toBe(false);
+  });
+
+  it("⚠ returns the prompt and the raw model response, which the live call never did", async () => {
+    /*
+     * The record's two extra fields, and both halves of the property: they are NOT
+     * in the replayed wire shape (that would make it a different object from the one
+     * a live run returns), and they ARE published beside it. Decision log 45's live
+     * check 2 confirmed the prompt is *"stored server-side, never returned over the
+     * wire"*; this is the one endpoint where that changes, on purpose, because
+     * reconstructing what produced an answer is the row's entire job.
+     */
+    const label = await proposalAccount("pr-recordonly");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const live = await realAssess(label, f.assessModel);
+    expect("promptText" in live.assess).toBe(false);
+
+    const res = await api("GET", `/api/proposals/${live.proposalId}`, {});
+    expect("promptText" in res.body.data.replay.response.assess).toBe(false);
+    expect("response" in res.body.data.replay.response.assess).toBe(false);
+
+    expect(typeof res.body.data.replay.recordOnly.promptText).toBe("string");
+    // The real prompt, not a placeholder: it is the exact text the fake model saw.
+    expect(res.body.data.replay.recordOnly.promptText).toBe(f.assessCalls[0]);
+    expect(res.body.data.replay.recordOnly.promptText.length).toBe(live.assess.promptChars);
+    // ⚠ BOTH `text` AND `raw`, kept separately on purpose (`serialize.ts`): the
+    // narrowing from Workers AI's output union to a string is a decision an
+    // implementation makes, and the record holds what it narrowed FROM as well as
+    // what it narrowed TO. Here the fake returns the same object for both.
+    expect(res.body.data.replay.recordOnly.response).toEqual({
+      text: assessAnswer(),
+      raw: assessAnswer(),
+    });
+  });
+
+  it("returns the record's own summary beside the replay, without the payloads", async () => {
+    const label = await proposalAccount("pr-summary");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const live = await realAssess(label, f.assessModel);
+
+    const res = await api("GET", `/api/proposals/${live.proposalId}`, {});
+    const proposal = res.body.data.proposal;
+    expect(proposal.id).toBe(live.proposalId);
+    expect(proposal.stage).toBe("assess");
+    expect(proposal.accountLabel).toBe(label);
+    expect(proposal.pair).toBe("BTCUSD");
+    expect(proposal.actor).toBe(HUMAN);
+    expect(proposal.outcome).toBeNull();
+    expect(proposal.pendingMs).toBeNull();
+    // Same shape the reject endpoint publishes, and the payloads are still absent
+    // from it -- they are on `replay`, once, rather than in two places.
+    expect("inputs" in proposal).toBe(false);
+    expect("reasoning" in proposal).toBe(false);
+  });
+
+  it("404s an unknown id and is Access-gated", async () => {
+    const missing = await api("GET", "/api/proposals/never-issued", {});
+    expect(missing.status).toBe(404);
+    expect(missing.body.error.code).toBe("unknown_proposal");
+
+    const unauthenticated = await api("GET", "/api/proposals/never-issued", { token: null });
+    expect(unauthenticated.status).toBe(401);
+    const listUnauthenticated = await api("GET", "/api/proposals", { token: null });
+    expect(listUnauthenticated.status).toBe(401);
+  });
+
+  it("⚠ reading a pending proposal leaves it pending, and writes nothing", async () => {
+    /*
+     * THE READ-ONLY GUARANTEE, checked against the real row rather than restated.
+     * Decision log 48 verified live that clicking through to a form changes no
+     * outcome; this is the same property for the history view, which is the other
+     * surface that now touches these rows.
+     */
+    const label = await proposalAccount("pr-readonly");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const live = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+    const auditBefore = await db.auditLog.count();
+
+    await api("GET", "/api/proposals", {});
+    await api("GET", `/api/proposals/${live.proposalId}`, {});
+    await api("GET", `/api/proposals/${assessData.proposalId}`, {});
+
+    for (const id of [live.proposalId, assessData.proposalId]) {
+      const row = (await db.proposals.findOne({ id }))!;
+      expect(row.outcome).toBeNull();
+      expect(row.outcome_actor).toBeNull();
+      expect(row.outcome_at).toBeNull();
+      expect(row.outcome_bot_instance_id).toBeNull();
+    }
+    // No bot, no capital movement, and not one new audit entry.
+    expect(await db.auditLog.count()).toBe(auditBefore);
+    expect(await db.botInstances.count()).toBe(0);
+  });
+
+  // -- The list endpoint -----------------------------------------------------
+
+  it("GET /api/proposals lists real rows, newest first, with a real total", async () => {
+    const label = await proposalAccount("pr-list");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    clock = T0 + MINUTE;
+    const deriveData = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+
+    const res = await api("GET", "/api/proposals", {});
+    expect(res.status).toBe(200);
+    expect(res.body.data.proposals.map((row: any) => row.id)).toEqual([
+      deriveData.proposalId,
+      assessData.proposalId,
+    ]);
+    expect(res.body.data.page).toEqual({
+      limit: 25,
+      offset: 0,
+      total: 2,
+      returned: 2,
+      hasMore: false,
+    });
+    expect(res.body.data.filters).toEqual({ accountLabel: null, stage: null, outcome: null });
+  });
+
+  it("⚠ never puts a proposal's inputs or reasoning on the list response", async () => {
+    /*
+     * THE LIST ENDPOINT'S WHOLE DESIGN, asserted on the wire. Migration 0009's third
+     * argument for a dedicated table was that `Repository.findMany` selects the full
+     * column list and every unrelated read pays for the payload -- measured at a
+     * 290,459-byte ceiling. A list built on `findMany` would have reproduced that
+     * cost inside the table that exists because of the argument.
+     */
+    const label = await proposalAccount("pr-list-size");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    await realAssess(label, f.assessModel);
+
+    const res = await api("GET", "/api/proposals", {});
+    const row = res.body.data.proposals[0];
+    expect("inputs" in row).toBe(false);
+    expect("reasoning" in row).toBe(false);
+    expect("inputs_json" in row).toBe(false);
+    expect("reasoning_json" in row).toBe(false);
+    expect("promptText" in row).toBe(false);
+    // Positively: the row IS the same shape a single record's summary takes, so the
+    // list and the detail page cannot disagree about what a proposal is.
+    const one = await api("GET", `/api/proposals/${row.id}`, {});
+    expect(row).toEqual(one.body.data.proposal);
+  });
+
+  it("⚠ PROPOSAL_LIST_COLUMNS is every column except the two payloads", () => {
+    /*
+     * The drift guard. A column added to `proposals` later must be either listed or
+     * deliberately excluded, and this is where that decision gets made rather than
+     * being made by omission -- `schema.test.ts`'s literal-table-list rule, applied
+     * to a projection.
+     */
+    expect([...PROPOSAL_LIST_COLUMNS, ...PROPOSAL_PAYLOAD_COLUMNS].sort()).toEqual(
+      Object.keys(proposals.columns).sort(),
+    );
+    expect(PROPOSAL_PAYLOAD_COLUMNS).toEqual(["inputs_json", "reasoning_json"]);
+  });
+
+  it("filters by accountLabel, stage and outcome against real rows", async () => {
+    const label = await proposalAccount("pr-filter-a");
+    const other = await proposalAccount("pr-filter-b");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const assessData = await realAssess(label, f.assessModel);
+    const deriveData = await realDerive(label, resubmissionFrom(assessData.assess), f.deriveModel);
+    const otherAssess = await realAssess(other, f.assessModel);
+    await api("POST", `/api/proposals/${assessData.proposalId}/reject`, { body: { note: "no" } });
+
+    const byAccount = await api("GET", `/api/proposals?accountLabel=${label}`, {});
+    expect(byAccount.body.data.proposals.map((row: any) => row.id).sort()).toEqual(
+      [assessData.proposalId, deriveData.proposalId].sort(),
+    );
+    expect(byAccount.body.data.page.total).toBe(2);
+
+    const byStage = await api("GET", "/api/proposals?stage=derive", {});
+    expect(byStage.body.data.proposals.map((row: any) => row.id)).toEqual([deriveData.proposalId]);
+
+    const rejected = await api("GET", "/api/proposals?outcome=rejected", {});
+    expect(rejected.body.data.proposals.map((row: any) => row.id)).toEqual([
+      assessData.proposalId,
+    ]);
+
+    // ⚠ THE FILTER 21.5 EXISTS FOR: the ones nobody acted on. `pending` is not a
+    // stored value -- it is `outcome IS NULL`, read after the fact.
+    const pending = await api("GET", "/api/proposals?outcome=pending", {});
+    expect(pending.body.data.proposals.map((row: any) => row.id).sort()).toEqual(
+      [deriveData.proposalId, otherAssess.proposalId].sort(),
+    );
+    expect(pending.body.data.filters.outcome).toBe("pending");
+
+    // Combined, and the echo describes what was ANSWERED rather than what the URL said.
+    const both = await api("GET", `/api/proposals?accountLabel=${label}&outcome=pending`, {});
+    expect(both.body.data.proposals.map((row: any) => row.id)).toEqual([deriveData.proposalId]);
+    expect(both.body.data.filters).toEqual({
+      accountLabel: label,
+      stage: null,
+      outcome: "pending",
+    });
+  });
+
+  it("⚠ pages without repeating or skipping a row, even when two share a timestamp", async () => {
+    /*
+     * THE PAGING BUG THAT LOOKS LIKE DATA LOSS. `/assess` and `/derive` can write
+     * two rows in the same millisecond, and `created_at` alone is not a total order.
+     * Under LIMIT/OFFSET an unstable sort does not merely reorder -- a row can
+     * appear on two consecutive pages while another appears on neither. The tie
+     * break on `id` is what makes the order total; this drives it with the clock
+     * held still so every row shares one `created_at`.
+     */
+    const label = await proposalAccount("pr-paging");
+    const f = fakes(assessAnswer(), deriveAnswer());
+    const ids: string[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      ids.push((await realAssess(label, f.assessModel)).proposalId);
+    }
+    expect(new Set((await db.proposals.findMany({})).map((row) => row.created_at)).size).toBe(1);
+
+    const seen: string[] = [];
+    for (let offset = 0; offset < 5; offset += 2) {
+      const page = await api("GET", `/api/proposals?limit=2&offset=${offset}`, {});
+      expect(page.body.data.page.total).toBe(5);
+      seen.push(...page.body.data.proposals.map((row: any) => row.id));
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen).size).toBe(5);
+    expect([...seen].sort()).toEqual([...ids].sort());
+
+    // And the last page reports that it is the last one.
+    const last = await api("GET", "/api/proposals?limit=2&offset=4", {});
+    expect(last.body.data.page).toEqual({
+      limit: 2,
+      offset: 4,
+      total: 5,
+      returned: 1,
+      hasMore: false,
+    });
+    const past = await api("GET", "/api/proposals?limit=2&offset=99", {});
+    expect(past.body.data.proposals).toEqual([]);
+    expect(past.body.data.page.total).toBe(5);
+    expect(past.body.data.page.hasMore).toBe(false);
+  });
+
+  it("400s a bad filter or a bad page rather than guessing", async () => {
+    for (const query of [
+      "stage=gather",
+      "outcome=ignored",
+      "accountLabel=",
+      "limit=0",
+      "limit=101",
+      "limit=-1",
+      "limit=1.5",
+      "offset=-1",
+    ]) {
+      const res = await api("GET", `/api/proposals?${query}`, {});
+      expect(res.status, `${query} was not refused`).toBe(400);
+      expect(res.body.error.code).toBe("invalid_filter");
+    }
+  });
+
+  it("an account with no proposals is an empty page, not an error", async () => {
+    // The deliberate divergence from `listWatchlist`: section 8.7 keeps every row
+    // forever and an account can be de-registered, so a label this registry does not
+    // know must still be a query rather than a 404.
+    const res = await api("GET", "/api/proposals?accountLabel=retired-last-year", {});
+    expect(res.status).toBe(200);
+    expect(res.body.data.proposals).toEqual([]);
+    expect(res.body.data.page.total).toBe(0);
   });
 });

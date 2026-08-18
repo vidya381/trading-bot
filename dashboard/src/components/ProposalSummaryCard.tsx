@@ -152,7 +152,29 @@ function HeadlineNumbers({ summary }: { summary: ProposalSummary }) {
   );
 }
 
-export function ProposalSummaryCard({ derive }: { derive: DeriveResponse }) {
+export function ProposalSummaryCard({
+  derive,
+  offerCreateBot = true,
+}: {
+  derive: DeriveResponse;
+  /**
+   * ⚠ FALSE ON THE PROPOSAL HISTORY VIEW, AND ON NOTHING ELSE.
+   *
+   * A historical record is a thing that already happened. The path from a proposal
+   * to a bot exists once, through a LIVE proposal, and decision log 48 built it
+   * with four constraints attached; a second entry point from a history page would
+   * be a second place that copy lives and drifts, which is the exact fault the
+   * relocation guard in `proposal-summary-card.test.ts` exists to catch.
+   *
+   * ⚠ IT SUPPRESSES AN AFFORDANCE, NOT A GUARANTEE. Nothing about "navigation does
+   * not approve" depends on this flag — `prefill-does-not-approve.test.ts` still
+   * holds in both directions, `createBot` is still called in exactly one place, and
+   * `proposals.outcome` still moves off NULL in exactly two places on the backend.
+   * What this decides is whether a control is on screen, and the history page's own
+   * copy says why it is not.
+   */
+  offerCreateBot?: boolean;
+}) {
   const now = useNow();
   const summary = summarize(derive, now);
   const candidate = derive.bundle.candidate;
@@ -195,7 +217,7 @@ export function ProposalSummaryCard({ derive }: { derive: DeriveResponse }) {
          * guarantee are properties of the component and of `proposalPrefill.ts`,
          * not of its position, and the component itself is imported unmodified.
          */}
-        <ProposalCreateBotLink derive={derive} />
+        {offerCreateBot && <ProposalCreateBotLink derive={derive} />}
       </div>
 
       <p className="border-t border-zinc-800 bg-zinc-950/40 px-4 py-2.5 text-xs text-zinc-500">

@@ -34,10 +34,14 @@ import {
   deriveProposalInputsView,
   deriveProposalReasoningView,
   deriveResultView,
+  proposalListEntryView,
   proposalRecordView,
   resubmittedAssessmentView,
+  PROPOSAL_LIST_COLUMNS,
   type BotFees,
 } from "./serialize";
+import { replayProposal } from "./proposal-replay";
+import { parseProposalQuery, proposalListWhere, proposalPage } from "./proposal-query";
 import {
   addToWatchlist,
   checkSpotInstrument,
@@ -62,6 +66,7 @@ import {
   checkProposalCanTakeOutcome,
   logAssessProposal,
   logDeriveProposal,
+  proposalRecordOf,
   recordProposalApproval,
   rejectProposal,
   type AssessResult,
@@ -2351,6 +2356,169 @@ export async function rejectProposalEntry(ctx: ApiContext): Promise<Response> {
     note: optionalString(body, "note"),
   });
   return ok({ proposal: proposalRecordView(record) });
+}
+
+/**
+ * `GET /api/proposals` -- the permanent record, read (21.5 requirement 5).
+ *
+ * ── WHAT THIS CLOSES ──
+ *
+ * Decision logs 46, 48 and 49 each carried the same item, and 46 stated its shape
+ * correctly: *"it reads like a missing feature and is actually a missing READ.
+ * Entry 45 built the `proposals` table with everything required... What is missing
+ * is a UI that reads it. Nothing needs designing at the storage layer."* This is
+ * that read. No migration, no new column, no new write path: `proposal-log.ts` is
+ * still the table's only writer, and this endpoint is the first reader that is not
+ * a check on whether a row can take an outcome.
+ *
+ * ── ⚠ IT NEVER READS `inputs_json` OR `reasoning_json`, AND THAT IS THE DESIGN ──
+ *
+ * `PROPOSAL_LIST_COLUMNS` is handed to `Repository.findManyProjected`, so a page of
+ * history reads sixteen short columns and not one candle. Migration 0009's THIRD
+ * argument for giving proposals their own table was that `Repository.findMany`
+ * always selects the full column list, so every unrelated read would pay for the
+ * payload -- measured at a 290,459-byte ceiling. A list endpoint over this table
+ * built on `findMany` would have reproduced, inside the table that exists because
+ * of that argument, the exact cost the argument was about: a 25-row page could read
+ * megabytes to render a table of short strings, and 100 rows could approach D1's
+ * documented per-row limit a hundred times over. The projection was added to
+ * /src/db for this and is a narrower READ, which is the one direction section 8.7's
+ * retention promise does not constrain.
+ *
+ * ── READ-ONLY, AND STRUCTURALLY SO ──
+ *
+ * `GET`, one `findManyProjected` and one `COUNT(*)`. It writes no row, no
+ * `audit_log` entry and no outcome; `proposals.outcome` still moves off NULL in
+ * exactly two places in this system (`recordProposalApproval` from
+ * `POST /api/bots`, `rejectProposal` from `POST /api/proposals/:id/reject`), and
+ * neither is reachable from here.
+ *
+ * ── THE FILTERS ──
+ *
+ * `accountLabel`, `stage`, `outcome`, `limit`, `offset` -- all optional, all parsed
+ * by `parseProposalQuery`, which owns every bound and every refusal and is unit
+ * tested there rather than through this handler. `outcome=pending` is the one that
+ * is not a column value: it is `outcome IS NULL`, 21.5's "ignored" read after the
+ * fact, and the reason `idx_proposals_unresolved` exists.
+ *
+ * ⚠ NEWEST FIRST, AND `id` BREAKS THE TIE. `created_at` alone is not a total order
+ * -- `/assess` and `/derive` write two rows that can share a millisecond, and
+ * `proposal-log.test.ts` drives an injected clock that makes ties routine. Under
+ * LIMIT/OFFSET an unstable sort does not merely reorder: a row can appear on two
+ * consecutive pages while another appears on neither, which is a paging bug that
+ * looks like data loss. `idx_proposals_created` and `idx_proposals_account_created`
+ * cover the leading column.
+ */
+export async function listProposals(ctx: ApiContext): Promise<Response> {
+  const parsed = parseProposalQuery(ctx.url.searchParams);
+  if (!parsed.ok) throw badRequest(parsed.code, parsed.message);
+  const query = parsed.query;
+  const where = proposalListWhere(query);
+
+  const rows = await ctx.db.proposals.findManyProjected(PROPOSAL_LIST_COLUMNS, {
+    where,
+    orderBy: [
+      { column: "created_at", direction: "desc" },
+      { column: "id", direction: "desc" },
+    ],
+    limit: query.limit,
+    offset: query.offset,
+  });
+  const total = await ctx.db.proposals.count(where);
+
+  return ok({
+    proposals: rows.map(proposalListEntryView),
+    page: proposalPage(query, total, rows.length),
+    /**
+     * The filters ACTUALLY APPLIED, echoed. A page that renders its own URL's
+     * filters is describing what it asked for; this describes what was answered,
+     * which is the difference that shows up the day a parameter is dropped.
+     */
+    filters: {
+      accountLabel: query.accountLabel,
+      stage: query.stage,
+      outcome: query.outcome,
+    },
+  });
+}
+
+/**
+ * `GET /api/proposals/:id` -- one whole record, rebuilt into the shape the live
+ * endpoint returned.
+ *
+ * ── ⚠ THE RECONSTRUCTION IS EXACT, AND THAT WAS TRACED RATHER THAN HOPED ──
+ *
+ * `replay.response` is the object `GET /api/accounts/:label/derive` (or `/assess`)
+ * really returned for this proposal, field for field, because the handler that
+ * wrote the row stored the very object it put on the wire -- `serialize.ts` argues
+ * that arrangement and `proposal-replay.ts`'s header traces it. `envelope`,
+ * `duplicateKeyCheck`, `settings`, `latencyMs`, `promptChars` and `promptVersion`
+ * are all in `reasoning_json`, because the reasoning view SPREADS the response
+ * view. So the dashboard hands `replay.response` to the unchanged `ProposalView`
+ * and a proposal from last week renders exactly as one from thirty seconds ago.
+ *
+ * ── THE TWO FIELDS THE RECORD HAS THAT THE WIRE NEVER DID ──
+ *
+ * `promptText` and the raw transport `response` are cut OUT of `replay.response`
+ * -- "the same shape" has to mean the same shape -- and published beside it in
+ * `recordOnly`. Withholding them would be the summarization section 8.7 forbids,
+ * from the one endpoint that reads the record they exist for.
+ *
+ * ⚠ THAT MAKES THIS A LARGE RESPONSE, and it is the only endpoint here that is.
+ * A `derive` record carries the full candle window plus a ~23 KB prompt. It is a
+ * deliberate single-record read, never a list, and `GET /api/proposals` exists
+ * precisely so nothing has to pay this cost to browse.
+ *
+ * ── WHAT A HISTORICAL RECORD CANNOT SHOW, PUBLISHED AS DATA ──
+ *
+ * `replay.fidelity` says so on the wire rather than leaving a reader to infer it:
+ *
+ *   * `assessResponseUnavailable` is ALWAYS true for a derive record. Nothing links
+ *     a derive row to the assess row it derives from (migration 0009 records that
+ *     as a decision), so Stage 2's own evidence table and the two-gather drift
+ *     comparison cannot be rendered. `ProposalView` already supports that state --
+ *     it is what a reviewer holding only the derive response has always seen.
+ *   * `renderableByProposalView` is false for an ASSESS record, and that is
+ *     structural rather than a storage gap: `ProposalView` is built around a
+ *     derivation's parameters, and an assessment has none. Its payload is rebuilt
+ *     exactly; what cannot be reused is the renderer.
+ *
+ * ── READ-ONLY ──
+ *
+ * `unknown_proposal` (404) is the only refusal, and it is already in `envelope.ts`'s
+ * table with its reasoning. Nothing here writes, and in particular nothing here
+ * touches `outcome`: reading a pending proposal leaves it pending, which is the
+ * property decision log 48 verified live at 1m59s against the real database.
+ */
+export async function getProposal(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const row = await ctx.db.proposals.findOne({ id });
+  if (row === null) {
+    // The same code and the same status `checkProposalCanTakeOutcome` raises, and
+    // the same sentence it uses: section 8.7 means no id was ever deleted, so a
+    // 404 here really does mean the id was never issued.
+    throw notFound(
+      "unknown_proposal",
+      `no proposal with id ${JSON.stringify(id)}. Proposal ids come from the "proposalId" ` +
+        `field a real /assess or /derive response carries; there is no way to mint one, and ` +
+        `section 8.7 means none has ever been deleted.`,
+    );
+  }
+
+  const record = proposalRecordOf(row);
+  const replay = replayProposal(record);
+
+  return ok({
+    proposal: proposalRecordView(record),
+    /**
+     * ⚠ A REFUSED REPLAY IS REPORTED, NOT SWALLOWED, and the record still comes
+     * back beside it. A row whose payload cannot be rebuilt is a real finding
+     * about a permanent record, and the id, actor, model, timestamps and outcome
+     * are all still true and still worth showing -- so the endpoint reports which
+     * fields are missing rather than 500ing and taking the readable half with it.
+     */
+    replay,
+  });
 }
 
 // ---------------------------------------------------------------------------

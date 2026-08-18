@@ -58,7 +58,21 @@ function EvidenceRow({ item, cited }: { item: EvidenceItem; cited: boolean }) {
   );
 }
 
-function EvidenceTable({
+/**
+ * ⚠ EXPORTED, so the Stage 2 record view can render the SAME table.
+ *
+ * A historical `assess` record has an evidence set and a cited subset exactly as a
+ * derivation does, and the one fact that matters about it — the DIFFERENCE between
+ * offered and cited — is computed here and printed above the toggle. Copying this
+ * component for the assess-only view would be a second place that count is computed
+ * and a second place the collapse rule can drift from
+ * `proposal-summary-card.test.ts`'s guard, which is the "copy that drifts is the one
+ * nobody is watching" fault this project refuses everywhere else.
+ *
+ * Its parent `ProposalEvidence` still owns the two-gather drift comparison, which is
+ * genuinely about having two responses and has nothing to render for one.
+ */
+export function EvidenceTable({
   evidence,
   cited,
 }: {

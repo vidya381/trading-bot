@@ -107,10 +107,35 @@ function ProvenanceLine({ derive }: { derive: DeriveResponse }) {
 export function ProposalView({
   derive,
   assess,
+  offerCreateBot = true,
 }: {
   derive: DeriveResponse;
-  /** The original Stage 2 response, when the reviewer still has it. Optional. */
+  /**
+   * The original Stage 2 response, when the reviewer still has it. Optional.
+   *
+   * ⚠ IT IS NEVER AVAILABLE FOR A HISTORICAL PROPOSAL, and that is a recorded
+   * decision rather than a gap in the record. Migration 0009: a `derive` row does
+   * NOT carry the id of the `assess` row it derives from, because nothing in the
+   * request carries that link and an `assessProposalId` taken from the caller would
+   * be a client-asserted claim this system cannot verify. So `/proposals/:id`
+   * renders with `assess={null}` — which is not a degraded mode invented for
+   * history, it is the state this component has supported since step 44 and the one
+   * a reviewer who pasted only the derive response has always seen. What is absent
+   * is Stage 2's own evidence table and the two-gather drift comparison; the full
+   * Stage 3 proposal is entirely present.
+   */
   assess?: AssessResponse | null;
+  /**
+   * Whether to offer the create-bot link. ⚠ FALSE ONLY ON THE HISTORY VIEW.
+   *
+   * The path from a proposal to a bot exists once, through a LIVE proposal, built
+   * to decision log 46's four constraints. A history page is a record of what
+   * happened, and a second entry point into that flow would be a second place its
+   * copy — the text that stops a human mistaking a prefill for an approval — lives
+   * and drifts. It suppresses an AFFORDANCE, never a guarantee:
+   * `prefill-does-not-approve.test.ts` holds identically either way.
+   */
+  offerCreateBot?: boolean;
 }) {
   const assessResponse = assess ?? null;
   const freshness = freshnessOf(derive);
@@ -166,11 +191,30 @@ export function ProposalView({
         <ProvenanceLine derive={derive} />
         <p className="mt-3 border-t border-zinc-800 pt-3 text-xs text-zinc-400">
           <strong className="text-zinc-200">This is a proposal, not a bot.</strong> Nothing here has
-          created, started or modified anything, and no capital has been reserved. To act on it, go
-          to the create-bot form — it runs every check it always runs. The link in the summary card
-          below opens that form with these values already in it; it is a starting point you can
-          edit, not an approval, and there is deliberately no approve button anywhere on this page
-          (spec 21.1).
+          created, started or modified anything, and no capital has been reserved.{" "}
+          {offerCreateBot ? (
+            <>
+              To act on it, go to the create-bot form — it runs every check it always runs. The link
+              in the summary card below opens that form with these values already in it; it is a
+              starting point you can edit, not an approval, and there is deliberately no approve
+              button anywhere on this page (spec 21.1).
+            </>
+          ) : (
+            /*
+             * ⚠ THE HISTORY VIEW'S OWN SENTENCE, and it is not the live one with a
+             * clause deleted. A reader arriving at a record from last week needs a
+             * different true statement: the proposal was made then, this is what it
+             * said, and the way to act on a proposal is to have a live one. Leaving
+             * the live copy in place would point at a link that is not on the page.
+             */
+            <>
+              This is a <strong className="text-zinc-200">record of a past proposal</strong>,
+              rebuilt from the permanent log. Its outcome — recorded or not — is stated above the
+              proposal, and this view cannot change it. There is deliberately no create-bot link
+              here: the path from a proposal to a bot runs through a live proposal and its own
+              form, which runs every check it always runs (spec 21.1).
+            </>
+          )}
         </p>
       </header>
 
@@ -206,7 +250,7 @@ export function ProposalView({
        * throws must cost a reviewer the card, not the proposal.
        */}
       <ErrorBoundary where="The summary card">
-        <ProposalSummaryCard derive={derive} />
+        <ProposalSummaryCard derive={derive} offerCreateBot={offerCreateBot} />
       </ErrorBoundary>
 
       {/*
@@ -281,16 +325,33 @@ export function ProposalView({
           . Nothing is retained indefinitely by accident — section 8.7 keeps it on purpose, and
           there is no delete path.
         </p>
-        <p>
-          <strong className="text-zinc-400">The outcome is still unrecorded.</strong> Creating a bot
-          through the link in the summary card carries <code>proposalId</code> in the{" "}
-          <code>POST /api/bots</code> body for you, so the record says a human acted on it — but
-          only on a real, completed creation. If you decide against it, post to{" "}
-          <code>/api/proposals/{derive.proposalId}/reject</code>. A proposal nobody records a
-          decision on counts as ignored, which is exactly the signal requirement 5 exists to
-          measure. <strong className="text-zinc-400">This page itself stores nothing</strong> — if
-          you close the tab this rendering is gone, though the record is not.
-        </p>
+        {offerCreateBot ? (
+          <p>
+            <strong className="text-zinc-400">The outcome is still unrecorded.</strong> Creating a
+            bot through the link in the summary card carries <code>proposalId</code> in the{" "}
+            <code>POST /api/bots</code> body for you, so the record says a human acted on it — but
+            only on a real, completed creation. If you decide against it, post to{" "}
+            <code>/api/proposals/{derive.proposalId}/reject</code>. A proposal nobody records a
+            decision on counts as ignored, which is exactly the signal requirement 5 exists to
+            measure. <strong className="text-zinc-400">This page itself stores nothing</strong> — if
+            you close the tab this rendering is gone, though the record is not.
+          </p>
+        ) : (
+          /*
+           * ⚠ THE HISTORY VIEW MUST NOT SAY "THE OUTCOME IS STILL UNRECORDED", because
+           * for a resolved record that is simply false, and it is the one sentence on
+           * this page a reader would act on. The outcome is a fact the record holds and
+           * the page above prints it; this footer says only what is true of the RENDERING.
+           */
+          <p>
+            <strong className="text-zinc-400">This view changes nothing.</strong> It is a read of{" "}
+            <code>GET /api/proposals/{derive.proposalId}</code>, which writes no row, no{" "}
+            <code>audit_log</code> entry and no outcome. A proposal&rsquo;s outcome moves off{" "}
+            <code>null</code> in exactly two places in this system — a real completed bot creation,
+            and <code>POST /api/proposals/{derive.proposalId}/reject</code> — and neither is
+            reachable from here.
+          </p>
+        )}
         {/*
          * ⚠ THE CREATE-BOT LINK USED TO BE HERE, LAST, AND IS NOW IN THE SUMMARY
          * CARD AT THE TOP. The comment that stood here argued the old position:
