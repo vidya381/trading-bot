@@ -51,8 +51,9 @@ const scheduled: ExportedHandlerScheduledHandler<Env> = async (controller, env, 
  * Two surfaces:
  *   - `/health` (and its `/api/health` alias): the unauthenticated version and
  *     environment probe (sections 16, 11.3). Kept OUTSIDE the Access-verified
- *     API so a deploy can be confirmed without a session, and left byte-for-byte
- *     unchanged from the placeholder step so its contract does not move.
+ *     API, and left byte-for-byte unchanged from the placeholder step so its
+ *     contract does not move. It does NOT confirm which build is deployed --
+ *     what it certifies and what it cannot is spelled out at the handler below.
  *   - `/api/*`: the dashboard API (build step 10), each request verified against
  *     Cloudflare Access's JWT before any handler runs. See /src/api.
  *
@@ -65,11 +66,21 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health" || url.pathname === "/api/health") {
-      // Spec section 16: a deployed version must always be confirmable against
-      // what is actually running. Spec section 11.3: the environment must be
-      // confirmable programmatically, not just from the dashboard banner.
-      // Unauthenticated on purpose -- post-deploy verification (section 16.1
-      // step 6) reads this without a dashboard session.
+      // WHAT THIS CERTIFIES: the route is live, and which environment's
+      // bindings are in scope. `environment` is read from the binding, so it is
+      // produced by the deployment rather than copied into it (section 11.3:
+      // the environment must be confirmable programmatically, not just from the
+      // dashboard banner).
+      //
+      // WHAT IT DOES NOT CERTIFY: which build is running. `version` is a static
+      // import of package.json's literal, inlined at bundle time and unchanged
+      // at 0.1.0 since the first commit, so it reads identically for every build
+      // ever deployed. Section 16's "a deployed version must always be
+      // confirmable against what is actually running" is NOT satisfied by this
+      // field. Build identity lives in Cloudflare's per-deploy version id
+      // (`wrangler deployments list`) -- minted by the platform per upload,
+      // not restated by the artifact under examination.
+      // Unauthenticated on purpose -- readable without a dashboard session.
       return Response.json({
         status: "ok",
         version,
