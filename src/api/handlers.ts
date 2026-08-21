@@ -17,6 +17,7 @@
 import { ApiError, badRequest, notFound, ok, statusForCode } from "./envelope";
 import type { ApiContext } from "./router";
 import {
+  accountCapitalView,
   alertView,
   botDetail,
   botSummary,
@@ -61,6 +62,8 @@ import {
   deriveParameters,
   gatherDeriveContext,
   parseResubmittedAssessment,
+  readAccountCapital,
+  ResearchCapitalError,
   selectNamedCandidate,
   selectWatchlistCandidates,
   checkProposalCanTakeOutcome,
@@ -1324,23 +1327,94 @@ export async function unarchiveBot(ctx: ApiContext): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 /**
- * GET /api/accounts -- every registered account and its exchange.
+ * One account's `capital_ledger` headroom, or null if the ledger could not be
+ * read.
  *
- * The registry the dashboard's future create-bot dropdown reads: a real list of
+ * NULL MEANS "UNREADABLE", NEVER "EMPTY". An account nobody has seeded has no
+ * ledger rows at all and gets `{ rowsRead: 0, assets: [] }` -- a real, common
+ * state (`ledger.ts` creates no row automatically), and a different fact from a
+ * D1 failure. Collapsing the two would tell a human "this account can fund
+ * nothing" about a read that never happened, which is section 5.6's rule and
+ * the exact distinction `readAccountCapital` refuses to blur.
+ *
+ * The failure is swallowed rather than surfaced as a 502 because THIS ENDPOINT
+ * IS THE CREATE-BOT FORM'S ACCOUNT DROPDOWN. An unreadable ledger is a reason
+ * to withhold one display figure; it is not a reason to take bot creation
+ * offline. Only `ResearchCapitalError` is caught -- anything else is a bug in
+ * this layer and still escapes.
+ */
+async function accountCapitalOrNull(ctx: ApiContext, accountLabel: string) {
+  try {
+    return accountCapitalView(await readAccountCapital(ctx.db, accountLabel, ctx.now));
+  } catch (cause) {
+    if (cause instanceof ResearchCapitalError) return null;
+    throw cause;
+  }
+}
+
+/**
+ * GET /api/accounts -- every registered account, its exchange, and its
+ * `capital_ledger` headroom per asset.
+ *
+ * The registry the dashboard's create-bot dropdown reads: a real list of
  * accounts to choose from, each with the venue it trades on. Ordered by label so
  * the dropdown is stable.
+ *
+ * THE CAPITAL BLOCK IS READ-ONLY DISPLAY, and it reuses `readAccountCapital`
+ * (`src/research/capital.ts`) rather than restating its arithmetic: that module
+ * already performs exactly this read, already documents why `available` may be
+ * negative, and -- as its header says in the plainest terms it has -- "writes no
+ * row, takes no reservation, touches no `total_allocated`, and holds no lock".
+ * Nothing here allocates, reserves or checks anything.
+ *
+ * `available = total_balance - total_allocated` is NOT a new calculation. It is
+ * the same subtraction `createBotInstanceWithCapital` performs as its binding
+ * gate, so the figure published here is precisely the one that decides whether a
+ * new bot can be created -- which is what makes it worth showing rather than
+ * making a human do it by hand.
+ *
+ * ⚠ TWO WAYS THIS FIGURE IS MOMENTARILY IMPRECISE, IN OPPOSITE DIRECTIONS.
+ * Neither is a bug, and neither changes the formula; both are properties of what
+ * the two columns MEAN. A future reader who finds the number slightly off should
+ * read these before going looking for an arithmetic error.
+ *
+ *   A. IT CAN OVERSTATE. `reconcileBalances` folds `manual_adjustments` into
+ *      `total_balance` only when it consumes them (it queries
+ *      `reconciled_at: null` and marks them in the same batch). A withdrawal
+ *      logged through `POST /api/manual-adjustments` is therefore invisible here
+ *      until the next reconciliation run, and headroom reads high until then.
+ *
+ *   B. IT CAN UNDERSTATE. Reconciliation writes `total_balance` as the
+ *      exchange's `free + locked` FOR THIS ASSET. Once a bot spends quote
+ *      currency on inventory, that cash has left `total_balance` while the bot's
+ *      full reservation still sits in `total_allocated` -- so the deployed
+ *      portion is subtracted twice, and headroom reads low by that amount.
+ *
+ * The subtraction is per (account, asset) and is never summed across either: a
+ * bot draws from one `capital_ledger` row, so a total spanning two accounts
+ * would be a number nothing can spend.
+ *
+ * ONE LEDGER READ PER ACCOUNT, sequentially. `readAccountCapital` filters by
+ * `account_label`, and the alternative -- one unfiltered `findMany` grouped here
+ * -- would be this layer restating the read that module owns, which is the
+ * duplication being avoided. The account registry is human-sized (section 4.4),
+ * so the cost is bounded by how many accounts a person has registered.
  */
 export async function listAccounts(ctx: ApiContext): Promise<Response> {
   const rows = await ctx.db.accounts.findMany({
     orderBy: [{ column: "account_label", direction: "asc" }],
   });
-  return ok(
-    rows.map((row) => ({
+
+  const views = [];
+  for (const row of rows) {
+    views.push({
       accountLabel: row.account_label,
       exchange: row.exchange,
       createdAt: row.created_at,
-    })),
-  );
+      capital: await accountCapitalOrNull(ctx, row.account_label),
+    });
+  }
+  return ok(views);
 }
 
 /**

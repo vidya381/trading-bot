@@ -7,10 +7,10 @@
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { fetchAlerts, fetchBots } from "../api/client";
+import { fetchAccounts, fetchAlerts, fetchBots } from "../api/client";
 import { usePolling } from "../api/usePolling";
 import { useKillSwitchStatus } from "../api/killSwitchStatus";
-import type { Alert, Bot } from "../api/types";
+import type { Account, Alert, Bot } from "../api/types";
 import { StatusStrip } from "../components/StatusStrip";
 import { BotList } from "../components/BotList";
 import { formatTime } from "../format";
@@ -87,6 +87,24 @@ export function Dashboard() {
    * never blanks another.
    */
   const killSwitchPoll = useKillSwitchStatus();
+  /*
+   * The account registry and its `capital_ledger` headroom, feeding the stat
+   * row's AVAILABLE tiles.
+   *
+   * A SEPARATE POLL and not a field on `/api/bots`, because free capital is by
+   * definition capital no bot holds -- there is no row in the bot list that
+   * could carry it, and an account with no bots at all still has headroom worth
+   * showing. Independent in the way that matters on this page: it keeps its
+   * last-good data through a blip, and a failure here never blanks the bot
+   * table or the counts.
+   *
+   * Plain `usePolling` on the shared 5-second interval, the same mechanism
+   * `bots` and `alerts` use -- no second timer and no polling machinery of its
+   * own. It therefore also inherits usePolling's known slow-response staleness
+   * behaviour (decision log 54) exactly as the two existing polls do; that is
+   * pre-existing and untouched here.
+   */
+  const accountsPoll = usePolling<Account[]>(fetchAccounts);
 
   const [showArchived, setShowArchived] = useState(false);
 
@@ -196,6 +214,7 @@ export function Dashboard() {
         bots={botsPoll.data}
         alerts={alertsPoll.data}
         killSwitch={killSwitchPoll.data}
+        accounts={accountsPoll.data}
       />
 
       {firstLoad ? (

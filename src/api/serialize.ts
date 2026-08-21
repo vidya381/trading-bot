@@ -60,6 +60,7 @@ import type {
   EvidenceItem,
   GatheredInput,
   NewsInput,
+  AccountCapital,
   ParsedAssessment,
   ProposalRecord,
   WatchlistEntry,
@@ -417,6 +418,38 @@ export function concentrationResultView(result: ConcentrationResult) {
  */
 export function accountExposureView(exposure: AccountExposure) {
   return jsonSafe(exposure);
+}
+
+/**
+ * One account's `capital_ledger` headroom, for `GET /api/accounts`.
+ *
+ * `accountLabel` is deliberately DROPPED: this rides inside the account object
+ * that already names it, and a second copy is a second thing that can disagree.
+ * Everything else is published as `readAccountCapital` produced it.
+ *
+ * `jsonSafe` for `accountExposureView`'s reason, one row stronger: every
+ * `AssetHeadroom` carries THREE raw `Money` bigints (`totalBalance`,
+ * `totalAllocated`, `available`), so a hand-written field list here is three
+ * chances per asset to ship a `TypeError: Do not know how to serialize a BigInt`
+ * on an endpoint the create-bot form cannot load without.
+ *
+ * ⚠ `available` MAY BE NEGATIVE and is published unclamped. Migration 0001 has
+ * no `CHECK (total_allocated <= total_balance)` on purpose -- a losing bot
+ * legitimately leaves an account allocated beyond its balance -- and
+ * `AssetHeadroom` says why hiding it would be wrong: clamping "would hide an
+ * over-allocated account from the one report a human reads before allocating
+ * more". The dashboard renders that case in amber rather than dropping it.
+ *
+ * See `listAccounts` in handlers.ts for the two ways this figure is momentarily
+ * imprecise (unreconciled manual adjustments; capital already deployed into
+ * inventory) without the subtraction being wrong.
+ */
+export function accountCapitalView(capital: AccountCapital) {
+  return jsonSafe({
+    readAt: capital.readAt,
+    rowsRead: capital.rowsRead,
+    assets: capital.assets,
+  });
 }
 
 /**

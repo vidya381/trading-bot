@@ -23,6 +23,8 @@
 import type { ReactNode } from "react";
 import type { AssetTotals } from "../accountTotals";
 import { gapSummary } from "../accountTotals";
+import type { AvailableCapital, AvailableCard } from "../availableCapital";
+import { assetsWithoutTotals, cardsForAsset } from "../availableCapital";
 import { formatMoney, signOf } from "../format";
 import { Unit } from "./Unit";
 
@@ -79,7 +81,43 @@ function Unknown() {
   return <span className="text-zinc-600">—</span>;
 }
 
-function AssetStrip({ totals, showHeading }: { totals: AssetTotals; showHeading: boolean }) {
+/**
+ * One AVAILABLE tile: `capital_ledger`'s `total_balance - total_allocated` for a
+ * single (account, asset).
+ *
+ * The SAME `Tile` and the SAME label/value/hint arrangement as every figure
+ * beside it -- this introduces no visual pattern of its own. Everything it shows
+ * was decided in `availableCapital.ts`, including its label and both hint
+ * sentences, so this function chooses nothing except the colour.
+ *
+ * NEGATIVE RENDERS AMBER, NOT RED, and is never clamped. Exactly the IDLE tile's
+ * treatment and for its stated reason: red reads as "a loss" everywhere else on
+ * this dashboard and this is not one. An over-allocated account wants attention,
+ * not alarm -- and hiding it would suppress the single figure that reveals real
+ * drift between the ledger and the bots.
+ */
+function AvailableTile({ card }: { card: AvailableCard }) {
+  return (
+    <Tile label={card.label} hint={card.hint}>
+      <span className={card.overAllocated ? "text-amber-300" : undefined}>
+        {formatMoney(card.value)}
+        <Unit>{card.asset}</Unit>
+      </span>
+    </Tile>
+  );
+}
+
+function AssetStrip({
+  totals,
+  showHeading,
+  available,
+}: {
+  totals: AssetTotals;
+  showHeading: boolean;
+  /** This asset's AVAILABLE tiles, already ordered. Empty when the ledger has
+   *  no row for it -- which is not an error, and renders as no tile. */
+  available: readonly AvailableCard[];
+}) {
   const gaps = gapSummary(totals.gaps);
   const asset = totals.capitalAsset;
 
@@ -107,6 +145,21 @@ function AssetStrip({ totals, showHeading }: { totals: AssetTotals; showHeading:
         <Tile label="Allocated" hint="committed; excludes stopped">
           <Money value={totals.allocated} asset={asset} />
         </Tile>
+        {/*
+         * AVAILABLE sits immediately beside ALLOCATED, because the two are the
+         * question and its complement: what is committed, and what is left. One
+         * tile per funding account, never summed -- see `availableCapital.ts`.
+         *
+         * ⚠ THE TWO TILES DO NOT COME FROM THE SAME PLACE, and are not expected
+         * to reconcile digit-for-digit. ALLOCATED is this page's own sum over
+         * the polled bot rows; AVAILABLE's subtrahend is `capital_ledger`'s
+         * `total_allocated`. Those two agreeing is reconciliation's
+         * `ledger_allocation_drift` check, which exists precisely because they
+         * can diverge. Nothing here reconciles them, deliberately.
+         */}
+        {available.map((card) => (
+          <AvailableTile key={`${card.accountLabel}:${card.asset}`} card={card} />
+        ))}
         <Tile label="In position" hint="cost basis, gross of fees">
           <Money value={totals.inPosition} asset={asset} />
         </Tile>
@@ -171,24 +224,97 @@ function AssetStrip({ totals, showHeading }: { totals: AssetTotals; showHeading:
   );
 }
 
-export function AccountSummary({ totals }: { totals: readonly AssetTotals[] }) {
-  // No bots, or none that parsed into a group: render nothing rather than a
-  // strip of confident zeroes. The bot list below already says the fleet is
-  // empty, and it says it better.
-  if (totals.length === 0) return null;
+/**
+ * A strip for an asset that has ledger headroom but NO bots.
+ *
+ * Only the AVAILABLE tiles, and deliberately not a row of zeroes for the eight
+ * bot-derived figures: there is no fleet here to have allocated, held or earned
+ * anything, and "0.00 realized" would be an assertion about trading that never
+ * happened. The heading is always shown, because a bare tile with no asset
+ * beside it is the unlabelled figure this dashboard's money rules exist to
+ * prevent.
+ */
+function CapitalOnlyStrip({ asset, available }: { asset: string; available: readonly AvailableCard[] }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline gap-2">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-300">{asset}</h2>
+        <span className="text-xs text-zinc-500">no bots</span>
+      </div>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        {available.map((card) => (
+          <AvailableTile key={`${card.accountLabel}:${card.asset}`} card={card} />
+        ))}
+      </div>
+    </div>
+  );
+}
 
-  const multiAsset = totals.length > 1;
+export function AccountSummary({
+  totals,
+  capital,
+}: {
+  totals: readonly AssetTotals[];
+  capital: AvailableCapital;
+}) {
+  const capitalOnly = assetsWithoutTotals(
+    capital,
+    totals.map((entry) => entry.capitalAsset),
+  );
+
+  /*
+   * Nothing to say at all: no bot groups AND no ledger headroom. Render nothing
+   * rather than a strip of confident zeroes -- the bot list below already says
+   * the fleet is empty, and it says it better.
+   *
+   * The condition now includes the ledger, because an account that has been
+   * funded but has no bots yet is NOT nothing: "how much can I start a bot with"
+   * is the only interesting figure on that page, and the previous bots-only test
+   * would have hidden exactly it. Unreadable accounts also count as something to
+   * say -- their note is the admission that a figure is missing.
+   */
+  if (totals.length === 0 && capitalOnly.length === 0 && capital.unreadableAccounts.length === 0) {
+    return null;
+  }
+
+  const multiAsset = totals.length + capitalOnly.length > 1;
   return (
     <section className="space-y-4">
       {multiAsset && (
         <p className="text-xs text-zinc-500">
-          Bots span {totals.length} capital assets. Totals are grouped per asset and never summed
-          across them.
+          Totals are grouped per capital asset and never summed across them. Available capital is
+          per account and asset, and is never summed across accounts either.
         </p>
       )}
       {totals.map((entry) => (
-        <AssetStrip key={entry.capitalAsset} totals={entry} showHeading={multiAsset} />
+        <AssetStrip
+          key={entry.capitalAsset}
+          totals={entry}
+          showHeading={multiAsset}
+          available={cardsForAsset(capital, entry.capitalAsset)}
+        />
       ))}
+      {capitalOnly.map((asset) => (
+        <CapitalOnlyStrip key={asset} asset={asset} available={cardsForAsset(capital, asset)} />
+      ))}
+      {/*
+       * An unreadable ledger is SAID, not silently omitted. A missing AVAILABLE
+       * tile would otherwise be indistinguishable from an account that genuinely
+       * has no ledger row, and those are opposite facts -- one is "nothing is
+       * funded here", the other is "this read did not happen" (section 5.6).
+       */}
+      {capital.unreadableAccounts.length > 0 && (
+        <p className="text-xs text-amber-300/80">
+          Available capital is unknown for {capital.unreadableAccounts.join(", ")}: the ledger could
+          not be read.
+        </p>
+      )}
+      {capital.malformedRows > 0 && (
+        <p className="text-xs text-amber-300/80">
+          {capital.malformedRows} ledger row{capital.malformedRows === 1 ? "" : "s"} could not be
+          read and {capital.malformedRows === 1 ? "is" : "are"} not shown.
+        </p>
+      )}
     </section>
   );
 }

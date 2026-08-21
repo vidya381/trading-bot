@@ -24,6 +24,55 @@ export interface Account {
   readonly accountLabel: string;
   readonly exchange: string;
   readonly createdAt: number;
+  /**
+   * This account's `capital_ledger` headroom, or NULL when the ledger read
+   * FAILED. Null is never "this account has no capital" -- an account nobody has
+   * seeded has no ledger rows and arrives as `{ rowsRead: 0, assets: [] }`,
+   * which is a real state and a different fact. The dashboard must not render a
+   * confident figure for either, and must not render the same figure for both.
+   */
+  readonly capital: AccountCapital | null;
+}
+
+/**
+ * One `capital_ledger` row's three money figures, per (account, asset).
+ *
+ * `available` is `totalBalance - totalAllocated`, computed SERVER-SIDE by
+ * `readAccountCapital` -- the dashboard never re-derives it. That subtraction is
+ * not a display convenience: it is the identical arithmetic
+ * `createBotInstanceWithCapital` runs as its binding gate, so this figure is
+ * exactly what a new bot is allowed to reserve.
+ *
+ * ⚠ `available` CAN BE NEGATIVE, and is not clamped anywhere in this chain. An
+ * account allocated beyond its balance is a real, representable state (migration
+ * 0001 deliberately omits the CHECK that would forbid it), and it is the one
+ * state a human most needs to see before allocating more. Rendered amber, in the
+ * same spirit as the negative IDLE tile.
+ */
+export interface AccountAssetHeadroom {
+  readonly asset: string;
+  readonly totalBalance: string;
+  readonly totalAllocated: string;
+  /** `totalBalance - totalAllocated`. May be negative; see above. */
+  readonly available: string;
+  /** The LEDGER ROW's own `updated_at`, not when the read ran. */
+  readonly updatedAt: number;
+}
+
+/**
+ * The capital block on an `Account` (`accountCapitalView` in
+ * src/api/serialize.ts).
+ *
+ * NEVER SUMMED ACROSS ASSETS OR ACROSS ACCOUNTS. A bot draws from exactly one
+ * `capital_ledger` row, keyed (account_label, asset), so a blended total would
+ * be a number nothing can actually spend -- the same rule `accountTotals.ts`
+ * keeps for its per-asset grouping, applied one key wider.
+ */
+export interface AccountCapital {
+  /** When the ledger was read. Stale from that instant on. */
+  readonly readAt: number;
+  readonly rowsRead: number;
+  readonly assets: readonly AccountAssetHeadroom[];
 }
 
 /**

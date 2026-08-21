@@ -47,8 +47,9 @@
 
 import { Link } from "react-router-dom";
 import { ENVIRONMENT } from "../env";
-import type { Alert, Bot, KillSwitchStatus } from "../api/types";
+import type { Account, Alert, Bot, KillSwitchStatus } from "../api/types";
 import { accountTotals } from "../accountTotals";
+import { availableCapital } from "../availableCapital";
 import { countValues, UNKNOWN } from "../statusCounts";
 import { AccountSummary } from "./AccountSummary";
 
@@ -156,10 +157,22 @@ export function StatusStrip({
   bots,
   alerts,
   killSwitch,
+  accounts,
 }: {
   bots: Bot[] | null;
   alerts: Alert[] | null;
   killSwitch: KillSwitchStatus | null;
+  /**
+   * `GET /api/accounts`, carrying each account's `capital_ledger` headroom.
+   *
+   * A SECOND poll, not derived from `bots`, because it answers a question the
+   * bot list structurally cannot: capital that is free is capital NO bot has
+   * claimed, so there is no row anywhere in `bots` that represents it. Null
+   * until its first successful load -- and null renders no AVAILABLE tiles at
+   * all rather than zeroed ones, for the same reason the count tiles above
+   * refuse to report a confident 0 for a fleet they have not seen.
+   */
+  accounts: Account[] | null;
 }) {
   const counts = countValues(bots, alerts);
   /*
@@ -174,6 +187,15 @@ export function StatusStrip({
    * count tiles above have just been given.
    */
   const totals = accountTotals(bots ?? []);
+  /*
+   * Deliberately handed the RAW nullable list, unlike `bots` above. `?? []`
+   * would be wrong here: an empty account list and an unloaded one are
+   * different, and `availableCapital` distinguishes them itself -- null yields
+   * no cards AND no "unreadable" note, whereas a loaded-but-empty list could
+   * legitimately carry accounts whose ledger read failed and which must be
+   * named on screen.
+   */
+  const capital = availableCapital(accounts);
 
   return (
     <div className="space-y-4">
@@ -191,7 +213,7 @@ export function StatusStrip({
         <Tile label="Created" value={counts.created} tone="neutral" muted />
         <UnresolvedAlertsTile count={counts.unresolved} />
       </section>
-      <AccountSummary totals={totals} />
+      <AccountSummary totals={totals} capital={capital} />
     </div>
   );
 }

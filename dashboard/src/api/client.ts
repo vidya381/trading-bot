@@ -108,10 +108,18 @@ export function fetchBots(signal?: AbortSignal): Promise<Bot[]> {
 }
 
 /**
- * Every registered account and its exchange (`GET /api/accounts`). The real,
- * authoritative list the create-bot form's account dropdown reads -- so an
- * account is chosen, never typed, and its exchange comes back alongside it rather
- * than being asked for a second time.
+ * Every registered account, its exchange, and its `capital_ledger` headroom
+ * (`GET /api/accounts`). The real, authoritative list the create-bot form's
+ * account dropdown reads -- so an account is chosen, never typed, and its
+ * exchange comes back alongside it rather than being asked for a second time.
+ *
+ * ALSO the source of the bot list's AVAILABLE tiles. One endpoint rather than a
+ * second capital-only one, because the account registry and the per-account
+ * ledger rows are the same fact at the same grain -- (account, asset) -- and
+ * splitting them would give the dashboard two lists it then had to join.
+ *
+ * `account.capital` is nullable: null means the LEDGER READ FAILED, not that the
+ * account holds nothing. See `Account.capital`.
  */
 export function fetchAccounts(signal?: AbortSignal): Promise<Account[]> {
   return requestJson<Account[]>("/api/accounts", "GET", { signal });

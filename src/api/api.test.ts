@@ -18,7 +18,14 @@ import { env, SELF } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
-import { alertRow, botInstanceRow, freshDatabase, orderRow, tradeRow } from "../db/test-helpers";
+import {
+  alertRow,
+  botInstanceRow,
+  capitalLedgerRow,
+  freshDatabase,
+  orderRow,
+  tradeRow,
+} from "../db/test-helpers";
 import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
 import { inBot, rateLimiterStub } from "../durable-objects/test-helpers";
 import type { BotInstance } from "../durable-objects/bot-instance";
@@ -2516,10 +2523,221 @@ describe("accounts (step 11)", () => {
     const mine = (res.body.data as { accountLabel: string; exchange: string }[]).filter((a) =>
       a.accountLabel.endsWith(`-${suffix}`),
     );
+    // `capital` rides on every account. An account with no ledger row reports
+    // an EMPTY asset list, which is a real state -- nothing creates a ledger
+    // row automatically -- and is deliberately not the same as the `null` that
+    // means the read failed.
     expect(mine).toEqual([
-      { accountLabel: `a-${suffix}`, exchange: "binance", createdAt: T0 },
-      { accountLabel: `z-${suffix}`, exchange: "gemini", createdAt: T0 },
+      {
+        accountLabel: `a-${suffix}`,
+        exchange: "binance",
+        createdAt: T0,
+        capital: { readAt: expect.any(Number), rowsRead: 0, assets: [] },
+      },
+      {
+        accountLabel: `z-${suffix}`,
+        exchange: "gemini",
+        createdAt: T0,
+        capital: { readAt: expect.any(Number), rowsRead: 0, assets: [] },
+      },
     ]);
+  });
+
+  /*
+   * ── AVAILABLE CAPITAL ─────────────────────────────────────────────────────
+   *
+   * `available = total_balance - total_allocated`, published per (account,
+   * asset) for the bot list's AVAILABLE tiles. NOT a new calculation: it is the
+   * same subtraction `createBotInstanceWithCapital` runs as its binding gate,
+   * reached here through `readAccountCapital`, which reserves nothing and
+   * writes nothing.
+   *
+   * The figures below are the operator's REAL live values for `gemini-main`/USD,
+   * written as the raw scale-8 integers D1 stores.
+   */
+  const BALANCE_RAW = 9_995_669_131_000n;
+  const ALLOCATED_RAW = 260_806_000_000n;
+
+  interface ServedHeadroom {
+    asset: string;
+    totalBalance: string;
+    totalAllocated: string;
+    available: string;
+    updatedAt: number;
+  }
+  interface ServedAccount {
+    accountLabel: string;
+    capital: { readAt: number; rowsRead: number; assets: ServedHeadroom[] } | null;
+  }
+
+  const servedCapital = (body: unknown, label: string): ServedAccount["capital"] =>
+    (body as { data: ServedAccount[] }).data.find((a) => a.accountLabel === label)!.capital;
+
+  it("serves available = balance - allocated exactly, at the operator's live figures", async () => {
+    const label = `cap-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await db.capitalLedger.insert(
+      capitalLedgerRow({
+        id: `cl-${suffix}`,
+        account_label: label,
+        asset: "USD",
+        total_balance: BALANCE_RAW,
+        total_allocated: ALLOCATED_RAW,
+        updated_at: T0,
+      }),
+    );
+
+    const res = await api("GET", "/api/accounts");
+    expect(res.status).toBe(200);
+
+    const capital = servedCapital(res.body, label)!;
+    expect(capital.rowsRead).toBe(1);
+    expect(capital.assets).toEqual([
+      {
+        asset: "USD",
+        totalBalance: "99956.69131000",
+        totalAllocated: "2608.06000000",
+        // 9995669131000 - 260806000000 = 9734863131000, i.e. $97,348.63131000.
+        available: "97348.63131000",
+        updatedAt: T0,
+      },
+    ]);
+
+    // The same figure, derived rather than asserted, so this fails if either
+    // input string or the subtraction drifts.
+    expect(toDecimalString(BALANCE_RAW - ALLOCATED_RAW)).toBe(capital.assets[0]!.available);
+  });
+
+  it("serves a NEGATIVE available, unclamped, when allocated exceeds balance", async () => {
+    const label = `over-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    // The live figures inverted. Migration 0001 has no
+    // `CHECK (total_allocated <= total_balance)` precisely so this state is
+    // representable, and it must reach the dashboard rather than be tidied away.
+    await db.capitalLedger.insert(
+      capitalLedgerRow({
+        id: `cl-over-${suffix}`,
+        account_label: label,
+        asset: "USD",
+        total_balance: ALLOCATED_RAW,
+        total_allocated: BALANCE_RAW,
+        updated_at: T0,
+      }),
+    );
+
+    const res = await api("GET", "/api/accounts");
+    expect(res.status).toBe(200);
+
+    const capital = servedCapital(res.body, label)!;
+    expect(capital.assets[0]!.available).toBe("-97348.63131000");
+    // The one outcome that would hide real drift from the operator.
+    expect(capital.assets[0]!.available).not.toBe("0.00000000");
+  });
+
+  it("serves available = 0 when allocated exactly equals balance", async () => {
+    const label = `flat-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await db.capitalLedger.insert(
+      capitalLedgerRow({
+        id: `cl-flat-${suffix}`,
+        account_label: label,
+        asset: "USD",
+        total_balance: BALANCE_RAW,
+        total_allocated: BALANCE_RAW,
+        updated_at: T0,
+      }),
+    );
+
+    const res = await api("GET", "/api/accounts");
+    const capital = servedCapital(res.body, label)!;
+    expect(capital.assets[0]!.available).toBe("0.00000000");
+  });
+
+  it("keeps two accounts' headroom separate and never sums them", async () => {
+    // Two accounts on the SAME asset. Constructed even though live data has one,
+    // because a blended total is unspendable (a bot draws from one ledger row)
+    // and would look completely normal on screen.
+    const first = `two-a-${suffix}`;
+    const second = `two-b-${suffix}`;
+    for (const [label, id] of [[first, "a"], [second, "b"]] as const) {
+      await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+      await db.capitalLedger.insert(
+        capitalLedgerRow({
+          id: `cl-${id}-${suffix}`,
+          account_label: label,
+          asset: "USD",
+          total_balance: label === first ? BALANCE_RAW : 500_000_000_000n,
+          total_allocated: label === first ? ALLOCATED_RAW : 100_000_000_000n,
+          updated_at: T0,
+        }),
+      );
+    }
+
+    const res = await api("GET", "/api/accounts");
+    expect(servedCapital(res.body, first)!.assets[0]!.available).toBe("97348.63131000");
+    expect(servedCapital(res.body, second)!.assets[0]!.available).toBe("4000.00000000");
+
+    // 97348.63131 + 4000 appears nowhere: there is no combined figure at all.
+    const every = (res.body as { data: ServedAccount[] }).data.flatMap(
+      (a) => a.capital?.assets.map((row) => row.available) ?? [],
+    );
+    expect(every).not.toContain("101348.63131000");
+  });
+
+  it("serves every asset row for one account, ordered by asset", async () => {
+    const label = `multi-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await db.capitalLedger.insert(
+      capitalLedgerRow({
+        id: `cl-usd-${suffix}`,
+        account_label: label,
+        asset: "USD",
+        total_balance: BALANCE_RAW,
+        total_allocated: ALLOCATED_RAW,
+        updated_at: T0,
+      }),
+    );
+    await db.capitalLedger.insert(
+      capitalLedgerRow({
+        id: `cl-btc-${suffix}`,
+        account_label: label,
+        asset: "BTC",
+        total_balance: 100_000_000n,
+        total_allocated: 0n,
+        updated_at: T0,
+      }),
+    );
+
+    const capital = servedCapital((await api("GET", "/api/accounts")).body, label)!;
+    expect(capital.rowsRead).toBe(2);
+    expect(capital.assets.map((row) => row.asset)).toEqual(["BTC", "USD"]);
+    expect(capital.assets.map((row) => row.available)).toEqual([
+      "1.00000000",
+      "97348.63131000",
+    ]);
+  });
+
+  it("reads the ledger without changing it -- no reservation, no write", async () => {
+    const label = `ro-${suffix}`;
+    await db.accounts.insert({ account_label: label, exchange: "gemini", created_at: T0, updated_at: T0 });
+    await db.capitalLedger.insert(
+      capitalLedgerRow({
+        id: `cl-ro-${suffix}`,
+        account_label: label,
+        asset: "USD",
+        total_balance: BALANCE_RAW,
+        total_allocated: ALLOCATED_RAW,
+        updated_at: T0,
+      }),
+    );
+
+    const before = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
+    await api("GET", "/api/accounts");
+    await api("GET", "/api/accounts");
+    const after = (await db.capitalLedger.findOne({ account_label: label, asset: "USD" }))!;
+
+    // Including `updated_at`: a display read must not even touch the row.
+    expect(after).toEqual(before);
   });
 
   it("GET /api/accounts/:label/symbols returns pairs, cached on the second call", async () => {
