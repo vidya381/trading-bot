@@ -117,6 +117,7 @@ import {
   DEFAULT_DRIFT_THRESHOLDS,
   highestTier,
   INGESTED_ALERT_TYPES,
+  type FindingKind,
   type ClassifiedFinding,
   type DriftThresholds,
   type Finding,
@@ -217,7 +218,9 @@ export async function reconcileAccount(
 
   // 2. Orders: the Durable Objects, D1, and the exchange, three ways.
   const snapshots = new Map<string, BotSnapshot>();
-  pending.push(...(await reconcileOrders(ports, bots, snapshots, skipped, thresholds)));
+  pending.push(
+    ...(await reconcileOrders(ports, accountLabel, bots, snapshots, skipped, thresholds)),
+  );
 
   // 3. Balances, per asset, as a delta from the previous run.
   pending.push(...(await reconcileBalances(ports, accountLabel, bots, runId, at, skipped)));
@@ -268,6 +271,9 @@ export async function reconcileAccount(
         bot_instance_id: finding.botInstanceId,
         asset: finding.asset,
         detail: finding.detail,
+        // STRUCTURED, and load-bearing rather than decorative: this is what a
+        // later run matches on to escalate an unconfirmed live-order drift.
+        client_order_id: finding.clientOrderId ?? null,
         source_alert_id: finding.sourceAlertId ?? null,
       })),
       halted: outcome.haltedBotIds,
@@ -302,6 +308,13 @@ export async function reconcileAccount(
  * so reconciliation deduplicates against, and resolves, only its own rows.
  */
 const RECONCILIATION_SOURCE = "reconciliation";
+
+/**
+ * How many recent `reconciliation.run` rows to scan for a previous unconfirmed
+ * sighting. Generous against `unconfirmedWindowMs` (two five-minute turns), so
+ * the time bound is what actually decides and this is only a query cap.
+ */
+const RECENT_RUN_SCAN = 20;
 
 /**
  * Raise a finding's alert ONCE per open incident.
@@ -434,6 +447,7 @@ async function ingestBotAlerts(db: Database, botIds: readonly string[]): Promise
 
 async function reconcileOrders(
   ports: ReconciliationPorts,
+  accountLabel: string,
   bots: readonly BotInstanceRow[],
   snapshots: Map<string, BotSnapshot>,
   skipped: string[],
@@ -442,6 +456,16 @@ async function reconcileOrders(
   const { db, exchange, now } = ports;
   const pending: PendingFinding[] = [];
   const at = now();
+
+  // ONCE PER RUN, not per bot: one query answers it for every bot on the
+  // account, and the escalation is a property of the run rather than of any one
+  // order's evaluation.
+  const seenUnconfirmed = await unconfirmedDriftFromRecentRuns(
+    db,
+    accountLabel,
+    at,
+    thresholds.unconfirmedWindowMs,
+  );
 
   // One call per distinct pair, not per bot: several bots can share a pair.
   const openOrdersByPair = new Map<Pair, OrderStatus[] | null>();
@@ -501,7 +525,17 @@ async function reconcileOrders(
     pending.push(...uncoveredInventoryFindings(bot, snapshot));
 
     if (remoteOpen !== null) {
-      pending.push(...(await liveOrderFindings(ports, bot, snapshot, remoteOpen, at, thresholds)));
+      pending.push(
+        ...(await liveOrderFindings(
+          ports,
+          bot,
+          snapshot,
+          remoteOpen,
+          at,
+          thresholds,
+          seenUnconfirmed,
+        )),
+      );
     }
   }
 
@@ -656,6 +690,63 @@ function mirrorFindings(
   return pending;
 }
 
+/**
+ * Live orders this account's own RECENT RUNS already reported as an unconfirmed
+ * disagreement, as `${botInstanceId}::${clientOrderId}`.
+ *
+ * THE ASYMMETRY THIS EXISTS TO CLOSE. Two observers watch the same order at
+ * different cadences: the owning bot polls it every THIRTY SECONDS, this job
+ * looks every FIVE MINUTES. The terminated-order branch already forgives the gap
+ * between them -- `timingWindowMs` calls a recent termination "a late fill, not
+ * drift; the bot's own fill path will record it". The LIVE branch forgave
+ * nothing, so a fill that landed between two poll passes was reported as
+ * meaningful drift and halted the bot, for a disagreement the poll would have
+ * cleared seconds later by its real fill id. That is what halted two real bots.
+ *
+ * WHY THE MEMORY LIVES IN `audit_log` AND NOT SOMEWHERE NEW. This job is
+ * structurally BLIND to the other observer: `BotSnapshot` carries `config`,
+ * `state` and `orders`, and the poll's schedule lives under its own storage key
+ * inside the Durable Object, so nothing here can ask when that bot last polled
+ * or whether its poll is even healthy. What this job does have is its own
+ * history -- every run already writes its complete findings list to
+ * `audit_log.details_json`, which `/src/alerts/standing.ts` names as the reason
+ * the alerts table may be deduplicated at all. Reading it back makes the record
+ * and the memory the same object, with no new table, no new column and no new
+ * alert type.
+ *
+ * A minor finding is deliberately enough to remember with: it is written to that
+ * findings list like any other, while raising no alert row and halting nothing.
+ */
+async function unconfirmedDriftFromRecentRuns(
+  db: Database,
+  accountLabel: string,
+  at: Timestamp,
+  windowMs: number,
+): Promise<ReadonlySet<string>> {
+  const seen = new Set<string>();
+  const rows = await db.auditLog.findMany({
+    where: { action: "reconciliation.run" },
+    orderBy: [{ column: "created_at", direction: "desc" }],
+    limit: RECENT_RUN_SCAN,
+  });
+
+  for (const row of rows) {
+    if (row.created_at < at - windowMs) break; // Ordered, so nothing older follows.
+    const details = row.details_json as {
+      account_label?: unknown;
+      findings?: readonly { kind?: unknown; bot_instance_id?: unknown; client_order_id?: unknown }[];
+    };
+    if (details.account_label !== accountLabel) continue;
+    for (const finding of details.findings ?? []) {
+      if (finding.kind !== "order_drift_unconfirmed") continue;
+      if (typeof finding.bot_instance_id !== "string") continue;
+      if (typeof finding.client_order_id !== "string") continue;
+      seen.add(`${finding.bot_instance_id}::${finding.client_order_id}`);
+    }
+  }
+  return seen;
+}
+
 /** Orders the object believes are live, against what the exchange reports. */
 async function liveOrderFindings(
   ports: ReconciliationPorts,
@@ -664,6 +755,7 @@ async function liveOrderFindings(
   remoteOpen: readonly OrderStatus[],
   at: Timestamp,
   thresholds: DriftThresholds,
+  seenUnconfirmed: ReadonlySet<string>,
 ): Promise<PendingFinding[]> {
   const pending: PendingFinding[] = [];
   const localById = new Map(snapshot.orders.map((order) => [order.clientOrderId, order]));
@@ -688,7 +780,25 @@ async function liveOrderFindings(
 
     const remote = remoteById.get(clientOrderId);
     if (remote !== undefined) {
-      pending.push(...driftAgainst(bot, local, remote));
+      // STILL ON THE BOOK, so the owning bot's own poll is still armed on it and
+      // will read it again within thirty seconds. A first sighting is reported
+      // as UNCONFIRMED -- logged, no alert, no halt -- and only a disagreement
+      // this account's runs have already seen inside `unconfirmedWindowMs`
+      // becomes real drift. Escalation is unconditional at that point: see
+      // `unconfirmedDriftFromRecentRuns` for why waiting is bounded and why it
+      // cannot become "never halts".
+      const alreadySeen = seenUnconfirmed.has(`${bot.id}::${clientOrderId}`);
+      pending.push(
+        ...driftAgainst(
+          bot,
+          local,
+          remote,
+          alreadySeen
+            ? `still disagreeing on a later run, so the bot's own 30s poll has not resolved it`
+            : "",
+          alreadySeen ? "order_state_drift" : "order_drift_unconfirmed",
+        ),
+      );
       continue;
     }
 
@@ -742,11 +852,20 @@ async function liveOrderFindings(
   return pending;
 }
 
+/**
+ * `kind` is a parameter, and the default keeps the terminated-order caller
+ * exactly as it was. The live-order caller passes `order_drift_unconfirmed` on a
+ * first sighting -- same comparison, same prose, a tier that does not halt. The
+ * ALTERNATIVE was a second copy of this function for the live branch, and two
+ * independently-worded comparisons of the same two quantities is the drift step
+ * 57 spent an entry refusing to introduce.
+ */
 function driftAgainst(
   bot: BotInstanceRow,
   local: TrackedOrder,
   remote: OrderStatus,
   context = "",
+  kind: FindingKind = "order_state_drift",
 ): PendingFinding[] {
   const comparison = compareWithExchange(local, {
     state: remote.state,
@@ -757,10 +876,11 @@ function driftAgainst(
   return [
     {
       finding: {
-        kind: "order_state_drift",
+        kind,
         scope: "bot",
         botInstanceId: bot.id,
         asset: null,
+        clientOrderId: local.clientOrderId,
         detail:
           `${local.clientOrderId}: the exchange reports ${remote.state} with ` +
           `${toDecimalString(remote.filledQuantity)} filled, the bot believes ` +

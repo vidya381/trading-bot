@@ -63,6 +63,13 @@ export type FindingKind =
   | "order_recently_terminated"
   /** The exchange and the bot disagree about an order's state or filled quantity. */
   | "order_state_drift"
+  /**
+   * The same disagreement, seen for the FIRST time on an order still on the
+   * book -- where the owning bot's own 30-second poll has not yet had its turn.
+   * Logged, never alerted, never halts; it escalates to `order_state_drift` if a
+   * later run still finds it. See `liveOrderFindings`.
+   */
+  | "order_drift_unconfirmed"
   /** INGESTED. Step 6's `cancel_fill_discrepancy`: a fill raced a cancellation. */
   | "cancel_fill_discrepancy"
   /** INGESTED. Step 6's `cancel_failed`: an order may still be live after a halt. */
@@ -118,6 +125,18 @@ export const TIER_FLOOR: Readonly<Record<FindingKind, DriftClassification>> = {
   // Section 9's own definition of meaningful: "a specific bot's believed
   // position doesn't match reality".
   order_state_drift: "meaningful",
+
+  // MINOR, AND THAT IS THE WHOLE POINT OF THE KIND. A live order whose fill
+  // count disagrees on its FIRST sighting is not yet known to be drift: this
+  // job runs every five minutes, the owning bot polls the same order every
+  // THIRTY SECONDS, and the overwhelmingly common cause of a first-sighting
+  // disagreement is a fill that landed in between -- which the poll will apply
+  // by its real id long before this job looks again. Section 9's own example of
+  // minor is "a fill recorded a few seconds late", and this is that example
+  // observed from the other side of the book. Minor raises no alert row and
+  // halts nothing; it is recorded in the run's audit findings, which is both
+  // the log and the memory the escalation reads.
+  order_drift_unconfirmed: "minor",
 
   // Step 6's decision 3 left the position deliberately understating what the
   // bot holds, because a cancellation response carries no trade id to
@@ -220,6 +239,13 @@ export const TIER_CEILING: Readonly<Record<FindingKind, DriftClassification>> = 
   order_recently_terminated: "meaningful",
   // Section 9's own words, honoured literally.
   order_state_drift: "meaningful",
+  // PINNED AT MINOR, deliberately, and it is the only kind whose ceiling equals
+  // its floor for a reason other than modesty. This kind means "not yet
+  // confirmed", so allowing magnitude to promote it would let a large
+  // first-sighting disagreement halt a bot on exactly the evidence the kind
+  // exists to say is insufficient. It carries no magnitude today; the pin makes
+  // that a property of the kind rather than of the call site.
+  order_drift_unconfirmed: "minor",
   cancel_fill_discrepancy: "meaningful",
   cancel_failed: "meaningful",
   reported_order_state_drift: "meaningful",
@@ -298,6 +324,16 @@ export interface Finding {
   /** Absent where a finding has no meaningful size (an unknown order). */
   readonly magnitude?: Magnitude;
   /**
+   * The order this finding is about, where it is about one.
+   *
+   * Carried STRUCTURALLY rather than left inside `detail`, because the
+   * unconfirmed-drift escalation has to recognise the same order across two
+   * runs, and it reads this run's findings out of the previous run's audit row.
+   * Matching that by searching prose would put a safety decision on a sentence
+   * nothing tests -- the trap step 58 recorded and refused.
+   */
+  readonly clientOrderId?: string;
+  /**
    * The `alerts.id` this finding was read from, when it came from step 6
    * rather than from an observation made this run. Set means: this run
    * consumed that alert, and will mark it resolved if the tier action lands.
@@ -334,6 +370,15 @@ export interface DriftThresholds {
    * (how much divergence is noise) expressed in different units.
    */
   readonly timingWindowMs: number;
+  /**
+   * How far back to look for a previous unconfirmed sighting of the same live
+   * order before escalating it to real drift.
+   *
+   * The third member of the same family as the two above -- how much divergence
+   * is noise -- expressed in runs rather than in units or in an instant. Read by
+   * detection in `reconcile.ts`, not by `classifyFinding`.
+   */
+  readonly unconfirmedWindowMs: number;
 }
 
 /**
@@ -358,6 +403,13 @@ export const DEFAULT_DRIFT_THRESHOLDS: DriftThresholds = {
   meaningfulPct: ONE / 10n, // 0.1
   severePct: 2n * ONE, // 2.0
   timingWindowMs: 60_000,
+  // 600s: two turns of the five-minute cron, so a run that could not read the
+  // venue (section 5.6 skips it entirely, and no finding is recorded for an
+  // order it never saw) does not silently reset the escalation to a first
+  // sighting. Twenty of the owning bot's own 30-second poll passes fit inside
+  // it, so a disagreement still standing at the end of it is not one the poll
+  // was ever going to resolve.
+  unconfirmedWindowMs: 600_000,
 };
 
 const TIER_RANK: Readonly<Record<DriftClassification, number>> = {

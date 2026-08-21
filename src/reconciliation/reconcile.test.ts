@@ -18,6 +18,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { readCircuitBreaker } from "./circuit-breaker";
+import { DEFAULT_DRIFT_THRESHOLDS } from "./findings";
 import {
   EMPTY_BALANCE_SET_ALERT,
   reconcileAccount,
@@ -457,6 +458,11 @@ describe("meaningful drift", () => {
       }),
     );
 
+    // Step 61: a LIVE order's first sighting is `order_drift_unconfirmed` --
+    // minor, no alert, no halt -- because the owning bot's own 30-second poll
+    // usually resolves it before this job looks again. This test is about what
+    // happens to CONFIRMED drift, so it runs the pass that confirms it first.
+    await reconcileAccount(ports(), ACCOUNT);
     const result = await reconcileAccount(ports(), ACCOUNT);
 
     expect(result.tier).toBe("meaningful");
@@ -521,6 +527,9 @@ describe("meaningful drift", () => {
       }),
     );
 
+    // Two passes: step 61 makes a LIVE order's first sighting unconfirmed and
+    // alert-free, so the row this asserts on only exists once it is confirmed.
+    await reconcileAccount(ports(), ACCOUNT);
     await reconcileAccount(ports(), ACCOUNT);
 
     const [raised] = await alerts();
@@ -1246,6 +1255,23 @@ describe("a persistent finding does not re-alert on every pass", () => {
     await reconcileAccount(ports(), ACCOUNT);
   }
 
+  /**
+   * Two passes, which is what a LIVE order now takes to become meaningful drift.
+   *
+   * Step 61: the first sighting of a disagreement on an order still ON THE BOOK
+   * is `order_drift_unconfirmed` -- minor, no alert row, no halt -- because the
+   * owning bot polls that same order every 30 seconds and will usually have
+   * resolved it before this job looks again. The second sighting escalates. The
+   * tests below are about the ALERT LIFECYCLE, so they need the condition to
+   * have reached the tier that writes a row; they say so by asking for it
+   * explicitly rather than by hiding a second pass inside `passWithDrift`, which
+   * the two audit-row-counting tests above still depend on being one pass.
+   */
+  async function passUntilConfirmed(): Promise<void> {
+    await passWithDrift();
+    await passWithDrift();
+  }
+
   beforeEach(async () => {
     await exchange.placeOrder({
       pair: TEST_PAIR,
@@ -1292,7 +1318,7 @@ describe("a persistent finding does not re-alert on every pass", () => {
   });
 
   it("resolves the standing alert once the finding stops recurring", async () => {
-    await passWithDrift();
+    await passUntilConfirmed();
     expect(await alerts({ resolved: false })).not.toHaveLength(0);
 
     // The drift is corrected: the bot now agrees with the exchange.
@@ -1313,7 +1339,7 @@ describe("a persistent finding does not re-alert on every pass", () => {
     // Section 5.6, applied to the alert lifecycle: a run that saw nothing found
     // nothing, and treating that as "the problem went away" would clear a live
     // incident on the strength of an outage. The nastiest possible failure here.
-    await passWithDrift();
+    await passUntilConfirmed();
     exchange.openOrdersFailure = { kind: "transport", message: "unreachable" };
     exchange.balancesFailure = { kind: "transport", message: "unreachable" };
 
@@ -1325,16 +1351,164 @@ describe("a persistent finding does not re-alert on every pass", () => {
   });
 
   it("raises a fresh incident if the same drift returns after being resolved", async () => {
-    await passWithDrift();
+    await passUntilConfirmed();
     // Resolve it by hand, standing in for a corrected pass.
     const [first] = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
     await db.alerts.update({ id: first!.id }, { resolved: true });
 
-    await passWithDrift();
+    await passUntilConfirmed();
 
     const drift = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
     expect(drift).toHaveLength(2);
     expect(drift.filter((row) => !row.resolved)).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The live-order timing tolerance (step 61)
+// ---------------------------------------------------------------------------
+
+describe("a live order's disagreement is not drift on first sight", () => {
+  beforeEach(async () => {
+    await seedBot("dca-btc-1");
+    await seedLedger("400");
+    await seedBaseline("USDT", "5000");
+    exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
+    await exchange.placeOrder({
+      pair: TEST_PAIR,
+      clientOrderId: "v1-dca-btc-1-0",
+      side: "buy",
+      type: "limit",
+      price: m("65000"),
+      quantity: m("0.01"),
+    });
+    // The exchange says half filled; the bot has not recorded it yet. Its own
+    // 30-second poll would apply this by its real fill id long before this
+    // five-minute job comes round again.
+    exchange.fillFor("v1-dca-btc-1-0", { quantity: m("0.005") });
+    // The D1 mirror agrees with the object, so `mirrorFindings` stays silent and
+    // the only thing under test here is the live-order comparison.
+    await db.orders.insert(
+      orderRow({
+        id: "v1-dca-btc-1-0",
+        bot_instance_id: "dca-btc-1",
+        client_order_id: "v1-dca-btc-1-0",
+        price: m("65000"),
+        quantity: m("0.01"),
+        filled_quantity: ZERO,
+        status: "pending",
+      }),
+    );
+  });
+
+  /** The bot still believes nothing has filled, and the order is still OPEN. */
+  function driftingLiveOrder(): void {
+    const order = trackedOrder();
+    snapshots.set(
+      "dca-btc-1",
+      snapshotFor("dca-btc-1", [order], { openOrderIds: [order.clientOrderId] }),
+    );
+  }
+
+  it("does NOT halt on the first sighting: the false alarm that halted two real bots", async () => {
+    driftingLiveOrder();
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    // Reported, and reported honestly -- but as a condition that has not yet
+    // earned an action.
+    const finding = result.findings.find((entry) => entry.kind === "order_drift_unconfirmed");
+    expect(finding).toBeDefined();
+    expect(finding!.tier).toBe("minor");
+    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(false);
+
+    // THE FIX: nothing halted, no alert row, and the bot is still running.
+    expect(result.haltedBotIds).toEqual([]);
+    expect(halted).toEqual([]);
+    expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("running");
+    expect(await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" })).toHaveLength(0);
+
+    // And the run's own audit row carries it, structurally, which is both the
+    // record and the memory the escalation below reads.
+    const [run] = await db.auditLog.findMany({ where: { action: "reconciliation.run" } });
+    const details = run!.details_json as unknown as {
+      findings: { kind: string; client_order_id: string | null }[];
+    };
+    expect(
+      details.findings.some(
+        (entry) =>
+          entry.kind === "order_drift_unconfirmed" && entry.client_order_id === "v1-dca-btc-1-0",
+      ),
+    ).toBe(true);
+  });
+
+  it("DOES halt once the same disagreement survives a second run", async () => {
+    // The safety property. The tolerance delays a false alarm by one run; it
+    // does not silence a real one. A drift the bot's own poll has had ten passes
+    // to resolve, and has not, is drift.
+    driftingLiveOrder();
+    await reconcileAccount(ports(), ACCOUNT);
+    expect(halted).toEqual([]);
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
+    expect(result.tier).toBe("meaningful");
+    expect(result.haltedBotIds).toEqual(["dca-btc-1"]);
+    expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("halted");
+    const raised = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.message).toMatch(/still disagreeing on a later run/);
+  });
+
+  it("forgives again once the bot's own poll has caught up", async () => {
+    // The other half of "delays, not silences": a disagreement that DOES
+    // self-resolve never reaches the tier that halts, however many runs follow.
+    driftingLiveOrder();
+    await reconcileAccount(ports(), ACCOUNT);
+
+    // The poll applied the fill, exactly as it would have within 30 seconds.
+    const caughtUp = trackedOrder({ filledQuantity: m("0.005"), state: "partially_filled" });
+    snapshots.set(
+      "dca-btc-1",
+      snapshotFor("dca-btc-1", [caughtUp], { openOrderIds: [caughtUp.clientOrderId] }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(false);
+    expect(result.haltedBotIds).toEqual([]);
+    expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("running");
+  });
+
+  it("does not escalate on an unconfirmed sighting older than the window", async () => {
+    // The window is what stops an ancient, long-resolved sighting escalating a
+    // brand-new disagreement. Two turns of the five-minute cron.
+    driftingLiveOrder();
+    await reconcileAccount(ports(), ACCOUNT);
+
+    clock += DEFAULT_DRIFT_THRESHOLDS.unconfirmedWindowMs + 1;
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.findings.some((entry) => entry.kind === "order_drift_unconfirmed")).toBe(true);
+    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(false);
+    expect(result.haltedBotIds).toEqual([]);
+  });
+
+  it("leaves the TERMINATED-order branch exactly as it was", async () => {
+    // The 60s `timingWindowMs` and its `order_recently_terminated` finding are
+    // deliberately untouched by this step. `driftAgainst` is shared by both
+    // branches, so this asserts the shared function still reports the
+    // terminated case as real drift rather than inheriting the new tolerance.
+    await exchange.cancelOrder(TEST_PAIR, "v1-dca-btc-1-0");
+    clock += DEFAULT_DRIFT_THRESHOLDS.timingWindowMs + 1;
+    driftingLiveOrder();
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    // Gone from the book, outside the window: real drift on the FIRST run.
+    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
+    expect(result.haltedBotIds).toEqual(["dca-btc-1"]);
   });
 });
 
