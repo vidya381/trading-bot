@@ -629,3 +629,26 @@ describe("checkOpenOrders on a grid ladder", () => {
     expect(details.refused.join(" ")).not.toMatch(/unreadable/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// repairPosition gate 1 (fix 3): grid is explicitly out of scope
+// ---------------------------------------------------------------------------
+
+describe("repairPosition on a grid bot", () => {
+  it("refuses at gate 1 rather than guessing at a ladder", async () => {
+    // The DCA repair rebuilds `position` from entry and exit fills. A grid bot's
+    // position IS its ladder -- levels, slots, `heldQuantity`, `heldCost` -- and
+    // reconstructing one is a different problem with different arithmetic.
+    // Refusing is honest; attempting it would not be.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+
+    expect(report.outcome).toBe("refused");
+    expect(report.committed).toBe(false);
+    expect(report.blockedBy).toBe("gate 1: strategy");
+    expect(report.reasons[0]).toMatch(/grid bot, whose position is its ladder/);
+  });
+});

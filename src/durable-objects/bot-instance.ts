@@ -87,6 +87,7 @@ import { validateOrder } from "../exchange/binance/filters";
 import type {
   Asset,
   Fill,
+  OrderSide,
   OrderStatus,
   Pair,
   Price,
@@ -106,14 +107,15 @@ import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
 import { assertAccountArmed } from "../reconciliation/circuit-breaker";
 import { assertGlobalArmed } from "../reconciliation/kill-switch";
-import { IdempotencyGuard } from "../shared/idempotency";
-import { divideRounded, mul, toDecimalString, ZERO, type Money } from "../shared/money";
+import { IdempotencyGuard, parseClientOrderId } from "../shared/idempotency";
+import { divideRounded, mul, ONE, toDecimalString, ZERO, type Money } from "../shared/money";
 import {
   applyFill,
   closeOrder,
   createOrder,
   isTerminal,
   OrderStateError,
+  type OrderState,
   type TrackedOrder,
 } from "../shared/order-state";
 import {
@@ -128,6 +130,7 @@ import {
   validateDcaParams,
   type DcaConfig,
   type DcaHaltReason,
+  type DcaEntry,
   type DcaParams,
   type DcaPosition,
 } from "../strategies/dca";
@@ -159,6 +162,21 @@ import { DurableObjectAttemptStore } from "./attempt-store";
 const CONFIG_KEY = "config";
 const STATE_KEY = "state";
 const ORDER_KEY_PREFIX = "order:";
+
+/** The position fields `repairPosition` reports on, as decimal strings. */
+function repairFieldsOf(state: BotRuntimeState): PositionRepairFields {
+  return {
+    quantity: toDecimalString(state.position.quantity),
+    cost: toDecimalString(state.position.cost),
+    averageEntryPrice: toDecimalString(state.position.averageEntryPrice),
+    lastEntryPrice: toDecimalString(state.position.lastEntryPrice),
+    entryCount: state.position.entries.length,
+    additionalBuysUsed: state.position.additionalBuysUsed,
+    realizedGross: toDecimalString(state.realizedGross),
+    exitOrderId: state.exitOrderId,
+    exitKind: state.exitKind ?? null,
+  };
+}
 /** Step 20's scheduling state. Deliberately NOT part of `BotRuntimeState`. */
 const POLL_KEY = "poll-schedule";
 
@@ -466,6 +484,72 @@ export interface OrderCheckResult {
    * look". A caller that cares should try again.
    */
   readonly deferred: boolean;
+}
+
+/**
+ * The DCA position fields `repairPosition` reads, recomputes and may write.
+ *
+ * Decimal strings for transport, matching `AppliedFill`: this crosses a Durable
+ * Object RPC boundary and then a JSON response, and a scale-8 `bigint` survives
+ * neither.
+ */
+export interface PositionRepairFields {
+  readonly quantity: string;
+  readonly cost: string;
+  readonly averageEntryPrice: string;
+  readonly lastEntryPrice: string;
+  readonly entryCount: number;
+  /** Carried through untouched. See `repairPosition` on why it is not rebuilt. */
+  readonly additionalBuysUsed: number;
+  readonly realizedGross: string;
+  readonly exitOrderId: string | null;
+  readonly exitKind: "take_profit" | "liquidation" | null;
+}
+
+/** One order's local-versus-exchange comparison, the evidence behind gates 3-5. */
+export interface PositionRepairEvidence {
+  readonly clientOrderId: string;
+  readonly sequence: number;
+  readonly side: OrderSide;
+  readonly state: OrderState;
+  readonly localFilledQuantity: string;
+  /** `null` when the exchange could not be read for this order (gate 4). */
+  readonly remoteFilledQuantity: string | null;
+  /** `null` when unread; otherwise whether the two quantities are equal. */
+  readonly agrees: boolean | null;
+}
+
+/** What one `repairPosition` pass found, computed, and (maybe) wrote. */
+export interface PositionRepairReport {
+  /**
+   * `no_change` -- the live cycle already agrees with its own orders.
+   * `would_repair` -- a report-mode pass that found a difference and wrote nothing.
+   * `repaired` -- a committing pass that wrote.
+   * `refused` -- a gate blocked it. `blockedBy` names which.
+   */
+  readonly outcome: "no_change" | "would_repair" | "repaired" | "refused";
+  /** True only when this pass actually wrote. Always false in report mode. */
+  readonly committed: boolean;
+  readonly status: BotStatus;
+  /** The gate that refused, e.g. `"gate 5: local/remote fill disagreement"`. */
+  readonly blockedBy: string | null;
+  /** Every reason behind `blockedBy`, one per offending order or condition. */
+  readonly reasons: readonly string[];
+  readonly before: PositionRepairFields;
+  /**
+   * What the live cycle's own orders say the position SHOULD be. Computed on
+   * every pass, including a refused one -- seeing the number is the point of
+   * report mode, and a gate that blocks the write does not invalidate the
+   * arithmetic that would have been written.
+   */
+  readonly after: PositionRepairFields;
+  readonly evidence: readonly PositionRepairEvidence[];
+  /** The live cycle: every order after the last fully-filled sell. */
+  readonly liveCycleOrderIds: readonly string[];
+  /** How many completed cycles the partition found ahead of the live one. */
+  readonly closedCycleCount: number;
+  /** Observations that are NOT gate failures and do not block a commit. */
+  readonly findings: readonly string[];
 }
 
 /** What happened on one pass of the event pipeline, for tests and the dashboard. */
@@ -1622,6 +1706,606 @@ export class BotInstance extends DurableObject<Env> {
     );
 
     return { status: (await this.#state()).status, applied, skipped };
+  }
+
+  // -------------------------------------------------------------------------
+  // Position repair (fix 3): rebuild the live cycle's position from its orders
+  // -------------------------------------------------------------------------
+
+  /**
+   * Recompute this DCA bot's position from its own order history, and -- only
+   * on an explicit `commit` -- write it back.
+   *
+   * THE GAP THIS CLOSES, and it is the only one in the chain that looks
+   * BACKWARDS. `applyEntry` has no inverse: within a cycle `quantity` and `cost`
+   * only ever grow, and both are zeroed together by `#completeCycle` /
+   * `#completeLiquidation`. So an exit sell that fills PARTIALLY and is then
+   * cancelled leaves a position the model has no way to express -- the sold base
+   * is still counted as held. Two live bots sat in exactly that state, one of
+   * them believing it held 3.7x what it actually did, with its stop-loss and
+   * take-profit both computed from the inflated number. Nothing automated was
+   * ever going to revisit them: `ALLOWED_TRANSITIONS` gives every terminal state
+   * an empty successor list, so `applyFill` refuses the order forever, and
+   * `applyMissedFills` iterates `openOrderIds`, which a cancelled order has left.
+   *
+   * REPORT MODE IS THE DEFAULT, and that is a deliberate inversion of the usual
+   * shape. This is the only operation in the system that OVERWRITES a position
+   * rather than deriving one forward, and every neighbouring path here reports
+   * rather than acts: `checkOpenOrders` hands back `applied`/`skipped`/`closed`,
+   * `applyMissedFills` refuses to synthesise a fill id and reports the gap, and
+   * section 9 halts and alerts and never auto-corrects. `commit: false` computes
+   * everything, writes nothing, and returns the full before/after diff plus the
+   * per-order evidence -- so the number can be read before it is trusted.
+   *
+   * THE COST MODEL IS PROPORTIONAL, and it is a decision rather than a
+   * derivation, because the model has no defined meaning for a partially exited
+   * position. `cost` serves four masters at once: capital headroom
+   * (`allocatedCapital - position.cost`), `averageEntryPrice` and therefore BOTH
+   * risk thresholds, realized PnL at cycle close, and the dashboard's unrealized
+   * PnL. Leaving `cost` at the full buy notional while reducing `quantity` would
+   * inflate `averageEntryPrice` by the inverse of the fraction still held -- 3.7x
+   * on the bot that prompted this -- and move the stop-loss and take-profit with
+   * it. So `cost` is scaled by the fraction still held, which holds
+   * `averageEntryPrice` steady (the coin still held WAS bought at that average)
+   * and restores headroom in proportion to what was sold. That is the continuous
+   * form of a rule this system already applies discretely: a completed cycle
+   * zeroes `cost` and restores the whole allocation.
+   *
+   * AND THE SOLD LEG'S PnL IS BOOKED IN THE SAME WRITE, because scaling `cost`
+   * down without it would simply lose that leg: `realizedGross` is written only
+   * by the two cycle-completion paths, and neither ran. It is computed from the
+   * REAL fill notionals -- `sum(mul(fill.price, fill.quantity))` -- rather than
+   * from `filledQuantity x order.price`, which is what `#completeCycle` uses. The
+   * difference is deliberate and is an improvement on that path, not a drift from
+   * it: the per-fill detail is right here in `order.fills`, and a limit price is
+   * only an approximation of what the fills actually executed at.
+   *
+   * `additionalBuysUsed` IS CARRIED THROUGH UNTOUCHED. It counts entries taken
+   * while `position.quantity > ZERO` -- a runtime observation at the moment of
+   * each fill, not a property of any order -- so replaying it from history is
+   * faithful only if every buy fill is present, which is precisely what this
+   * repair cannot assume. Preserving the stored value keeps the bot's remaining
+   * buy budget exactly as it was; recomputing it could silently hand back budget
+   * that was already spent.
+   *
+   * TEN GATES, IN ORDER, AND IT REFUSES WHOLE. There is no partial apply: every
+   * check runs before the single write, and the first failure returns a report
+   * naming the gate and every reason behind it. This is fix 1's shape --
+   * gate-before-write -- applied to a much larger write.
+   */
+  async repairPosition(
+    actor: string,
+    options: { commit: boolean } = { commit: false },
+  ): Promise<PositionRepairReport> {
+    return await this.#outsidePoll(() =>
+      this.#repairPositionPass(actor, options.commit === true),
+    );
+  }
+
+  async #repairPositionPass(actor: string, commit: boolean): Promise<PositionRepairReport> {
+    const config = await this.#config();
+    const state = await this.#state();
+    const before = repairFieldsOf(state);
+
+    /** A refusal that carries whatever was computed before the gate fired. */
+    const refuse = (
+      blockedBy: string,
+      reasons: readonly string[],
+      partial: Partial<PositionRepairReport> = {},
+    ): PositionRepairReport => ({
+      outcome: "refused",
+      committed: false,
+      status: state.status,
+      blockedBy,
+      reasons,
+      before,
+      after: before,
+      evidence: [],
+      liveCycleOrderIds: [],
+      closedCycleCount: 0,
+      findings: [],
+      ...partial,
+    });
+
+    // --- Gate 1: DCA only. -------------------------------------------------
+    // Grid's position is its `ladder` -- levels, slots, `heldQuantity`,
+    // `heldCost` -- and rebuilding one is a different problem with a different
+    // arithmetic. Refusing is honest; guessing at it would not be.
+    if (config.strategy !== "dca") {
+      return refuse("gate 1: strategy", [
+        `this repair rebuilds a DCA position from its entries and exits; bot ` +
+          `${config.botInstanceId} is a ${config.strategy} bot, whose position is its ladder`,
+      ]);
+    }
+
+    // --- Gate 2: halted only. ----------------------------------------------
+    // The same rule `applyMissedFills` states: repairing the books under a live
+    // pipeline races it. `onPriceUpdate`, `#onFillPass` and the poll all read
+    // `position` to decide whether to place an order. A `stopped` bot has
+    // released its capital and nothing may act on a repaired number.
+    if (state.status !== "halted") {
+      return refuse("gate 2: status", [
+        `a position can only be repaired on a halted bot; this one is ` +
+          `${JSON.stringify(state.status)}. Halt it first, so the books are not ` +
+          `rewritten underneath a running pipeline.`,
+      ]);
+    }
+
+    // --- Load the whole order history, in sequence order. -------------------
+    // Nothing ever deletes an order (`storage.delete` is used only for the
+    // alarm), so this is the bot's complete lifetime. `nextSequence` is set to 0
+    // at creation and only ever incremented -- never reset by `#completeCycle` --
+    // so the sequence inside the clientOrderId is a total order ACROSS cycles,
+    // which `createdAt` (an exchange timestamp) is not.
+    const stored = await this.ctx.storage.list<TrackedOrder>({ prefix: ORDER_KEY_PREFIX });
+    const history: { order: TrackedOrder; sequence: number }[] = [];
+    const unparseable: string[] = [];
+    for (const order of stored.values()) {
+      const parsed = parseClientOrderId(order.clientOrderId);
+      if (parsed === null) {
+        unparseable.push(order.clientOrderId);
+        continue;
+      }
+      history.push({ order, sequence: parsed.sequence });
+    }
+    history.sort((a, b) => a.sequence - b.sequence);
+
+    // --- Partition into cycles. --------------------------------------------
+    // A cycle ends at a fully-filled SELL, and that marker is trustworthy rather
+    // than a heuristic: `position: EMPTY_POSITION` is written at runtime by
+    // exactly `#completeCycle` and `#completeLiquidation`, both reached only from
+    // `#applyFillToOrder`'s `isExit && effect.fullyFilled`, which is exactly the
+    // transition to `filled`. And `filled` cannot be asserted over an order from
+    // outside: `closeOrder` accepts only cancelled/rejected/expired, and
+    // `#foldTerminalState` says in as many words that "an order is recorded as
+    // filled by applying its fills, never by asserting the end state over them".
+    // So a sell in `filled` means fills summing to its full quantity really were
+    // applied, which means the position really was zeroed.
+    const closeIndices: number[] = [];
+    for (let i = 0; i < history.length; i++) {
+      const order = history[i]!.order;
+      if (order.side === "sell" && order.state === "filled") closeIndices.push(i);
+    }
+    const closedCycleCount = closeIndices.length;
+    const liveFrom = closedCycleCount === 0 ? 0 : closeIndices[closedCycleCount - 1]! + 1;
+    const live = history.slice(liveFrom);
+    const liveCycleOrderIds = live.map((entry) => entry.order.clientOrderId);
+
+    // Buy FILLS per closed cycle, for gate 7. Counted per fill rather than per
+    // order because that is what `#completeCycle` audited: `entries` is
+    // `position.entries.length`, and `entries` gains one element per applied buy
+    // fill, not one per order.
+    const closedBuyFillCounts: number[] = [];
+    const closedDust: string[] = [];
+    let sliceStart = 0;
+    for (const end of closeIndices) {
+      let fills = 0;
+      let bought = ZERO;
+      let soldInCycle = ZERO;
+      for (let i = sliceStart; i <= end; i++) {
+        const order = history[i]!.order;
+        for (const fill of order.fills) {
+          if (order.side === "buy") {
+            fills += 1;
+            bought += fill.quantity;
+          } else {
+            soldInCycle += fill.quantity;
+          }
+        }
+      }
+      closedBuyFillCounts.push(fills);
+      if (bought > soldInCycle) closedDust.push(toDecimalString(bought - soldInCycle));
+      sliceStart = end + 1;
+    }
+
+    // NOT a gate, and deliberately NOT folded into anything below. A completed
+    // cycle can leave real base behind: `#placeTakeProfitSell` sizes the exit
+    // from `position.quantity` through `validateOrder`, whose quantity "rounds
+    // DOWN unconditionally, on either side", and `#completeCycle` then zeroes the
+    // position regardless. That residue is a separate defect with its own
+    // accounting, and absorbing it into THIS cycle's position would be inventing
+    // base this cycle never bought. Reported so it is visible, and left alone.
+    const findings: string[] = [];
+    if (closedDust.length > 0) {
+      findings.push(
+        `${closedDust.length} completed cycle(s) left base unmodelled by the step-size ` +
+          `rounding on their exit sells (${closedDust.join(", ")}). This is a SEPARATE ` +
+          `defect, is not part of the live cycle, and is deliberately not folded into the ` +
+          `numbers below. Gate 7 compares fill COUNTS, which this does not shift.`,
+      );
+    }
+
+    // --- Read every live-cycle order back from the exchange. ---------------
+    // ROUTINE priority: this is bookkeeping, and section 5.4's reserved slice is
+    // for getting OUT of positions. The reads exist because the arithmetic below
+    // is a subtraction over local records, and local records are exactly what
+    // this chain of bugs corrupts -- a repair that trusted them could only
+    // reproduce the drift it was built to remove, while looking authoritative.
+    const exchange = this.#exchange(config, "routine");
+    const evidence: PositionRepairEvidence[] = [];
+    const unreadable: string[] = [];
+    const disagreements: string[] = [];
+    const unsettled: string[] = [];
+
+    for (const { order, sequence } of live) {
+      const outcome = await exchange.getOrderStatus(config.pair, order.clientOrderId);
+      const remote = isUsable(outcome) ? outcome.value : null;
+      const agrees = remote === null ? null : remote.filledQuantity === order.filledQuantity;
+
+      evidence.push({
+        clientOrderId: order.clientOrderId,
+        sequence,
+        side: order.side,
+        state: order.state,
+        localFilledQuantity: toDecimalString(order.filledQuantity),
+        remoteFilledQuantity: remote === null ? null : toDecimalString(remote.filledQuantity),
+        agrees,
+      });
+
+      if (remote === null) {
+        unreadable.push(
+          `${order.clientOrderId}: ${isUsable(outcome) ? "usable" : `${outcome.kind} ${outcome.message}`}`,
+        );
+      } else if (!agrees) {
+        disagreements.push(
+          `${order.clientOrderId}: the exchange reports ` +
+            `${toDecimalString(remote.filledQuantity)} filled, this bot recorded ` +
+            `${toDecimalString(order.filledQuantity)}`,
+        );
+      }
+
+      // Gate 3's condition, gathered here because it needs the same read. An
+      // order still open on the exchange may fill again at any moment, and a
+      // position rebuilt underneath it is stale before it is written.
+      if (!isTerminal(order.state) && (remote === null || agrees !== true)) {
+        unsettled.push(
+          `${order.clientOrderId} is ${order.state} (not terminal) and ` +
+            (remote === null
+              ? `could not be read back, so whether it has settled is unknown`
+              : `the exchange reports ${toDecimalString(remote.filledQuantity)} against ` +
+                `${toDecimalString(order.filledQuantity)} recorded, so it has not settled`),
+        );
+      }
+    }
+
+    const carry = { evidence, liveCycleOrderIds, closedCycleCount, findings };
+
+    // --- Gate 3: nothing in the live cycle is still moving. ----------------
+    if (unsettled.length > 0) return refuse("gate 3: unsettled orders", unsettled, carry);
+
+    // --- Gate 4: the exchange answered for every one of them. --------------
+    // Section 5.6: an unreachable exchange is not data. This is also where a
+    // venue that no longer serves status for a long-cancelled order lands -- the
+    // repair refuses rather than falling back to local-only arithmetic.
+    if (unreadable.length > 0) return refuse("gate 4: unreadable orders", unreadable, carry);
+
+    // --- Gate 5: local and remote agree, exactly. --------------------------
+    // A disagreement means there IS an unrecorded execution, and this is not the
+    // tool for it: applying a fill needs the exchange's own fill id, which
+    // `checkOpenOrders` and `applyMissedFills` obtain and this repair does not.
+    if (disagreements.length > 0) {
+      return refuse("gate 5: local/remote fill disagreement", disagreements, carry);
+    }
+
+    // --- Gate 6: the partition is derivable and consistent with cycleCount. -
+    if (unparseable.length > 0) {
+      return refuse(
+        "gate 6: partition sanity",
+        [
+          `${unparseable.length} order(s) do not parse as this system's clientOrderId ` +
+            `scheme (${unparseable.join(", ")}), so the cycles cannot be ordered`,
+        ],
+        carry,
+      );
+    }
+    if (closedCycleCount < state.cycleCount) {
+      return refuse(
+        "gate 6: partition sanity",
+        [
+          `the order history shows ${closedCycleCount} fully-filled sell(s) but this bot ` +
+            `records ${state.cycleCount} completed cycle(s). Every completed cycle ends in a ` +
+            `fully-filled exit, so fewer of those than cycles means the history is incomplete ` +
+            `and the live cycle cannot be identified.`,
+        ],
+        carry,
+      );
+    }
+
+    // --- Gate 7: the partition agrees with what the cycles audited. --------
+    // An independent source, in D1 rather than in this object. `#completeCycle`
+    // records `entries` (that cycle's buy-fill count) and `#completeLiquidation`
+    // records a liquidation; each fully-filled sell produced exactly one of the
+    // two, in time order, so the i-th closed cycle lines up with the i-th row.
+    // A liquidation row carries no entry count, so it is aligned but not counted
+    // against -- that is what can be checked, and no more.
+    const cycleAudits = await this.#db().auditLog.findMany({
+      where: {
+        target_bot_instance_id: config.botInstanceId,
+        action: { in: ["bot.cycle_completed", "bot.liquidation_filled"] },
+      },
+      orderBy: [{ column: "created_at", direction: "asc" }],
+    });
+    if (cycleAudits.length !== closedCycleCount) {
+      return refuse(
+        "gate 7: cycle audit cross-check",
+        [
+          `the order history shows ${closedCycleCount} completed cycle(s) but audit_log holds ` +
+            `${cycleAudits.length} completion row(s) for this bot. The partition cannot be ` +
+            `corroborated, so the live cycle's boundary is not trustworthy.`,
+        ],
+        carry,
+      );
+    }
+    const auditMismatches: string[] = [];
+    for (let i = 0; i < cycleAudits.length; i++) {
+      const row = cycleAudits[i]!;
+      if (row.action !== "bot.cycle_completed") continue;
+      const recorded = (row.details_json as { entries?: unknown }).entries;
+      if (typeof recorded !== "number") continue;
+      const counted = closedBuyFillCounts[i] ?? -1;
+      if (recorded !== counted) {
+        auditMismatches.push(
+          `cycle ${i + 1}: audit_log recorded ${recorded} entries, the partition counts ` +
+            `${counted} buy fill(s) before its exit`,
+        );
+      }
+    }
+    if (auditMismatches.length > 0) {
+      return refuse("gate 7: cycle audit cross-check", auditMismatches, carry);
+    }
+
+    // --- Compute the live cycle's position from its own fills. -------------
+    // Per FILL, not per order, and with `mul(price, quantity, "half-even")` --
+    // the same notional `applyFill` computes and `#applyFillToOrder` hands to
+    // `applyEntry` as `cost`. So on a healthy bot this reproduces the stored
+    // numbers exactly, which is what makes `no_change` meaningful.
+    let bought = ZERO;
+    let boughtCost = ZERO;
+    let sold = ZERO;
+    let soldProceeds = ZERO;
+    const rebuilt: DcaEntry[] = [];
+
+    for (const { order } of live) {
+      for (const fill of order.fills) {
+        const notional = mul(fill.price, fill.quantity, "half-even");
+        if (order.side === "buy") {
+          bought += fill.quantity;
+          boughtCost += notional;
+          rebuilt.push({
+            clientOrderId: order.clientOrderId,
+            price: fill.price,
+            quantity: fill.quantity,
+            cost: notional,
+            at: fill.executedAt,
+          });
+        } else {
+          sold += fill.quantity;
+          soldProceeds += notional;
+        }
+      }
+    }
+    rebuilt.sort((a, b) => (a.at === b.at ? 0 : a.at < b.at ? -1 : 1));
+
+    const quantity = bought - sold;
+    // The cycle's average entry across everything it bought. Preserved by the
+    // proportional model, and the basis the sold leg's PnL is measured against.
+    const cycleAverageEntry =
+      bought > ZERO ? divideRounded(boughtCost * ONE, bought, "half-even") : ZERO;
+
+    // One rounding, not two: scaling by a pre-divided fraction would round the
+    // fraction and then round the product.
+    const cost =
+      quantity > ZERO ? divideRounded(boughtCost * quantity, bought, "half-even") : ZERO;
+    const averageEntryPrice =
+      quantity > ZERO ? divideRounded(cost * ONE, quantity, "half-even") : ZERO;
+    const lastEntryPrice =
+      quantity > ZERO && rebuilt.length > 0 ? rebuilt[rebuilt.length - 1]!.price : ZERO;
+    // Flat means flat: nothing is held, so nothing describes what is held.
+    const entries = quantity > ZERO ? rebuilt : [];
+
+    const soldPnl =
+      sold > ZERO ? soldProceeds - mul(sold, cycleAverageEntry, "half-even") : ZERO;
+
+    // --- Gate 8: the arithmetic produced a real position. ------------------
+    if (quantity < ZERO) {
+      return refuse(
+        "gate 8: negative quantity",
+        [
+          `the live cycle's own orders sum to ${toDecimalString(quantity)} base ` +
+            `(${toDecimalString(bought)} bought, ${toDecimalString(sold)} sold). A bot cannot ` +
+            `hold less than nothing, so the order history is wrong rather than the position.`,
+        ],
+        carry,
+      );
+    }
+
+    // --- Gate 9: the repaired cost fits inside the allocation. -------------
+    // `#placeBuy` guards spending with `allocatedCapital - position.cost`, so a
+    // repaired cost above the allocation would leave the bot's own budget
+    // permanently negative.
+    if (cost > config.allocatedCapital) {
+      return refuse(
+        "gate 9: cost exceeds allocation",
+        [
+          `the repaired cost ${toDecimalString(cost)} ${config.capitalAsset} exceeds this ` +
+            `bot's allocation of ${toDecimalString(config.allocatedCapital)}`,
+        ],
+        carry,
+      );
+    }
+
+    // --- Gate 10: the exit pointer is terminal AND accounted for. ----------
+    // Terminal alone is NOT enough. Clearing the pointer while the sold quantity
+    // is still counted as held re-arms `#placeTakeProfitSell` to sell base that
+    // is already gone. The condition is that this repair's own `sold` includes it.
+    if (state.exitOrderId !== null) {
+      const exit = live.find((entry) => entry.order.clientOrderId === state.exitOrderId);
+      if (exit === undefined) {
+        return refuse(
+          "gate 10: exit order",
+          [
+            `exitOrderId names ${state.exitOrderId}, which is not among the live cycle's ` +
+              `orders, so its fills are not in the ${toDecimalString(sold)} this repair ` +
+              `subtracted and clearing the pointer would drop them silently`,
+          ],
+          carry,
+        );
+      }
+      if (!isTerminal(exit.order.state)) {
+        return refuse(
+          "gate 10: exit order",
+          [
+            `exitOrderId names ${state.exitOrderId}, which is still ${exit.order.state} on ` +
+              `this bot's own books. A live exit may still fill; clearing it now would let a ` +
+              `second exit be placed alongside it.`,
+          ],
+          carry,
+        );
+      }
+    }
+
+    // --- Every gate passed. What would change? -----------------------------
+    const after: PositionRepairFields = {
+      quantity: toDecimalString(quantity),
+      cost: toDecimalString(cost),
+      averageEntryPrice: toDecimalString(averageEntryPrice),
+      lastEntryPrice: toDecimalString(lastEntryPrice),
+      entryCount: entries.length,
+      additionalBuysUsed: state.position.additionalBuysUsed,
+      realizedGross: toDecimalString(state.realizedGross),
+      exitOrderId: null,
+      exitKind: null,
+    };
+
+    // THE IDEMPOTENCY HINGE. The sold leg's PnL is booked only when the position
+    // is actually being reduced. After a successful commit the stored quantity
+    // and cost already equal what this recomputes -- the orders did not change --
+    // so a second run books nothing and `realizedGross` cannot double.
+    const reducing =
+      state.position.quantity !== quantity || state.position.cost !== cost;
+    const realizedGross = reducing ? state.realizedGross + soldPnl : state.realizedGross;
+    const withPnl: PositionRepairFields = { ...after, realizedGross: toDecimalString(realizedGross) };
+
+    const changed =
+      reducing ||
+      state.position.averageEntryPrice !== averageEntryPrice ||
+      state.position.lastEntryPrice !== lastEntryPrice ||
+      state.position.entries.length !== entries.length ||
+      state.exitOrderId !== null ||
+      state.exitKind !== undefined;
+
+    if (!changed) {
+      return {
+        outcome: "no_change",
+        committed: false,
+        status: state.status,
+        blockedBy: null,
+        reasons: [],
+        before,
+        after: withPnl,
+        ...carry,
+      };
+    }
+
+    if (!commit) {
+      return {
+        outcome: "would_repair",
+        committed: false,
+        status: state.status,
+        blockedBy: null,
+        reasons: [],
+        before,
+        after: withPnl,
+        ...carry,
+      };
+    }
+
+    // --- Commit: one write, guarded against the reads having gone stale. ---
+    // Step 21's discipline. Every `getOrderStatus` above suspended this object,
+    // and an RPC is delivered into exactly that window. `#mutateState` stops two
+    // writes reverting each other; it cannot stop a DECISION taken against state
+    // that has since moved, which is what this whole computation is. So the
+    // mutate re-reads and refuses to apply if the position it measured is no
+    // longer the position that is there.
+    let raced = false;
+    await this.#mutateState((current) => {
+      if (
+        current.position.quantity !== state.position.quantity ||
+        current.position.cost !== state.position.cost ||
+        current.realizedGross !== state.realizedGross ||
+        current.exitOrderId !== state.exitOrderId ||
+        current.status !== state.status
+      ) {
+        raced = true;
+        return current;
+      }
+      return {
+        ...current,
+        position: {
+          quantity,
+          cost,
+          averageEntryPrice,
+          entries,
+          // Carried, never rebuilt. See the docblock.
+          additionalBuysUsed: current.position.additionalBuysUsed,
+          lastEntryPrice,
+        },
+        realizedGross,
+        exitOrderId: null,
+        exitKind: undefined,
+      };
+    });
+
+    if (raced) {
+      return refuse(
+        "concurrent state change during the exchange reads",
+        [
+          `this bot's position, realized total, exit pointer or status changed while the ` +
+            `live-cycle orders were being read back, so the repair was computed against state ` +
+            `that no longer exists. Nothing was written; run it again.`,
+        ],
+        carry,
+      );
+    }
+
+    await this.#alert(config, {
+      severity: "info",
+      category: "trading",
+      alertType: "position_repaired",
+      message:
+        `position rebuilt from the live cycle's own orders: quantity ${before.quantity} -> ` +
+        `${after.quantity}, cost ${before.cost} -> ${after.cost}, average entry ` +
+        `${before.averageEntryPrice} -> ${after.averageEntryPrice}. The sold leg's realized ` +
+        `${toDecimalString(soldPnl)} ${config.capitalAsset} was booked; the stale exit pointer ` +
+        `was cleared. Requested by ${actor}.`,
+    });
+
+    await this.#audit(
+      config,
+      "bot.position_repaired",
+      actor,
+      {
+        before,
+        after: withPnl,
+        realized_delta: toDecimalString(soldPnl),
+        live_cycle_order_ids: liveCycleOrderIds,
+        closed_cycle_count: closedCycleCount,
+        evidence,
+        findings,
+      },
+      this.#now(),
+    );
+
+    return {
+      outcome: "repaired",
+      committed: true,
+      status: (await this.#state()).status,
+      blockedBy: null,
+      reasons: [],
+      before,
+      after: withPnl,
+      ...carry,
+    };
   }
 
   /**

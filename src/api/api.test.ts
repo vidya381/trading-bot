@@ -1145,6 +1145,53 @@ describe("bots", () => {
     expect(row!.status).toBe("halted");
   });
 
+  /**
+   * Fix 3 through the real endpoint. The two things worth asserting here rather
+   * than in the DO's own suite: `?commit` defaults to REPORT, and this is
+   * reachable while step 58's drift alert stands -- which is the whole point,
+   * since resolving that alert is what it exists to enable.
+   */
+  it("reports a position repair without committing, and defaults to report mode", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rp${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.halt("manual", "operator review", HUMAN));
+    // The alert that makes `resume` refuse. This endpoint must not be behind it.
+    await db.alerts.insert(
+      alertRow({
+        id: `rpdrift-${suffix}`,
+        bot_instance_id: id,
+        alert_type: "reconciliation_meaningful_order_state_drift",
+        source: "reconciliation",
+        resolved: false,
+      }),
+    );
+
+    const res = await api("POST", `/api/bots/${id}/repair-position`);
+    expect(res.status).toBe(200);
+    // A freshly halted bot with no fills has nothing to repair.
+    expect(res.body.data.result.outcome).toBe("no_change");
+    expect(res.body.data.result.committed).toBe(false);
+
+    // And resume is still refused, proving the two are independent.
+    const resume = await api("POST", `/api/bots/${id}/resume`);
+    expect(resume.status).toBe(409);
+    expect(resume.body.error.code).toBe("position_unverified");
+  });
+
+  it("rejects a malformed ?commit value rather than guessing", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rpc${suffix}`;
+    await createDcaBot(id, account);
+
+    const res = await api("POST", `/api/bots/${id}/repair-position?commit=yes`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_field");
+  });
+
   it("refuses to resume while the global kill switch is pulled (409)", async () => {
     const account = `acct-${suffix}`;
     await seedBalance(account);

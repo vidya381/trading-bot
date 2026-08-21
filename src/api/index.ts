@@ -52,6 +52,7 @@ const ROUTES: readonly Route[] = [
   // in production. Capital could be allocated and never returned.
   route("POST", "/api/bots/:id/close", handlers.closeBot),
   route("POST", "/api/bots/:id/apply-missed-fills", handlers.applyMissedFills),
+  route("POST", "/api/bots/:id/repair-position", handlers.repairPosition),
   route("POST", "/api/bots/:id/check-open-orders", handlers.checkOpenOrders),
   route("POST", "/api/bots/:id/archive", handlers.archiveBot),
   route("POST", "/api/bots/:id/unarchive", handlers.unarchiveBot),

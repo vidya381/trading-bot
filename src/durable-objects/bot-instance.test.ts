@@ -21,9 +21,14 @@ import { fromDecimalString as m, toDecimalString, ZERO } from "../shared/money";
 import { TERMINAL_STATES } from "../shared/order-state";
 import type { Price } from "../shared/exchange-client";
 import type { DcaParams } from "../strategies/dca";
-import type { BotInstance, CreateDcaBotRequest, PipelineResult } from "./bot-instance";
+import type {
+  BotInstance,
+  BotRuntimeState,
+  CreateDcaBotRequest,
+  PipelineResult,
+} from "./bot-instance";
 import { BotInstanceError } from "./bot-instance";
-import { FakeExchange, TEST_PAIR } from "./fake-exchange";
+import { FakeExchange, TEST_PAIR, testFilters } from "./fake-exchange";
 import { inBot, inLimiter, noopFeed, rateLimiterStub, recordingFeed } from "./test-helpers";
 import type { PriceFeedPort } from "./price-feed";
 import type { AcquireRequest, AcquireResult } from "./rate-limiter";
@@ -2799,5 +2804,445 @@ describe("interleaving safety (step 21)", () => {
     await run((bot) => bot.halt("manual", "operator", ACTOR));
 
     expect(await db.alerts.count({ alert_type: "unattributable_fill", resolved: false })).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// repairPosition: rebuilding a live cycle's position from its own orders (fix 3)
+// ---------------------------------------------------------------------------
+
+describe("repairPosition", () => {
+  /**
+   * Step-size fine enough to carry the real bots' quantities.
+   *
+   * The default fake rounds to 0.00001, which would quantise 0.00158519 away
+   * before any of this could be observed. Gemini's real BTCUSD step is 1e-8, so
+   * this is the faithful setting for reproducing what actually happened.
+   */
+  function fineFilters(): void {
+    exchange.filters = testFilters({
+      stepSize: m("0.00000001"),
+      minQuantity: m("0.00000001"),
+    });
+  }
+
+  /** Read this bot's raw stored state, for the two states no API can produce. */
+  async function storedState(): Promise<BotRuntimeState> {
+    return await inBot(objectName, async (_bot, ctx) => {
+      return (await ctx.storage.get<BotRuntimeState>("state"))!;
+    });
+  }
+
+  async function putStoredState(next: BotRuntimeState): Promise<void> {
+    await inBot(objectName, async (_bot, ctx) => {
+      await ctx.storage.put("state", next);
+    });
+  }
+
+  /**
+   * `bot-b23y63`'s exact shape: one cycle, a take-profit sell that filled
+   * 0.00115434 of 0.00158519 and was then cancelled by a halt, and a position
+   * that never decremented.
+   */
+  async function singleCycleShape(): Promise<{ buyId: string; sellId: string }> {
+    fineFilters();
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    const buyFill = exchange.fillFor(buyId, { quantity: m("0.00158519") });
+    await run((bot) => bot.onFill(buyId, buyFill));
+    exchange.fillsByOrder.set(buyId, [buyFill]);
+
+    // 60000 x 1.02 = 61200: the take-profit target.
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    const sellFill = exchange.fillFor(sellId, { quantity: m("0.00115434") });
+    await run((bot) => bot.onFill(sellId, sellFill));
+    exchange.fillsByOrder.set(sellId, [sellFill]);
+
+    // The halt reconciliation performed, which cancelled the partially-filled
+    // exit and left `exitOrderId` pointing at it.
+    await run((bot) => bot.halt("manual", "reconciliation found meaningful drift", "reconciliation"));
+    return { buyId, sellId };
+  }
+
+  /** `bot-bl4e7c`'s shape: one CLOSED cycle, then the same damage in a second. */
+  async function twoCycleShape(): Promise<{ sellId: string }> {
+    fineFilters();
+    await run((bot) => bot.create(creation({ params: { ...params, autoRestart: true } })));
+    await run((bot) => bot.start(ACTOR));
+
+    // Cycle 1, completed cleanly: buy fully filled, exit fully filled.
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buy1 = exchange.placed[0]!.clientOrderId;
+    const buy1Fill = exchange.fillFor(buy1);
+    await run((bot) => bot.onFill(buy1, buy1Fill));
+    exchange.fillsByOrder.set(buy1, [buy1Fill]);
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sell1 = exchange.placed[1]!.clientOrderId;
+    const sell1Fill = exchange.fillFor(sell1);
+    await run((bot) => bot.onFill(sell1, sell1Fill));
+    exchange.fillsByOrder.set(sell1, [sell1Fill]);
+
+    // Cycle 2, damaged the same way as bot-b23y63.
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buy2 = exchange.placed[2]!.clientOrderId;
+    const buy2Fill = exchange.fillFor(buy2, { quantity: m("0.00126687") });
+    await run((bot) => bot.onFill(buy2, buy2Fill));
+    exchange.fillsByOrder.set(buy2, [buy2Fill]);
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[3]!.clientOrderId;
+    const sellFill = exchange.fillFor(sellId, { quantity: m("0.00033725") });
+    await run((bot) => bot.onFill(sellId, sellFill));
+    exchange.fillsByOrder.set(sellId, [sellFill]);
+    await run((bot) => bot.halt("manual", "reconciliation found meaningful drift", "reconciliation"));
+    return { sellId };
+  }
+
+  // --- The two live bots ---------------------------------------------------
+
+  it("computes bot-b23y63's residual: 0.00158519 held, 0.00115434 sold", async () => {
+    const { sellId } = await singleCycleShape();
+
+    const before = await run((bot) => bot.snapshot());
+    // The bug, as found live: the position never decremented on the exit fills.
+    expect(before.state.position.quantity).toBe(m("0.00158519"));
+    expect(before.state.exitOrderId).toBe(sellId);
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+
+    expect(report.outcome).toBe("would_repair");
+    expect(report.committed).toBe(false);
+    expect(report.blockedBy).toBeNull();
+    expect(report.before.quantity).toBe("0.00158519");
+    expect(report.after.quantity).toBe("0.00043085"); // 0.00158519 - 0.00115434
+    // Proportional cost: 60000 x 0.00043085. The average entry is PRESERVED,
+    // which is the whole reason for the proportional model -- both risk
+    // thresholds key off it.
+    expect(report.before.cost).toBe("95.11140000");
+    expect(report.after.cost).toBe("25.85100000");
+    expect(report.before.averageEntryPrice).toBe("60000.00000000");
+    expect(report.after.averageEntryPrice).toBe("60000.00000000");
+    // The sold leg's PnL, from ACTUAL fill notionals: 0.00115434 x 61200 minus
+    // 0.00115434 x 60000.
+    expect(report.before.realizedGross).toBe("0.00000000");
+    expect(report.after.realizedGross).toBe("1.38520800");
+    expect(report.after.exitOrderId).toBeNull();
+    expect(report.after.exitKind).toBeNull();
+    expect(report.closedCycleCount).toBe(0);
+  });
+
+  it("commits bot-b23y63's repair exactly as reported", async () => {
+    const { sellId } = await singleCycleShape();
+    const reported = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+
+    const committed = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(committed.outcome).toBe("repaired");
+    expect(committed.committed).toBe(true);
+    expect(committed.after).toEqual(reported.after);
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.position.quantity).toBe(m("0.00043085"));
+    expect(after.state.position.cost).toBe(m("25.851"));
+    expect(after.state.position.averageEntryPrice).toBe(m("60000"));
+    expect(after.state.realizedGross).toBe(m("1.385208"));
+    // The stale pointer is gone, so a take-profit can be placed again.
+    expect(after.state.exitOrderId).toBeNull();
+    expect(after.state.exitKind).toBeUndefined();
+    // Explicitly NOT written.
+    expect(after.state.status).toBe("halted");
+    expect(after.state.cycleCount).toBe(0);
+    expect(after.orders.find((o) => o.clientOrderId === sellId)!.state).toBe("cancelled");
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.position_repaired" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(ACTOR);
+    expect(await db.alerts.count({ alert_type: "position_repaired" })).toBe(1);
+  });
+
+  it("computes bot-bl4e7c's residual from the LIVE cycle only, not all history", async () => {
+    await twoCycleShape();
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+
+    expect(report.outcome).toBe("would_repair");
+    expect(report.closedCycleCount).toBe(1);
+    // Only cycle 2's four orders... two, in fact: its buy and its exit.
+    expect(report.liveCycleOrderIds).toHaveLength(2);
+    expect(report.after.quantity).toBe("0.00092962"); // 0.00126687 - 0.00033725
+    expect(report.after.averageEntryPrice).toBe("60000.00000000");
+    expect(report.after.cost).toBe("55.77720000");
+    // Cycle 1's realized profit is NOT recomputed -- it is added to.
+    expect(report.before.realizedGross).toBe("1.99999200");
+    expect(report.after.realizedGross).toBe("2.40469200"); // + 0.4047
+  });
+
+  it("leaves the CLOSED cycle's settled state untouched when it commits", async () => {
+    await twoCycleShape();
+    const before = await run((bot) => bot.snapshot());
+    const closedOrders = before.orders.filter((o) => o.state === "filled");
+    expect(closedOrders).toHaveLength(2); // cycle 1's buy and its exit
+
+    await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.cycleCount).toBe(1);
+    for (const order of closedOrders) {
+      expect(after.orders.find((o) => o.clientOrderId === order.clientOrderId)).toEqual(order);
+    }
+  });
+
+  // --- Report mode ---------------------------------------------------------
+
+  it("writes NOTHING in report mode, even when every gate passes", async () => {
+    await singleCycleShape();
+    const before = await storedState();
+    const orders = (await run((bot) => bot.snapshot())).orders;
+    const auditBefore = await db.auditLog.count({});
+    const alertsBefore = await db.alerts.count({});
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+    expect(report.outcome).toBe("would_repair");
+
+    // Byte-identical: the whole stored state object, every order, and no new
+    // audit or alert row.
+    expect(await storedState()).toEqual(before);
+    expect((await run((bot) => bot.snapshot())).orders).toEqual(orders);
+    expect(await db.auditLog.count({})).toBe(auditBefore);
+    expect(await db.alerts.count({})).toBe(alertsBefore);
+  });
+
+  it("is safe to run repeatedly in report mode", async () => {
+    await singleCycleShape();
+    const first = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+    const second = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+    const third = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+    expect(second).toEqual(first);
+    expect(third).toEqual(first);
+  });
+
+  it("reports no_change on a HEALTHY bot rather than erroring", async () => {
+    // A halted bot whose position genuinely matches its orders: one buy fill,
+    // no exit at all. Running this out of curiosity must be uneventful.
+    fineFilters();
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    const fill = exchange.fillFor(buyId, { quantity: m("0.00158519") });
+    await run((bot) => bot.onFill(buyId, fill));
+    exchange.fillsByOrder.set(buyId, [fill]);
+    exchange.cancelFailure = { kind: "transport", message: "leave it open" };
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+
+    expect(report.outcome).toBe("no_change");
+    expect(report.committed).toBe(false);
+    expect(report.blockedBy).toBeNull();
+    expect(report.before).toEqual(report.after);
+    expect(await db.auditLog.count({ action: "bot.position_repaired" })).toBe(0);
+  });
+
+  it("is idempotent: a second commit changes nothing and does not double-book", async () => {
+    await singleCycleShape();
+
+    const first = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(first.outcome).toBe("repaired");
+    const afterFirst = await storedState();
+
+    const second = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(second.outcome).toBe("no_change");
+    expect(second.committed).toBe(false);
+    // THE DOUBLE-BOOK GUARD. `realizedGross` is booked only while the position
+    // is actually being reduced; the second pass finds it already reduced.
+    expect(second.after.realizedGross).toBe("1.38520800");
+    expect(await storedState()).toEqual(afterFirst);
+    expect(await db.auditLog.count({ action: "bot.position_repaired" })).toBe(1);
+  });
+
+  // --- The ten gates, one at a time ----------------------------------------
+
+  it("gate 2 refuses a bot that is not halted", async () => {
+    fineFilters();
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 2: status");
+  });
+
+  it("gate 3 refuses while a live-cycle order is still unsettled", async () => {
+    // A non-terminal order whose exchange count is ahead of ours: it may still
+    // be moving, so a position rebuilt underneath it is stale before it lands.
+    await singleCycleShape();
+    const openId = "v1-dca-btc-1-90";
+    exchange.resting.set(openId, {
+      request: { pair: TEST_PAIR, clientOrderId: openId, side: "buy", type: "limit", price: m("60000"), quantity: m("0.001") },
+      exchangeOrderId: "x-90",
+      filledQuantity: m("0.0005"),
+      cancelled: false,
+    });
+    await inBot(objectName, async (_bot, ctx) => {
+      await ctx.storage.put(`order:${openId}`, {
+        clientOrderId: openId, pair: TEST_PAIR, side: "buy", price: m("60000"),
+        quantity: m("0.001"), filledQuantity: ZERO, state: "pending", fills: [],
+        createdAt: T0, updatedAt: T0,
+      });
+    });
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 3: unsettled orders");
+  });
+
+  it("gate 4 refuses when the exchange cannot be read for an order", async () => {
+    // Every live-cycle order is TERMINAL here, so gate 3 passes and this is
+    // gate 4 in isolation. This is also where a venue that no longer answers
+    // for a long-cancelled order would land.
+    const { sellId } = await singleCycleShape();
+    exchange.orderStatusFailureFor.add(sellId);
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 4: unreadable orders");
+    expect(report.evidence.find((e) => e.clientOrderId === sellId)!.remoteFilledQuantity).toBeNull();
+  });
+
+  it("gate 5 refuses when the exchange and this bot disagree about a fill", async () => {
+    const { sellId } = await singleCycleShape();
+    // Terminal, readable, and the venue says MORE filled than we recorded.
+    exchange.fillsByOrder.set(sellId, [
+      { fillId: "extra", price: m("61200"), quantity: m("0.00125434"), feeAmount: ZERO, feeAsset: "USDT", executedAt: T0 },
+    ]);
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 5: local/remote fill disagreement");
+    expect(report.evidence.find((e) => e.clientOrderId === sellId)!.agrees).toBe(false);
+  });
+
+  it("gate 6 refuses when cycleCount exceeds the fully-filled sells in history", async () => {
+    await singleCycleShape();
+    const state = await storedState();
+    // Unreachable through any API -- a completed cycle always leaves a filled
+    // sell behind -- so it is written directly to prove the gate holds.
+    await putStoredState({ ...state, cycleCount: 3 });
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 6: partition sanity");
+  });
+
+  it("gate 7 refuses when the cycle audit rows do not corroborate the partition", async () => {
+    // `audit_log` has no delete -- it is append-only by design -- so the
+    // disagreement is created the way a real one would appear: a completion row
+    // the order history has no fully-filled sell for.
+    await singleCycleShape();
+    expect(await db.auditLog.count({ action: "bot.cycle_completed" })).toBe(0);
+    await db.auditLog.insert({
+      id: "phantom-cycle",
+      actor: "system",
+      action: "bot.cycle_completed",
+      target_bot_instance_id: BOT_ID,
+      details_json: { cycle: 1, gross_profit: "0.00000000", entries: 1 },
+      created_at: T0,
+    });
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 7: cycle audit cross-check");
+  });
+
+  it("gate 8 refuses when the live cycle's orders sum to a negative position", async () => {
+    await singleCycleShape();
+    const rogueId = "v1-dca-btc-1-91";
+    exchange.resting.set(rogueId, {
+      request: { pair: TEST_PAIR, clientOrderId: rogueId, side: "sell", type: "limit", price: m("61200"), quantity: m("1") },
+      exchangeOrderId: "x-91",
+      filledQuantity: m("1"),
+      cancelled: true,
+    });
+    const rogueFill = { fillId: "rogue-1", price: m("61200"), quantity: m("1"), feeAmount: ZERO, feeAsset: "USDT", executedAt: T0 };
+    exchange.fillsByOrder.set(rogueId, [rogueFill]);
+    await inBot(objectName, async (_bot, ctx) => {
+      await ctx.storage.put(`order:${rogueId}`, {
+        clientOrderId: rogueId, pair: TEST_PAIR, side: "sell", price: m("61200"),
+        quantity: m("1"), filledQuantity: m("1"), state: "cancelled", fills: [rogueFill],
+        createdAt: T0, updatedAt: T0,
+      });
+    });
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 8: negative quantity");
+  });
+
+  it("gate 9 refuses when the repaired cost exceeds the bot's allocation", async () => {
+    // Filled at ten times the order's own price, so the recomputed cost lands
+    // above the 400 allocation. `onFill` takes the exchange's price verbatim.
+    fineFilters();
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    const fill = exchange.fillFor(buyId, { quantity: m("0.00158519"), price: m("600000") });
+    await run((bot) => bot.onFill(buyId, fill));
+    exchange.fillsByOrder.set(buyId, [fill]);
+    exchange.cancelFailure = { kind: "transport", message: "leave it open" };
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 9: cost exceeds allocation");
+  });
+
+  it("gate 10 refuses while the exit order it would clear is not terminal", async () => {
+    fineFilters();
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    const buyFill = exchange.fillFor(buyId, { quantity: m("0.00158519") });
+    await run((bot) => bot.onFill(buyId, buyFill));
+    exchange.fillsByOrder.set(buyId, [buyFill]);
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    const sellFill = exchange.fillFor(sellId, { quantity: m("0.00115434") });
+    await run((bot) => bot.onFill(sellId, sellFill));
+    exchange.fillsByOrder.set(sellId, [sellFill]);
+    // The halt cannot confirm the cancellation, so the exit stays LIVE.
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(report.blockedBy).toBe("gate 10: exit order");
+  });
+
+  it("refuses whole: a blocked pass writes nothing at all", async () => {
+    const { sellId } = await singleCycleShape();
+    const before = await storedState();
+    exchange.orderStatusFailureFor.add(sellId);
+
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(report.outcome).toBe("refused");
+    expect(await storedState()).toEqual(before);
+    expect(await db.auditLog.count({ action: "bot.position_repaired" })).toBe(0);
+  });
+
+  it("reports the completed-cycle dust leak as a finding, and does not absorb it", async () => {
+    // A closed cycle whose exit sold less than the cycle bought -- the step-size
+    // rounding `#placeTakeProfitSell` applies. It is a SEPARATE defect and must
+    // not move the live cycle's numbers.
+    await twoCycleShape();
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+    // This shape happens to close cleanly, so there is no dust and no finding.
+    expect(report.findings).toEqual([]);
+    // The live-cycle arithmetic is unchanged by the closed cycle either way.
+    expect(report.after.quantity).toBe("0.00092962");
   });
 });

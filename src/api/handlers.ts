@@ -826,6 +826,47 @@ export async function applyMissedFills(ctx: ApiContext): Promise<Response> {
 }
 
 /**
+ * POST /api/bots/:id/repair-position -- rebuild a DCA position from its orders.
+ *
+ * REPORT BY DEFAULT. `?commit=true` is the only thing that writes; without it
+ * this is a pure read that computes the whole before/after diff, runs every gate,
+ * and returns which one would block. That inversion is deliberate and matches how
+ * the rest of this surface behaves: `check-open-orders` reports what it folded
+ * and what it refused, `apply-missed-fills` reports what it could not attribute,
+ * and section 9 halts and alerts rather than correcting. This is the only call in
+ * the system that OVERWRITES a position, so the number is meant to be read before
+ * it is trusted.
+ *
+ * `?commit=` rather than a body, for the reason `removeWatchlistEntry` gives: a
+ * POST with no body is the normal case here and `readJsonObject` would turn one
+ * into an `invalid_json` 400.
+ *
+ * REACHABLE WHILE A DRIFT ALERT STANDS, which is the whole point. Step 58 makes
+ * `resume` refuse a bot with an open `order_state_drift` alert; this endpoint is
+ * how that condition gets resolved, so it must not be gated behind the thing it
+ * unblocks. It is independent of `resume` in both directions -- it never changes
+ * status, and a halted bot stays halted.
+ */
+export async function repairPosition(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const raw = ctx.url.searchParams.get("commit");
+  if (raw !== null && raw !== "true" && raw !== "false") {
+    throw badRequest(
+      "invalid_field",
+      `query parameter "commit", if given, must be "true" or "false"; got ${JSON.stringify(raw)}`,
+    );
+  }
+  const commit = raw === "true";
+  const result = await botStub(ctx, id).repairPosition(ctx.actor, { commit });
+  const [row, snapshot, fees] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+    feesFor(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
+}
+
+/**
  * POST /api/bots/:id/check-open-orders -- observe this bot's resting orders NOW.
  *
  * Calls `BotInstance.checkOpenOrders(actor)`, built at step 19 and until now
