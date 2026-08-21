@@ -17,7 +17,7 @@
 
 import type { GridLadder, GridParams } from "../api/types";
 import { compareDecimal, formatMoney, formatQuantity } from "../format";
-import { unrealizedPnl } from "../derive";
+import { gridStepOf, unrealizedPnl } from "../derive";
 import { SideBadge } from "./SideBadge";
 import { ConfigItem, ConfigSection, enabled, percent } from "./ConfigSection";
 import { Unit } from "./Unit";
@@ -85,6 +85,16 @@ export function GridLadderView({
    * It appears in the configuration block below, as the amount it is.
    */
   const pnl = unrealizedPnl(ladder.heldQuantity, ladder.heldCost, currentPrice);
+
+  /*
+   * The ladder's own spacing, shown in the configuration block below. This is
+   * the scale the DEFAULT breakout threshold is measured in (spec 6.2 step 5:
+   * one grid step above the highest line), which until now appeared in no UI at
+   * all -- an operator could read a breakout halt alert naming a trigger price
+   * and find nothing on this page that accounted for it. Deliberately the gap
+   * and NOT the resolved breakout price; see `gridStepOf` for why.
+   */
+  const gridStep = gridStepOf(ladder.levels);
 
   // Pair each level with its slot, then sort descending (highest at top),
   // keeping the level<->slot alignment intact.
@@ -229,14 +239,51 @@ export function GridLadderView({
         <ConfigItem label="Breakout take-profit" hint="cash out on an upside breakout">
           {enabled(params.breakoutTakeProfit)}
         </ConfigItem>
+        {/*
+         * ⚠ NULL HERE IS A DEFAULT IN FORCE, NOT AN ABSENCE, and this field used
+         * to say the opposite. It read "Not set", which an operator reasonably
+         * takes as "no breakout threshold governs this bot" -- while the bot was
+         * halting on a concrete trigger price that the halt alert named and this
+         * page did not. What null actually means is `breakoutPrice`'s default
+         * branch (grid.ts): one grid step above the highest line, the ladder's
+         * own spacing, per spec 6.2 step 5 and decision log 09's decision 4.
+         *
+         * So the null case is worded as the rule that governs it, the "Grid
+         * step" row beside it carries the number that rule is measured in, and
+         * the label regains the "%" unit the create form's own label
+         * ("Breakout threshold %") always carried -- this is the optional
+         * PERCENTAGE OVERRIDE, not a price, and dropping the unit was half of
+         * why the field read as broken.
+         *
+         * No resolved breakout PRICE is shown, deliberately: see `gridStepOf`.
+         */}
         <ConfigItem
-          label="Breakout threshold"
-          hint={params.breakoutThresholdPct === null ? "not set" : "above the upper bound"}
+          label="Breakout threshold %"
+          hint={
+            params.breakoutThresholdPct === null
+              ? "one grid step above the top line"
+              : "above the upper bound"
+          }
         >
           {params.breakoutThresholdPct === null ? (
-            <span className="text-zinc-600">Not set</span>
+            <span className="text-zinc-400">Default</span>
           ) : (
             percent(params.breakoutThresholdPct)
+          )}
+        </ConfigItem>
+        {/*
+         * The gap between the two highest grid lines -- `topRungGap` in grid.ts.
+         * Sits immediately after the threshold it explains, so the default and
+         * its scale read together.
+         */}
+        <ConfigItem label="Grid step" hint="gap between the top two lines">
+          {gridStep === null ? (
+            <span className="text-zinc-600">—</span>
+          ) : (
+            <>
+              {formatMoney(gridStep)}
+              <Unit>{capitalAsset}</Unit>
+            </>
           )}
         </ConfigItem>
       </ConfigSection>

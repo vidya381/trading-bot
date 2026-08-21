@@ -1,10 +1,11 @@
 /**
- * Derived figures for the bot detail view: the price a DCA cycle exits at, and
- * mark-to-market unrealized profit for a position the bot is still holding.
+ * Derived figures for the bot detail view: the price a DCA cycle exits at,
+ * mark-to-market unrealized profit for a position the bot is still holding, and
+ * the spacing of a grid ladder's top rung.
  *
  * Read-only presentation. Nothing here is written back, sent, or acted on -- the
  * bot computes its own thresholds from its own state and this module never feeds
- * that path. It exists so an operator can see, at a glance, the two numbers the
+ * that path. It exists so an operator can see, at a glance, the numbers the
  * detail view previously made them work out in their head.
  *
  * WHY THIS IMPORTS FROM THE WORKER'S SOURCE TREE
@@ -157,4 +158,39 @@ export function unrealizedPnl(
     basis === ZERO ? null : toDecimalString(divideRounded(amount * HUNDRED_PERCENT, basis, "half-even"));
 
   return { value: toDecimalString(value), amount: toDecimalString(amount), pct };
+}
+
+/**
+ * The ladder's top rung gap: the distance between the two highest grid lines.
+ *
+ * MIRROR of `topRungGap` in src/strategies/grid.ts, and the second deliberate
+ * re-derivation in this file after `applyPercent` above. Direct import was tried
+ * and REJECTED for the same concrete reason `dca.ts` was, verified by building
+ * rather than assumed: `tsc -b` on the dashboard fails with
+ * `../src/strategies/grid.ts(66,26): error TS6196: 'Timestamp' is declared but
+ * never used`, because the dashboard sets `noUnusedLocals` where the Worker does
+ * not. Correcting that is a backend edit, and this change is display-only.
+ *
+ * `src/strategies/grid-dashboard-parity.test.ts` runs BOTH implementations over
+ * the same ladders and asserts they agree, so the mirror cannot drift silently.
+ *
+ * WHY THIS FIGURE AND NOT THE BREAKOUT PRICE. When `breakoutThresholdPct` is
+ * null the bot's breakout trigger is `highest line + this gap` (spec 6.2 step 5,
+ * decision log 09). Showing the GAP lets an operator see the scale that governs
+ * the default without this module growing a second copy of `breakoutPrice` --
+ * whose `applyPercent`/ceil branch is exactly the kind of formula that drifts a
+ * rounding step from the one the bot compares against. The addition is left to
+ * the reader on purpose.
+ *
+ * `null` -- rendered "—" -- for a ladder with fewer than two levels, which no
+ * validated grid can have (`gridLines >= 2`), or for a level string this module
+ * cannot parse. Never zero, which would read as "the lines sit on top of
+ * each other".
+ */
+export function gridStepOf(levels: readonly string[]): string | null {
+  if (levels.length < 2) return null;
+  const top = parse(levels[levels.length - 1]!);
+  const below = parse(levels[levels.length - 2]!);
+  if (top === null || below === null) return null;
+  return toDecimalString(top - below);
 }
