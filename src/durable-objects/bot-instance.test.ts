@@ -20,7 +20,7 @@ import { GlobalKillSwitchError, tripGlobalKillSwitch } from "../reconciliation/k
 import { fromDecimalString as m, toDecimalString, ZERO } from "../shared/money";
 import { TERMINAL_STATES } from "../shared/order-state";
 import type { Price } from "../shared/exchange-client";
-import type { DcaParams } from "../strategies/dca";
+import { EMPTY_POSITION, type DcaParams } from "../strategies/dca";
 import type {
   BotInstance,
   BotRuntimeState,
@@ -2906,27 +2906,37 @@ describe("repairPosition", () => {
     const { sellId } = await singleCycleShape();
 
     const before = await run((bot) => bot.snapshot());
-    // The bug, as found live: the position never decremented on the exit fills.
-    expect(before.state.position.quantity).toBe(m("0.00158519"));
+    // UPDATED BY FIX 5. This assertion used to read 0.00158519 -- the bug, as
+    // found live: the position never decremented on the exit fills. `applyExit`
+    // now runs on every exit fill, so this shape can no longer be BUILT through
+    // the ordinary path; the position is already right by the time the exit is
+    // cancelled. The repair tool is unchanged and still correct for state that
+    // is already damaged (which is how the two live bots reached it, on the old
+    // code) -- what changed is that the normal path stopped producing it.
+    expect(before.state.position.quantity).toBe(m("0.00043085"));
     expect(before.state.exitOrderId).toBe(sellId);
 
     const report = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
 
+    // Still `would_repair`, because the STALE EXIT POINTER is still there --
+    // clearing that is fix 5's explicitly unchanged behaviour (it clears only on
+    // full completion or repair). The quantities agree, and that is the point.
     expect(report.outcome).toBe("would_repair");
     expect(report.committed).toBe(false);
     expect(report.blockedBy).toBeNull();
-    expect(report.before.quantity).toBe("0.00158519");
+    expect(report.before.quantity).toBe("0.00043085");
     expect(report.after.quantity).toBe("0.00043085"); // 0.00158519 - 0.00115434
-    // Proportional cost: 60000 x 0.00043085. The average entry is PRESERVED,
-    // which is the whole reason for the proportional model -- both risk
-    // thresholds key off it.
-    expect(report.before.cost).toBe("95.11140000");
+    // Proportional cost: 60000 x 0.00043085, reached incrementally rather than
+    // by repair. The average entry is PRESERVED either way, which is the whole
+    // reason for the proportional model -- both risk thresholds key off it.
+    expect(report.before.cost).toBe("25.85100000");
     expect(report.after.cost).toBe("25.85100000");
     expect(report.before.averageEntryPrice).toBe("60000.00000000");
     expect(report.after.averageEntryPrice).toBe("60000.00000000");
-    // The sold leg's PnL, from ACTUAL fill notionals: 0.00115434 x 61200 minus
-    // 0.00115434 x 60000.
-    expect(report.before.realizedGross).toBe("0.00000000");
+    // The sold leg's PnL is now booked as the fill lands, not at repair time --
+    // and the repair does NOT book it again. `reducing` is false, so the
+    // idempotency hinge holds across the two fixes.
+    expect(report.before.realizedGross).toBe("1.38520800");
     expect(report.after.realizedGross).toBe("1.38520800");
     expect(report.after.exitOrderId).toBeNull();
     expect(report.after.exitKind).toBeNull();
@@ -2970,12 +2980,16 @@ describe("repairPosition", () => {
     expect(report.closedCycleCount).toBe(1);
     // Only cycle 2's four orders... two, in fact: its buy and its exit.
     expect(report.liveCycleOrderIds).toHaveLength(2);
+    expect(report.before.quantity).toBe("0.00092962");
     expect(report.after.quantity).toBe("0.00092962"); // 0.00126687 - 0.00033725
     expect(report.after.averageEntryPrice).toBe("60000.00000000");
     expect(report.after.cost).toBe("55.77720000");
-    // Cycle 1's realized profit is NOT recomputed -- it is added to.
-    expect(report.before.realizedGross).toBe("1.99999200");
-    expect(report.after.realizedGross).toBe("2.40469200"); // + 0.4047
+    // UPDATED BY FIX 5, and this is the composition worth asserting: cycle 1's
+    // 1.999992 plus cycle 2's partial exit realizing 0.4047 as it landed. The
+    // repair adds NOTHING on top -- it finds the position already reduced, so
+    // `reducing` is false and `realizedGross` cannot double.
+    expect(report.before.realizedGross).toBe("2.40469200");
+    expect(report.after.realizedGross).toBe("2.40469200");
   });
 
   it("leaves the CLOSED cycle's settled state untouched when it commits", async () => {
@@ -3244,5 +3258,135 @@ describe("repairPosition", () => {
     expect(report.findings).toEqual([]);
     // The live-cycle arithmetic is unchanged by the closed cycle either way.
     expect(report.after.quantity).toBe("0.00092962");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyExit: the position decrements on EVERY exit fill (fix 5)
+// ---------------------------------------------------------------------------
+
+describe("exit-side fills decrement the position", () => {
+  /** A running bot holding 0.00158519 at an average entry of 60000. */
+  async function holding(): Promise<void> {
+    exchange.filters = testFilters({
+      stepSize: m("0.00000001"),
+      minQuantity: m("0.00000001"),
+    });
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.00158519") })));
+  }
+
+  it("decrements on a PARTIAL fill of an exit that is still resting", async () => {
+    // The plain case, and the one that used to do nothing at all: two fills land
+    // on an exit that has not completed and has not been cancelled. The position
+    // must reflect both, immediately -- section 5.3 requires the position to move
+    // incrementally on each partial fill, which the entry side always did.
+    await holding();
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0005") })));
+    const afterFirst = await run((bot) => bot.snapshot());
+    expect(afterFirst.state.position.quantity).toBe(m("0.00108519"));
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0003") })));
+    const afterSecond = await run((bot) => bot.snapshot());
+    expect(afterSecond.state.position.quantity).toBe(m("0.00078519"));
+
+    // Still resting, still the live exit: fix 5 changes the POSITION, not when
+    // the exit pointer clears.
+    expect(afterSecond.state.exitOrderId).toBe(sellId);
+    expect(afterSecond.state.openOrderIds).toContain(sellId);
+    expect(afterSecond.state.cycleCount).toBe(0);
+    // The average entry is preserved by the proportional model, so the
+    // take-profit and stop-loss the bot is still being judged against are the
+    // same prices they were before it sold anything.
+    expect(afterSecond.state.position.averageEntryPrice).toBe(m("60000"));
+    expect(afterSecond.state.position.cost).toBe(m("47.1114")); // 0.00078519 x 60000
+  });
+
+  it("accumulates realizedGross across MULTIPLE partial fills on one exit", async () => {
+    // Each fill realizes what it earned, as it lands: 1200 of margin per unit,
+    // at the ACTUAL fill price rather than the order's limit price.
+    await holding();
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0005") })));
+    expect((await run((bot) => bot.snapshot())).state.realizedGross).toBe(m("0.6")); // 0.0005 x 1200
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0003") })));
+    expect((await run((bot) => bot.snapshot())).state.realizedGross).toBe(m("0.96")); // + 0.36
+
+    // A fill at a DIFFERENT price than the order's limit is measured at the
+    // price it actually executed at.
+    await run((bot) =>
+      bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0002"), price: m("62000") })),
+    );
+    // + 0.0002 x (62000 - 60000) = 0.4
+    expect((await run((bot) => bot.snapshot())).state.realizedGross).toBe(m("1.36"));
+  });
+
+  it("reproduces the ORIGINAL bug shape and gets it right: partial fill, then cancelled", async () => {
+    // bot-b23y63's exact shape. On the old code this ended with the position
+    // still counting all 0.00158519. Fix 1's gate is genuinely exercised here and
+    // does NOT fire -- local and remote agree (0.00115434 each), so the order is
+    // closed as `cancelled` normally, which is the correct outcome for this
+    // scenario. Fix 1 refuses only when the venue reports MORE than was recorded.
+    await holding();
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) =>
+      bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.00115434") })),
+    );
+
+    await run((bot) => bot.halt("manual", "reconciliation found meaningful drift", "reconciliation"));
+
+    const after = await run((bot) => bot.snapshot());
+    // THE BUG, GONE: 0.00158519 - 0.00115434, already correct at cancellation.
+    expect(after.state.position.quantity).toBe(m("0.00043085"));
+    expect(after.state.position.cost).toBe(m("25.851"));
+    expect(after.state.position.averageEntryPrice).toBe(m("60000"));
+    expect(after.state.realizedGross).toBe(m("1.385208"));
+    // Fix 1's gate did not refuse, so the order closed normally.
+    expect(after.orders.find((o) => o.clientOrderId === sellId)!.state).toBe("cancelled");
+    expect(await db.alerts.count({ alert_type: "cancel_fill_discrepancy" })).toBe(0);
+    // Unchanged by fix 5: the exit pointer still clears only on completion or
+    // repair, which is why the repair tool still has something to do here.
+    expect(after.state.exitOrderId).toBe(sellId);
+  });
+
+  it("still zeroes out correctly on a FULLY filled exit, with the same realizedGross", async () => {
+    // The common path, and it must not regress. The decrement now happens
+    // incrementally, so `#completeCycle` is closing out a position already at
+    // zero rather than performing the whole reduction itself.
+    await holding();
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+
+    // Two partials and a final, so the incremental path is genuinely used.
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0005") })));
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.0005") })));
+    const result = await run((bot) =>
+      bot.onFill(sellId, exchange.fillFor(sellId, { quantity: m("0.00058519") })),
+    );
+    // `autoRestart` is off in these params, so the completed cycle halts for
+    // review -- `take_profit_reached`, exactly as before fix 5.
+    expect(result).toMatchObject({ status: "halted" });
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.position).toEqual(EMPTY_POSITION);
+    expect(after.state.cycleCount).toBe(1);
+    expect(after.state.exitOrderId).toBeNull();
+    expect(after.state.exitKind).toBeUndefined();
+    expect(after.state.openOrderIds).toEqual([]);
+    // 0.00158519 x (61200 - 60000), booked across three fills and NOT re-added
+    // by `#completeCycle`.
+    expect(after.state.realizedGross).toBe(m("1.902228"));
+    const audit = await db.auditLog.findMany({ where: { action: "bot.cycle_completed" } });
+    expect(audit[0]!.details_json).toMatchObject({ gross_profit: "1.90222800" });
   });
 });

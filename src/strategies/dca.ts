@@ -413,6 +413,102 @@ export function applyEntry(position: DcaPosition, entry: DcaEntry, isAdditional:
   };
 }
 
+/** One exit-side execution, as the accounting needs it. */
+export interface DcaExit {
+  /** Base sold by THIS fill. Positive. */
+  readonly quantity: Money;
+  /**
+   * Quote received for it, at the price the fill actually executed at -- not at
+   * the order's limit price. `applyFill` already computes exactly this figure as
+   * its `quoteDelta`, so the caller has it to hand and nothing is re-derived.
+   */
+  readonly proceeds: Money;
+}
+
+/** What one exit fill did to the position, and what it realized doing it. */
+export interface DcaExitEffect {
+  readonly position: DcaPosition;
+  /**
+   * Realized profit (or loss) on the base this fill sold: what it fetched, less
+   * the cost basis that left the position with it.
+   */
+  readonly realized: Money;
+}
+
+/**
+ * Apply one exit fill: the inverse `applyEntry` never had.
+ *
+ * WHY THIS DID NOT EXIST, AND WHAT IT COST. Within a cycle `quantity` and `cost`
+ * only ever grew, and both were zeroed together, wholesale, at
+ * `#completeCycle` / `#completeLiquidation` -- reached only when an exit sell
+ * FULLY fills. An exit that filled PARTIALLY and was then cancelled, or that
+ * simply rested part-filled, never touched the position at all. Two live bots
+ * sat holding a `position.quantity` that counted coin they had already sold, one
+ * of them by a factor of 3.7, with its stop-loss and take-profit both computed
+ * from the inflated figure. This is the function whose absence caused that.
+ *
+ * THE COST MODEL IS PROPORTIONAL, matching the one-time repair built for those
+ * two bots so that a normally-run position and a repaired one cannot disagree.
+ * `cost` is scaled by the fraction still held, which holds `averageEntryPrice`
+ * steady -- the coin still held WAS bought at that average, and both risk
+ * thresholds key off it. Leaving `cost` whole while reducing `quantity` would
+ * inflate the average by the inverse of the fraction remaining and drag the
+ * stop-loss and take-profit with it.
+ *
+ * THE COST BASIS IS TAKEN AS A REMAINDER, NOT AS A PRODUCT, and that is a small
+ * but deliberate improvement on the repair's form. The repair measured the sold
+ * leg as `soldQuantity x averageEntryPrice`; this measures it as `cost - newCost`.
+ * The two agree to within rounding on any single exit, but only the remainder
+ * form is SELF-BALANCING: the amounts removed across every fill of a full exit
+ * sum to exactly the cycle's original cost, leaving no residue and no drift, at
+ * any number of partial fills. `cost` therefore reaches exactly ZERO when the
+ * position goes flat rather than approximately zero.
+ *
+ * WHAT IT DELIBERATELY DOES NOT TOUCH. `entries` is buy-side by definition -- it
+ * records what BUILT the position, one element per applied buy fill -- so an
+ * exit appends nothing and removes nothing; `#completeCycle` clears the whole
+ * position when the cycle ends. `additionalBuysUsed` and `lastEntryPrice` are
+ * likewise properties of the entry side: selling does not hand back a buy
+ * allowance, and it does not change which entry the next drop trigger is
+ * measured from.
+ */
+export function applyExit(position: DcaPosition, exit: DcaExit): DcaExitEffect {
+  if (exit.quantity <= ZERO) {
+    throw new DcaError("invalid_parameter", `exit quantity must be positive, got ${exit.quantity}`);
+  }
+  if (exit.quantity > position.quantity) {
+    // Unreachable in ordinary operation -- an exit is sized from
+    // `position.quantity` and rounded DOWN onto the symbol's step, and
+    // `applyFill` caps fills at the order's own quantity -- so reaching here
+    // means the books already disagree with themselves. Refusing is section
+    // 7.5's business; silently clamping would hide the very condition this
+    // function exists to stop producing.
+    throw new DcaError(
+      "invalid_parameter",
+      `exit quantity ${exit.quantity} exceeds the position's ${position.quantity}`,
+    );
+  }
+
+  const quantity = position.quantity - exit.quantity;
+  const cost =
+    quantity > ZERO
+      ? divideRounded(position.cost * quantity, position.quantity, "half-even")
+      : ZERO;
+
+  return {
+    position: {
+      quantity,
+      cost,
+      averageEntryPrice:
+        quantity > ZERO ? divideRounded(cost * ONE, quantity, "half-even") : ZERO,
+      entries: position.entries,
+      additionalBuysUsed: position.additionalBuysUsed,
+      lastEntryPrice: position.lastEntryPrice,
+    },
+    realized: exit.proceeds - (position.cost - cost),
+  };
+}
+
 /**
  * Quote value of the position at a given price, for reporting. Not used by any
  * threshold: every threshold keys off average entry, per section 6.3.

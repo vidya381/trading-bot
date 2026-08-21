@@ -120,6 +120,7 @@ import {
 } from "../shared/order-state";
 import {
   applyEntry,
+  applyExit,
   assertReadableSchema,
   decide,
   DCA_SCHEMA_VERSION,
@@ -3794,6 +3795,10 @@ export class BotInstance extends DurableObject<Env> {
 
     const isExit = state.exitOrderId === order.clientOrderId;
 
+    // Accumulated across the mutate below so the completion paths can REPORT
+    // what this fill realized without re-deriving it.
+    let realized = ZERO;
+
     // Both changes are DELTAS ON CURRENT STATE, not fields of a rebuilt
     // snapshot. `{ ...state, position }` would write back every other field as
     // this caller saw it, and the callers reach here holding a `state` read
@@ -3820,6 +3825,35 @@ export class BotInstance extends DurableObject<Env> {
             },
             updated.position.quantity > ZERO,
           ),
+        };
+      } else {
+        // THE INVERSE, AND IT RUNS ON EVERY EXIT FILL -- partial, final, or one
+        // that a cancellation is about to end. This branch used to be absent
+        // entirely: an exit fill moved the ORDER and left the POSITION alone, so
+        // a position was only ever corrected wholesale by `#completeCycle` on a
+        // FULLY filled exit, and an exit that stopped short left the bot
+        // counting coin it had already sold. Section 5.3 requires the position
+        // to move incrementally on each partial fill; the entry side always did,
+        // and this is the exit side finally doing the same.
+        //
+        // `effect.quoteDelta` is positive on a sell and is the notional at the
+        // price the fill ACTUALLY executed at, which is exactly the proceeds
+        // figure the accounting wants -- so nothing is re-derived here.
+        const exited = applyExit(updated.position, {
+          quantity: fill.quantity,
+          proceeds: effect.quoteDelta,
+        });
+        realized += exited.realized;
+        updated = {
+          ...updated,
+          position: exited.position,
+          // BOOKED HERE, PER FILL, and it has to be: the cost basis that backed
+          // this quantity leaves the position in the same step, so a realization
+          // deferred to cycle completion would have nothing left to measure
+          // against. It also means a cycle that never completes -- the exit
+          // cancelled part-filled -- still books what it actually earned,
+          // which is the case that had no home at all before.
+          realizedGross: updated.realizedGross + exited.realized,
         };
       }
 
@@ -3876,11 +3910,29 @@ export class BotInstance extends DurableObject<Env> {
    */
   async #completeCycle(config: DcaConfig, exit: TrackedOrder, at: Timestamp): Promise<PipelineResult> {
     const state = await this.#state();
-    // Half-even, matching the notional rounding in `order-state.ts`: this is an
-    // internal accounting figure that accumulates across cycles, so it should
-    // carry no directional bias (step 2, decision 3).
-    const proceeds = mul(exit.filledQuantity, exit.price, "half-even");
-    const gross = proceeds - state.position.cost;
+    // NO LONGER THE PLACE THE PROFIT IS BOOKED. `applyExit` realizes each exit
+    // fill as it lands -- it has to, because the cost basis backing that
+    // quantity leaves the position in the same step -- so `realizedGross` is
+    // already complete by the time this runs, and adding a cycle total here
+    // would count the whole exit twice.
+    //
+    // What is left for this method is CLEANUP and REPORTING. The position it
+    // zeroes has already been reduced to ZERO by the final fill's `applyExit`
+    // (a full exit sells exactly what the position held, and the remainder-form
+    // cost basis reaches exactly zero with it), so `EMPTY_POSITION` now clears
+    // `entries`, `additionalBuysUsed` and `lastEntryPrice` rather than
+    // performing the decrement itself.
+    //
+    // The reported figure is derived from the exit's OWN fills against the
+    // cost that backed them -- `entries` is still intact at this point, and its
+    // costs sum to exactly what the cycle spent -- so the audit and the alert
+    // say what this cycle earned, without either re-deriving or re-booking it.
+    const proceeds = exit.fills.reduce(
+      (total, each) => total + mul(each.price, each.quantity, "half-even"),
+      ZERO,
+    );
+    const spent = state.position.entries.reduce((total, each) => total + each.cost, ZERO);
+    const gross = proceeds - spent;
 
     const completed = await this.#mutateState((current) => ({
       ...current,
@@ -3889,7 +3941,6 @@ export class BotInstance extends DurableObject<Env> {
       openOrderIds: [],
       exitOrderId: null,
       exitKind: undefined,
-      realizedGross: current.realizedGross + gross,
     }));
     await this.#audit(
       config,
@@ -3937,9 +3988,15 @@ export class BotInstance extends DurableObject<Env> {
    */
   async #completeLiquidation(config: DcaConfig, exit: TrackedOrder, fill: Fill): Promise<PipelineResult> {
     const state = await this.#state();
-    // Half-even, matching `#completeCycle`: an internal accounting figure.
-    const proceeds = mul(exit.filledQuantity, exit.price, "half-even");
-    const gross = proceeds - state.position.cost;
+    // As in `#completeCycle`: `applyExit` has already realized every fill of
+    // this liquidation as it landed, so this reports the total rather than
+    // booking it a second time.
+    const proceeds = exit.fills.reduce(
+      (total, each) => total + mul(each.price, each.quantity, "half-even"),
+      ZERO,
+    );
+    const spent = state.position.entries.reduce((total, each) => total + each.cost, ZERO);
+    const gross = proceeds - spent;
 
     const completed = await this.#mutateState((current) => ({
       ...current,
@@ -3947,7 +4004,6 @@ export class BotInstance extends DurableObject<Env> {
       openOrderIds: current.openOrderIds.filter((id) => id !== exit.clientOrderId),
       exitOrderId: null,
       exitKind: undefined,
-      realizedGross: current.realizedGross + gross,
     }));
     await this.#audit(
       config,
