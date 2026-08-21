@@ -101,7 +101,7 @@ import {
 import { envAssessModel } from "../workers/assess";
 import { envDeriveModel } from "../workers/derive";
 import type { Asset, CandleInterval, Pair } from "../shared/exchange-client";
-import { fromDecimalString, toDecimalString, type Money } from "../shared/money";
+import { fromDecimalString, toDecimalString, ZERO, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { readGlobalKillSwitch } from "../reconciliation/kill-switch";
 import {
@@ -902,6 +902,66 @@ export async function liquidateBot(ctx: ApiContext): Promise<Response> {
   return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
 }
 
+/**
+ * POST /api/bots/:id/close -- close a bot and return its capital to the account.
+ *
+ * Calls `BotInstance.close(actor)`, which has existed and been tested since step
+ * 6 and until now was reachable ONLY from the test suite -- there was no route,
+ * no worker and no dashboard path to it, which meant `releaseBotCapital` (and
+ * therefore the `stopped` status itself) could not be reached in production at
+ * all. This is that route. Thin, the same shape as `startBot`, `haltBot`,
+ * `resumeBot` and `liquidateBot`: `close()` owns the mechanics and they are not
+ * re-implemented here.
+ *
+ * WHAT CLOSING DOES, from `#closePass`, read rather than assumed: it cancels any
+ * open orders through the same path a halt uses, calls `releaseBotCapital`
+ * (which owns the `stopped` transition and is the mutual exclusion against a
+ * double release), clears `openOrderIds`, audits `bot.closed`, and unsubscribes
+ * from the price feed. It does NOT sell anything.
+ *
+ * ⚠ IT IS THE POINT OF NO RETURN FOR THE ALLOCATION. A second close raises
+ * `bot_already_stopped` from the ledger, and nothing in this system moves a bot
+ * back out of `stopped` -- re-funding a closed bot is not built. So this ends
+ * the bot for capital purposes even though its history, config and position all
+ * survive intact.
+ *
+ * GATED ON A FLAT POSITION, exactly as `archive` is and through the same
+ * function. This is a wider gate than `close()` itself imposes -- the object
+ * would happily close over a held position -- and it is deliberate: releasing
+ * capital from a bot still carrying inventory returns capital that is not cash
+ * (see `assertFlatBeforeRelease`), and that hazard does not care which endpoint
+ * the release came through. An ungated route beside a gated one would be a hole
+ * straight through the gate. Loosening it later is deleting one line.
+ *
+ * Failures:
+ *   - `unknown_bot` (404)         -- no such row. Raised here, before the object
+ *                                    is woken, because the gate needs the row
+ *                                    anyway and a close is not worth creating an
+ *                                    object to refuse.
+ *   - `position_held` (409)       -- still holding inventory; liquidate first.
+ *   - `not_created` (404)         -- from the object: it holds no config.
+ *   - `bot_already_stopped` (409) -- from the ledger: capital already released.
+ * Deliberately NOT gated on `archived`: `assertNotArchived` exists to stop a
+ * hidden bot TRADING, and closing is the opposite of trading. `halt` skips it
+ * for the same reason.
+ */
+export async function closeBot(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const row = await requireBotRow(ctx, id);
+  assertFlatBeforeRelease(row, await snapshotOf(ctx, id), "closing it");
+
+  const result = await botStub(ctx, id).close(ctx.actor);
+  const [refreshed, snapshot, fees] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+    feesFor(ctx, id),
+  ]);
+  return ok({
+    result,
+    bot: refreshed === null ? null : botSummary(refreshed, snapshot, fees),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Archiving (step 26)
 // ---------------------------------------------------------------------------
@@ -917,6 +977,93 @@ export async function liquidateBot(ctx: ApiContext): Promise<Response> {
  * started. Widening this later is a one-line change plus a test.
  */
 const ARCHIVABLE_STATUSES: readonly BotStatus[] = ["halted", "stopped"];
+
+/**
+ * How much base asset this bot is still holding, from its OWN state.
+ *
+ * NOT from the `bot_instances` row, and that is the whole point: the row
+ * carries `allocated_capital` (a reservation) and `status`, but the POSITION
+ * lives only in Durable Object storage, which section 8.1 makes the source of
+ * truth for it. `serialize.ts`'s `positionOf` already publishes exactly these
+ * two fields to the dashboard, and `#liquidatePositionPass` already branches on
+ * exactly this expression to decide whether there is anything to sell:
+ *
+ *   config.strategy === "grid" ? state.ladder.heldQuantity : state.position.quantity
+ *
+ * This is that expression, third copy, deliberately kept identical -- the gate
+ * below must refuse precisely the bots Liquidate would accept, or the message it
+ * prints ("liquidate it first") would name an action that then reports nothing
+ * to do.
+ *
+ * The one difference from the DO's version is `ladder?.` rather than `ladder!`.
+ * A grid bot that has never placed its ladder has no `ladder` at all, and
+ * `positionOf` already treats that as "0" rather than asserting. A gate is the
+ * wrong place to be the first caller that throws on it.
+ */
+function heldQuantityOf(snapshot: BotSnapshot): Money {
+  const state = snapshot.state;
+  if (snapshot.config.strategy === "grid") return state.ladder?.heldQuantity ?? ZERO;
+  return state.position.quantity;
+}
+
+/**
+ * Refuse to release a bot's capital while it is still holding inventory.
+ *
+ * THE PROBLEM THIS EXISTS FOR, stated as money rather than as a rule.
+ * `releaseBotCapital` returns exactly `allocated_capital` to the account's
+ * available pool -- the reservation, whatever the position ended up being worth
+ * (ledger.ts's header). `close()` cancels open ORDERS but does not flatten the
+ * POSITION: `#closePass` calls `#cancelOpenOrders` and nothing else, and
+ * `accountTotals.ts` already documents the consequence ("a stopped bot can
+ * genuinely still be holding inventory") and lets `idle` go negative to show it.
+ *
+ * So closing a bot that holds 0.4 BTC hands its full quote allocation back to
+ * the pool as if it were cash. It is not cash; it is BTC. The next bot created
+ * spends capital that exists only as somebody else's inventory, and nothing in
+ * the ledger can tell -- `total_allocated` is a reservation count, not a
+ * valuation, and reconciliation's `ledger_allocation_drift` compares it against
+ * the SUM OF RESERVATIONS, so it agrees with itself and reports nothing wrong.
+ *
+ * IT REFUSES; IT NEVER SELLS. The operator liquidates by hand first, through the
+ * existing control. Both strategies deliberately decline to sell a held position
+ * on their own (DCA's `sellOnStopLoss` is refused outright, grid's stop-loss
+ * liquidates only for its own three exit reasons), and `liquidatePosition`'s
+ * header calls itself "the deliberate, human-triggered counterpart" to exactly
+ * that. A gate that auto-sold to get itself unblocked would be the one thing
+ * every one of those decisions was written to prevent.
+ *
+ * WHY IT IS SKIPPED FOR AN ALREADY-`stopped` BOT. There is nothing left to
+ * protect: its capital was released when it stopped, so refusing could not
+ * prevent a release, it could only strand the bot. And `liquidatePosition`
+ * requires `halted` -- so a stopped bot cannot take the action this error tells
+ * it to take, and gating it would print an instruction it is unable to follow.
+ */
+function assertFlatBeforeRelease(
+  row: BotInstanceRow,
+  snapshot: BotSnapshot | null,
+  action: string,
+): void {
+  // Nothing to release, and no route to the remedy. See above.
+  if (row.status === "stopped") return;
+  // An orphan (a row whose object holds no state) cannot answer, and cannot be
+  // closed either -- `close()` reaches `#config()`, which throws `not_created`.
+  // The caller skips the release for one entirely; see `archiveBot`.
+  if (snapshot === null) return;
+
+  const held = heldQuantityOf(snapshot);
+  if (held <= ZERO) return;
+
+  throw new ApiError(
+    409,
+    "position_held",
+    `bot instance ${JSON.stringify(row.id)} still holds ${toDecimalString(held)} of the base ` +
+      `asset of ${row.pair}, so ${action} would return its full ` +
+      `${toDecimalString(row.allocated_capital)} ${row.capital_asset} allocation to the account ` +
+      `while that capital is still sitting in inventory rather than in cash. Liquidate the ` +
+      `position first (the bot must be halted to do so), then try again. Nothing was changed, ` +
+      `and nothing was sold -- selling is never done on your behalf.`,
+  );
+}
 
 /**
  * Write the archived flag and its audit entry. Returns whether it changed.
@@ -940,6 +1087,7 @@ async function setArchived(
   ctx: ApiContext,
   row: BotInstanceRow,
   archived: boolean,
+  capitalReleased = false,
 ): Promise<boolean> {
   const now = ctx.now();
   const where =
@@ -954,9 +1102,21 @@ async function setArchived(
     actor: ctx.actor,
     action: archived ? "bot.archived" : "bot.unarchived",
     target_bot_instance_id: row.id,
-    // The status is recorded because it is the thing the gate was checked
-    // against, and it is not otherwise recoverable from this entry later.
-    details_json: { status: row.status, account_label: row.account_label },
+    // `status` is the status the GATE WAS CHECKED AGAINST -- read before this
+    // action ran, and deliberately not re-read. Since archiving now closes the
+    // bot, the row is very often `stopped` by the time this row is written, and
+    // recording that would lose the only evidence of what was actually gated.
+    // `capital_released` is the other half: whether THIS action performed the
+    // release, which `status` alone can no longer answer (a bot archived while
+    // already stopped, and an orphan that could not be closed, both end at
+    // `stopped`/`halted` with no release having happened here). The two together
+    // are what makes an archive entry readable years later; neither is
+    // recoverable from the row afterwards.
+    details_json: {
+      status: row.status,
+      account_label: row.account_label,
+      capital_released: capitalReleased,
+    },
     created_at: now,
   });
   return true;
@@ -973,39 +1133,70 @@ async function refreshedBot(ctx: ApiContext, id: string) {
 }
 
 /**
- * POST /api/bots/:id/archive -- hide a finished bot from the default list view.
+ * POST /api/bots/:id/archive -- retire a finished bot AND return its capital.
  *
- * WHAT THIS IS NOT. It is not a delete, and that is structural rather than a
- * promise made in a comment: `Repository` exposes no `delete` method at all
- * (/src/db/table.ts's header explains why -- section 8.7 retains everything),
- * and `no-raw-d1.test.ts` fails the build if any file outside /src/db reaches
- * for the raw binding to route around it. There is no code path from this
- * endpoint to a removed row, because there is no code path from ANY endpoint to
- * one.
+ * ⚠ WHAT THIS ENDPOINT MEANS CHANGED HERE, ON PURPOSE. Until this step it wrote
+ * one boolean and nothing else, and said so everywhere -- step 26's migration,
+ * this handler's own header, and the dialog copy all promised that "archiving is
+ * not closing" and that the allocation was untouched. That promise is now
+ * DELIBERATELY BROKEN for the flat case, at the operator's decision: an archived
+ * bot is a finished bot, and capital reserved for a finished bot is capital no
+ * new bot can use. Archiving now performs the `stopped` transition through
+ * `close()` and the allocation genuinely returns to the account.
  *
- * What it writes is one boolean and `updated_at`, on the `bot_instances` row.
- * It does not touch the Durable Object -- the object is never asked to mutate
- * anything here, only read for the response -- so the bot's configuration,
- * position, ladder or DCA entries, order history and idempotency records are
- * exactly as they were. It does not touch `orders`, `trades`, `alerts` or
- * `capital_ledger` either: an archived bot still holds its allocation (only the
- * `stopped` transition releases capital, via `releaseBotCapital`), still counts
- * toward the account-level totals on the dashboard, and its detail page renders
- * identically before and after.
+ * The old guarantee is not gone, it is SPLIT, and both halves are deliberate:
+ *   - Nothing is DELETED, still, and still structurally: `Repository` exposes no
+ *     `delete` and `no-raw-d1.test.ts` forbids routing around it. Every order,
+ *     trade, alert, audit entry, and the object's own config, position and order
+ *     history survive exactly as before. An archived bot is a permanent,
+ *     read-only record. That half of "archiving removes nothing" is unchanged.
+ *   - The STATUS and the ALLOCATION now do change, from `halted` to `stopped`
+ *     and from reserved to returned. That half is new.
+ * `api.test.ts` carries both halves as two named tests rather than one, so the
+ * split reads as intent rather than as a test somebody weakened.
  *
- * GATED ON `halted` OR `stopped`, mirroring the status-gating every other
- * action here uses, and read from the D1 ROW rather than the object's snapshot.
- * That is deliberate: archived is a property of the row, and an ORPHANED bot --
- * a row whose object holds no state, which `botSummary` already surfaces as
- * `orphaned: true` -- must still be archivable. A snapshot-authoritative gate
- * could not answer for one, since there is no snapshot to ask.
+ * THE ORDER IS: gate, then close, then set the flag. Never the reverse.
+ * Every partial failure must leave the bot MORE visible, not less. If `close()`
+ * succeeds and the flag write then fails, the operator sees a `stopped` bot
+ * still on the list and clicking Archive again finishes the job (the close is
+ * skipped for a bot that is already stopped, so the retry is safe). If the flag
+ * were written first, a failed close would leave a HIDDEN bot silently still
+ * holding its allocation -- capital lost from the pool with nothing on screen to
+ * say so, which is precisely the outcome migration 0007 called "the one outcome
+ * archiving must never produce".
+ *
+ * GATED ON A FLAT POSITION (`position_held`, 409). `close()` cancels open orders
+ * but does not sell what the bot is holding, so releasing capital from a bot
+ * still carrying inventory would return capital that is not cash. The operator
+ * liquidates by hand first. See `assertFlatBeforeRelease` for the full argument;
+ * nothing here ever sells.
+ *
+ * STILL GATED ON `halted` OR `stopped`, read from the D1 ROW rather than the
+ * object's snapshot, unchanged from step 26 and for its original reason: an
+ * ORPHANED bot (a row whose object holds no state) must stay archivable, and a
+ * snapshot-authoritative gate could not answer for one.
+ *
+ * ⚠ AN ORPHAN IS ARCHIVED WITHOUT ITS CAPITAL BEING RELEASED, and that is a
+ * known, deliberate gap rather than an oversight. `close()` reaches `#config()`,
+ * which throws `not_created` when the object holds no state -- so an orphan
+ * CANNOT be closed, and calling it would turn step 26's "an orphan must still be
+ * archivable" guarantee into a 404. Its allocation therefore stays reserved.
+ * That is the safe direction by this codebase's own rule (ledger.ts: "Every
+ * partial failure then leaves capital over-reserved rather than under-reserved.
+ * The bad outcome is losing access to capital you own, which a human can see in
+ * the audit log and correct"), and `reconcileAllocations` keeps counting it
+ * because the row is not `stopped`, so the books stay consistent. The response
+ * says `capitalReleased: false` so the caller is never told otherwise.
+ *
+ * Idempotence is unchanged: a second archive reports `already_archived`, writes
+ * no second audit entry, and -- because the bot is `stopped` by then -- attempts
+ * no second release.
  *
  * Failures:
- *   - `unknown_bot` (404)    -- no such row.
- *   - `invalid_status` (409) -- the bot is `running` or `created`.
- * Archiving an already-archived bot is NOT an error: it reports
- * `already_archived`, changes nothing and writes no second audit entry, which
- * is the same idempotence `halt` gives a double-click.
+ *   - `unknown_bot` (404)     -- no such row.
+ *   - `invalid_status` (409)  -- the bot is `running` or `created`.
+ *   - `position_held` (409)   -- it still holds inventory; liquidate first.
+ *   - anything `close()` raises, which reaches the operator unflattened.
  */
 export async function archiveBot(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
@@ -1022,14 +1213,37 @@ export async function archiveBot(ctx: ApiContext): Promise<Response> {
       409,
       "invalid_status",
       `bot instance ${JSON.stringify(id)} is ${row.status}; only a ${ARCHIVABLE_STATUSES.join(" or ")} ` +
-        `bot can be archived. Archiving removes nothing, but hiding a live bot from the default ` +
-        `view would hide orders being placed with real capital.`,
+        `bot can be archived. Archiving closes the bot and returns its capital, and doing that to ` +
+        `a live bot would pull the funding out from under orders it is still placing.`,
     );
   }
 
-  const changed = await setArchived(ctx, row, true);
+  // Everything below is skipped for a bot that is ALREADY archived, so a repeat
+  // stays the pure no-op it has always been: no snapshot read, no gate, no
+  // second close, no second audit entry.
+  let capitalReleased = false;
+  if (!row.archived && row.status !== "stopped") {
+    const snapshot = await snapshotOf(ctx, id);
+    assertFlatBeforeRelease(row, snapshot, "archiving it");
+    // An orphan is archived without a release; see the header. `snapshot` is the
+    // only thing that can tell us, and it already told us.
+    if (snapshot !== null) {
+      await botStub(ctx, id).close(ctx.actor);
+      capitalReleased = true;
+    }
+  }
+
+  const changed = await setArchived(ctx, row, true, capitalReleased);
   return ok({
-    result: { action: changed ? ("archived" as const) : ("already_archived" as const) },
+    result: {
+      action: changed ? ("archived" as const) : ("already_archived" as const),
+      /**
+       * Whether THIS call returned the allocation to the account. False for a
+       * repeat, for a bot that was already `stopped`, and for an orphan -- three
+       * different reasons the caller must not have to infer from the status.
+       */
+      capitalReleased,
+    },
     bot: await refreshedBot(ctx, id),
   });
 }

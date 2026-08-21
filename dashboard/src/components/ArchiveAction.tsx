@@ -8,18 +8,44 @@
  *
  * WHAT ARCHIVING IS, AND THE THING THE COPY MUST NOT LET AN OPERATOR ASSUME
  * ------------------------------------------------------------------------
- * It writes one boolean on the bot's `bot_instances` row. It does not delete,
- * and it is not a soft delete that becomes a hard one later -- the backend's
- * storage layer has no delete method at all, so there is no path from here to a
- * removed row. The bot's Durable Object is not even called: its configuration,
- * position, ladder or DCA entries, order history and idempotency records are
- * untouched, as are its orders, trades, alerts and audit entries in D1. Its
- * capital allocation is untouched too -- archiving is NOT closing, and only the
- * `stopped` transition returns capital to the ledger.
+ * ⚠ THIS CHANGED AT STEP 26.1 AND THE COPY BELOW CHANGED WITH IT. Step 26's
+ * archive wrote one boolean and this file said so at length: "archiving is NOT
+ * closing", the allocation "is untouched". That is no longer true and the old
+ * wording is not merely stale, it is the exact reassurance an operator would now
+ * act on wrongly. Archiving CLOSES the bot: it moves to `stopped` and its
+ * allocated capital genuinely returns to the account, where the next bot can
+ * spend it. That is the point -- capital reserved for a finished bot is capital
+ * nothing can use.
  *
- * That is why the dialog spends its words on what does NOT happen. An operator
- * who reads "archive" as "delete" will either avoid a harmless action or, worse,
- * use it believing they have cleaned something up.
+ * WHAT IS STILL TRUE, and still structural rather than a promise: nothing is
+ * DELETED. The backend's storage layer has no delete method at all, so there is
+ * no path from here to a removed row. The bot's configuration, position, ladder
+ * or DCA entries, order history, idempotency records, orders, trades, alerts and
+ * audit entries all survive, permanently, and the detail page still renders. An
+ * archived bot is a finished bot, not an erased one.
+ *
+ * So the dialog still spends most of its words on what does NOT happen -- an
+ * operator who reads "archive" as "delete" will either avoid the action or use
+ * it believing they have cleaned something up -- but it now has to say plainly
+ * that the capital comes back and that the bot cannot be restarted afterwards.
+ *
+ * THE POSITION GATE, AND WHY IT IS SHOWN RATHER THAN HIDDEN
+ * --------------------------------------------------------
+ * Closing cancels open orders but never SELLS, so archiving a bot that still
+ * holds base asset would hand its full quote allocation back to the account
+ * while that capital is still sitting in inventory. The backend refuses this
+ * (`position_held`, 409) and never sells on the operator's behalf; the operator
+ * clicks Liquidate first, on the halted bot, and archives once it is flat.
+ *
+ * `LiquidateAction` renders nothing at all when its action is unavailable ("if
+ * it's not a valid action, don't render it") and this component has followed the
+ * same rule for `running`/`created`. THE HELD-POSITION CASE DELIBERATELY BREAKS
+ * THAT RULE and renders a disabled button with the reason. The difference is
+ * that the other unavailable states are self-evident from the page -- a running
+ * bot obviously cannot be retired yet -- whereas "halted, finished, and still
+ * refusing to archive" looks like a broken button. The operator needs the
+ * sentence that names Liquidate as the next step, and a component that rendered
+ * nothing could not give it to them.
  *
  * WHY ARCHIVING GETS A DIALOG AND UNARCHIVING DOES NOT
  * ---------------------------------------------------
@@ -48,6 +74,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, archiveBot, unarchiveBot } from "../api/client";
 import type { BotDetail } from "../api/types";
+import { baseAssetOf, formatMoney, formatQuantity, signOf } from "../format";
 
 type OutcomeTone = "success" | "info" | "error";
 
@@ -69,6 +96,18 @@ function outcomeForError(error: unknown, archiving: boolean): Outcome {
     ? "Nothing changed and the bot is still on the list."
     : "Nothing changed and the bot is still archived.";
   if (error instanceof ApiError) {
+    // The gate this step exists for. The backend's message already names the
+    // exact held amount and the remedy, so it is shown rather than replaced --
+    // but the title has to say which of the two 409s this is, because "wrong
+    // status" and "still holding" need completely different next moves.
+    if (error.code === "position_held") {
+      return {
+        tone: "error",
+        title: "This bot still holds a position",
+        text:
+          `${error.message} ${nothingChanged}`,
+      };
+    }
     if (error.code === "invalid_status") {
       return {
         tone: "error",
@@ -142,28 +181,37 @@ function ConfirmDialog({
 
         <div className="mt-3 space-y-2 text-sm text-zinc-300">
           <p>
-            Archiving hides <span className="font-medium text-zinc-100">{bot.id}</span> from the bot
-            list’s default view. It stays {bot.status}; nothing about it is stopped, sold or changed.
+            This retires <span className="font-medium text-zinc-100">{bot.id}</span> for good: it is
+            closed, its capital is returned to the account, and it is hidden from the bot list’s
+            default view.
           </p>
           {/*
-           * The load-bearing paragraph. "Archive" reads as "delete" to most
-           * people, and every one of these is a fact about what this action
-           * does not touch, not a reassurance about intent.
+           * The paragraph the operator must not skim. Step 26's dialog promised
+           * the opposite of this in so many words ("archiving is not closing"),
+           * so anyone who learned the old behaviour is carrying exactly the
+           * wrong model. It leads with the irreversible half.
+           */}
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-[0.8125rem] text-amber-100">
+            <span className="font-medium">
+              {formatMoney(bot.allocatedCapital)} {bot.capitalAsset} goes back to the account
+            </span>{" "}
+            and becomes available for new bots. The bot’s status becomes stopped, and a stopped bot
+            cannot be started or resumed — not even after unarchiving it. This part cannot be undone.
+          </div>
+          {/*
+           * Still load-bearing, and still true: "archive" reads as "delete" to
+           * most people. Every fact here is about what is not touched.
            */}
           <div className="rounded-md border border-zinc-700 bg-zinc-800/40 px-3 py-2 text-[0.8125rem] text-zinc-300">
             <span className="font-medium text-zinc-100">Nothing is deleted.</span> This bot’s full
             history — every order, trade and alert — its strategy state and its configuration are all
-            kept exactly as they are, and this page will look the same afterwards. Its allocated
-            capital is unchanged too: archiving is not closing.
+            kept exactly as they are, and this page will still render afterwards. Archiving retires a
+            bot; it never erases one.
           </div>
           <p className="text-[0.8125rem] text-zinc-400">
             You can find it again with <span className="font-medium">Show archived</span> on the bot
-            list, and unarchive it from here at any time. It keeps counting toward this account’s
-            totals while archived, because its allocation and position are still real.
-          </p>
-          <p className="text-[0.8125rem] text-zinc-400">
-            One thing to know: an archived bot cannot be started or resumed. Unarchive it first — a
-            running bot must never be hidden from the default view.
+            list, and unarchive it from here at any time — that puts it back in the default view, but
+            it stays stopped and its capital stays returned.
           </p>
         </div>
 
@@ -221,7 +269,25 @@ export function ArchiveAction({
 
   // Re-checked here as well as at the caller. Same list as the backend's
   // ARCHIVABLE_STATUSES; a `created` bot is deliberately not archivable.
-  const canArchive = !bot.archived && (bot.status === "halted" || bot.status === "stopped");
+  const statusAllows = !bot.archived && (bot.status === "halted" || bot.status === "stopped");
+
+  /*
+   * The position gate, mirroring the backend's `assertFlatBeforeRelease` field
+   * for field -- including the part that is easy to miss: it is SKIPPED for a
+   * bot that is already `stopped`. Such a bot's capital has already been
+   * returned, so blocking it could not prevent a release, and Liquidate needs a
+   * HALTED bot, so the message would name an action it cannot take. Getting this
+   * wrong in either direction shows the operator a button whose enabled state
+   * disagrees with what the server will do.
+   *
+   * `bot.position?.heldQuantity ?? "0"` is the same expression `LiquidateAction`
+   * uses to decide whether there is anything to sell, deliberately -- this must
+   * block exactly the bots that one offers.
+   */
+  const held = bot.position?.heldQuantity ?? "0";
+  const holdsPosition = bot.status !== "stopped" && signOf(held) === "positive";
+  const canArchive = statusAllows && !holdsPosition;
+  const blocked = statusAllows && holdsPosition;
 
   async function run(archiving: boolean) {
     if (submitting) return; // double-click guard
@@ -234,11 +300,19 @@ export function ArchiveAction({
           response.result.action === "archived"
             ? {
                 tone: "success",
-                title: "Bot archived",
+                title: response.result.capitalReleased
+                  ? "Bot closed and archived"
+                  : "Bot archived",
                 text:
-                  "It is hidden from the bot list’s default view and nothing else changed. Its history, " +
-                  "state and allocated capital are exactly as they were. Use Show archived on the bot " +
-                  "list to see it, or unarchive it here.",
+                  (response.result.capitalReleased
+                    ? `Its ${formatMoney(bot.allocatedCapital)} ${bot.capitalAsset} allocation has been ` +
+                      "returned to the account and is available for new bots. The bot is now stopped " +
+                      "and cannot be started or resumed again. "
+                    : "Its capital allocation was not released by this action — it had already been " +
+                      "returned, or this bot's object holds no state to close. ") +
+                  "Nothing was deleted: its full history, strategy state and configuration are kept " +
+                  "exactly as they are. Use Show archived on the bot list to see it, or unarchive it " +
+                  "here to put it back in the default view.",
               }
             : {
                 // A repeat is a success, not an error -- the backend reports it
@@ -279,8 +353,11 @@ export function ArchiveAction({
   }
 
   // Nothing to offer and nothing to report: a running or created bot that is
-  // not archived. Never a shown-but-disabled button.
-  if (!canArchive && !bot.archived && outcome === null) return null;
+  // not archived. A HELD POSITION is deliberately excluded from this early
+  // return -- that is the one unavailable state that gets a shown-but-disabled
+  // button, because it is the only one whose reason is not obvious from the rest
+  // of the page. See the header.
+  if (!canArchive && !blocked && !bot.archived && outcome === null) return null;
 
   return (
     <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-3">
@@ -291,8 +368,10 @@ export function ArchiveAction({
           </div>
           <p className="mt-0.5 text-xs text-zinc-500">
             {bot.archived
-              ? "Hidden from the bot list’s default view. Nothing was deleted, and it cannot be started or resumed until it is unarchived."
-              : "Hide this finished bot from the bot list’s default view. Nothing is deleted and it can be brought back at any time."}
+              ? "Hidden from the bot list’s default view. Nothing was deleted; its history is kept in full."
+              : blocked
+                ? "Retire this bot and return its capital to the account. Not available yet — see below."
+                : "Retire this finished bot: it is closed, its capital returns to the account, and it leaves the default list view. Nothing is deleted."}
           </p>
         </div>
         {bot.archived ? (
@@ -305,17 +384,51 @@ export function ArchiveAction({
             {submitting ? "Unarchiving…" : "Unarchive bot"}
           </button>
         ) : (
-          canArchive && (
+          (canArchive || blocked) && (
             <button
               type="button"
-              onClick={() => setDialogOpen(true)}
-              className="shrink-0 rounded-md border border-zinc-700 px-3 py-2 text-sm font-semibold text-zinc-300 hover:border-zinc-600 hover:bg-zinc-800"
+              onClick={blocked ? undefined : () => setDialogOpen(true)}
+              disabled={blocked}
+              /*
+               * `title` as well as the panel below, so the reason is reachable
+               * from the control itself and not only from prose beside it.
+               */
+              title={
+                blocked
+                  ? "This bot still holds a position. Liquidate it first."
+                  : undefined
+              }
+              className="shrink-0 rounded-md border border-zinc-700 px-3 py-2 text-sm font-semibold text-zinc-300 hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-zinc-700 disabled:hover:bg-transparent"
             >
               Archive bot
             </button>
           )
         )}
       </div>
+
+      {/*
+       * The reason the button above is disabled, stated where the operator is
+       * already looking, with the remedy named. A 409 they have to read and
+       * interpret is the thing this exists to avoid -- and the amount is the
+       * real held quantity, not a generic phrase, matching how `LiquidateAction`
+       * names the position it would sell.
+       */}
+      {blocked && (
+        <div className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-sm text-amber-100">
+          <div className="font-medium">Liquidate the position first</div>
+          <p className="mt-0.5 text-[0.8125rem] leading-snug opacity-90">
+            This bot still holds{" "}
+            <span className="font-medium">
+              {formatQuantity(held)} {baseAssetOf(bot.pair, bot.capitalAsset)}
+            </span>
+            . Archiving would return its full {formatMoney(bot.allocatedCapital)}{" "}
+            {bot.capitalAsset} allocation to the account while that capital is still sitting in
+            inventory rather than in cash, so it is refused. Use{" "}
+            <span className="font-medium">Liquidate position</span> above to sell the holding, then
+            archive once it is flat. Nothing is ever sold on your behalf.
+          </p>
+        </div>
+      )}
 
       {outcome !== null && (
         <div className={["mt-3 rounded-md border px-3 py-2 text-sm", OUTCOME_CLASS[outcome.tone]].join(" ")}>

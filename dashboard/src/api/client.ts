@@ -20,6 +20,7 @@ import type {
   AlertSeverity,
   ApplyMissedFillsResponse,
   ArchiveResponse,
+  CloseResponse,
   Bot,
   BotDetail,
   CheckOpenOrdersResponse,
@@ -252,16 +253,37 @@ export function resumeBot(id: string, signal?: AbortSignal): Promise<ResumeRespo
 }
 
 /**
- * Hide a finished bot from the bot list's default view
+ * Close a bot and return its capital to the account
+ * (`POST /api/bots/:id/close`). No request body.
+ *
+ * The only action that releases an allocation, and it does not come back:
+ * nothing moves a bot out of `stopped`. It cancels open orders but NEVER sells,
+ * which is why it refuses a bot that still holds a position (`position_held`,
+ * 409) -- liquidate by hand first. A second close is `bot_already_stopped`.
+ */
+export function closeBot(id: string, signal?: AbortSignal): Promise<CloseResponse> {
+  return requestJson<CloseResponse>(`/api/bots/${encodeURIComponent(id)}/close`, "POST", { signal });
+}
+
+/**
+ * Retire a finished bot AND return its capital
  * (`POST /api/bots/:id/archive`). No request body.
  *
- * NOT A DELETE. It writes one boolean on the bot's row; the bot's own state,
- * order and trade history, alerts and capital allocation are untouched, and its
- * detail page is unchanged. Nothing in this system can delete a bot's data --
+ * ⚠ ARCHIVING NOW CLOSES. Step 26 wrote one boolean and promised the allocation
+ * was untouched; step 26.1 changed that on purpose -- capital reserved for a
+ * finished bot is capital no new bot can use. The bot moves to `stopped` and its
+ * allocation returns to the account. `result.capitalReleased` says whether THIS
+ * call did it.
+ *
+ * STILL NOT A DELETE, and still structurally so: the bot's own state, order and
+ * trade history, alerts and audit entries are all kept, permanently, and its
+ * detail page still renders. Nothing in this system can delete a bot's data --
  * the backend's storage layer has no delete method at all.
  *
- * A repeat is a SUCCESS, not an error: `result.action` is `already_archived`.
- * The one refusal is `invalid_status` (409) on a `running` or `created` bot.
+ * A repeat is a SUCCESS, not an error: `result.action` is `already_archived`
+ * with `capitalReleased: false`. The refusals are `invalid_status` (409) on a
+ * `running` or `created` bot, and `position_held` (409) on one still carrying
+ * inventory.
  */
 export function archiveBot(id: string, signal?: AbortSignal): Promise<ArchiveResponse> {
   return requestJson<ArchiveResponse>(`/api/bots/${encodeURIComponent(id)}/archive`, "POST", { signal });

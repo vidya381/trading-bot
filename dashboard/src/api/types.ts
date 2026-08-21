@@ -121,14 +121,22 @@ export interface Bot {
   /**
    * Hidden from the bot list's DEFAULT view (step 26). NOT a status and not a
    * deletion: an archived bot's row, object state, orders, trades and alerts are
-   * all untouched, its detail page renders identically, and it still holds its
-   * capital allocation.
+   * all untouched and its detail page still renders in full.
+   *
+   * ⚠ IT NO LONGER STILL HOLDS ITS ALLOCATION (step 26.1). Archiving now closes
+   * the bot, so a bot archived through the endpoint is `stopped` and its capital
+   * has been returned. Two exceptions keep their reservation and are the reason
+   * this flag still must not be read as "capital returned": a bot archived
+   * BEFORE step 26.1 shipped, and an orphan (no object state, so it cannot be
+   * closed). `status === "stopped"` is the only honest test for whether the
+   * capital came back, exactly as it has always been.
    *
    * It is orthogonal to `status` and must not be derived from it -- an archived
    * bot is halted or stopped, but a halted bot is not archived by implication.
    * The backend never filters on it; hiding is this dashboard's job, and it
    * hides only the TABLE. Archived bots keep counting toward the account-level
-   * totals, because their allocation and position are still real.
+   * totals, because a stopped bot can still be holding real inventory (see
+   * `accountTotals.ts`) and an unclosed archived bot still holds its allocation.
    */
   readonly archived: boolean;
   readonly createdAt: number;
@@ -616,23 +624,69 @@ export interface ResumeResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Archive / unarchive (`POST /api/bots/:id/archive` and `/unarchive`, step 26)
+// Close (`POST /api/bots/:id/close`, step 26.1)
+//
+// The `{ result, bot }` shape every other action uses. `result` is the object's
+// own `PipelineResult` and a successful close is always
+// `{ status: "stopped", action: "closed" }`.
+//
+// ⚠ THIS IS THE ONE ACTION THAT RETURNS CAPITAL, and it is not reversible:
+// nothing in this system moves a bot back out of `stopped`. It refuses a bot
+// that still holds a position (`position_held`, 409) -- closing cancels orders
+// but never sells, so releasing capital from a bot carrying inventory would hand
+// back capital that is not cash. A second close is `bot_already_stopped` (409).
+// ---------------------------------------------------------------------------
+
+export interface CloseResult {
+  readonly status: BotStatus;
+  readonly action: string;
+  readonly detail?: string;
+}
+
+export interface CloseResponse {
+  readonly result: CloseResult;
+  /** The refreshed summary (now `stopped`), or null if the row vanished. */
+  readonly bot: Bot | null;
+}
+
+// ---------------------------------------------------------------------------
+// Archive / unarchive (`POST /api/bots/:id/archive` and `/unarchive`, step 26,
+// and step 26.1 which changed what archiving MEANS)
 //
 // The `{ result, bot }` shape every other action uses. Both are idempotent and
 // report which of the two things happened rather than failing on a repeat, so a
 // double-click is harmless: `already_archived` and `not_archived` are SUCCESSES,
 // not errors, and both come back 200 with the current bot.
 //
-// Archiving refuses a `running` or `created` bot with `invalid_status` (409).
+// ⚠ ARCHIVING NOW CLOSES THE BOT AND RETURNS ITS CAPITAL. Step 26 promised the
+// opposite in so many words ("archiving is not closing"); step 26.1 reversed it
+// deliberately, because capital reserved for a finished bot is capital no new
+// bot can use. What is still true, and still structural, is that NOTHING IS
+// DELETED -- history, config and strategy state all survive, permanently and
+// read-only. What changed is that the status moves to `stopped` and the
+// allocation comes back.
+//
+// `capitalReleased` says whether THIS call did the release. It is false for a
+// repeat, for a bot that was already `stopped`, and for an orphan (a row whose
+// object holds no state, which cannot be closed at all and keeps its
+// reservation) -- three different reasons a caller must not have to infer.
+//
+// Archiving refuses a `running` or `created` bot with `invalid_status` (409),
+// and one still holding a position with `position_held` (409).
 // Unarchiving refuses nothing -- it is the reversing half, and a gate on it
-// could only ever strand a bot in the hidden state.
+// could only ever strand a bot in the hidden state. It does NOT re-allocate
+// capital: an unarchived bot comes back `stopped` and stays that way.
 // ---------------------------------------------------------------------------
 
 export type ArchiveAction = "archived" | "already_archived";
 export type UnarchiveAction = "unarchived" | "not_archived";
 
 export interface ArchiveResponse {
-  readonly result: { readonly action: ArchiveAction };
+  readonly result: {
+    readonly action: ArchiveAction;
+    /** Whether this call returned the allocation to the account. */
+    readonly capitalReleased: boolean;
+  };
   /** The refreshed summary, or null if the row vanished mid-call. */
   readonly bot: Bot | null;
 }

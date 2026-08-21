@@ -23,6 +23,7 @@ import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
 import { inBot, rateLimiterStub } from "../durable-objects/test-helpers";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import { tripAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
+import { reconcileAccount } from "../reconciliation/reconcile";
 import { isGloballyTripped, tripGlobalKillSwitch } from "../reconciliation/kill-switch";
 import type { DcaParams } from "../strategies/dca";
 import type { GridParams } from "../strategies/grid";
@@ -1489,15 +1490,141 @@ describe("check open orders", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Archiving (step 26)
+// Closing (step 26.1)
 //
-// The whole feature is one boolean, so most of what is worth testing is what
-// archiving does NOT do: it must not change a status, must not remove a row,
-// must not disturb an object, and must not let a hidden bot start trading.
+// `BotInstance.close()` and `releaseBotCapital` have existed and been tested
+// since steps 6 and 5 -- with NO ROUTE TO THEM. Nothing outside the test suite
+// could reach either, which meant the `stopped` status was unreachable in
+// production and an allocation, once made, could never be returned. This block
+// covers the route that fixes that, and the one gate it adds on top.
+// ---------------------------------------------------------------------------
+
+describe("closing", () => {
+  async function haltedFlatBot(id: string, account: string): Promise<void> {
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.halt("manual", "done", HUMAN));
+  }
+
+  it("closes a flat bot and returns its capital to the account", async () => {
+    const account = `acct-${suffix}`;
+    const id = `cl${suffix}`;
+    await haltedFlatBot(id, account);
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("500"));
+
+    const res = await api("POST", `/api/bots/${id}/close`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.result).toMatchObject({ status: "stopped", action: "closed" });
+    expect(res.body.data.bot).toMatchObject({ id, status: "stopped" });
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("0"));
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(1);
+    // It does NOT archive. The two actions are separate, and closing leaves the
+    // bot visible on the list -- which is the safe direction if the operator
+    // meant to archive and only got halfway.
+    expect((await db.botInstances.findOne({ id }))!.archived).toBe(false);
+  });
+
+  it("refuses a bot that still holds a position, and sells nothing", async () => {
+    const account = `acct-${suffix}`;
+    const id = `clh${suffix}`;
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    const resting = exchange.resting.get(clientOrderId)!.request;
+    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "done", HUMAN));
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: `gemini-tid-${id}`,
+        price: resting.price,
+        quantity: resting.quantity,
+        feeAmount: m("0.1"),
+        feeAsset: "USDT",
+        executedAt: clock + 1000,
+      },
+    ]);
+    await api("POST", `/api/bots/${id}/apply-missed-fills`);
+    const placedBefore = exchange.placed.length;
+
+    const res = await api("POST", `/api/bots/${id}/close`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("position_held");
+    // Nothing released, nothing sold, status untouched.
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("halted");
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("500"));
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(0);
+    expect(exchange.placed.length).toBe(placedBefore);
+  });
+
+  it("refuses a second close rather than releasing the same capital twice", async () => {
+    const account = `acct-${suffix}`;
+    const id = `cl2${suffix}`;
+    await haltedFlatBot(id, account);
+    expect((await api("POST", `/api/bots/${id}/close`)).status).toBe(200);
+
+    const second = await api("POST", `/api/bots/${id}/close`);
+
+    // The ledger's own mutual exclusion, surfaced rather than swallowed.
+    expect(second.status).toBeGreaterThanOrEqual(400);
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("0"));
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(1);
+  });
+
+  it("404s an unknown bot without creating anything", async () => {
+    const res = await api("POST", `/api/bots/nope${suffix}/close`);
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("unknown_bot");
+    expect(await db.botInstances.count()).toBe(0);
+  });
+
+  it("405s on GET, so the wrong method is not a missing endpoint", async () => {
+    expect((await api("GET", `/api/bots/whatever/close`)).status).toBe(405);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Archiving (step 26, and step 26.1 which changed what it MEANS)
+//
+// ⚠ THE GUARANTEE THIS BLOCK TESTS WAS DELIBERATELY SPLIT IN TWO AT STEP 26.1,
+// AND BOTH HALVES ARE INTENTIONAL. Step 26 built archiving as one boolean and
+// this block's headline test asserted the whole claim in one line: "archiving
+// removes nothing", proved by deep-comparing the entire detail payload across an
+// archive. That claim is now FALSE for one specific thing and still TRUE for
+// everything else, so it is two tests instead of one:
+//
+//   1. NOTHING IS DELETED -- still true, still structural, and still proved by
+//      the same deep comparison. History, strategy state and configuration all
+//      survive an archive untouched. See "refused archive changes nothing at
+//      all", which now carries that deep compare, and the retained-history
+//      assertions inside the success case.
+//   2. THE STATUS AND THE ALLOCATION DO CHANGE -- new, and the point of the
+//      step. Archiving closes the bot: `halted` becomes `stopped` and the
+//      capital returns to the ledger. See "archives a FLAT halted bot".
+//
+// A future reader finding the old one-line claim in decision log 26 should read
+// this comment as the amendment, not assume a test was weakened. The deep
+// compare was not deleted; it moved to the case where the old guarantee still
+// holds completely -- a REFUSED archive, which must still touch nothing.
+//
+// The rest of the block is unchanged in intent: archiving must not remove a row,
+// must not let a hidden bot start trading, and must stay idempotent.
 // ---------------------------------------------------------------------------
 
 describe("archiving", () => {
-  /** A halted DCA bot -- the ordinary archivable case. */
+  /** A halted DCA bot with a FLAT position -- the ordinary archivable case. */
   async function haltedBot(id: string, account: string): Promise<void> {
     await seedBalance(account);
     await createDcaBot(id, account);
@@ -1505,44 +1632,127 @@ describe("archiving", () => {
     await inBotId(id, (bot) => bot.halt("manual", "done experimenting", HUMAN));
   }
 
-  it("archives a halted bot, leaving its status and everything else alone", async () => {
+  /**
+   * A halted DCA bot that IS still holding base asset.
+   *
+   * The position is built the honest way -- a real resting buy, a real fill
+   * folded through the real `apply-missed-fills` endpoint -- rather than by
+   * writing state, so the gate is exercised against a position the system
+   * actually produced. The cancellation is failed on purpose so the order stays
+   * believed-open through the halt and there is something for the fill to land
+   * on.
+   */
+  async function haltedBotHoldingPosition(id: string, account: string): Promise<void> {
+    await seedBalance(account);
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const clientOrderId = exchange.placed[0]!.clientOrderId;
+    const resting = exchange.resting.get(clientOrderId)!.request;
+    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "finished with this experiment", HUMAN));
+    exchange.fillsByOrder.set(clientOrderId, [
+      {
+        fillId: `gemini-tid-${id}`,
+        price: resting.price,
+        quantity: resting.quantity,
+        feeAmount: m("0.1"),
+        feeAsset: "USDT",
+        executedAt: clock + 1000,
+      },
+    ]);
+    await api("POST", `/api/bots/${id}/apply-missed-fills`);
+  }
+
+  /**
+   * ⚠ THE HALF OF THE OLD GUARANTEE THAT WAS DELIBERATELY REVERSED (step 26.1).
+   *
+   * Step 26's version of this test was named "archives a halted bot, LEAVING ITS
+   * STATUS AND EVERYTHING ELSE ALONE" and asserted `status: "halted"` and
+   * `allocated_capital` still reserved after the archive. Both assertions were
+   * correct then and are wrong now, on purpose: archiving a finished bot that is
+   * holding nothing now closes it, because capital reserved for a finished bot
+   * is capital no new bot can spend.
+   *
+   * What did NOT change is asserted here too, in the same test, so the two are
+   * impossible to confuse: the row still exists, the allocation column still
+   * carries its historical figure, the halt reason survives, and the object's
+   * own history is untouched. Retiring a bot is not erasing one.
+   */
+  it("archives a FLAT halted bot: it is CLOSED, its capital returns, and nothing is deleted", async () => {
     const account = `acct-${suffix}`;
     const id = `ar${suffix}`;
     await haltedBot(id, account);
+    const before = (await api("GET", `/api/bots/${id}`)).body.data;
+    expect(Number(before.position.heldQuantity)).toBe(0);
+    // The capital is genuinely reserved before the archive, or the release below
+    // would be proving nothing.
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("500"));
 
     const res = await api("POST", `/api/bots/${id}/archive`);
 
     expect(res.status).toBe(200);
-    expect(res.body.data.result).toEqual({ action: "archived" });
-    expect(res.body.data.bot).toMatchObject({ id, archived: true, status: "halted" });
+    expect(res.body.data.result).toEqual({ action: "archived", capitalReleased: true });
+    expect(res.body.data.bot).toMatchObject({ id, archived: true, status: "stopped" });
 
     const row = await db.botInstances.findOne({ id });
-    // The flag moved and NOTHING else did. `status` in particular: archiving is
-    // orthogonal to the lifecycle, not a fifth status.
     expect(row!.archived).toBe(true);
-    expect(row!.status).toBe("halted");
-    expect(row!.halt_reason).toContain("manual");
+    // THE CHANGE: the status moved, and it moved via `releaseBotCapital`, which
+    // is the only writer of this value in the whole system.
+    expect(row!.status).toBe("stopped");
+    // THE POINT: the account's allocation is back to zero and available.
+    const ledger = await db.capitalLedger.findOne({ account_label: account, asset: "USDT" });
+    expect(ledger!.total_allocated).toBe(m("0"));
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(1);
+    expect(await db.auditLog.count({ action: "bot.closed" })).toBe(1);
+
+    // WHAT DID NOT CHANGE. `allocated_capital` keeps its historical figure --
+    // it is never zeroed, it has a CHECK (> 0), and `status` is what records
+    // that the reservation was returned.
     expect(row!.allocated_capital).toBe(m("500"));
+    expect(row!.halt_reason).toContain("manual");
+    // And the bot's own record is intact and still readable.
+    const after = (await api("GET", `/api/bots/${id}`)).body.data;
+    expect(after.config).not.toBeNull();
+    expect(after.state).not.toBeNull();
+    expect(after.orders.length).toBe(before.orders.length);
+    expect(after.trades.length).toBe(before.trades.length);
 
     const audit = await db.auditLog.findMany({ where: { action: "bot.archived" } });
     expect(audit).toHaveLength(1);
     expect(audit[0]!.actor).toBe(HUMAN);
     expect(audit[0]!.target_bot_instance_id).toBe(id);
-    expect(audit[0]!.details_json).toMatchObject({ status: "halted", account_label: account });
+    // `status` records what the GATE saw (pre-close), and `capital_released`
+    // records what this action did -- neither is recoverable from the row after.
+    expect(audit[0]!.details_json).toMatchObject({
+      status: "halted",
+      account_label: account,
+      capital_released: true,
+    });
   });
 
-  it("archives a stopped bot", async () => {
+  it("archives an already-stopped bot without releasing its capital a second time", async () => {
     const account = `acct-${suffix}`;
     const id = `as${suffix}`;
     await haltedBot(id, account);
-    await inBotId(id, (bot) => bot.close(HUMAN));
+    // Closed through the endpoint this step exposed, rather than by reaching
+    // into the object -- the release has already happened before the archive.
+    expect((await api("POST", `/api/bots/${id}/close`)).status).toBe(200);
     expect((await db.botInstances.findOne({ id }))!.status).toBe("stopped");
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(1);
 
     const res = await api("POST", `/api/bots/${id}/archive`);
 
     expect(res.status).toBe(200);
-    expect(res.body.data.result).toEqual({ action: "archived" });
+    // `capitalReleased: false` is the load-bearing assertion. A second release
+    // would have thrown `bot_already_stopped`; reporting `true` here would be
+    // this endpoint claiming credit for capital it did not return.
+    expect(res.body.data.result).toEqual({ action: "archived", capitalReleased: false });
     expect((await db.botInstances.findOne({ id }))!.archived).toBe(true);
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(1);
+    expect(await db.auditLog.count({ action: "bot.closed" })).toBe(1);
   });
 
   it("refuses a running bot, and changes nothing at all", async () => {
@@ -1586,14 +1796,19 @@ describe("archiving", () => {
     const id = `aid${suffix}`;
     await haltedBot(id, account);
 
-    await api("POST", `/api/bots/${id}/archive`);
+    const first = await api("POST", `/api/bots/${id}/archive`);
+    expect(first.body.data.result).toEqual({ action: "archived", capitalReleased: true });
     const second = await api("POST", `/api/bots/${id}/archive`);
 
     // Not an error -- a double-click is harmless, as it is for halt.
     expect(second.status).toBe(200);
-    expect(second.body.data.result).toEqual({ action: "already_archived" });
+    expect(second.body.data.result).toEqual({ action: "already_archived", capitalReleased: false });
     expect(second.body.data.bot.archived).toBe(true);
     expect(await db.auditLog.count({ action: "bot.archived" })).toBe(1);
+    // And the release is idempotent too: the repeat must not attempt a second
+    // close, which would surface `bot_already_stopped` as a failed archive.
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(1);
+    expect(await db.auditLog.count({ action: "bot.closed" })).toBe(1);
   });
 
   it("unarchives, and reports a bot that was not archived rather than failing", async () => {
@@ -1605,13 +1820,22 @@ describe("archiving", () => {
     const res = await api("POST", `/api/bots/${id}/unarchive`);
     expect(res.status).toBe(200);
     expect(res.body.data.result).toEqual({ action: "unarchived" });
-    expect(res.body.data.bot).toMatchObject({ archived: false, status: "halted" });
+    // `stopped`, not `halted`: the archive above closed it. Unarchiving is still
+    // purely a visibility change -- it does NOT re-allocate capital and does not
+    // move the status back, which is exactly why the bot comes back stopped.
+    expect(res.body.data.bot).toMatchObject({ archived: false, status: "stopped" });
     expect((await db.botInstances.findOne({ id }))!.archived).toBe(false);
     expect(await db.auditLog.count({ action: "bot.unarchived" })).toBe(1);
 
-    // Unarchiving resumes nothing: the bot comes back exactly as halted as it
-    // was, and starting it again stays a separate, explicit action.
-    expect((await db.botInstances.findOne({ id }))!.status).toBe("halted");
+    // Unarchiving resumes nothing and RE-ALLOCATES nothing: the bot comes back
+    // exactly as stopped as the archive left it, with its capital still returned
+    // to the account. Re-funding a closed bot is not built (that is the next
+    // step's problem, deliberately out of scope here), so this is the honest
+    // assertion rather than an aspirational one.
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("stopped");
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("0"));
 
     const again = await api("POST", `/api/bots/${id}/unarchive`);
     expect(again.status).toBe(200);
@@ -1649,7 +1873,7 @@ describe("archiving", () => {
     // both already hidden and refused for the state it is already in.
     const repeat = await api("POST", `/api/bots/${id}/archive`);
     expect(repeat.status).toBe(200);
-    expect(repeat.body.data.result).toEqual({ action: "already_archived" });
+    expect(repeat.body.data.result).toEqual({ action: "already_archived", capitalReleased: false });
 
     const res = await api("POST", `/api/bots/${id}/unarchive`);
 
@@ -1670,44 +1894,30 @@ describe("archiving", () => {
   });
 
   /**
-   * The claim this whole step rests on: archiving removes NOTHING.
+   * ⚠ HALF OF STEP 26's HEADLINE CLAIM, PRESERVED EXACTLY -- and now attached to
+   * the case where it is still completely true.
    *
-   * Built as a deep comparison of the entire detail payload across an archive
-   * rather than a list of field assertions, because a list can only check the
-   * fields whoever wrote it thought of. The payload carries the object's own
-   * config and runtime state, plus every order, trade and alert row for the
-   * bot -- so if archiving touched any of them, this fails without anyone
-   * having predicted which one.
+   * Step 26 asserted "archiving removes NOTHING" by deep-comparing the entire
+   * `GET /api/bots/:id` payload across an archive, with only `archived` and
+   * `updatedAt` permitted to differ. Step 26.1 made that false for a SUCCESSFUL
+   * archive -- the status and the allocation now change on purpose -- but it is
+   * still exactly true for a REFUSED one, and a refusal that quietly did half
+   * the work would be far worse than the old behaviour.
    *
-   * The three history assertions BEFORE the archive are not decoration. Without
+   * So the deep compare is not deleted and not weakened; it is pointed at the
+   * refusal, where "nothing moved" is still the whole requirement. The bot used
+   * here is the very bot step 26 used -- one with real orders, trades and alerts
+   * -- and it is now the bot the gate refuses, because building real history for
+   * a DCA bot means giving it a real position.
+   *
+   * The three history assertions BEFORE the call are not decoration. Without
    * them this test would pass just as happily against a bot with no history at
-   * all, comparing two empty arrays and proving nothing -- the vacuous-assertion
-   * failure this suite has hit more than once.
+   * all, comparing two empty arrays and proving nothing.
    */
-  it("removes nothing: the whole detail payload survives an archive intact", async () => {
+  it("refused archive changes nothing at all: the whole detail payload survives intact", async () => {
     const account = `acct-${suffix}`;
     const id = `akeep${suffix}`;
-    await seedBalance(account);
-    await createDcaBot(id, account);
-    await inBotId(id, (bot) => bot.start(HUMAN));
-    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
-    const clientOrderId = exchange.placed[0]!.clientOrderId;
-    const resting = exchange.resting.get(clientOrderId)!.request;
-    // Fail the cancellation so the order stays believed-open and the halt
-    // raises an alert -- this bot needs real history, not a clean one.
-    exchange.nextCancelFailure = { kind: "exchange_error", message: "could not read response" };
-    await inBotId(id, (bot) => bot.halt("manual", "finished with this experiment", HUMAN));
-    exchange.fillsByOrder.set(clientOrderId, [
-      {
-        fillId: "gemini-tid-archive",
-        price: resting.price,
-        quantity: resting.quantity,
-        feeAmount: m("0.1"),
-        feeAsset: "USDT",
-        executedAt: clock + 1000,
-      },
-    ]);
-    await api("POST", `/api/bots/${id}/apply-missed-fills`);
+    await haltedBotHoldingPosition(id, account);
 
     const before = (await api("GET", `/api/bots/${id}`)).body.data;
     // There is genuinely something to lose.
@@ -1717,22 +1927,168 @@ describe("archiving", () => {
     expect(before.state).not.toBeNull();
     expect(before.config).not.toBeNull();
     expect(before.archived).toBe(false);
+    // And it is genuinely holding something, which is why it gets refused.
+    expect(Number(before.position.heldQuantity)).toBeGreaterThan(0);
 
-    expect((await api("POST", `/api/bots/${id}/archive`)).status).toBe(200);
+    const refused = await api("POST", `/api/bots/${id}/archive`);
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe("position_held");
 
     const after = (await api("GET", `/api/bots/${id}`)).body.data;
-    // Exactly two fields may differ: the flag itself, and the row's mtime.
-    expect(after.archived).toBe(true);
-    expect({ ...after, archived: false, updatedAt: before.updatedAt }).toStrictEqual(before);
+    // NOT ONE FIELD may differ here -- not even `updatedAt`, because unlike the
+    // step 26 version nothing was written at all.
+    expect(after).toStrictEqual(before);
 
     // And the same again through the row counts, which the payload's own
     // ordering and limits cannot hide.
     expect(await db.orders.count({ bot_instance_id: id })).toBe(before.orders.length);
     expect(await db.trades.count({ bot_instance_id: id })).toBe(before.trades.length);
     expect(await db.alerts.count({ bot_instance_id: id })).toBe(before.alerts.length);
-    // The capital allocation is untouched too -- archiving is not closing.
+    // The capital allocation is untouched -- a refused archive releases nothing.
     const ledger = await db.capitalLedger.findOne({ account_label: account, asset: "USDT" });
     expect(ledger!.total_allocated).toBe(m("500"));
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(0);
+    expect(await db.auditLog.count({ action: "bot.archived" })).toBe(0);
+  });
+
+  /**
+   * The gate's message must name the remedy, because the remedy is a DIFFERENT
+   * button and the operator has no way to guess it from a 409 code.
+   */
+  it("names the held amount and points at liquidation, and never sells anything itself", async () => {
+    const account = `acct-${suffix}`;
+    const id = `amsg${suffix}`;
+    await haltedBotHoldingPosition(id, account);
+    const placedBefore = exchange.placed.length;
+
+    const refused = await api("POST", `/api/bots/${id}/archive`);
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe("position_held");
+    expect(refused.body.error.message).toMatch(/liquidate/i);
+    // The real held quantity, not a generic phrase.
+    expect(refused.body.error.message).toContain(TEST_PAIR);
+    // THE DECISION THIS ENCODES: the gate refuses, it never sells on the
+    // operator's behalf. Not one order was placed.
+    expect(exchange.placed.length).toBe(placedBefore);
+  });
+
+  it("refuses a GRID bot that is holding base asset, through the ladder rather than a DCA position", async () => {
+    // The two strategies keep their held quantity in completely different
+    // places (`state.position.quantity` vs `state.ladder.heldQuantity`), so a
+    // gate that read only DCA's would pass every other test in this block while
+    // letting every grid bot release capital over live inventory.
+    const account = `acct-${suffix}`;
+    const id = `agrid${suffix}`;
+    await seedBalance(account);
+    await inBotId(id, (bot) =>
+      bot.createGrid({
+        botInstanceId: id,
+        accountLabel: account,
+        exchange: "binance",
+        pair: TEST_PAIR,
+        capitalAsset: "USDT",
+        allocatedCapital: m("500"),
+        params: gridParams,
+        actor: HUMAN,
+      }),
+    );
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    const buy = exchange.placed.find((order) => order.side === "buy")!.clientOrderId;
+    exchange.cancelFailure = { kind: "exchange_error", message: "could not read response" };
+    await inBotId(id, (bot) => bot.halt("manual", "done", HUMAN));
+    exchange.fillsByOrder.set(buy, [exchange.fillFor(buy, { fillId: `gemini-tid-${id}` })]);
+    await api("POST", `/api/bots/${id}/apply-missed-fills`);
+
+    const detail = (await api("GET", `/api/bots/${id}`)).body.data;
+    expect(detail.position.strategy).toBe("grid");
+    expect(Number(detail.position.heldQuantity)).toBeGreaterThan(0);
+
+    const refused = await api("POST", `/api/bots/${id}/archive`);
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.code).toBe("position_held");
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("halted");
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("500"));
+  });
+
+  /**
+   * The ledger invariant, checked by RUNNING RECONCILIATION -- not by
+   * re-deriving its arithmetic here.
+   *
+   * `reconcileAllocations` (src/reconciliation/reconcile.ts) compares
+   * `capital_ledger.total_allocated` against `SUM(allocated_capital)` over bots
+   * whose status is NOT `stopped`, and raises `ledger_allocation_drift` when
+   * they disagree. That predicate names `status` and knows nothing about
+   * `archived` -- so an archive that released capital WITHOUT also flipping the
+   * status to `stopped` would leave reconciliation reporting drift on every run,
+   * forever. This build releases through `close()`, which performs that flip, so
+   * the bot leaves BOTH sides of the comparison at once.
+   *
+   * ⚠ WRITTEN THE SLOW WAY ON PURPOSE. The first version of this test summed
+   * `allocated_capital` itself and compared it to the ledger -- which is the
+   * invariant's arithmetic copied into the test, and would have agreed with a
+   * bug in the real predicate just as happily as with a correct one. Building
+   * the ports and calling `reconcileAccount` is more setup for exactly one
+   * reason: it is the actual auditor that would page the operator.
+   */
+  it("leaves reconciliation's ledger invariant intact: a real reconciliation run finds no drift", async () => {
+    const account = `acct-${suffix}`;
+    const archivedId = `ainv${suffix}`;
+    const survivorId = `aliv${suffix}`;
+    await seedBalance(account, "10000");
+    await createDcaBot(survivorId, account, "700");
+    await haltedBot(archivedId, account);
+
+    const reconcile = async () =>
+      await reconcileAccount(
+        {
+          db,
+          exchange,
+          now: () => clock,
+          newId: () => `rec-${(idCounter += 1)}`,
+          haltBot: async () => {},
+          snapshotBot: async (botInstanceId) =>
+            await inBotId(botInstanceId, (bot) => bot.snapshotIfCreated()),
+        },
+        account,
+      );
+
+    // Clean before, or the "clean after" below would prove nothing -- the
+    // vacuous-assertion failure this suite has hit more than once.
+    const before = await reconcile();
+    expect(before.findings.map((f) => f.kind)).not.toContain("ledger_allocation_drift");
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("1200"));
+
+    expect((await api("POST", `/api/bots/${archivedId}/archive`)).status).toBe(200);
+    expect(
+      (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
+    ).toBe(m("700"));
+
+    /*
+     * Still clean: the ledger fell by 500 and the summed side fell by 500 too,
+     * because the archived bot is now `stopped` and drops out of the sum.
+     *
+     * ⚠ THIS ASSERTION COMES BEFORE THE STATUS ONE BELOW, DELIBERATELY. With the
+     * order reversed, breaking the release so that it left the bot `halted`
+     * failed on `expect(status).toBe("stopped")` -- a precondition -- and the
+     * drift assertion never ran at all. The test would have reported a catch it
+     * had not actually made. Reconciliation's verdict is this test's subject, so
+     * it is the assertion that must fire first.
+     */
+    const after = await reconcile();
+    expect(after.findings.map((f) => f.kind)).not.toContain("ledger_allocation_drift");
+
+    // And the mechanism behind it: the bot left the sum by becoming `stopped`.
+    expect((await db.botInstances.findOne({ id: archivedId }))!.status).toBe("stopped");
+
+    // The survivor kept its reservation; only the archived bot's came back.
+    expect((await db.botInstances.findOne({ id: survivorId }))!.status).toBe("created");
   });
 
   it("keeps archived bots in GET /api/bots, because hiding them is the view's job", async () => {
@@ -1755,11 +2111,21 @@ describe("archiving", () => {
     expect(res.body.data.find((b: any) => b.id === kept).archived).toBe(false);
   });
 
-  it("refuses to resume an archived bot, and leaves it halted", async () => {
+  /**
+   * The `bot_archived` gate, on a bot that is archived but still HALTED.
+   *
+   * That combination is no longer what the archive endpoint produces -- it now
+   * closes -- but it is emphatically still a real state: every bot archived
+   * before this step shipped is sitting in it, and an orphan archived today
+   * still lands there (it cannot be closed). So the flag is written directly to
+   * reach it, and the "unarchive restores the resume path" half of this test,
+   * which step 26 wrote, is preserved intact for exactly those bots.
+   */
+  it("refuses to resume an archived-but-halted bot, and unarchiving restores the path", async () => {
     const account = `acct-${suffix}`;
     const id = `ares${suffix}`;
     await haltedBot(id, account);
-    await api("POST", `/api/bots/${id}/archive`);
+    await db.botInstances.update({ id }, { archived: true });
 
     const refused = await api("POST", `/api/bots/${id}/resume`);
 
@@ -1801,6 +2167,51 @@ describe("archiving", () => {
     expect(res.body.error.code).toBe("bot_archived");
     expect((await db.botInstances.findOne({ id }))!.status).toBe("created");
     expect(exchange.placed).toEqual([]);
+  });
+
+  /**
+   * ⚠ THE CONSEQUENCE OF ARCHIVING NOW CLOSING, ASSERTED RATHER THAN LEFT TO BE
+   * DISCOVERED IN PRODUCTION.
+   *
+   * Before this step, archive → unarchive → resume was a complete round trip:
+   * archiving changed nothing, so the bot came back exactly as resumable as it
+   * went in. It is not any more, and the reason is structural rather than a
+   * missing feature. Archiving closes; closing sets `stopped`; `resume()`
+   * accepts only `halted`; and nothing in this system moves a bot out of
+   * `stopped`. So archiving is now the end of a bot's trading life.
+   *
+   * That is the intended meaning of the change -- a retired bot is retired --
+   * but it is a one-way door and the operator must not meet it by surprise.
+   * Re-funding a closed bot is a separate piece of work and is deliberately not
+   * built here; this test pins the CURRENT truth so that work has something to
+   * flip when it arrives.
+   */
+  it("cannot be resumed after archiving, even once unarchived: archiving closes, and closing is final", async () => {
+    const account = `acct-${suffix}`;
+    const id = `afin${suffix}`;
+    await haltedBot(id, account);
+
+    expect((await api("POST", `/api/bots/${id}/archive`)).status).toBe(200);
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("stopped");
+
+    // Archived: refused by the archive gate, which runs first and never even
+    // asks the object what its status is.
+    const whileArchived = await api("POST", `/api/bots/${id}/resume`);
+    expect(whileArchived.status).toBe(409);
+    expect(whileArchived.body.error.code).toBe("bot_archived");
+
+    await api("POST", `/api/bots/${id}/unarchive`);
+
+    // Unarchived, and STILL refused -- now by the object itself, because it is
+    // stopped rather than halted. This is the assertion that would have been
+    // `expect(200)` before this step.
+    const afterUnarchive = await api("POST", `/api/bots/${id}/resume`);
+    expect(afterUnarchive.status).toBe(409);
+    expect(afterUnarchive.body.error.code).toBe("invalid_status");
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("stopped");
+    expect(await db.auditLog.count({ action: "bot.resumed" })).toBe(0);
+    // Starting it is refused too, for its own reason: `start` takes `created`.
+    expect((await api("POST", `/api/bots/${id}/start`)).status).toBe(409);
   });
 
   it("405s on GET, so the wrong method is not a missing endpoint", async () => {

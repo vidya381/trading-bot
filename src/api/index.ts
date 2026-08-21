@@ -47,6 +47,10 @@ const ROUTES: readonly Route[] = [
   route("POST", "/api/bots/:id/halt", handlers.haltBot),
   route("POST", "/api/bots/:id/resume", handlers.resumeBot),
   route("POST", "/api/bots/:id/liquidate", handlers.liquidateBot),
+  // Step 26.1: `close()` has existed since step 6 with no route to it, which
+  // left `releaseBotCapital` -- and the `stopped` status itself -- unreachable
+  // in production. Capital could be allocated and never returned.
+  route("POST", "/api/bots/:id/close", handlers.closeBot),
   route("POST", "/api/bots/:id/apply-missed-fills", handlers.applyMissedFills),
   route("POST", "/api/bots/:id/check-open-orders", handlers.checkOpenOrders),
   route("POST", "/api/bots/:id/archive", handlers.archiveBot),
