@@ -984,8 +984,13 @@ describe("resume (section 7.2 step 5)", () => {
       // Same source, same bot, owned by the poll's own resolve half.
       { alert_type: "poll_blind", source: "bot-instance" },
       { alert_type: "unattributable_fill", source: "bot-instance" },
-      // Reconciliation's, ingested.
-      { alert_type: "order_state_drift", source: "bot-instance" },
+      // Reconciliation's, ingested. `order_state_drift` USED TO BE IN THIS LIST
+      // and moved to "refuses to resume while an order-state-drift alert stands"
+      // below at step 57 (fix 2): it is now a REFUSAL condition, so a resume
+      // that reaches the point of resolving anything can no longer have one
+      // open. The property this test asserted about it -- that a resume does not
+      // close it -- is asserted there instead, and more strongly.
+      { alert_type: "cancel_fill_discrepancy", source: "bot-instance" },
       // A DIFFERENT writer's row about this bot, excluded twice over.
       { alert_type: "price_feed_fanout_failed", source: "price-feed" },
     ];
@@ -1000,6 +1005,131 @@ describe("resume (section 7.2 step 5)", () => {
     expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(0);
     for (const alert of untouched) {
       expect(await db.alerts.count({ alert_type: alert.alert_type, resolved: false })).toBe(1);
+    }
+  });
+
+  /**
+   * Step 57, fix 2. The scenario found on two real bots: reconciliation halted
+   * them for a meaningful drift finding, an operator resumed both, and resuming
+   * cleared the halt and the halt alert while correcting nothing.
+   */
+  it("refuses to resume while an order-state-drift alert stands", async () => {
+    await openPosition("100");
+    // Exactly how reconciliation halts a bot: through `haltBot`, which calls
+    // `halt("manual", detail, "reconciliation")`. There is no drift HaltReason --
+    // which is the whole reason the gate reads the alert and not the reason.
+    await run((bot) =>
+      bot.halt("manual", "reconciliation run r-1 found meaningful drift: ...", "reconciliation"),
+    );
+    await db.alerts.insert(
+      alertRow({
+        id: "drift-1",
+        bot_instance_id: BOT_ID,
+        alert_type: "reconciliation_meaningful_order_state_drift",
+        source: "reconciliation",
+      }),
+    );
+
+    await expect(run((bot) => bot.resume(ACTOR))).rejects.toMatchObject({
+      code: "position_unverified",
+    });
+
+    // The refusal happens BEFORE anything is written, so the bot is still halted
+    // in its own state and in D1 -- a gate that flipped the status first would
+    // last exactly as long as it takes to click resume twice.
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.status).toBe("halted");
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("halted");
+    // And the halt alert is NOT closed, which is what made the live incident
+    // invisible afterwards: an operator counting open criticals saw nothing.
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(1);
+    // The drift row stands too. Resume cannot dismiss it by running.
+    expect(await db.alerts.count({ id: "drift-1", resolved: false })).toBe(1);
+  });
+
+  it("refuses on the bot's OWN drift alert too, not just reconciliation's", async () => {
+    // `#onOrderStateError` writes an untiered `order_state_drift` when the order
+    // state machine refuses a fill. Same condition, different writer -- which is
+    // why the gate is not scoped by `source`.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    await db.alerts.insert(
+      alertRow({
+        id: "drift-own",
+        bot_instance_id: BOT_ID,
+        alert_type: "order_state_drift",
+        source: "bot-instance",
+      }),
+    );
+
+    await expect(run((bot) => bot.resume(ACTOR))).rejects.toMatchObject({
+      code: "position_unverified",
+    });
+  });
+
+  it("resumes once the drift alert is resolved by its owner", async () => {
+    // The gate is a latch on a CONDITION, not a permanent brand. Whatever closes
+    // the row -- reconciliation no longer re-finding it, or the repair path --
+    // restores the resume, and resume itself never closes it.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "reconciliation run r-1 found meaningful drift: ...", "reconciliation"));
+    await db.alerts.insert(
+      alertRow({
+        id: "drift-2",
+        bot_instance_id: BOT_ID,
+        alert_type: "reconciliation_meaningful_order_state_drift",
+        source: "reconciliation",
+      }),
+    );
+    await expect(run((bot) => bot.resume(ACTOR))).rejects.toMatchObject({
+      code: "position_unverified",
+    });
+
+    await db.alerts.update({ id: "drift-2" }, { resolved: true });
+
+    const result = await run((bot) => bot.resume(ACTOR));
+    expect(result).toMatchObject({ status: "running", action: "resumed" });
+  });
+
+  it("does not refuse on ANOTHER bot's drift alert", async () => {
+    // The row is scoped to its bot. A drift finding elsewhere on the account is
+    // reconciliation's business and not this bot's resume.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    await db.alerts.insert(
+      alertRow({
+        id: "drift-other",
+        bot_instance_id: null,
+        alert_type: "reconciliation_meaningful_order_state_drift",
+        source: "reconciliation",
+      }),
+    );
+
+    const result = await run((bot) => bot.resume(ACTOR));
+    expect(result).toMatchObject({ status: "running", action: "resumed" });
+  });
+
+  it("resumes normally for every ORDINARY halt reason", async () => {
+    // The majority path, and the one that must not regress. Every reason in the
+    // `HaltReason` union that a bot can actually be sitting on, resumed with no
+    // drift row present. `take_profit` and `breakout_take_profit` are grid-only
+    // reasons but `halt` takes the union, so driving them here proves the gate
+    // does not consult the reason at all -- which is exactly its design.
+    const ordinary = [
+      "stop_loss",
+      "manual",
+      "order_rejected",
+      "unhandled_error",
+      "take_profit_reached",
+      "take_profit",
+      "breakout_take_profit",
+    ] as const;
+
+    await openPosition("100");
+    for (const reason of ordinary) {
+      await run((bot) => bot.halt(reason, `halted for ${reason}`, ACTOR));
+      const result = await run((bot) => bot.resume(ACTOR));
+      expect(result).toMatchObject({ status: "running", action: "resumed" });
     }
   });
 

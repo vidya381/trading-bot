@@ -95,7 +95,11 @@ import type {
   Timestamp,
 } from "../shared/exchange-client";
 import { isUsable } from "../shared/downtime";
-import { haltAlertType, POLL_HEALTH_ALERT_TYPES } from "../shared/alert-types";
+import {
+  haltAlertType,
+  ORDER_STATE_DRIFT_ALERT_TYPES,
+  POLL_HEALTH_ALERT_TYPES,
+} from "../shared/alert-types";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import type { PriceFeedConfig, PriceFeedPort } from "./price-feed";
 import type { RequestPriority } from "../shared/rate-limiter";
@@ -200,7 +204,18 @@ export type BotInstanceErrorCode =
    */
   | "throttled"
   /** The bot row exists in D1 but this object holds no state. */
-  | "orphaned_bot_row";
+  | "orphaned_bot_row"
+  /**
+   * `resume` on a bot whose own books are currently known to disagree with the
+   * exchange (step 57's fix 2).
+   *
+   * A code of its own rather than `invalid_status`, because the status is not
+   * the problem: the bot IS halted and resuming a halted bot is exactly what
+   * this method is for. What is wrong is the state it would resume ONTO, and an
+   * operator reading `invalid_status` on a correctly-halted bot would reasonably
+   * conclude the request was malformed and retry it.
+   */
+  | "position_unverified";
 
 export class BotInstanceError extends Error {
   readonly code: BotInstanceErrorCode;
@@ -2392,6 +2407,77 @@ export class BotInstance extends DurableObject<Env> {
     // 7.2 step 5. Global first: it is the broader condition.
     await assertGlobalArmed(this.#db(), `resume bot ${config.botInstanceId}`);
     await assertAccountArmed(this.#db(), config.accountLabel, `resume bot ${config.botInstanceId}`);
+
+    // THE THIRD LATCH, and the narrowest: this bot's own books (step 57, fix 2).
+    //
+    // WHAT WENT WRONG WITHOUT IT. Reconciliation halted two real bots for a
+    // meaningful `order_state_drift` finding -- their own fill counts
+    // disagreeing with the exchange's -- and an operator resumed both. Resuming
+    // cleared the halt and closed the halt alert and corrected nothing: the
+    // wrong number was still the wrong number, and the bot went back to trading
+    // on it. Section 9 halts and alerts and DELIBERATELY never auto-corrects, so
+    // "reconciliation owns it" was never going to put the number back on its
+    // own; the halt was the whole mechanism, and resume dismantled it in one
+    // click while looking like an ordinary review.
+    //
+    // WHY THIS IS NOT A CHECK ON `haltReason`, which is where one would look
+    // first and where it cannot work. Every reason in the `HaltReason` union is
+    // a STRATEGY or ERROR reason -- `stop_loss`, `take_profit`,
+    // `breakout_take_profit`, `take_profit_reached`, `order_rejected`,
+    // `unhandled_error`, `manual`. There is no drift reason, because
+    // reconciliation does not have one: `workers/reconciliation.ts` halts
+    // through `haltBot`, which calls `halt("manual", detail, "reconciliation")`.
+    // So does the global kill switch, and so does an operator clicking halt.
+    // All three land as `manual`, and the only thing separating "reconciliation
+    // found this bot untrustworthy" from "a human paused it" is the DETAIL
+    // PROSE -- `haltReason` is the string `"manual: reconciliation run {id}
+    // found meaningful drift: ..."`. Branching on that means matching a
+    // sentence that nothing tests and any reword silently defeats, on the one
+    // path where failing open means trading with known-wrong numbers.
+    //
+    // SO THE GATE READS THE CONDITION, NOT THE REASON, and the condition already
+    // exists as durable, queryable, typecheck-tied state:
+    // `ORDER_STATE_DRIFT_ALERT_TYPES` -- the same set `dashboard/src/driftAlerts.ts`
+    // imports to decide whether to show the "Apply missed fills" control. An
+    // unresolved row of one of those types IS "this bot's fill tracking is
+    // currently known to be unreliable", written by whichever of the two writers
+    // saw it. That makes the refusal and the repair control agree by
+    // construction: the button is on screen exactly when resume is refused.
+    //
+    // Reading the condition is also STRICTLY WIDER than reading the reason, and
+    // deliberately so. A bot halted on `stop_loss` while a drift row stands is
+    // just as unsafe to resume as one halted by reconciliation -- the books are
+    // in question either way, and why it stopped does not change that.
+    //
+    // NOT SCOPED BY `source`: both this object (`#onOrderStateError`) and
+    // reconciliation write into this set, and either standing means the same
+    // thing. Nor is it cleared here -- `resolveHaltAlerts` below owns only
+    // `halt_*` rows and has always excluded these, which is what makes this a
+    // condition resume cannot dismiss by running.
+    const openDrift = await this.#db().alerts.findMany({
+      where: {
+        bot_instance_id: config.botInstanceId,
+        alert_type: { in: [...ORDER_STATE_DRIFT_ALERT_TYPES] },
+        resolved: false,
+      },
+    });
+    if (openDrift.length > 0) {
+      const types = [...new Set(openDrift.map((row) => row.alert_type))].sort().join(", ");
+      throw new BotInstanceError(
+        "position_unverified",
+        `bot ${config.botInstanceId} cannot resume: ${openDrift.length} unresolved ` +
+          `order-state-drift alert(s) (${types}) say this bot's own record of what it holds ` +
+          `disagrees with the exchange. Resuming would put it back to trading -- sizing orders, ` +
+          `and evaluating its stop-loss and take-profit -- against a quantity known to be ` +
+          `wrong, and resume neither checks nor corrects that number. The drift has to be ` +
+          `resolved first, by its own owner rather than by this call: reconciliation closes ` +
+          `the row once it no longer re-finds the disagreement, and the ` +
+          `apply-missed-fills repair can fold in executions the bot never recorded. ` +
+          `Note that repair reaches only orders still in openOrderIds -- if the order has ` +
+          `already gone terminal locally, there is no automated correction for it today and ` +
+          `this needs a human decision about the position.`,
+      );
+    }
 
     // Fail-closed, as in `start`: re-subscribe to the feed before re-entering
     // running. A resume is another entry into the trading state, so it needs a

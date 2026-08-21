@@ -1110,6 +1110,41 @@ describe("bots", () => {
     expect(row!.status).toBe("halted");
   });
 
+  /**
+   * Step 57, fix 2, through the real endpoint: the refusal has to reach the
+   * dashboard as a coded 409, not as a 500 with a generic message. This also
+   * proves the new `BotInstanceErrorCode` survives the Durable Object RPC
+   * boundary, which is the thing `snapshotIfCreated`'s docblock warns is not
+   * automatic.
+   */
+  it("refuses to resume a bot with an open drift alert, surfacing position_unverified (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `rdr${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) =>
+      bot.halt("manual", "reconciliation run r-9 found meaningful drift: ...", "reconciliation"),
+    );
+    await db.alerts.insert(
+      alertRow({
+        id: `drift-${suffix}`,
+        bot_instance_id: id,
+        alert_type: "reconciliation_meaningful_order_state_drift",
+        source: "reconciliation",
+        resolved: false,
+      }),
+    );
+
+    const res = await api("POST", `/api/bots/${id}/resume`);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("position_unverified");
+    // The operator is told WHY, not just refused.
+    expect(res.body.error.message).toMatch(/disagrees with the exchange/);
+    const row = await db.botInstances.findOne({ id });
+    expect(row!.status).toBe("halted");
+  });
+
   it("refuses to resume while the global kill switch is pulled (409)", async () => {
     const account = `acct-${suffix}`;
     await seedBalance(account);
