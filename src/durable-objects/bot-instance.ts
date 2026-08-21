@@ -4119,7 +4119,17 @@ export class BotInstance extends DurableObject<Env> {
         continue;
       }
 
-      await this.#recordCancellation(config, order, outcome.value, now);
+      // FALSE means the cancellation landed but this bot's own record was
+      // deliberately NOT closed, because the exchange reported more filled than
+      // it had recorded. That order must stay in `openOrderIds`: it is the poll
+      // that repairs it (read with per-fill detail, apply by real id, then
+      // `#foldTerminalState` closes it), and the poll only reads what is on
+      // this list. Dropping it here would leave a non-terminal order that
+      // nothing observes -- the understatement made permanent by a different
+      // route than the one the gate just closed.
+      if (!(await this.#recordCancellation(config, order, outcome.value, now))) {
+        stillOpen.push(clientOrderId);
+      }
     }
 
     // REMOVE WHAT THIS SWEEP RESOLVED, rather than assigning the list it
@@ -4133,6 +4143,14 @@ export class BotInstance extends DurableObject<Env> {
     // "Resolved" is every id this sweep started with that is not still open:
     // the ones it cancelled, plus the ones already terminal or unknown, which
     // the loop skips and which must still leave the list.
+    //
+    // `stillOpen` now carries TWO kinds of unresolved order, and they are
+    // unresolved in different senses: one whose fate on the exchange is unknown
+    // (the cancel could not be confirmed), and one that IS cancelled on the
+    // exchange but whose local record this sweep refused to close over a fill
+    // it had not recorded. Both want exactly the same treatment here -- keep
+    // the id, keep the poll on it -- which is why they share the list rather
+    // than getting a second one.
     const resolved = new Set(state.openOrderIds.filter((id) => !stillOpen.includes(id)));
     await this.#mutateState((current) => ({
       ...current,
@@ -4143,6 +4161,10 @@ export class BotInstance extends DurableObject<Env> {
   /**
    * Fold a cancellation response into the local order.
    *
+   * Returns whether the local record was actually CLOSED. `false` means this
+   * sweep declined to close it and the caller must leave it in `openOrderIds`;
+   * see the gate below.
+   *
    * Step 3.1's open question 1 asked what happens when the exchange reports
    * MORE filled at cancellation than this bot knew about. It happens: a resting
    * order can fill in the window before the cancel lands. The answer here is to
@@ -4152,21 +4174,50 @@ export class BotInstance extends DurableObject<Env> {
    * mean that when the real fill arrives from the account trade list, it either
    * double-counts or is silently swallowed.
    *
-   * So the position is left understating what the bot holds, the discrepancy is
-   * alerted with both numbers, and section 9's reconciliation is what closes it
-   * -- which is the job it already exists to do.
+   * THE GATE, AND WHY IT IS `#foldTerminalState`'s AND NOT A NEW ONE. That
+   * answer was only half of one. Leaving the difference off the POSITION is
+   * right and unchanged; going on to `closeOrder` the local record anyway was
+   * not. A terminal order can never accept a fill afterwards
+   * (`ALLOWED_TRANSITIONS` gives every terminal state an empty successor list,
+   * and `applyFill` throws `fill_after_terminal`), so closing here at the
+   * understated number is what made the understatement PERMANENT rather than
+   * merely current -- the poll could no longer apply the real fill when
+   * `getOrderStatus` finally handed it over with its real `tid`, and
+   * `applyMissedFills` could not reach an order that had left `openOrderIds`.
+   * "Reconciliation owns it" was true of the position and false of the record:
+   * section 9 halts and alerts and deliberately never auto-corrects, so nothing
+   * downstream was ever going to put the number back.
+   *
+   * `#foldTerminalState` already refuses exactly this, for the other trigger --
+   * an order the EXCHANGE ended, read by the poll -- and its docblock states the
+   * reasoning verbatim. This is the same order, in the same condition, reached
+   * by the other door, so it takes the same comparison rather than a second one
+   * that could drift from it: `order.filledQuantity < remote.filledQuantity`,
+   * exact, no tolerance. Anything else (equal, or a local record AHEAD of the
+   * cancellation response) closes as before -- a local record ahead of remote
+   * loses nothing by being closed, which is why the gate is one-sided.
+   *
+   * What refusing leaves behind is deliberately the shape the poll can finish:
+   * a non-terminal order still in `openOrderIds`, on a bot that is halted but
+   * still polled (`#pollArmed` excludes only `stopped`). The next pass reads it
+   * with per-fill detail, `applyFill` accepts the missing execution under its
+   * real id, and `#foldTerminalState` -- whose gate now passes -- closes it
+   * properly. The refusal is a deferral to the one path that can repair it, not
+   * a dead end.
+   *
+   * THE ALERT IS UNCHANGED IN TYPE, deliberately: `cancel_fill_discrepancy` is
+   * already this condition's signal, it is already ingested by reconciliation
+   * (`INGESTED_ALERT_TYPES`), and a new alert type would be a second name for
+   * one incident. Only its message changes, because what happens to the order
+   * changed and the message said so.
    */
   async #recordCancellation(
     config: BotConfigBase,
     order: TrackedOrder,
     remote: OrderStatus,
     now: Timestamp,
-  ): Promise<void> {
-    const cancelled = closeOrder(order, "cancelled", remote.updatedAt);
-    await this.#putOrder(cancelled);
-    await this.#mirrorOrderUpdate(cancelled);
-
-    if (remote.filledQuantity > order.filledQuantity) {
+  ): Promise<boolean> {
+    if (order.filledQuantity < remote.filledQuantity) {
       await this.#alert(config, {
         severity: "warning",
         category: "trading",
@@ -4175,10 +4226,19 @@ export class BotInstance extends DurableObject<Env> {
           `${order.clientOrderId} was cancelled with ${toDecimalString(remote.filledQuantity)} ` +
           `filled, but this bot had recorded ${toDecimalString(order.filledQuantity)}. The ` +
           `cancellation response carries no per-fill breakdown and therefore no trade id, so ` +
-          `the difference is NOT applied to the position here; reconciliation owns it.`,
+          `the difference is NOT applied to the position here; reconciliation owns it. The ` +
+          `local order is left OPEN rather than closed at the understated number: a terminal ` +
+          `order can never accept the missing fill afterwards, so closing it now would make ` +
+          `this permanent. The poll re-reads it and applies the fill by its real id.`,
       });
+      return false;
     }
+
+    const cancelled = closeOrder(order, "cancelled", remote.updatedAt);
+    await this.#putOrder(cancelled);
+    await this.#mirrorOrderUpdate(cancelled);
     void now;
+    return true;
   }
 
   /**

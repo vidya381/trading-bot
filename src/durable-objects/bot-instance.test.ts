@@ -17,7 +17,8 @@ import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
 import { alertRow, freshDatabase } from "../db/test-helpers";
 import { GlobalKillSwitchError, tripGlobalKillSwitch } from "../reconciliation/kill-switch";
-import { fromDecimalString as m, ZERO } from "../shared/money";
+import { fromDecimalString as m, toDecimalString, ZERO } from "../shared/money";
+import { TERMINAL_STATES } from "../shared/order-state";
 import type { Price } from "../shared/exchange-client";
 import type { DcaParams } from "../strategies/dca";
 import type { BotInstance, CreateDcaBotRequest, PipelineResult } from "./bot-instance";
@@ -648,6 +649,126 @@ describe("halt (section 7.2)", () => {
     // The position is deliberately left understating what is held.
     const snapshot = await run((bot) => bot.snapshot());
     expect(snapshot.state.position.quantity).toBe(m("1"));
+  });
+
+  /**
+   * The loss-causing step, gated.
+   *
+   * Reproduces what happened to two live testnet bots: reconciliation found the
+   * local record behind the exchange's real fill count, halted the bot, and the
+   * halt's own cancel sweep then `closeOrder`d that record at the understated
+   * number. A terminal order can never accept a fill afterwards, so the fills
+   * the bot had not yet observed became permanently unattributable -- the poll
+   * could no longer apply them, and `applyMissedFills` could not reach an order
+   * that had left `openOrderIds`.
+   *
+   * `#foldTerminalState` already refuses exactly this for the poll's trigger.
+   * These assert `#recordCancellation` now refuses it for the halt's.
+   */
+  it("does NOT close an order cancelled with more filled than it recorded", async () => {
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const resting = exchange.placed[1]!.clientOrderId;
+    // The exchange saw 0.25 fill in the window before the cancel landed; this
+    // bot recorded none of it, and the cancellation response carries no trade
+    // id to apply it with.
+    exchange.fillOnCancel = m("0.25");
+
+    const result = await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    // The halt itself is correct and is NOT swallowed by the refusal.
+    expect(result.status).toBe("halted");
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("halted");
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const order = snapshot.orders.find((each) => each.clientOrderId === resting)!;
+
+    // THE FIX. Terminal at 0 filled is what made the understatement permanent.
+    expect(order.state).not.toBe("cancelled");
+    expect(order.state).toBe("pending");
+    // And the record still ACCEPTS a fill, which is the whole point of not
+    // closing it: `isTerminal` false means `applyFill` will not throw
+    // `fill_after_terminal` when the real execution finally arrives with its id.
+    expect(TERMINAL_STATES).not.toContain(order.state);
+
+    // Left where the poll can still reach it. The poll only reads what is on
+    // this list, and a halted bot is still polled (`#pollArmed` excludes only
+    // `stopped`), so this is what makes the refusal a deferral rather than a
+    // dead end.
+    expect(snapshot.state.openOrderIds).toEqual([resting]);
+    // The D1 mirror is not flipped either: `#mirrorOrderUpdate` is downstream
+    // of the gate.
+    expect((await db.orders.findOne({ id: resting }))!.status).toBe("pending");
+
+    // Still signalled, through the alert type this condition already had.
+    const alerts = await db.alerts.findMany({ where: { alert_type: "cancel_fill_discrepancy" } });
+    expect(alerts).toHaveLength(1);
+  });
+
+  it("still closes a cancelled order normally when the fill counts agree", async () => {
+    // The common case, and the one that must not regress: nothing filled behind
+    // the bot's back, so there is nothing to lose by closing the record.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const resting = exchange.placed[1]!.clientOrderId;
+    expect(exchange.fillOnCancel).toBe(ZERO);
+
+    await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const order = snapshot.orders.find((each) => each.clientOrderId === resting)!;
+    expect(order.state).toBe("cancelled");
+    expect(snapshot.state.openOrderIds).toEqual([]);
+    expect((await db.orders.findOne({ id: resting }))!.status).toBe("cancelled");
+    expect(await db.alerts.count({ alert_type: "cancel_fill_discrepancy" })).toBe(0);
+  });
+
+  it("lets the poll finish what the refusal deferred: apply the fill, then close", async () => {
+    // What the refusal is FOR. Leaving the record open is only worth anything
+    // if the missing execution can still be applied afterwards -- so this drives
+    // the repair the old code made impossible, end to end.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const resting = exchange.placed[1]!.clientOrderId;
+    const placed = exchange.resting.get(resting)!;
+    exchange.fillOnCancel = m("0.25");
+
+    await run((bot) => bot.halt("manual", "operator", ACTOR));
+
+    // The venue now hands over the same execution WITH its own trade id, which
+    // is the one thing the cancellation response could not supply.
+    exchange.fillsByOrder.set(resting, [
+      {
+        fillId: "gemini-tid-9001",
+        price: placed.request.price,
+        quantity: m("0.25"),
+        feeAmount: ZERO,
+        feeAsset: "USDT",
+        executedAt: T0 + 1000,
+      },
+    ]);
+
+    const pass = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(pass.applied).toEqual([
+      {
+        clientOrderId: resting,
+        fillId: "gemini-tid-9001",
+        quantity: toDecimalString(m("0.25")),
+        price: toDecimalString(placed.request.price),
+      },
+    ]);
+    // Applied by real id, and only NOW closed -- by `#foldTerminalState`, whose
+    // own gate passes because the two counts finally agree.
+    expect(pass.closed).toEqual([resting]);
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const order = snapshot.orders.find((each) => each.clientOrderId === resting)!;
+    expect(order.filledQuantity).toBe(m("0.25"));
+    expect(order.state).toBe("cancelled");
+    expect(snapshot.state.openOrderIds).toEqual([]);
+    // The bot never left `halted`: observing is not resuming.
+    expect(pass.status).toBe("halted");
   });
 
   it("halts on an unexpected exception (section 7.5)", async () => {
