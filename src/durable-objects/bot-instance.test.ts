@@ -1208,6 +1208,87 @@ describe("close (section 8.5)", () => {
     expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("stopped");
   });
 
+  /**
+   * Step 64: the close path's own version of step 57's gate.
+   *
+   * `#closePass` used to wipe `openOrderIds` unconditionally after its sweep.
+   * Nothing observes a `stopped` bot -- `#pollArmed` excludes it, reconciliation's
+   * `RECONCILED_STATUSES` omits it, and every repair path requires `halted` -- so
+   * an order the sweep could not resolve was not merely untracked, it was
+   * unreachable forever.
+   */
+  it("REFUSES to close while the sweep left an order with an unrecorded fill", async () => {
+    // Step 57's exact scenario, on the close path: the venue reports more filled
+    // than this bot recorded, so `#recordCancellation` declines to close the
+    // record and leaves the id on the list.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const resting = exchange.placed[1]!.clientOrderId;
+    exchange.fillOnCancel = m("0.25");
+
+    await expect(run((bot) => bot.close(ACTOR))).rejects.toMatchObject({
+      code: "orders_unresolved",
+    });
+
+    // NOTHING was released and nothing was stopped: the refusal happens before
+    // `releaseBotCapital`, which is the point of no return.
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.status).toBe("running");
+    const ledger = await db.capitalLedger.findOne({ account_label: "main", asset: "USDT" });
+    expect(ledger!.total_allocated).toBe(m("400"));
+    // And the order is still on the list, still observable while the bot lives.
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([resting]);
+    expect(snapshot.state.status).toBe("running");
+  });
+
+  it("REFUSES to close while a cancellation could not be confirmed", async () => {
+    // The other reason an id survives the sweep, and the more dangerous one: the
+    // order may still be LIVE on the exchange. Releasing capital and going
+    // unobservable in that state is what this gate exists to stop.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    exchange.nextCancelFailure = { kind: "transport", message: "connection reset" };
+
+    await expect(run((bot) => bot.close(ACTOR))).rejects.toMatchObject({
+      code: "orders_unresolved",
+    });
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("running");
+    expect(await db.alerts.count({ alert_type: "cancel_failed" })).toBe(1);
+  });
+
+  it("closes normally once the outstanding order resolves", async () => {
+    // The refusal is a latch on a condition, not a dead end: clear the condition
+    // and the identical request works.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    exchange.nextCancelFailure = { kind: "transport", message: "connection reset" };
+    await expect(run((bot) => bot.close(ACTOR))).rejects.toMatchObject({
+      code: "orders_unresolved",
+    });
+
+    const result = await run((bot) => bot.close(ACTOR));
+    expect(result).toMatchObject({ status: "stopped", action: "closed" });
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("stopped");
+  });
+
+  it("still wipes the list and closes when the sweep resolves everything", async () => {
+    // The common path, unregressed: a resting order that cancels cleanly leaves
+    // nothing on the list, so the close proceeds exactly as it always did.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    const resting = exchange.placed[1]!.clientOrderId;
+
+    const result = await run((bot) => bot.close(ACTOR));
+
+    expect(result).toMatchObject({ status: "stopped", action: "closed" });
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([]);
+    expect(snapshot.state.status).toBe("stopped");
+    expect(snapshot.orders.find((o) => o.clientOrderId === resting)!.state).toBe("cancelled");
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("stopped");
+  });
+
   it("never writes stopped from the Durable Object's own mirror", async () => {
     // The guard on the settled ownership split: even a halt on a bot that was
     // somehow already stopped must not rewrite that column.

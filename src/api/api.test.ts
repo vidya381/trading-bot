@@ -1656,6 +1656,35 @@ describe("closing", () => {
     expect(exchange.placed.length).toBe(placedBefore);
   });
 
+  /**
+   * Step 64 through the real endpoint. The flat-position gate
+   * (`assertFlatBeforeRelease`) reads the POSITION; this reads the ORDER LIST,
+   * and the two are independent -- an unobserved fill leaves the position flat
+   * PRECISELY BECAUSE it is unobserved, so the flat gate is structurally blind
+   * to it and lets the request through to the DO.
+   */
+  it("refuses to close when the cancel sweep left an order unresolved (409)", async () => {
+    const account = `acct-${suffix}`;
+    await seedBalance(account);
+    const id = `cu${suffix}`;
+    await createDcaBot(id, account);
+    await inBotId(id, (bot) => bot.start(HUMAN));
+    await inBotId(id, (bot) => bot.onPriceUpdate({ pair: TEST_PAIR, price: m("100"), at: clock }));
+    // Resting, unfilled: the bot's POSITION is flat, so the archive/close gate
+    // that reads position passes and this reaches `#closePass`.
+    exchange.nextCancelFailure = { kind: "transport", message: "connection reset" };
+
+    const res = await api("POST", `/api/bots/${id}/close`);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("orders_unresolved");
+    expect(res.body.error.message).toMatch(/NOTHING observes it/);
+    // Nothing released, status untouched.
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("running");
+    expect(await db.auditLog.count({ action: "capital.released" })).toBe(0);
+  });
+
+
   it("refuses a second close rather than releasing the same capital twice", async () => {
     const account = `acct-${suffix}`;
     const id = `cl2${suffix}`;

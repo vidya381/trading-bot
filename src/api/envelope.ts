@@ -117,6 +117,10 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   // state makes the identical request work. Not 403 -- this is not about who is
   // asking, and no actor may resume a bot whose books are in question.
   position_unverified: 409,
+  // 409, with `position_unverified` above it: the request is well formed and
+  // conflicts with current state, and resolving the outstanding orders makes the
+  // identical request work.
+  orders_unresolved: 409,
   // Account circuit breaker (section 7.3).
   account_tripped: 409,
   reset_requires_human_actor: 403,

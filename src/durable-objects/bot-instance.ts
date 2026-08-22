@@ -234,7 +234,15 @@ export type BotInstanceErrorCode =
    * operator reading `invalid_status` on a correctly-halted bot would reasonably
    * conclude the request was malformed and retry it.
    */
-  | "position_unverified";
+  | "position_unverified"
+  /**
+   * `close` on a bot whose cancel sweep could not resolve every open order.
+   *
+   * Distinct from `position_unverified`, which is about the POSITION being
+   * untrustworthy. This is about an ORDER whose fate is unresolved, on the one
+   * transition after which nothing observes this bot ever again.
+   */
+  | "orders_unresolved";
 
 export class BotInstanceError extends Error {
   readonly code: BotInstanceErrorCode;
@@ -3367,6 +3375,56 @@ export class BotInstance extends DurableObject<Env> {
 
     if (state.status !== "stopped") {
       await this.#cancelOpenOrders(config, state);
+
+      // REFUSE RATHER THAN WIPE, and the write below is why it has to be a
+      // refusal rather than the retention step 57 uses on the halt path.
+      //
+      // `#cancelOpenOrders` removes from `openOrderIds` every id this sweep
+      // RESOLVED. Whatever is still on the list afterwards is there for one of
+      // exactly two reasons, and both are reasons not to stop watching it:
+      //
+      //  - step 57's gate refused to close the local record, because the
+      //    exchange reported more filled than this bot had recorded. Real base
+      //    was bought or sold that this bot has not attributed.
+      //  - the cancellation could not be CONFIRMED (`cancel_failed`), so the
+      //    order may still be live on the exchange.
+      //
+      // The list is read rather than re-derived deliberately: `#cancelOpenOrders`
+      // has already done the local-versus-remote comparison, and asking the
+      // venue a second time here would be a second, independently-worded
+      // comparison of the same two quantities -- the drift steps 57 and 61 both
+      // went out of their way not to introduce.
+      //
+      // WHY NOT SIMPLY KEEP THE IDS, as the halt path does. Because on a halt
+      // the bot stays observable and the retention hands the order to the poll,
+      // which repairs it. After a close there is no one to hand it to:
+      // `#pollArmed` excludes `stopped` outright, `checkOpenOrders` refuses a
+      // stopped bot, `applyMissedFills` and `repairPosition` both require
+      // `halted`, and reconciliation's `RECONCILED_STATUSES` is
+      // `created`/`running`/`halted` -- it never looks at a stopped bot at all.
+      // Retaining an id here would change nothing whatsoever; it would be a fix
+      // in appearance only. So the choice is refuse or lose it, and refusing is
+      // recoverable: cancel the order, or let the poll fold the fill, then close
+      // again.
+      //
+      // BEFORE `releaseBotCapital`, which is the point of no return -- it flips
+      // the row to `stopped` and returns the allocation. Refusing after it would
+      // leave a half-closed bot, which is exactly what this is protecting
+      // against.
+      const swept = await this.#state();
+      if (swept.openOrderIds.length > 0) {
+        throw new BotInstanceError(
+          "orders_unresolved",
+          `bot ${config.botInstanceId} cannot be closed: its cancel sweep could not resolve ` +
+            `${swept.openOrderIds.length} order(s) (${swept.openOrderIds.join(", ")}). Either the ` +
+            `exchange reported more filled than this bot recorded, or the cancellation could not ` +
+            `be confirmed and the order may still be live. Closing would release this bot's ` +
+            `capital and mark it stopped, after which NOTHING observes it -- no poll, no ` +
+            `reconciliation pass, no repair -- so whatever those orders are still carrying would ` +
+            `be lost silently. Resolve them first: cancel the order, or let the 30s poll fold the ` +
+            `outstanding fill, then close again. Nothing was released and nothing was changed.`,
+        );
+      }
     }
 
     // Step 5 owns this: it flips the row to `stopped` conditionally, inspects
