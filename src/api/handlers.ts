@@ -107,6 +107,7 @@ import type { Asset, CandleInterval, Pair } from "../shared/exchange-client";
 import { fromDecimalString, toDecimalString, ZERO, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { readGlobalKillSwitch } from "../reconciliation/kill-switch";
+import { isHaltAlertType } from "../shared/alert-types";
 import {
   resetGlobalKillSwitchFromEnv,
   tripGlobalKillSwitchFromEnv,
@@ -3050,6 +3051,145 @@ export async function resetKillSwitch(ctx: ApiContext): Promise<Response> {
 
   const row = await readGlobalKillSwitch(ctx.db);
   return ok(killSwitchView(row));
+}
+
+// ---------------------------------------------------------------------------
+// One-time maintenance: stale halt alerts on already-stopped bots (step 66)
+// ---------------------------------------------------------------------------
+
+/** One alert this backfill would resolve, or did. */
+interface StaleHaltAlertView {
+  readonly id: string;
+  readonly botInstanceId: string;
+  readonly alertType: string;
+  readonly severity: string;
+  readonly createdAt: number;
+}
+
+/**
+ * POST /api/maintenance/resolve-stale-halt-alerts -- close halt alerts that
+ * nothing else ever will.
+ *
+ * WHY THIS EXISTS AT ALL, AND WHY IT IS NOT A MECHANISM. Step 65 gave `close()`
+ * the alert lifecycle it never had: a bot leaving `halted` by being CLOSED now
+ * resolves its own `halt_*` rows, exactly as leaving by being RESUMED always
+ * did. That covers every bot closed from that point on and needs no maintenance
+ * of any kind.
+ *
+ * It cannot help a bot that was ALREADY closed. The resolution fires during
+ * `close()`, a bot cannot be closed twice (`releaseBotCapital` refuses a second
+ * release), and `resume()` requires `halted` -- so for a bot that went through
+ * the old path, the alert is not merely unresolved, it is unresolvable by any
+ * code path that exists. This endpoint is the one-time correction for exactly
+ * that population, run by a human when they want it, and it is deliberately NOT
+ * wired to a cron, an alarm, or a startup hook. A cleanup that runs forever is a
+ * mechanism, and a mechanism for a condition nothing can produce any more is a
+ * thing that will one day fire on something it was never meant to touch.
+ *
+ * THE PREDICATE IS `resolveHaltAlerts`' OWN, NOT A WIDER ONE, and the narrowness
+ * is the entire safety argument. Two conditions, both required:
+ *
+ *   - the owning bot's status is `stopped` -- TERMINAL, so no halt on it can be
+ *     current, and no future transition will ever revisit it;
+ *   - the alert type satisfies `isHaltAlertType`, the SAME predicate `halt.ts`
+ *     uses, imported rather than re-spelled. A second, independently-worded
+ *     prefix match here is the drift steps 57 and 61 were both built to end, and
+ *     `alert-types.test.ts` already pins this one against the real `HaltReason`
+ *     union.
+ *
+ * WHAT IT MUST NEVER TOUCH, and why the distinction is not cosmetic. A `halt_*`
+ * row on a stopped bot is STALE: it describes a state that is over. An
+ * `order_state_drift`, `unattributable_fill`, `cancel_fill_discrepancy` or
+ * `cancel_failed` row on the SAME bot is UNRESOLVED: it describes base that
+ * really moved and really was never attributed, and that stays true whatever the
+ * bot's status becomes. Closing the first kind is bookkeeping. Closing the
+ * second would assert a discrepancy went away when nothing made it go away --
+ * and on a stopped bot, nothing ever will. The type filter is what separates
+ * them, and it is enforced HERE in code rather than trusted to today's data
+ * happening to be clean.
+ *
+ * REPORT BY DEFAULT, `?commit=true` to write, matching `repair-position`
+ * (step 59) and for the same reason: this is a bulk write to rows an operator
+ * reads to decide what is on fire, so the list is meant to be read before it is
+ * trusted.
+ */
+export async function resolveStaleHaltAlerts(ctx: ApiContext): Promise<Response> {
+  const raw = ctx.url.searchParams.get("commit");
+  if (raw !== null && raw !== "true" && raw !== "false") {
+    throw badRequest(
+      "invalid_field",
+      `query parameter "commit", if given, must be "true" or "false"; got ${JSON.stringify(raw)}`,
+    );
+  }
+  const commit = raw === "true";
+
+  const stopped = await ctx.db.botInstances.findMany({ where: { status: "stopped" } });
+  const stoppedIds = stopped.map((row) => row.id);
+
+  // An empty `in` is a SQLite syntax error and the table layer refuses it
+  // rather than silently matching nothing, so the no-stopped-bots case returns
+  // here instead of building a query that cannot run.
+  if (stoppedIds.length === 0) {
+    return ok({ outcome: "no_change" as const, committed: false, alerts: [], botIds: [] });
+  }
+
+  const open = await ctx.db.alerts.findMany({
+    where: { bot_instance_id: { in: stoppedIds }, resolved: false },
+    orderBy: [{ column: "created_at", direction: "asc" }],
+  });
+  // The type filter, in memory and through the shared predicate. The alternative
+  // is a `LIKE 'halt\_%'` in the query, which would be a second spelling of the
+  // rule that `halt.ts` owns.
+  const stale = open.filter((row) => isHaltAlertType(row.alert_type));
+
+  const alerts: StaleHaltAlertView[] = stale.map((row) => ({
+    id: row.id,
+    botInstanceId: row.bot_instance_id!,
+    alertType: row.alert_type,
+    severity: row.severity,
+    createdAt: row.created_at,
+  }));
+  const botIds = [...new Set(alerts.map((alert) => alert.botInstanceId))].sort();
+
+  // Idempotent by construction: a second run finds the rows already resolved, so
+  // `open` no longer contains them and there is nothing to report or write.
+  if (alerts.length === 0) {
+    return ok({ outcome: "no_change" as const, committed: false, alerts: [], botIds: [] });
+  }
+
+  if (!commit) {
+    return ok({ outcome: "would_resolve" as const, committed: false, alerts, botIds });
+  }
+
+  for (const alert of alerts) {
+    await ctx.db.alerts.update({ id: alert.id }, { resolved: true });
+  }
+
+  // A DISTINCT audit action, deliberately. `bot.closed` and `bot.resumed` both
+  // carry `resolved_halt_alert_ids` for resolutions that happened as part of a
+  // lifecycle transition; this one happened as part of no transition at all, and
+  // filing it under either would make a manual correction look like a bot doing
+  // something. `target_bot_instance_id` is null because this spans bots, the
+  // same reason `reconciliation.run` leaves it null.
+  await ctx.db.auditLog.insert({
+    id: ctx.newId(),
+    actor: ctx.actor,
+    action: "alerts.stale_halt_backfill",
+    target_bot_instance_id: null,
+    details_json: {
+      bot_instance_ids: botIds,
+      resolved_alert_ids: alerts.map((alert) => alert.id),
+      alerts: alerts.map((alert) => ({
+        id: alert.id,
+        bot_instance_id: alert.botInstanceId,
+        alert_type: alert.alertType,
+        severity: alert.severity,
+      })),
+    },
+    created_at: ctx.now(),
+  });
+
+  return ok({ outcome: "resolved" as const, committed: true, alerts, botIds });
 }
 
 // ---------------------------------------------------------------------------

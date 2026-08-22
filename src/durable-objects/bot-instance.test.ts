@@ -1289,6 +1289,104 @@ describe("close (section 8.5)", () => {
     expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("stopped");
   });
 
+  /**
+   * Step 65: closing a bot is the OTHER way out of `halted`, and until now it
+   * had no alert lifecycle. `resolveHaltAlerts` ran only on resume, a stopped
+   * bot can never resume, and nothing else closes a `halt_*` row -- so a bot
+   * halted and then closed left its critical open permanently.
+   */
+  it("resolves the bot's halt alert when it is closed, not only when resumed", async () => {
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(1);
+
+    await run((bot) => bot.close(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(0);
+    // The row is RESOLVED, not deleted: `alerts` stays the full history.
+    expect(await db.alerts.count({ alert_type: "halt_manual" })).toBe(1);
+    // Recorded in the existing close entry, matching `bot.resumed`'s field.
+    const [closed] = await db.auditLog.findMany({ where: { action: "bot.closed" } });
+    const details = closed!.details_json as unknown as { resolved_halt_alert_ids: string[] };
+    expect(details.resolved_halt_alert_ids).toHaveLength(1);
+  });
+
+  it("closes a stop-loss halt alert too, not just a manual one", async () => {
+    // Every open `halt_*` row, exactly as the resume path treats them: the bot
+    // is terminal, so no halt on it is current.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("79"))); // breaches the stop-loss
+    expect(await db.alerts.count({ alert_type: "halt_stop_loss", resolved: false })).toBe(1);
+
+    await run((bot) => bot.close(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "halt_stop_loss", resolved: false })).toBe(0);
+  });
+
+  it("does NOT resolve alerts that describe a real, still-true discrepancy", async () => {
+    // THE SAFETY SCOPE. A `halt_*` row on a stopped bot is STALE -- it describes
+    // a state that is over. These describe base that really moved and was really
+    // never attributed, which stays true forever; closing them would assert a
+    // discrepancy went away when nothing made it go away. `resolveHaltAlerts`'
+    // own exclusions are reused rather than widened, so this holds by
+    // construction rather than by a second list that could drift.
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const untouched = [
+      { alert_type: "order_state_drift", source: "bot-instance" },
+      { alert_type: "unattributable_fill", source: "bot-instance" },
+      { alert_type: "cancel_fill_discrepancy", source: "bot-instance" },
+      { alert_type: "cancel_failed", source: "bot-instance" },
+      { alert_type: "poll_blind", source: "bot-instance" },
+      { alert_type: "reconciliation_meaningful_order_state_drift", source: "reconciliation" },
+      { alert_type: "price_feed_fanout_failed", source: "price-feed" },
+    ];
+    for (const [index, alert] of untouched.entries()) {
+      await db.alerts.insert(
+        alertRow({ id: `keep-${index}`, bot_instance_id: BOT_ID, ...alert }),
+      );
+    }
+
+    await run((bot) => bot.close(ACTOR));
+
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(0);
+    for (const alert of untouched) {
+      expect(await db.alerts.count({ alert_type: alert.alert_type, resolved: false })).toBe(1);
+    }
+  });
+
+  it("resolves per bot: closing one leaves another bot's halt alert open", async () => {
+    const OTHER_ID = "dca-btc-2";
+    const otherObject = `${objectName}-other`;
+    const inOther = <T>(body: (bot: BotInstance) => Promise<T>) => run(body, noopFeed, otherObject);
+
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    await inOther((bot) => bot.create(creation({ botInstanceId: OTHER_ID })));
+    await inOther((bot) => bot.halt("manual", "the other operator review", ACTOR));
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(2);
+
+    await run((bot) => bot.close(ACTOR));
+
+    const open = await db.alerts.findMany({
+      where: { alert_type: "halt_manual", resolved: false },
+    });
+    expect(open).toHaveLength(1);
+    expect(open[0]!.bot_instance_id).toBe(OTHER_ID);
+  });
+
+  it("closes a never-halted bot without inventing anything to resolve", async () => {
+    // The common path: no halt, nothing to close, an empty list in the audit.
+    await openPosition("100");
+
+    await run((bot) => bot.close(ACTOR));
+
+    const [closed] = await db.auditLog.findMany({ where: { action: "bot.closed" } });
+    const details = closed!.details_json as unknown as { resolved_halt_alert_ids: string[] };
+    expect(details.resolved_halt_alert_ids).toEqual([]);
+  });
+
   it("never writes stopped from the Durable Object's own mirror", async () => {
     // The guard on the settled ownership split: even a halt on a bot that was
     // somehow already stopped must not rewrite that column.

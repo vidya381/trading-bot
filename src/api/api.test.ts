@@ -7126,3 +7126,170 @@ describe("proposal record (section 21.5 requirement 5)", () => {
     expect(res.body.data.page.total).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /api/maintenance/resolve-stale-halt-alerts (step 66)
+// ---------------------------------------------------------------------------
+
+describe("resolve-stale-halt-alerts", () => {
+  const ROUTE = "/api/maintenance/resolve-stale-halt-alerts";
+
+  /**
+   * The operator's REAL population, from a live D1 query, used as a fixture
+   * rather than a live call: five bots already `stopped`, each carrying one
+   * `halt_*` alert that nothing will ever resolve, because `close()` ran for
+   * them before step 65 gave that path an alert lifecycle.
+   */
+  const LIVE_SHAPE = [
+    { bot: "bot-9wzfci", alert_type: "halt_breakout_take_profit", severity: "info" as const },
+    { bot: "bot-f170nr", alert_type: "halt_order_rejected", severity: "critical" as const },
+    { bot: "prop-live-1", alert_type: "halt_breakout_take_profit", severity: "info" as const },
+    { bot: "v-perp-1", alert_type: "halt_manual", severity: "critical" as const },
+    { bot: "v-spot-1", alert_type: "halt_manual", severity: "critical" as const },
+  ];
+
+  async function seedLiveShape(): Promise<void> {
+    for (const [index, entry] of LIVE_SHAPE.entries()) {
+      const id = `${entry.bot}-${suffix}`;
+      await db.botInstances.insert(
+        botInstanceRow({ id, account_label: `acct-${suffix}`, status: "stopped" }),
+      );
+      await db.alerts.insert(
+        alertRow({
+          id: `stale-${index}-${suffix}`,
+          bot_instance_id: id,
+          alert_type: entry.alert_type,
+          severity: entry.severity,
+          resolved: false,
+          created_at: T0 + index,
+        }),
+      );
+    }
+  }
+
+  it("reports exactly the operator's five stale alerts, and writes nothing", async () => {
+    await seedLiveShape();
+
+    const res = await api("POST", ROUTE);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.outcome).toBe("would_resolve");
+    expect(res.body.data.committed).toBe(false);
+    expect(res.body.data.alerts).toHaveLength(5);
+    expect(res.body.data.botIds).toEqual(
+      LIVE_SHAPE.map((entry) => `${entry.bot}-${suffix}`).sort(),
+    );
+    expect(res.body.data.alerts.map((a: { alertType: string }) => a.alertType).sort()).toEqual([
+      "halt_breakout_take_profit",
+      "halt_breakout_take_profit",
+      "halt_manual",
+      "halt_manual",
+      "halt_order_rejected",
+    ]);
+    // Report mode writes NOTHING: every row still open, no audit entry.
+    expect(await db.alerts.count({ resolved: false })).toBe(5);
+    expect(await db.auditLog.count({ action: "alerts.stale_halt_backfill" })).toBe(0);
+  });
+
+  it("resolves all five on commit, and records the correction in audit_log", async () => {
+    await seedLiveShape();
+
+    const res = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.outcome).toBe("resolved");
+    expect(res.body.data.committed).toBe(true);
+    expect(res.body.data.alerts).toHaveLength(5);
+    expect(await db.alerts.count({ resolved: false })).toBe(0);
+    // Resolved, not deleted: `alerts` stays the full history.
+    expect(await db.alerts.count({})).toBe(5);
+
+    const audit = await db.auditLog.findMany({ where: { action: "alerts.stale_halt_backfill" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(HUMAN);
+    expect(audit[0]!.target_bot_instance_id).toBeNull();
+    const details = audit[0]!.details_json as unknown as {
+      bot_instance_ids: string[];
+      resolved_alert_ids: string[];
+    };
+    expect(details.bot_instance_ids).toHaveLength(5);
+    expect(details.resolved_alert_ids).toHaveLength(5);
+  });
+
+  it("NEVER touches a discrepancy-type alert, even on the same bot as a halt alert", async () => {
+    // THE SAFETY SCOPE. A `halt_*` row on a stopped bot is stale; these describe
+    // base that really moved and was really never attributed, which stays true
+    // whatever the bot's status is. On a stopped bot nothing will ever resolve
+    // them either -- and that is correct, not a gap to paper over.
+    const id = `mix-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({ id, account_label: `acct-${suffix}`, status: "stopped" }),
+    );
+    await db.alerts.insert(
+      alertRow({ id: `m-halt-${suffix}`, bot_instance_id: id, alert_type: "halt_manual" }),
+    );
+    const keep = [
+      "order_state_drift",
+      "cancel_fill_discrepancy",
+      "unattributable_fill",
+      "cancel_failed",
+      "poll_blind",
+      "reconciliation_meaningful_order_state_drift",
+    ];
+    for (const [index, alertType] of keep.entries()) {
+      await db.alerts.insert(
+        alertRow({ id: `m-keep-${index}-${suffix}`, bot_instance_id: id, alert_type: alertType }),
+      );
+    }
+
+    const res = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(res.body.data.alerts).toHaveLength(1);
+    expect(res.body.data.alerts[0].alertType).toBe("halt_manual");
+    for (const alertType of keep) {
+      expect(await db.alerts.count({ alert_type: alertType, resolved: false })).toBe(1);
+    }
+  });
+
+  it("NEVER touches a bot that is not stopped, even with a halt alert open", async () => {
+    // Scoped to TERMINAL bots. A halted bot's halt alert is current, not stale --
+    // it is the alert system working, and `resume()` owns closing it.
+    const id = `live-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({
+        id,
+        account_label: `acct-${suffix}`,
+        status: "halted",
+        halt_reason: "manual: operator review",
+        halted_at: T0,
+      }),
+    );
+    await db.alerts.insert(
+      alertRow({ id: `l-halt-${suffix}`, bot_instance_id: id, alert_type: "halt_manual" }),
+    );
+
+    const res = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(res.body.data.outcome).toBe("no_change");
+    expect(await db.alerts.count({ alert_type: "halt_manual", resolved: false })).toBe(1);
+  });
+
+  it("is idempotent: a second commit reports no_change and writes no second audit row", async () => {
+    await seedLiveShape();
+    await api("POST", `${ROUTE}?commit=true`);
+
+    const again = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(again.status).toBe(200);
+    expect(again.body.data.outcome).toBe("no_change");
+    expect(again.body.data.committed).toBe(false);
+    expect(again.body.data.alerts).toEqual([]);
+    expect(await db.auditLog.count({ action: "alerts.stale_halt_backfill" })).toBe(1);
+  });
+
+  it("rejects a malformed ?commit value rather than guessing", async () => {
+    const res = await api("POST", `${ROUTE}?commit=yes`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_field");
+  });
+});

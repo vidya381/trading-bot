@@ -3433,7 +3433,59 @@ export class BotInstance extends DurableObject<Env> {
 
     const latest = await this.#state();
     await this.#mutateState((current) => ({ ...current, status: "stopped", openOrderIds: [] }));
-    await this.#audit(config, "bot.closed", actor, { cycles_completed: latest.cycleCount }, now);
+
+    // THE SECOND TRIGGER FOR AN OLD LIFECYCLE (step 65), and the reason it needs
+    // one. `resolveHaltAlerts` has always had exactly one caller -- `#resumePass`
+    // -- because a halt alert describes a condition that resuming ends. But a
+    // bot can also leave `halted` by being CLOSED, and that exit had no
+    // counterpart: `resume()` requires `halted`, a stopped bot can never be
+    // resumed, and nothing else in this system closes a `halt_*` row. So a bot
+    // halted and then closed left its critical standing open FOREVER -- not
+    // stale-until-someone-looks, but permanently unresolvable by any code path
+    // that exists. Two real testnet bots are in exactly that state.
+    //
+    // Closing is the stronger claim of the two, which is why it belongs here: a
+    // resumed bot might halt again for the same reason, while a stopped bot is
+    // TERMINAL. Its halt is definitively over.
+    //
+    // TIED TO STATUS, NOT TO `archived`, deliberately. Archiving is a visibility
+    // flag -- it hides a row from a list and can be undone by `unarchiveBot`,
+    // which would leave the alerts closed and the bot back on screen. `stopped`
+    // is the irreversible one, and it is the one that makes the halt past tense.
+    //
+    // THE SCOPE IS `resolveHaltAlerts`' OWN, reused rather than widened, and the
+    // narrowness is the safety argument. It closes `halt_*` rows under this
+    // object's own source and nothing else, so the exclusions its header spells
+    // out hold here unchanged. That distinction matters more on this path than
+    // on resume: a `halt_*` row on a stopped bot is STALE -- it describes a state
+    // that is over. An `order_state_drift` or `unattributable_fill` row on the
+    // same bot is UNRESOLVED -- it describes base that really moved and was
+    // really never attributed, and that stays true forever. Closing the first
+    // kind is bookkeeping; closing the second would be asserting a discrepancy
+    // went away when nothing made it go away.
+    //
+    // AFTER the status write, for the same reason `#resumePass` puts it after
+    // its own: everything above can refuse the close -- step 64's unresolved-
+    // order gate, `releaseBotCapital`'s own guard -- and a bot that did NOT
+    // close must keep its halt alert open.
+    const resolvedAlertIds = await resolveHaltAlerts(this.#db(), {
+      source: BOT_ALERT_SOURCE,
+      botInstanceId: config.botInstanceId,
+    });
+
+    await this.#audit(
+      config,
+      "bot.closed",
+      actor,
+      {
+        cycles_completed: latest.cycleCount,
+        // Recorded in the EXISTING close entry rather than as a second audit
+        // action, matching `bot.resumed`'s `resolved_halt_alert_ids`. One event
+        // closed these rows; one row should say so.
+        resolved_halt_alert_ids: resolvedAlertIds,
+      },
+      now,
+    );
 
     // Closing can go running -> stopped directly (bypassing #halt), so this is a
     // genuine "leaving running" point. Best-effort, like the halt path; a bot

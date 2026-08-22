@@ -110,6 +110,12 @@ const ROUTES: readonly Route[] = [
   route("GET", "/api/kill-switch", handlers.getKillSwitch),
   route("POST", "/api/kill-switch/trigger", handlers.triggerKillSwitch),
   route("POST", "/api/kill-switch/reset", handlers.resetKillSwitch),
+  // Step 66: one-time cleanup, operator-triggered. Never scheduled.
+  route(
+    "POST",
+    "/api/maintenance/resolve-stale-halt-alerts",
+    handlers.resolveStaleHaltAlerts,
+  ),
   route("GET", "/api/reconciliation", handlers.listReconciliationRuns),
 ];
 
