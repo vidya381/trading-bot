@@ -97,6 +97,28 @@ const NAVIGATION_PATH: readonly string[] = [
    */
   "/dashboard/src/components/ProposalSummaryCard.tsx",
   "/dashboard/src/proposalSummary.ts",
+  /*
+   * ⚠ THE CLONE PATH JOINS THE LIST, for the identical reason and with an extra
+   * one of its own.
+   *
+   * "Clone this bot" lands a human on the SAME pre-filled create-bot form by a
+   * different route, so every argument this guard makes about the proposal path
+   * applies to it unchanged: the files between the bot detail page and that form
+   * must not be able to make a state-changing request, on mount or on click.
+   *
+   * The extra reason is that the source of a clone is a LIVE BOT rather than a
+   * stored document. The proposal path's worst failure is recording an outcome
+   * nobody chose; this path's would be touching a running bot -- halting it,
+   * resizing it, archiving it -- as a side effect of copying its numbers. Neither
+   * file below imports `api/client`, so neither can, and that is what is checked.
+   *
+   * `pages/BotDetail.tsx` is deliberately NOT here: it holds the client because
+   * polling the bot is its whole job. The link it renders is a separate file
+   * precisely so the navigation path itself stays checkable.
+   */
+  "/dashboard/src/research/botClonePrefill.ts",
+  "/dashboard/src/components/CloneBotLink.tsx",
+  "/dashboard/src/components/CloneSourceBanner.tsx",
 ];
 
 /**
@@ -281,11 +303,68 @@ describe("navigating to a pre-filled form cannot approve a proposal", () => {
     expect(offenders, offenders.join("\n")).toEqual([]);
   });
 
-  it("the prefill module makes no request of any kind, by any route", () => {
+  it("⚠ the clone prefill never puts the SOURCE BOT's id into anything submitted", () => {
+    /*
+     * The clone's analogue of the `proposalId` rule above, and the mechanical form
+     * of "there is no relationship between the source bot and the new one".
+     *
+     * `sourceBotId` exists so the banner can name where the numbers came from. It
+     * is not a field `POST /api/bots` reads, there is no column for it, and the
+     * moment it appears in a request body it stops being provenance and starts
+     * being a link between two bots. So: the only file allowed to name it at all
+     * is the clone module and the banner that displays it, and the create-bot form
+     * -- the one file that can submit anything -- must never mention it.
+     */
+    const CLONE = "/dashboard/src/research/botClonePrefill.ts";
+    const BANNER = "/dashboard/src/components/CloneSourceBanner.tsx";
     const offenders: string[] = [];
-    for (const { line, number } of code(PREFILL)) {
-      if (/\bfetch\s*\(|XMLHttpRequest|navigator\.sendBeacon|new\s+WebSocket|EventSource/.test(line)) {
-        offenders.push(`${PREFILL}:${number}: ${line}`);
+    for (const [path, module] of Object.entries(SOURCES)) {
+      if (path === CLONE || path === BANNER) continue;
+      if (path.endsWith(".test.ts") || path.endsWith(".test.tsx")) continue;
+      for (const { line, number } of codeLines(module.default)) {
+        if (/\bsourceBotId\b/.test(line)) offenders.push(`${path}:${number}: ${line}`);
+      }
+    }
+    expect(
+      offenders,
+      "the source bot's id is provenance for the banner and nothing else; it must not " +
+        "reach the form or any request body\n" + offenders.join("\n"),
+    ).toEqual([]);
+    // And the form -- the one file that can submit -- does not know it exists.
+    expect(code(FORM).some(({ line }) => /sourceBotId/.test(line))).toBe(false);
+  });
+
+  it("⚠ the clone prefill cannot carry a bot instance id into the form", () => {
+    /*
+     * THE "FRESH ID" GUARANTEE, pinned as an absence.
+     *
+     * The create-bot form mints `botInstanceId` itself at mount (`generatedId`)
+     * and the clone prefill has no field for it, so a cloned bot cannot inherit or
+     * collide with the source bot's id. That is true only for as long as nobody
+     * adds the field, and adding it would typecheck and look helpful -- so the
+     * absence is asserted rather than assumed. `cloneFrom` is the URL key and is
+     * not a form value; it is excluded by anchoring on the property name.
+     */
+    const offenders: string[] = [];
+    for (const { line, number } of code("/dashboard/src/research/botClonePrefill.ts")) {
+      if (/(^|[{,\s])botInstanceId\s*[:,]/.test(line)) offenders.push(`${number}: ${line}`);
+    }
+    expect(
+      offenders,
+      "the clone prefill must not carry a botInstanceId; the new bot's id is minted " +
+        "by the form and never inherited\n" + offenders.join("\n"),
+    ).toEqual([]);
+    // The form still generates its own, unconditionally.
+    expect(code(FORM).some(({ line }) => /useState\(generatedId\)/.test(line))).toBe(true);
+  });
+
+  it("the prefill modules make no request of any kind, by any route", () => {
+    const offenders: string[] = [];
+    for (const path of [PREFILL, "/dashboard/src/research/botClonePrefill.ts"]) {
+      for (const { line, number } of code(path)) {
+        if (/\bfetch\s*\(|XMLHttpRequest|navigator\.sendBeacon|new\s+WebSocket|EventSource/.test(line)) {
+          offenders.push(`${path}:${number}: ${line}`);
+        }
       }
     }
     expect(offenders, offenders.join("\n")).toEqual([]);

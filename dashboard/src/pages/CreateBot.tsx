@@ -102,6 +102,27 @@
  * The URL is read ONCE, at mount, and never written back -- so a reload restores
  * the PROPOSAL's numbers and drops edits, exactly as a reload of a half-typed
  * manual form drops those. `proposalPrefill.ts` argues that trade in full.
+ *
+ * ── ⚠ IT CAN ALSO OPEN PRE-FILLED BY CLONING AN EXISTING BOT ──
+ *
+ * A SECOND, SEPARATE query string describes an existing bot's configuration
+ * (`research/botClonePrefill.ts`), reached from the Clone control on any bot's
+ * detail page. Everything in the five bullets above applies to it WORD FOR WORD:
+ * one component, one route, no locked fields, no skipped check, and nothing
+ * recorded by arriving -- less than nothing, in fact, since a clone has no outcome
+ * to write and sends no source id to the server at all.
+ *
+ * ⚠ THE TWO PREFILLS ARE TWO DECODERS, NOT TWO MODES OF ONE. Each refuses
+ * everything it does not recognise, and `readBotClonePrefill` additionally refuses
+ * any URL that also carries a `proposalId`, so a link can never be read under the
+ * wrong banner. `botClonePrefill.ts` argues that choice in full. What reaches the
+ * state below is one `FormPrefillSeed` from whichever decoder answered -- so there
+ * is still no branch per source at any `useState`, and a manual visit (both null)
+ * is byte-identical to what it always was.
+ *
+ * ⚠ ONLY THE PROPOSAL PREFILL CAN EVER ATTACH A `proposalId` TO THE SUBMIT. The
+ * clone seed is deliberately not consulted by `onSubmit`; `withProposalId` still
+ * reads `prefill` alone, so cloning cannot resolve anybody's proposal.
  */
 
 import {
@@ -124,7 +145,9 @@ import {
 import type { Account, Bot, CreateBotRequest, ProposalLink, Strategy } from "../api/types";
 import { compareDecimal } from "../format";
 import { ProposalPrefillBanner } from "../components/ProposalPrefillBanner";
+import { CloneSourceBanner } from "../components/CloneSourceBanner";
 import { readProposalPrefill, withProposalId } from "../research/proposalPrefill";
+import { readBotClonePrefill, type FormPrefillSeed } from "../research/botClonePrefill";
 
 // ---------------------------------------------------------------------------
 // Validation helpers -- pure string checks, no float ever constructed. The
@@ -801,19 +824,46 @@ export function CreateBot() {
    * values can never appear without the banner that explains them.
    */
   const [prefill] = useState(() => readProposalPrefill(searchParams));
-  const gridPrefill = prefill?.fields.strategy === "grid" ? prefill.fields : null;
-  const dcaPrefill = prefill?.fields.strategy === "dca" ? prefill.fields : null;
+  /*
+   * ── THE CLONE PREFILL, READ THE SAME WAY, FROM A DIFFERENT DECODER ──
+   *
+   * Also once, also at mount, also null for an ordinary manual visit.
+   * `readBotClonePrefill` returns null for anything lacking a real `cloneFrom`
+   * and a recognised `strategy`, AND for any URL that carries a `proposalId` --
+   * so the two can never both answer, and prefilled values can never appear
+   * under the wrong banner.
+   *
+   * ⚠ THE PROPOSAL IS ASKED FIRST AND THE GUARD IS STILL IN THE DECODER. The
+   * `prefill === null` short-circuit here is an optimisation, not the safety
+   * property: `readBotClonePrefill` refuses a proposal-bearing URL by itself, so
+   * this order cannot be the thing that keeps the two apart. A test pins that.
+   */
+  const [clonePrefill] = useState(() =>
+    prefill === null ? readBotClonePrefill(searchParams) : null,
+  );
+  /*
+   * ONE SEED FOR THE STATE BELOW, whichever decoder answered. Both prefill types
+   * satisfy `FormPrefillSeed` structurally, so every `useState` initialiser reads
+   * one value of one type and no line below branches on where it came from. Null
+   * for a manual visit, which is what every `??` fallback here has always meant.
+   */
+  const seed: FormPrefillSeed | null = prefill ?? clonePrefill;
+  const gridPrefill = seed?.fields.strategy === "grid" ? seed.fields : null;
+  const dcaPrefill = seed?.fields.strategy === "dca" ? seed.fields : null;
 
-  const [strategy, setStrategy] = useState<Strategy>(() => prefill?.strategy ?? "dca");
+  const [strategy, setStrategy] = useState<Strategy>(() => seed?.strategy ?? "dca");
 
   // Shared fields.
   const [botInstanceId, setBotInstanceId] = useState(generatedId);
-  const [accountLabel, setAccountLabel] = useState(() => prefill?.accountLabel ?? "");
+  const [accountLabel, setAccountLabel] = useState(() => seed?.accountLabel ?? "");
   // Read-only, derived from the selected account (step 11); never an input, never sent.
+  // ⚠ NOT CARRIED BY EITHER PREFILL, deliberately -- the account registry is the
+  // authority on which venue an account trades at, and a carried value could
+  // contradict it.
   const [exchange, setExchange] = useState("");
-  const [pair, setPair] = useState(() => prefill?.pair ?? "");
-  const [capitalAsset, setCapitalAsset] = useState(() => prefill?.capitalAsset ?? "USDT");
-  const [allocatedCapital, setAllocatedCapital] = useState(() => prefill?.allocatedCapital ?? "");
+  const [pair, setPair] = useState(() => seed?.pair ?? "");
+  const [capitalAsset, setCapitalAsset] = useState(() => seed?.capitalAsset ?? "USDT");
+  const [allocatedCapital, setAllocatedCapital] = useState(() => seed?.allocatedCapital ?? "");
 
   // DCA fields. Each falls back to EXACTLY the default it had before the prefill
   // existed, so a manual visit is byte-identical to what it always was.
@@ -1193,6 +1243,16 @@ export function CreateBot() {
        * why nothing else on this page needed a branch.
        */}
       {prefill !== null && <ProposalPrefillBanner prefill={prefill} currentStrategy={strategy} />}
+      {/*
+       * The clone banner, in the same place and for the same reason. Mutually
+       * exclusive with the one above by construction -- `clonePrefill` is only
+       * read when `prefill` is null, and the decoder refuses a proposal-bearing
+       * URL anyway -- so at most one of these ever renders, and a manual creation
+       * renders neither.
+       */}
+      {clonePrefill !== null && (
+        <CloneSourceBanner prefill={clonePrefill} currentStrategy={strategy} />
+      )}
 
       {/* Suggestion list for the capital-asset field only (best effort). Account
           and pair are now driven by the registry, not scraped from existing bots. */}

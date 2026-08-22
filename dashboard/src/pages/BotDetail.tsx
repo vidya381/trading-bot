@@ -33,6 +33,7 @@ import { HaltAction } from "../components/HaltAction";
 import { ResumeAction } from "../components/ResumeAction";
 import { LiquidateAction } from "../components/LiquidateAction";
 import { ArchiveAction } from "../components/ArchiveAction";
+import { CloneBotLink } from "../components/CloneBotLink";
 import { StrategyState } from "../components/StrategyState";
 import { OrderHistory } from "../components/OrderHistory";
 import { TradeHistory } from "../components/TradeHistory";
@@ -217,6 +218,22 @@ function BotDetailView({ id }: { id: string }) {
            * neighbours it needs no status condition here.
            */}
           <ArchiveAction bot={bot} onChanged={poll.refetch} />
+          {/*
+           * Clone (this session), BELOW every control that acts on this bot and
+           * above the read-only sections, because that is what it is: it does
+           * nothing to this bot at all. It reads the configuration rendered above
+           * and navigates to the ordinary create-bot form carrying those values.
+           *
+           * ⚠ IT IS THE ONE CONTROL HERE WITH NO STATUS CONDITION, and the absence
+           * is deliberate rather than an oversight. Every neighbour above is gated
+           * because it changes this bot's state and would only fail if offered at
+           * the wrong moment. Copying a configuration is valid whatever the bot is
+           * doing -- and the moment an operator most wants "another one like that"
+           * is usually just after watching one stop. The component renders its own
+           * refusal for the one case it cannot serve (an orphan with no config),
+           * which is not a status.
+           */}
+          <CloneBotLink bot={bot} />
           <StrategyState bot={bot} />
           <OrderHistory orders={bot.orders} />
           <TradeHistory trades={bot.trades} />
