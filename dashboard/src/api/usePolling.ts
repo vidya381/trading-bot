@@ -2,26 +2,52 @@
  * Poll a fetcher on a fixed interval (this session's brief item 7: refetch every
  * 5 seconds while the page is open; no WebSockets, a deliberate simplification).
  *
- * Behaviour that matters for a money dashboard:
+ * ── ⚠ THIS FILE IS WIRING. THE DECISIONS ARE IN `pollEngine.ts` ──
+ *
+ * Every branch that used to live here -- when to fetch, what to do with an
+ * abort, how a failure combines with the last good data -- now lives in
+ * `pollEngine.ts`, which imports no React and which the test suite can therefore
+ * actually execute. A test importing a `.tsx` collects ZERO TESTS RATHER THAN
+ * FAILING in the Workers pool this suite runs in, and this module is one import
+ * away from that world; `pollEngine.ts` is not.
+ *
+ * What remains here is the three things only React can do: hold the state, tie
+ * the poll's lifetime to the component's, and keep `refetch` callable across
+ * renders. If a future edit adds an `if` to this file, it has put a decision
+ * somewhere no test can reach -- `poll-structure.test.ts` fails the build for it.
+ *
+ * Behaviour that matters for a money dashboard, unchanged and now pinned by
+ * tests rather than asserted in a comment:
  *   - Fetches once immediately, then every `intervalMs`.
  *   - Keeps the LAST GOOD data when a poll fails, and surfaces the error
  *     alongside it -- a transient blip must not blank the screen. `loading` is
  *     true only until the first successful (or failed) load.
- *   - Aborts an in-flight request on unmount and on each new tick, so a slow
- *     response cannot overwrite a newer one or leak past unmount.
+ *   - Aborts an in-flight request on unmount, so a slow response cannot leak
+ *     past unmount.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPollEngine, initialPollData, type PollData, type PollTimers } from "./pollEngine";
 
 export const POLL_INTERVAL_MS = 5000;
 
-interface PollData<T> {
-  readonly data: T | null;
-  readonly error: Error | null;
-  readonly loading: boolean;
-  /** Epoch ms of the last SUCCESSFUL load, or null before the first. */
-  readonly lastUpdated: number | null;
-}
+/**
+ * The platform's real timers, supplied to the engine here and NOWHERE ELSE.
+ *
+ * This is the only place in the dashboard that touches a real timer or a real
+ * clock for polling purposes, which is what lets every test drive a manual one
+ * without any global patching (see `pollEngine.ts`'s "NO FAKE TIMERS").
+ */
+const REAL_TIMERS: PollTimers = {
+  repeat: (fn, ms) => {
+    const id = setInterval(fn, ms);
+    return () => clearInterval(id);
+  },
+  delay: (fn, ms) => {
+    const id = setTimeout(fn, ms);
+    return () => clearTimeout(id);
+  },
+};
 
 export interface PollState<T> extends PollData<T> {
   /**
@@ -37,59 +63,42 @@ export function usePolling<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number = POLL_INTERVAL_MS,
 ): PollState<T> {
-  const [state, setState] = useState<PollData<T>>({
-    data: null,
-    error: null,
-    loading: true,
-    lastUpdated: null,
-  });
+  const [state, setState] = useState<PollData<T>>(initialPollData<T>);
 
   // Keep the fetcher in a ref so changing its identity does not restart the
-  // interval; the polling loop reads the latest one each tick.
+  // interval; the engine reads the latest one through this stable wrapper.
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
-  // The live `tick` for this mount, exposed through `refetch`. Reset to a no-op
-  // on unmount so a forced refetch after unmount does nothing.
-  const tickRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  // What the engine RESUMES FROM if the effect re-runs. React's `useState` does
+  // not reset across an effect restart, so the engine must not either -- see
+  // `PollEnginePorts.initial`.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  // The live engine's `refetch` for this mount. Reset to a no-op on unmount so a
+  // forced refetch after unmount does nothing.
+  const refetchRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   useEffect(() => {
-    let stopped = false;
-    let controller: AbortController | null = null;
-
-    const tick = async () => {
-      controller?.abort();
-      controller = new AbortController();
-      try {
-        const data = await fetcherRef.current(controller.signal);
-        if (stopped) return;
-        setState({ data, error: null, loading: false, lastUpdated: Date.now() });
-      } catch (error) {
-        if (stopped) return;
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        // Keep last-good data; report the error next to it.
-        setState((prev) => ({
-          data: prev.data,
-          error: error instanceof Error ? error : new Error(String(error)),
-          loading: false,
-          lastUpdated: prev.lastUpdated,
-        }));
-      }
-    };
-
-    tickRef.current = tick;
-    void tick();
-    const id = setInterval(() => void tick(), intervalMs);
+    const engine = createPollEngine<T>({
+      fetcher: (signal) => fetcherRef.current(signal),
+      now: () => Date.now(),
+      timers: REAL_TIMERS,
+      onChange: setState,
+      intervalMs,
+      initial: stateRef.current,
+    });
+    refetchRef.current = engine.refetch;
+    engine.start();
 
     return () => {
-      stopped = true;
-      controller?.abort();
-      clearInterval(id);
-      tickRef.current = () => Promise.resolve();
+      engine.stop();
+      refetchRef.current = () => Promise.resolve();
     };
   }, [intervalMs]);
 
-  const refetch = useCallback(() => tickRef.current(), []);
+  const refetch = useCallback(() => refetchRef.current(), []);
 
   return { ...state, refetch };
 }
