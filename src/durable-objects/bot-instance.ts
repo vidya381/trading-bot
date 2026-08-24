@@ -394,6 +394,57 @@ export interface BotRuntimeState {
    */
   readonly exitKind?: "take_profit" | "liquidation";
   /**
+   * DCA ONLY: base this bot bought, still owns on the exchange, and no longer
+   * counts anywhere else. Cumulative across every cycle, and NEVER traded.
+   *
+   * A cycle's exit sell is sized from `position.quantity` through
+   * `validateOrder`, whose quantity "rounds DOWN unconditionally, on either
+   * side" -- the only safe direction, since rounding up would ask to sell more
+   * base than the account holds and the exchange rejects the whole order rather
+   * than trimming it. `#completeCycle` then clears the position. Whatever the
+   * final exit fill did not remove was therefore discarded: real base, bought
+   * with this bot's own capital, sitting in the account and modelled nowhere,
+   * on every completed cycle, permanently.
+   *
+   * TWO THINGS LAND HERE, and they are different sizes. The rounding residue is
+   * strictly smaller than one `stepSize` and is normally exactly ZERO -- every
+   * buy is PLACED at a step-aligned quantity and a venue fills it in step-aligned
+   * pieces, so `position.quantity` is already a multiple of the step and the
+   * floor is a no-op. It becomes non-zero when the grid itself moves: filters are
+   * refetched hourly, and a venue that COARSENS `stepSize` mid-cycle strands
+   * everything below the new step. The second is not bounded by the step at all:
+   * base acquired AFTER the exit was sized cannot be in an order whose quantity
+   * was fixed at placement. `#placeTakeProfitSell` cancels resting buys first,
+   * but a cancellation that cannot be confirmed leaves the buy live (it alerts
+   * `cancel_failed` and keeps the id), and `#recordCancellation` deliberately
+   * defers an under-recorded fill to the poll -- so a whole buy's worth can land
+   * between the sizing and the completion. That is thousands of steps, not a few
+   * sats.
+   *
+   * WHY ACCUMULATED RATHER THAN CARRIED FORWARD INTO THE NEXT CYCLE. `decide`
+   * reads `position.quantity <= ZERO` as "fresh cycle, place the base order", so
+   * a carried-forward remainder would stop the bot ever opening one again and
+   * would immediately judge it against the PREVIOUS cycle's
+   * `averageEntryPrice` -- take-profit or stop-loss on a quantity too small to
+   * construct an order from, which halts. It would also make `position.quantity`
+   * mean two things at once (this cycle's holdings plus prior cycles' orphans),
+   * which is exactly the ambiguity the position-tracking fixes removed: the
+   * repair action rebuilds the position as `bought - sold` over the LIVE cycle's
+   * orders and would read a carried remainder as an overstatement to correct
+   * away. Kept outside `position` entirely, it is inert to all of that.
+   *
+   * WHY NOT SOLD OFF. The rounding residue is by definition below one step, and
+   * `minQuantity` is never finer than `stepSize` on a real symbol, so an order
+   * for it cannot be constructed at all -- `validateOrder` answers
+   * `rounded_to_zero` or `quantity_below_min`. It is reported so a human can
+   * decide, which for a sub-lot amount usually means "sweep it by hand, or leave
+   * it".
+   *
+   * Optional and defaulted to ZERO on read, so state written before this field
+   * existed stays valid. Nothing in the trading path reads it.
+   */
+  readonly unmodelledBase?: Money;
+  /**
    * GRID ONLY: replacement orders that could not be placed yet because their
    * target level was still occupied by a live order.
    *
@@ -4027,7 +4078,6 @@ export class BotInstance extends DurableObject<Env> {
    * and a close is a human decision.
    */
   async #completeCycle(config: DcaConfig, exit: TrackedOrder, at: Timestamp): Promise<PipelineResult> {
-    const state = await this.#state();
     // NO LONGER THE PLACE THE PROFIT IS BOOKED. `applyExit` realizes each exit
     // fill as it lands -- it has to, because the cost basis backing that
     // quantity leaves the position in the same step -- so `realizedGross` is
@@ -4035,31 +4085,68 @@ export class BotInstance extends DurableObject<Env> {
     // would count the whole exit twice.
     //
     // What is left for this method is CLEANUP and REPORTING. The position it
-    // zeroes has already been reduced to ZERO by the final fill's `applyExit`
-    // (a full exit sells exactly what the position held, and the remainder-form
-    // cost basis reaches exactly zero with it), so `EMPTY_POSITION` now clears
-    // `entries`, `additionalBuysUsed` and `lastEntryPrice` rather than
-    // performing the decrement itself.
+    // zeroes has USUALLY been reduced to ZERO by the final fill's `applyExit`,
+    // so `EMPTY_POSITION` mostly just clears `entries`, `additionalBuysUsed` and
+    // `lastEntryPrice` rather than performing the decrement itself.
     //
-    // The reported figure is derived from the exit's OWN fills against the
-    // cost that backed them -- `entries` is still intact at this point, and its
-    // costs sum to exactly what the cycle spent -- so the audit and the alert
-    // say what this cycle earned, without either re-deriving or re-booking it.
+    // USUALLY, NOT ALWAYS, and the gap is real base. An exit is sized by rounding
+    // `position.quantity` DOWN onto the symbol's step, and base acquired after
+    // it was sized is not in it at all -- so what `applyExit` removed can be less
+    // than what the position held. That remainder used to be discarded here in
+    // silence. It is now accumulated into `unmodelledBase`, which documents both
+    // shapes and why this is where they are caught.
+    //
+    // The reported figure is derived from the exit's OWN fills against the cost
+    // that ACTUALLY BACKED THEM -- the cycle's total entry cost less the basis
+    // still sitting against any remainder -- so the audit and the alert say what
+    // this cycle earned, without re-deriving it, re-booking it, or expensing
+    // coin the bot still owns.
     const proceeds = exit.fills.reduce(
       (total, each) => total + mul(each.price, each.quantity, "half-even"),
       ZERO,
     );
-    const spent = state.position.entries.reduce((total, each) => total + each.cost, ZERO);
-    const gross = proceeds - spent;
 
-    const completed = await this.#mutateState((current) => ({
-      ...current,
-      cycleCount: current.cycleCount + 1,
-      position: EMPTY_POSITION,
-      openOrderIds: [],
-      exitOrderId: null,
-      exitKind: undefined,
-    }));
+    // CAPTURED FROM INSIDE THE MUTATION, not from the `state` read above. Both
+    // figures are properties of the position at the instant it is cleared, and
+    // this write is the thing clearing it -- reading them from a snapshot taken
+    // before the audit and alert below (each a D1 write, and therefore a
+    // re-entry point) would report a position a concurrent pass had since moved.
+    let stranded = ZERO;
+    let spent = ZERO;
+    let entryCount = 0;
+
+    const completed = await this.#mutateState((current) => {
+      // WHAT THE EXIT DID NOT SELL. `applyExit` has decremented the position on
+      // every fill of this exit, so whatever is left is precisely the base this
+      // cycle bought and did not dispose of -- see `unmodelledBase`. Zeroing the
+      // position on top of it, which is what this method has always done, is
+      // correct; DISCARDING it was not. Accumulated rather than dropped, and
+      // deliberately not folded into `position`, `realizedGross` or the
+      // allocation: it is base the bot owns and no longer trades.
+      stranded = current.position.quantity;
+      // NET OF THE COST BASIS THAT STAYED BEHIND. `entries` sums to what the
+      // cycle SPENT in total, and while a clean exit leaves `position.cost` at
+      // exactly ZERO -- `applyExit`'s remainder form guarantees that -- an exit
+      // that stranded base leaves the basis backing it still sitting there. The
+      // bare `entries` sum therefore expensed coin the cycle still owns, which
+      // understated `gross_profit` by that basis and put the audited figure
+      // permanently at odds with `realizedGross`, which only ever charged the
+      // basis that actually left. Subtracting the retained basis is a no-op on
+      // the ordinary path (it is ZERO) and makes the two agree on the other.
+      spent = current.position.entries.reduce((total, each) => total + each.cost, ZERO) -
+        current.position.cost;
+      entryCount = current.position.entries.length;
+      return {
+        ...current,
+        cycleCount: current.cycleCount + 1,
+        unmodelledBase: (current.unmodelledBase ?? ZERO) + stranded,
+        position: EMPTY_POSITION,
+        openOrderIds: [],
+        exitOrderId: null,
+        exitKind: undefined,
+      };
+    });
+    const gross = proceeds - spent;
     await this.#audit(
       config,
       "bot.cycle_completed",
@@ -4067,7 +4154,11 @@ export class BotInstance extends DurableObject<Env> {
       {
         cycle: completed.cycleCount,
         gross_profit: toDecimalString(gross),
-        entries: state.position.entries.length,
+        entries: entryCount,
+        // Unconditional, so "this cycle stranded nothing" is a recorded fact
+        // rather than an absent key that could equally mean an older deploy.
+        unmodelled_base: toDecimalString(stranded),
+        unmodelled_base_total: toDecimalString(completed.unmodelledBase ?? ZERO),
       },
       at,
     );
@@ -4079,6 +4170,24 @@ export class BotInstance extends DurableObject<Env> {
         `cycle ${completed.cycleCount} closed at ${toDecimalString(exit.price)} for a gross ` +
         `${toDecimalString(gross)} ${config.capitalAsset}`,
     });
+    if (stranded > ZERO) {
+      // SEPARATE FROM THE TAKE-PROFIT ALERT ABOVE, which is an `info` the
+      // operator is expected to skim. This one says the account holds base the
+      // bot has stopped modelling, which is a fact about the OPERATOR's
+      // holdings and needs a decision from them -- sweep it by hand, or accept
+      // it. Nothing here will ever trade it.
+      await this.#alert(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "cycle_unmodelled_base",
+        message:
+          `cycle ${completed.cycleCount} sold ${toDecimalString(exit.filledQuantity)} but held ` +
+          `${toDecimalString(stranded)} more, which the exit could not be sized to include. ` +
+          `That base is still in the account and this bot no longer counts it; it will not be ` +
+          `traded. ${toDecimalString(completed.unmodelledBase ?? ZERO)} has accumulated this way ` +
+          `across ${completed.cycleCount} cycle(s).`,
+      });
+    }
 
     if (config.params.autoRestart) {
       return { status: "running", action: "cycle_completed", detail: "auto-restarting" };
@@ -4105,7 +4214,6 @@ export class BotInstance extends DurableObject<Env> {
    * it).
    */
   async #completeLiquidation(config: DcaConfig, exit: TrackedOrder, fill: Fill): Promise<PipelineResult> {
-    const state = await this.#state();
     // As in `#completeCycle`: `applyExit` has already realized every fill of
     // this liquidation as it landed, so this reports the total rather than
     // booking it a second time.
@@ -4113,21 +4221,40 @@ export class BotInstance extends DurableObject<Env> {
       (total, each) => total + mul(each.price, each.quantity, "half-even"),
       ZERO,
     );
-    const spent = state.position.entries.reduce((total, each) => total + each.cost, ZERO);
-    const gross = proceeds - spent;
 
-    const completed = await this.#mutateState((current) => ({
-      ...current,
-      position: EMPTY_POSITION,
-      openOrderIds: current.openOrderIds.filter((id) => id !== exit.clientOrderId),
-      exitOrderId: null,
-      exitKind: undefined,
-    }));
+    // THE SAME LEAK ON THE SAME SHAPE, and it is fixed the same way rather than
+    // left for later. `#placeLiquidationSell` sizes through the identical
+    // `validateOrder(..., { rounding: "adjust" })`, and this method clears the
+    // position identically. A liquidation is a human getting a halted bot flat,
+    // so base it could not be sized to include is exactly the thing that human
+    // needs told about. See `unmodelledBase`.
+    let stranded = ZERO;
+    let spent = ZERO;
+
+    const completed = await this.#mutateState((current) => {
+      stranded = current.position.quantity;
+      spent = current.position.entries.reduce((total, each) => total + each.cost, ZERO) -
+        current.position.cost;
+      return {
+        ...current,
+        unmodelledBase: (current.unmodelledBase ?? ZERO) + stranded,
+        position: EMPTY_POSITION,
+        openOrderIds: current.openOrderIds.filter((id) => id !== exit.clientOrderId),
+        exitOrderId: null,
+        exitKind: undefined,
+      };
+    });
+    const gross = proceeds - spent;
     await this.#audit(
       config,
       "bot.liquidation_filled",
       "system",
-      { gross_proceeds: toDecimalString(gross), quantity: toDecimalString(exit.filledQuantity) },
+      {
+        gross_proceeds: toDecimalString(gross),
+        quantity: toDecimalString(exit.filledQuantity),
+        unmodelled_base: toDecimalString(stranded),
+        unmodelled_base_total: toDecimalString(completed.unmodelledBase ?? ZERO),
+      },
       fill.executedAt,
     );
     await this.#alert(config, {
@@ -4139,6 +4266,17 @@ export class BotInstance extends DurableObject<Env> {
         `${toDecimalString(exit.price)} for a gross ${toDecimalString(gross)} ${config.capitalAsset}. ` +
         `The bot stays halted.`,
     });
+    if (stranded > ZERO) {
+      await this.#alert(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "cycle_unmodelled_base",
+        message:
+          `the liquidation left ${toDecimalString(stranded)} of base it could not be sized to ` +
+          `include. It is still in the account and this bot no longer counts it; it will not be ` +
+          `traded. ${toDecimalString(completed.unmodelledBase ?? ZERO)} has accumulated this way.`,
+      });
+    }
 
     return { status: "halted", action: "liquidation_filled", detail: exit.clientOrderId };
   }

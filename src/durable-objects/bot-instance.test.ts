@@ -3617,3 +3617,266 @@ describe("exit-side fills decrement the position", () => {
     expect(audit[0]!.details_json).toMatchObject({ gross_profit: "1.90222800" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// The completed-cycle dust leak: base the exit could not be sized to include
+// ---------------------------------------------------------------------------
+
+describe("a completed cycle accounts for base its exit could not sell", () => {
+  /** A grid fine enough that nothing rounds, so each test strands base on purpose. */
+  const FINE = { stepSize: m("0.00000001"), minQuantity: m("0.00000001") };
+
+  async function running(filters = FINE): Promise<void> {
+    exchange.filters = testFilters(filters);
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+  }
+
+  it("SHAPE 1: a coarsened step size strands the sub-lot remainder, and it is kept", async () => {
+    // The rounding shape, and the reason it is normally invisible: a buy is
+    // PLACED step-aligned and filled in step-aligned pieces, so the floor in
+    // `validateOrder` is usually a no-op. It stops being one when the venue
+    // moves the grid underneath a live cycle -- filters are refetched once an
+    // hour -- and everything below the new step is stranded.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.00158519") })));
+
+    exchange.filters = testFilters({ stepSize: m("0.00001"), minQuantity: m("0.00001") });
+    clock += 3_600_001; // past FILTER_MAX_AGE_MS, so the new grid is read
+    exchange.now = clock;
+
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    // Rounded DOWN onto the new grid, which is the only safe direction.
+    expect(exchange.placed[1]!.quantity).toBe(m("0.00158"));
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.position).toEqual(EMPTY_POSITION);
+    expect(after.state.cycleCount).toBe(1);
+    // 0.00158519 held, 0.00158 sold. The difference is real BTC in the account.
+    expect(after.state.unmodelledBase).toBe(m("0.00000519"));
+    // Strictly below one step of the grid that stranded it, which is what makes
+    // this shape unsellable on its own.
+    expect(after.state.unmodelledBase!).toBeLessThan(m("0.00001"));
+  });
+
+  it("SHAPE 2: base bought AFTER the exit was sized is kept in full, not capped at a step", async () => {
+    // Not a rounding residue and not bounded by one. `#placeTakeProfitSell`
+    // cancels resting buys first, but a cancellation it cannot CONFIRM leaves
+    // the buy live on the exchange -- and that buy can fill while the exit
+    // rests. The exit's quantity was fixed when it was placed, so none of it is
+    // covered.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.001") })));
+
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    expect(exchange.placed[1]!.quantity).toBe(m("0.001"));
+    expect(await db.alerts.count({ alert_type: "cancel_failed" })).toBe(1);
+
+    exchange.cancelFailure = null;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.0005") })));
+    expect((await run((bot) => bot.snapshot())).state.position.quantity).toBe(m("0.0015"));
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.position).toEqual(EMPTY_POSITION);
+    // The whole late fill, 50,000 steps wide -- nothing about this shape is
+    // bounded by the symbol's step size.
+    expect(after.state.unmodelledBase).toBe(m("0.0005"));
+  });
+
+  it("accumulates across cycles rather than reporting only the latest", async () => {
+    // The property that makes this worth keeping at all: the leak is per-cycle
+    // and compounds, so a figure that only ever showed the last cycle's would
+    // understate what the account actually holds.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const firstBuy = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(firstBuy, exchange.fillFor(firstBuy, { quantity: m("0.001") })));
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const firstSell = exchange.placed[1]!.clientOrderId;
+    exchange.cancelFailure = null;
+    await run((bot) => bot.onFill(firstBuy, exchange.fillFor(firstBuy, { quantity: m("0.0002") })));
+    await run((bot) => bot.onFill(firstSell, exchange.fillFor(firstSell)));
+    expect((await run((bot) => bot.snapshot())).state.unmodelledBase).toBe(m("0.0002"));
+
+    // `autoRestart` is off in these params, so the bot halted for review. Resume
+    // it and run the same shape again.
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const secondBuy = exchange.placed[2]!.clientOrderId;
+    await run((bot) => bot.onFill(secondBuy, exchange.fillFor(secondBuy, { quantity: m("0.001") })));
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const secondSell = exchange.placed[3]!.clientOrderId;
+    exchange.cancelFailure = null;
+    await run((bot) => bot.onFill(secondBuy, exchange.fillFor(secondBuy, { quantity: m("0.0003") })));
+    await run((bot) => bot.onFill(secondSell, exchange.fillFor(secondSell)));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.cycleCount).toBe(2);
+    expect(after.state.unmodelledBase).toBe(m("0.0005")); // 0.0002 + 0.0003
+  });
+
+  it("reports it: an audit entry every cycle, and a warning alert only when there is some", async () => {
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.001") })));
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    exchange.cancelFailure = null;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.0005") })));
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const audit = await db.auditLog.findMany({ where: { action: "bot.cycle_completed" } });
+    expect(audit[0]!.details_json).toMatchObject({
+      unmodelled_base: "0.00050000",
+      unmodelled_base_total: "0.00050000",
+    });
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "cycle_unmodelled_base" },
+    });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("warning");
+    expect(alerts[0]!.message).toContain("0.00050000");
+    expect(alerts[0]!.message).toContain("will not be traded");
+  });
+
+  it("says so explicitly when a cycle stranded nothing, and raises no alert", async () => {
+    // The ordinary path. The audit key is written unconditionally so that "zero"
+    // is a recorded fact rather than an absent key, which would read the same as
+    // state written before this field existed.
+    await running({ stepSize: m("0.00001"), minQuantity: m("0.00001") });
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.00158") })));
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.position).toEqual(EMPTY_POSITION);
+    expect(after.state.unmodelledBase).toBe(ZERO);
+    const audit = await db.auditLog.findMany({ where: { action: "bot.cycle_completed" } });
+    expect(audit[0]!.details_json).toMatchObject({ unmodelled_base: "0.00000000" });
+    expect(await db.alerts.count({ alert_type: "cycle_unmodelled_base" })).toBe(0);
+  });
+
+  it("stops the audited gross from expensing coin the bot still owns", async () => {
+    // The second symptom of the same defect. `realizedGross` is booked per exit
+    // fill and only ever charges the basis that actually LEFT the position; the
+    // cycle audit used to charge the whole of `entries`, including the basis
+    // still sitting against the stranded base. The two figures disagreed by
+    // exactly that basis, permanently, with no way to tell which was right.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.00158519") })));
+    exchange.filters = testFilters({ stepSize: m("0.00001"), minQuantity: m("0.00001") });
+    clock += 3_600_001;
+    exchange.now = clock;
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    // 0.00158 x (61200 - 60000) = 1.896, the margin on what was actually sold.
+    expect(after.state.realizedGross).toBe(m("1.896"));
+    const audit = await db.auditLog.findMany({ where: { action: "bot.cycle_completed" } });
+    // Was 1.58460000 -- understated by 0.3114, the basis of the 0.00000519 the
+    // bot still holds.
+    expect(audit[0]!.details_json).toMatchObject({ gross_profit: "1.89600000" });
+  });
+
+  it("agrees with the repair action's independently-derived closed-cycle finding", async () => {
+    // `repairPosition` measures the same quantity a completely different way --
+    // by walking this bot's order history and differencing bought against sold
+    // per closed cycle. It is untouched by this change, so the two are genuinely
+    // independent derivations of one number and must land on the same value.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.00158519") })));
+    exchange.filters = testFilters({ stepSize: m("0.00001"), minQuantity: m("0.00001") });
+    clock += 3_600_001;
+    exchange.now = clock;
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.unmodelledBase).toBe(m("0.00000519"));
+    // `autoRestart` off, so the completed cycle halted for review and the repair
+    // is callable. Dry run: it must not write anything.
+    const report = await run((bot) => bot.repairPosition(ACTOR, { commit: false }));
+    expect(report.findings.join(" ")).toContain("0.00000519");
+  });
+
+  it("carries nothing into the next cycle: the position stays flat and a base order still opens", async () => {
+    // The property that makes this safe, and the reason the remainder is NOT
+    // carried forward in `position`. `decide` reads `position.quantity <= ZERO`
+    // as "fresh cycle, place the base order"; a non-zero carry would stop that
+    // happening and would judge the new cycle against the old average entry.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.001") })));
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    exchange.cancelFailure = null;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.0005") })));
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+    expect((await run((bot) => bot.snapshot())).state.unmodelledBase).toBe(m("0.0005"));
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const next = exchange.placed[2]!;
+    // A BUY, sized from the quote allocation as any fresh cycle's base order is
+    // -- not a take-profit sell of the carried remainder, and not a hold.
+    expect(next.side).toBe("buy");
+    expect(next.quantity).toBe(m("0.00166666")); // 100 USDT at 60000, floored
+    const state = (await run((bot) => bot.snapshot())).state;
+    expect(state.position.quantity).toBe(ZERO);
+    // Untouched by the new cycle: it is not capital, not inventory, not traded.
+    expect(state.unmodelledBase).toBe(m("0.0005"));
+  });
+
+  it("keeps what a human liquidation could not sell, on the same terms", async () => {
+    // `#completeLiquidation` clears the position exactly as `#completeCycle`
+    // does, and `#placeLiquidationSell` sizes through the same rounding.
+    await running();
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.00158519") })));
+    exchange.filters = testFilters({ stepSize: m("0.00001"), minQuantity: m("0.00001") });
+    clock += 3_600_001;
+    exchange.now = clock;
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+    exchange.currentPrice = m("61200");
+    await run((bot) => bot.liquidatePosition(ACTOR));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    expect(exchange.placed[1]!.side).toBe("sell");
+    expect(exchange.placed[1]!.quantity).toBe(m("0.00158"));
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.position).toEqual(EMPTY_POSITION);
+    expect(after.state.unmodelledBase).toBe(m("0.00000519"));
+    expect(after.state.cycleCount).toBe(0); // a liquidation is not a cycle
+    const audit = await db.auditLog.findMany({ where: { action: "bot.liquidation_filled" } });
+    expect(audit[0]!.details_json).toMatchObject({ unmodelled_base: "0.00000519" });
+  });
+});
