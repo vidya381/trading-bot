@@ -242,7 +242,24 @@ export class FakeExchange implements RestExchangeClient {
     };
   }
 
+  /**
+   * Awaited at the TOP of every `cancelOrder`, before any outcome is decided.
+   *
+   * The one thing this fake could not previously model: `#outsidePoll` is a
+   * counter and not a lock -- its own docblock records an RPC and an alarm
+   * being delivered while the object sat inside an await -- so a sweep of N
+   * network cancellations is a genuinely re-entrant window, and a caller that
+   * read the position BEFORE the sweep may size an order from a number a fill
+   * has since moved. A test sets this to fold that fill at exactly the moment
+   * the real race would.
+   *
+   * Test-only, and deliberately unset by default: every existing test sees the
+   * identical fake it always did.
+   */
+  onCancelAttempt: ((clientOrderId: string) => Promise<void>) | null = null;
+
   async cancelOrder(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>> {
+    if (this.onCancelAttempt !== null) await this.onCancelAttempt(clientOrderId);
     // Persistent form, for a halt that cancels a whole ladder and must see EVERY
     // cancellation fail -- the state the 2026-07-31 incident actually left behind
     // (all five cancellations failed on one parse bug). `nextCancelFailure` is

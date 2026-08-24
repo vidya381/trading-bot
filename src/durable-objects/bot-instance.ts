@@ -3370,10 +3370,14 @@ export class BotInstance extends DurableObject<Env> {
       return { status: "halted", action: "hold", detail: "a liquidation or exit order is already live" };
     }
 
-    const heldQuantity =
-      config.strategy === "grid" ? state.ladder!.heldQuantity : state.position.quantity;
-
-    if (heldQuantity <= ZERO) {
+    // THE FIRST OF TWO READS OF THE SAME NUMBER, and they answer different
+    // questions. This one is the CHEAP REFUSAL: a bot that is already flat
+    // returns `nothing_to_liquidate` having cancelled nothing and written
+    // nothing but its own receipt. That is the shape verified live on
+    // `bot-4xcq8p` and `bot-3trlgb`, and it is why this check stays HERE rather
+    // than moving after the sweep with the other one -- a no-op that cancels
+    // orders on its way to doing nothing is not a no-op.
+    if (this.#heldQuantityOf(config, state) <= ZERO) {
       await this.#alert(config, {
         severity: "info",
         category: "trading",
@@ -3394,9 +3398,84 @@ export class BotInstance extends DurableObject<Env> {
     // `#gridExit`, so the liquidation sell is the only live order afterwards.
     await this.#cancelOpenOrders(config, state);
     state = await this.#state();
+
+    // REFUSE RATHER THAN SELL ALONGSIDE IT -- the gate entry 64 put on
+    // `#closePass`, on the other action that acts on a swept list, for the same
+    // reason and reusing the same code.
+    //
+    // The comment directly above asserts an outcome nothing was enforcing:
+    // "so the liquidation sell is the only live order afterwards". It is not,
+    // whenever `#cancelOpenOrders` leaves something behind -- and it leaves
+    // exactly two classes behind, both deliberately:
+    //
+    //  - `cancel_failed`: the cancellation could not be CONFIRMED, so the order
+    //    may still be resting on the exchange;
+    //  - entry 57's gate refused to close the local record, because the venue
+    //    reported more filled than this bot had recorded.
+    //
+    // THE FIRST CLASS IS WHY THIS IS A REFUSAL AND NOT A WARNING, and it is
+    // worse here than on a close. `exitOrderId` above catches a live EXIT, but a
+    // grid LADDER sell is not an exit order and that guard never sees it. So an
+    // unconfirmed ladder sell for part of this position would still be resting
+    // while this method sizes a fresh sell from the WHOLE of it. Both filling
+    // sells more base than the bot holds -- real coin, sold twice, on a bot the
+    // operator was trying to get flat.
+    //
+    // READING THE RESIDUAL LIST, not re-querying the venue, for the reason entry
+    // 64 set out: `#cancelOpenOrders` has already done the local-versus-remote
+    // comparison and removed everything it resolved, so the residue IS that
+    // comparison's outcome. Asking again would be a second, independently
+    // worded comparison of the same two quantities -- the drift entries 57 and
+    // 61 both went out of their way not to introduce.
+    //
+    // BEFORE THE LADDER CLEAR BELOW, which is one step earlier than entry 64's
+    // equivalent sits. There is no capital to release here, so the point of no
+    // return is `#placeLiquidationSell`; refusing before the clear means this
+    // pass has mutated NOTHING of its own, and the sweep's own writes are its
+    // legitimate work either way. Recoverable exactly as a refused close is:
+    // resolve the order, then call again.
+    if (state.openOrderIds.length > 0) {
+      throw new BotInstanceError(
+        "orders_unresolved",
+        `bot ${config.botInstanceId} cannot be liquidated: its cancel sweep could not resolve ` +
+          `${state.openOrderIds.length} order(s) (${state.openOrderIds.join(", ")}). Either the ` +
+          `exchange reported more filled than this bot recorded, or the cancellation could not ` +
+          `be confirmed and the order may still be live. Selling now would place a liquidation ` +
+          `sell for the WHOLE held position beside an order that may already be selling part of ` +
+          `it, so both filling would dispose of more base than this bot holds. The bot stays ` +
+          `halted and is still polled, so resolve them first: cancel the order, or let the 30s ` +
+          `poll fold the outstanding fill, then liquidate again. Nothing was sold and nothing ` +
+          `was changed.`,
+      );
+    }
+
     if (config.strategy === "grid") {
       const cleared: GridLadder = { ...state.ladder!, slots: state.ladder!.slots.map(() => null) };
-      await this.#mutateState((current) => ({ ...current, ladder: cleared }));
+      state = await this.#mutateState((current) => ({ ...current, ladder: cleared }));
+    }
+
+    // THE SECOND READ, and the one every number below is taken from. The first
+    // was several awaits ago: `#cancelOpenOrders` is N network cancellations,
+    // deliberately throttled, and `#outsidePoll` is a COUNTER rather than a
+    // lock -- it delays no one. An `onFill` RPC or an alarm delivered into that
+    // window folds a fill and moves the held position, and sizing the sell from
+    // the pre-sweep snapshot would sell a quantity this bot no longer holds.
+    const heldQuantity = this.#heldQuantityOf(config, state);
+
+    if (heldQuantity <= ZERO) {
+      // Flat between the two reads. The same receipt as the early return, for
+      // the same condition read one moment later -- a fill that landed during
+      // the sweep took the position to zero, and there is nothing left to sell.
+      await this.#alert(config, {
+        severity: "info",
+        category: "trading",
+        alertType: "liquidation_noop",
+        message:
+          "liquidatePosition was called but the position went flat while its cancel sweep ran; " +
+          "nothing to sell",
+        resolved: true,
+      });
+      return { status: "halted", action: "nothing_to_liquidate" };
     }
 
     // "At current price" (section 4.5's marketable limit) needs a price, and a
@@ -3437,6 +3516,21 @@ export class BotInstance extends DurableObject<Env> {
     await this.#placeLiquidationSell(config, heldQuantity, priceOutcome.value);
 
     return { status: "halted", action: "liquidating", detail: toDecimalString(heldQuantity) };
+  }
+
+  /**
+   * What this bot actually holds, whichever strategy is holding it.
+   *
+   * One definition rather than the ternary written out at each read, because
+   * `#liquidatePositionPass` now reads it TWICE -- once to refuse cheaply on a
+   * flat bot, once after the cancel sweep to size the sell -- and two copies of
+   * a strategy switch are two places for the grid and DCA branches to drift.
+   * Takes the state as an argument rather than reading it, so the caller
+   * controls WHICH read it is measuring; that is the whole point of there being
+   * two.
+   */
+  #heldQuantityOf(config: BotConfigBase, state: BotRuntimeState): Money {
+    return config.strategy === "grid" ? state.ladder!.heldQuantity : state.position.quantity;
   }
 
   /**
@@ -4610,7 +4704,39 @@ export class BotInstance extends DurableObject<Env> {
         claim.kind === "claimed"
           ? claim.ladder
           : ((evicted = claim.by), withSlot(current.ladder!, intent.levelIndex, slot));
-      return { ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) };
+      // MAINTAINED, NOT RE-DERIVED -- the same rule `#applyGridFillToOrder` now
+      // uses, for the same reason, on the other write that used to assign this
+      // list from the ladder. See the long note there: an id with no rung is not
+      // an id that ended, and after a `#gridExit` whose cancel sweep failed the
+      // retained ones have no rung by construction.
+      //
+      // THIS SITE IS REACHABLE WHILE RUNNING, which is what makes it the more
+      // dangerous of the two. A placement requires `running` -- `#placeGridOrder`
+      // aborts at its point of no return otherwise -- so it cannot be reached
+      // while a liquidation sell rests on a halted bot. But `#resumePass` never
+      // clears `openOrderIds`, and its drift latch reads
+      // `ORDER_STATE_DRIFT_ALERT_TYPES`, which contains neither `cancel_failed`
+      // nor `cancel_fill_discrepancy`. So a bot that exited with orders it could
+      // not resolve can be resumed carrying them, and the next replacement it
+      // placed dropped every one -- silently, while actively trading.
+      //
+      // THE EVICTION STILL DROPS ITS ID, deliberately and unchanged. That is not
+      // this list losing track of something; it is the documented outcome of a
+      // slot collision, which `grid_slot_collision` below states in as many
+      // words. Resolved BY NAME, from the claim itself rather than from the
+      // outer `evicted` binding, so a retried mutation cannot read a previous
+      // attempt's value.
+      //
+      // BYTE-IDENTICAL ON THE ORDINARY PATH: the placed order is in `ladder`, so
+      // it is in `slotIds`; on a healthy running bot every other tracked id is
+      // slot-backed too, `retained` is empty, and this writes exactly the ids in
+      // exactly the level order it always did.
+      const displaced = claim.kind === "occupied" ? claim.by.clientOrderId : null;
+      const slotIds = ladderOpenOrderIds(ladder);
+      const retained = current.openOrderIds.filter(
+        (id) => id !== displaced && !slotIds.includes(id),
+      );
+      return { ...current, ladder, openOrderIds: [...slotIds, ...retained] };
     });
     if (evicted !== null) {
       const lost = evicted as GridSlot;
@@ -4725,11 +4851,65 @@ export class BotInstance extends DurableObject<Env> {
           ...(displaced ? { slot: currentLevel.slot, ownsSlot: false } : {}),
         },
       );
+      // MAINTAINED, NOT RE-DERIVED. This used to assign the whole list from the
+      // ladder's slots, and for a grid that is USUALLY the same list -- which is
+      // exactly what made it wrong in the cases where it is not.
+      //
+      // SLOT-ABSENCE IS NOT RESOLUTION. Nothing in this object signals "this
+      // order is resolved" by removing its ladder slot; every real removal is by
+      // NAME -- `#cancelOpenOrders`' resolved set, `#foldTerminalState`'s
+      // by-name filter, `#completeLiquidation`'s `filter(id !== exit)`. There
+      // are exactly two reasons a tracked id has no slot, and neither is that it
+      // ended:
+      //
+      //  - `#placeLiquidationSell` appends its sell and grants it no rung, by
+      //    design: it is strategy-agnostic and DCA, which shares it, has no
+      //    ladder at all.
+      //  - `#gridExit` and `liquidatePosition` null EVERY slot on their way out,
+      //    while `#cancelOpenOrders` deliberately RETAINS what it could not
+      //    resolve -- an unconfirmed cancellation (the order may still be live on
+      //    the exchange) or entry 57's gate refusing to close over a fill the
+      //    venue reported and this bot had not recorded.
+      //
+      // So after a grid exit whose sweep failed, the retained ids are on the list
+      // with no rung, and re-deriving from the slots dropped every one of them --
+      // from the only list the poll, `checkOpenOrders`, `applyMissedFills` and
+      // `repairPosition` ever read. The 2026-07-31 incident ("all five
+      // cancellations failed on one parse bug") is that shape exactly, and the
+      // irony is precise: retention exists to hand the order to the poll, and the
+      // poll's own fold is what dropped its siblings.
+      //
+      // THE DISCIPLINE IS ALREADY WRITTEN DOWN, in `#cancelOpenOrders`: "REMOVE
+      // WHAT THIS SWEEP RESOLVED, rather than assigning the list it believed in
+      // when it started." This is the assign-form of that same mistake, and it
+      // takes the same cure rather than a second one that could drift from it.
+      //
+      // WHAT THIS FOLD RESOLVED, and nothing else: a rung the plan CLEARED
+      // (`planFill` nulls a level only when the order that owns it completed),
+      // plus the folded order itself if it completed. A partial fill resolves
+      // nothing and the id stays, which is correct -- it is still live.
+      //
+      // NOTHING IS CREATED HERE. `planFill` returns a replacement as an INTENT
+      // and never claims its slot; `#placeGridOrder` does that later, and does
+      // its own maintenance of this list. So there is no "added" term to carry.
+      //
+      // BYTE-IDENTICAL ON THE ORDINARY PATH. On a running bot every tracked id
+      // is slot-backed, so `retained` is empty and this is `slotIds` -- the same
+      // ids in the same level order this always wrote. It can only ever DECLINE
+      // to drop something; it never adds an id that was not already tracked, so
+      // an order the sweep genuinely resolved cannot be resurrected here.
+      const beforeSlots = ladderOpenOrderIds(current.ladder!);
+      const slotIds = ladderOpenOrderIds(plan.ladder);
+      const resolved = new Set(beforeSlots.filter((id) => !slotIds.includes(id)));
+      if (effect.fullyFilled) resolved.add(order.clientOrderId);
+      const retained = current.openOrderIds.filter(
+        (id) => !resolved.has(id) && !slotIds.includes(id),
+      );
       return {
         ...current,
         ladder: plan.ladder,
         realizedGross: plan.ladder.realizedGross,
-        openOrderIds: ladderOpenOrderIds(plan.ladder),
+        openOrderIds: [...slotIds, ...retained],
       };
     });
 
