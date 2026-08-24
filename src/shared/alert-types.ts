@@ -136,6 +136,52 @@ export const ORDER_STATE_DRIFT_ALERT_TYPES: ReadonlySet<string> = new Set<string
 ]);
 
 /**
+ * RECEIPT alert types: an event that was already complete when it was recorded.
+ *
+ * THE DISTINCTION THIS ENCODES. `alerts.resolved` answers "is this still going
+ * on?". Most types here describe a CONDITION -- drift that is still true, a
+ * venue still unreachable, a bot still halted -- and something later closes
+ * them. These four describe an EVENT: a cycle closed, a liquidation filled, a
+ * repair committed, a click that found nothing to do. Nothing closes them
+ * because there is nothing to close, so before step 72 every one sat
+ * `resolved: false` forever, inflating the single number an operator reads to
+ * decide what needs attention while describing things that had already
+ * finished.
+ *
+ * WHY THE LIST LIVES HERE AND NOT AT THE CALL SITES. Step 72's forward fix marks
+ * each of these `resolved: true` where it is raised, which is the right place to
+ * make that decision but leaves no enumeration behind -- and step 73's backfill
+ * needs exactly such an enumeration to find the rows written BEFORE that fix.
+ * Spelling the list out a second time inside the backfill is the drift steps 57
+ * and 61 were both built to end, so it is spelled once, here, beside the two
+ * sets that already exist for the same reason. `alert-types.test.ts` pins it to
+ * the call sites: every member must actually be raised resolved, so adding a
+ * type here without marking it (or the reverse) fails the suite rather than
+ * producing a backfill that quietly misses rows.
+ *
+ * DELIBERATELY ABSENT: `circuit_breaker_reset` and `global_kill_switch_reset`.
+ * They are the same SHAPE -- info-severity receipts of a completed re-arm -- and
+ * step 72 deliberately left them alone: they belong to a different subsystem
+ * with its own alert conventions, they are account/global-scoped rather than
+ * per-bot (`bot_instance_id` is null), and each records the resolution of a
+ * prior critical, which is a lifecycle worth examining on its own terms rather
+ * than assuming it matches. Since the forward fix does not mark them, the
+ * backfill must not sweep them in by resemblance either -- the two halves have
+ * to agree about what a receipt is.
+ */
+export const RECEIPT_ALERT_TYPES = [
+  "liquidation_noop",
+  "position_repaired",
+  "take_profit",
+  "liquidation_filled",
+] as const;
+
+/** True for an alert that records a completed event rather than an open condition. */
+export function isReceiptAlertType(alertType: string): boolean {
+  return (RECEIPT_ALERT_TYPES as readonly string[]).includes(alertType);
+}
+
+/**
  * The bot object's own POLL-HEALTH alert types: "this bot's observation of
  * itself has stopped working", as distinct from "this bot found something
  * wrong".

@@ -107,7 +107,7 @@ import type { Asset, CandleInterval, Pair } from "../shared/exchange-client";
 import { fromDecimalString, toDecimalString, ZERO, type Money } from "../shared/money";
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { readGlobalKillSwitch } from "../reconciliation/kill-switch";
-import { isHaltAlertType } from "../shared/alert-types";
+import { isHaltAlertType, isReceiptAlertType } from "../shared/alert-types";
 import {
   resetGlobalKillSwitchFromEnv,
   tripGlobalKillSwitchFromEnv,
@@ -3175,6 +3175,110 @@ export async function resolveStaleHaltAlerts(ctx: ApiContext): Promise<Response>
     id: ctx.newId(),
     actor: ctx.actor,
     action: "alerts.stale_halt_backfill",
+    target_bot_instance_id: null,
+    details_json: {
+      bot_instance_ids: botIds,
+      resolved_alert_ids: alerts.map((alert) => alert.id),
+      alerts: alerts.map((alert) => ({
+        id: alert.id,
+        bot_instance_id: alert.botInstanceId,
+        alert_type: alert.alertType,
+        severity: alert.severity,
+      })),
+    },
+    created_at: ctx.now(),
+  });
+
+  return ok({ outcome: "resolved" as const, committed: true, alerts, botIds });
+}
+
+/**
+ * POST /api/maintenance/resolve-stale-receipt-alerts -- close receipt alerts
+ * written before they were born resolved.
+ *
+ * THE SAME SHAPE AS `resolve-stale-halt-alerts` (step 66), for the same reason,
+ * against a different family. Step 72 made receipt alerts -- `take_profit`,
+ * `liquidation_filled`, `liquidation_noop`, `position_repaired` -- arrive
+ * `resolved: true`, because each records an event that was already complete when
+ * it was written and nothing was ever going to close it. That fix is
+ * forward-only by construction: it changes what gets INSERTED, so every row
+ * written before it stays open forever. This is the one-time correction for
+ * those rows, run by a human when they want it, and deliberately NOT wired to a
+ * cron, an alarm, or a startup hook.
+ *
+ * THE TYPE LIST IS `RECEIPT_ALERT_TYPES`, IMPORTED, NOT RE-SPELLED. That set is
+ * the single definition of what a receipt is, and `alert-types.test.ts` pins it
+ * to the raise sites -- so this endpoint and the forward fix cannot disagree
+ * about the family without the suite failing. A second literal list here is
+ * exactly the drift steps 57 and 61 were built to end.
+ *
+ * WHAT IT WILL NOT TOUCH, AND THE ONE THAT LOOKS LIKE IT SHOULD.
+ * `circuit_breaker_reset` and `global_kill_switch_reset` are the same shape and
+ * are deliberately excluded, because step 72 did not mark them either -- the two
+ * halves agree about the family or neither can be trusted. Beyond that, this
+ * touches no CONDITION alert of any kind: an `order_state_drift` or
+ * `unattributable_fill` row describes base that really moved and was really
+ * never attributed, and that stays true whatever else happens. The type filter
+ * is enforced HERE, in code, rather than trusted to whatever today's data
+ * happens to contain.
+ *
+ * REPORT BY DEFAULT, `?commit=true` to write, matching step 66 and
+ * `repair-position` before it.
+ */
+export async function resolveStaleReceiptAlerts(ctx: ApiContext): Promise<Response> {
+  const raw = ctx.url.searchParams.get("commit");
+  if (raw !== null && raw !== "true" && raw !== "false") {
+    throw badRequest(
+      "invalid_field",
+      `query parameter "commit", if given, must be "true" or "false"; got ${JSON.stringify(raw)}`,
+    );
+  }
+  const commit = raw === "true";
+
+  const open = await ctx.db.alerts.findMany({
+    where: { resolved: false },
+    orderBy: [{ column: "created_at", direction: "asc" }],
+  });
+  // In memory and through the shared predicate. Unlike step 66's halt backfill
+  // this needs no bot join: a receipt is stale by virtue of WHAT IT IS, not by
+  // the state of any bot -- an event that already happened cannot become
+  // unfinished, whatever its bot is doing now. Several of these types are even
+  // raised on bots that are still happily running.
+  const stale = open.filter((row) => isReceiptAlertType(row.alert_type));
+
+  const alerts = stale.map((row) => ({
+    id: row.id,
+    botInstanceId: row.bot_instance_id,
+    alertType: row.alert_type,
+    severity: row.severity,
+    createdAt: row.created_at,
+  }));
+  const botIds = [
+    ...new Set(alerts.map((alert) => alert.botInstanceId).filter((id): id is string => id !== null)),
+  ].sort();
+
+  // Idempotent by construction: a second run finds the rows already resolved, so
+  // `open` no longer contains them and there is nothing to report or write.
+  if (alerts.length === 0) {
+    return ok({ outcome: "no_change" as const, committed: false, alerts: [], botIds: [] });
+  }
+
+  if (!commit) {
+    return ok({ outcome: "would_resolve" as const, committed: false, alerts, botIds });
+  }
+
+  for (const alert of alerts) {
+    await ctx.db.alerts.update({ id: alert.id }, { resolved: true });
+  }
+
+  // A distinct action, and `target_bot_instance_id: null` because it spans bots
+  // -- the same pattern `alerts.stale_halt_backfill` and `reconciliation.run`
+  // use. Filing a manual correction under a bot's own lifecycle actions would
+  // make it look like something a bot did.
+  await ctx.db.auditLog.insert({
+    id: ctx.newId(),
+    actor: ctx.actor,
+    action: "alerts.stale_receipt_backfill",
     target_bot_instance_id: null,
     details_json: {
       bot_instance_ids: botIds,

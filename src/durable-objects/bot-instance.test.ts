@@ -21,6 +21,7 @@ import { fromDecimalString as m, toDecimalString, ZERO } from "../shared/money";
 import { TERMINAL_STATES } from "../shared/order-state";
 import type { Price } from "../shared/exchange-client";
 import { EMPTY_POSITION, type DcaParams } from "../strategies/dca";
+import { RECEIPT_ALERT_TYPES } from "../shared/alert-types";
 import type {
   BotInstance,
   BotRuntimeState,
@@ -1395,6 +1396,128 @@ describe("close (section 8.5)", () => {
     await expect(run((bot) => bot.halt("manual", "after close", ACTOR))).rejects.toThrow(
       /stopped bot cannot be halted/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Receipt alerts are born resolved (step 72)
+// ---------------------------------------------------------------------------
+
+describe("informational receipt alerts", () => {
+  /**
+   * The enumerable family, and why it is a family rather than one bug.
+   *
+   * `resolved` answers "is this still going on?". Most alerts here describe a
+   * CONDITION and something later closes them. These describe an EVENT that was
+   * already complete when it was recorded -- a cycle closed, a liquidation
+   * filled, a repair committed. Nothing closes them because there is nothing to
+   * close, so every one sat `resolved: false` forever. Same structural gap
+   * entry 65 fixed for `halt_*`, a different reason for it.
+   */
+  it("raises take_profit resolved when a cycle completes", async () => {
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("102"))); // take-profit target
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const [alert] = await db.alerts.findMany({ where: { alert_type: "take_profit" } });
+    expect(alert!.resolved).toBe(true);
+    // The bot ALSO halts (autoRestart is off), and THAT alert describes a bot
+    // sitting halted awaiting review -- a real condition, with a real
+    // lifecycle. It must still be open.
+    const [halt] = await db.alerts.findMany({ where: { alert_type: "halt_take_profit_reached" } });
+    expect(halt!.resolved).toBe(false);
+  });
+
+  it("raises liquidation_filled resolved when a human liquidation fills", async () => {
+    await openPosition("100");
+    await run((bot) => bot.halt("manual", "review", ACTOR));
+    await run((bot) => bot.liquidatePosition(ACTOR));
+    const sellId = exchange.placed[exchange.placed.length - 1]!.clientOrderId;
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const [alert] = await db.alerts.findMany({ where: { alert_type: "liquidation_filled" } });
+    expect(alert!.resolved).toBe(true);
+  });
+
+  it("leaves every CONDITION alert unresolved, so the queue still means something", async () => {
+    // The blast-radius guard: the default is untouched, and only the receipts
+    // opt out of it.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    exchange.nextCancelFailure = { kind: "transport", message: "connection reset" };
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    for (const alertType of ["halt_manual", "cancel_failed"]) {
+      const [row] = await db.alerts.findMany({ where: { alert_type: alertType } });
+      expect(row!.resolved).toBe(false);
+    }
+  });
+
+  it("marks every RECEIPT_ALERT_TYPES member resolved at its raise site", async () => {
+    // THE PIN between the enumeration and the call sites (step 73). The backfill
+    // endpoint finds old rows by that list; the forward fix marks new ones at
+    // four separate raise sites. Nothing structurally ties the two together, so
+    // this does: adding a type to the list without marking it -- or marking one
+    // without listing it -- fails here rather than producing a backfill that
+    // silently misses rows, or a list that claims a type is handled when it is
+    // not.
+    //
+    // Driven through the REAL paths rather than by inspecting source, so it
+    // fails if a raise site is edited as well as if the list is.
+    // Phase A -- a full cycle, which raises `take_profit` and halts (autoRestart
+    // is off in these params).
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("102")));
+    const tpSell = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.onFill(tpSell, exchange.fillFor(tpSell)));
+    await run((bot) => bot.resume(ACTOR));
+
+    // Phase B -- a second cycle whose exit only PARTIALLY fills before a halt
+    // cancels it, leaving `exitOrderId` pointing at a terminal order. That stale
+    // pointer is what gives `repairPosition` something real to commit.
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    const buy = exchange.placed[2]!.clientOrderId;
+    await run((bot) => bot.onFill(buy, exchange.fillFor(buy)));
+    await run((bot) => bot.onPriceUpdate(priceAt("102")));
+    const partial = exchange.placed[3]!.clientOrderId;
+    await run((bot) => bot.onFill(partial, exchange.fillFor(partial, { quantity: m("0.4") })));
+    await run((bot) => bot.halt("manual", "review", ACTOR));
+    const repaired = await run((bot) => bot.repairPosition(ACTOR, { commit: true }));
+    expect(repaired.outcome).toBe("repaired"); // raises `position_repaired`
+
+    // The remaining 0.6 sold by hand, then a second click with nothing left.
+    await run((bot) => bot.liquidatePosition(ACTOR));
+    const liq = exchange.placed[exchange.placed.length - 1]!.clientOrderId;
+    await run((bot) => bot.onFill(liq, exchange.fillFor(liq))); // liquidation_filled
+    await run((bot) => bot.liquidatePosition(ACTOR)); // liquidation_noop (now flat)
+
+    for (const alertType of RECEIPT_ALERT_TYPES) {
+      const rows = await db.alerts.findMany({ where: { alert_type: alertType } });
+      // Every type in the list must be reachable through a real path, or the
+      // list is asserting something this system cannot actually produce.
+      expect(rows.length, `${alertType} was never raised`).toBeGreaterThan(0);
+      for (const row of rows) {
+        expect(row.resolved, `${alertType} must be raised resolved`).toBe(true);
+      }
+    }
+  });
+
+  it("does not suppress the outbound notification for a receipt", async () => {
+    // THE PROPERTY THAT MAKES THIS SAFE rather than a silencing: the dispatcher
+    // selects on `notified_at IS NULL` and never reads `resolved`. Asserted here
+    // against `take_profit` -- `liquidate-position.test.ts` asserts the same
+    // property against `liquidation_noop`, so both ends of the family are
+    // covered rather than one being checked twice.
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("102")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const [receipt] = await db.alerts.findMany({ where: { alert_type: "take_profit" } });
+    expect(receipt!.resolved).toBe(true);
+    const pending = await db.alerts.findMany({ where: { notified_at: null } });
+    expect(pending.map((row) => row.id)).toContain(receipt!.id);
   });
 });
 

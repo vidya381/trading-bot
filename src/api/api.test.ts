@@ -7293,3 +7293,192 @@ describe("resolve-stale-halt-alerts", () => {
     expect(res.body.error.code).toBe("invalid_field");
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /api/maintenance/resolve-stale-receipt-alerts (step 73)
+// ---------------------------------------------------------------------------
+
+describe("resolve-stale-receipt-alerts", () => {
+  const ROUTE = "/api/maintenance/resolve-stale-receipt-alerts";
+
+  /**
+   * The operator's REAL population, from a live D1 query, as a fixture rather
+   * than a live call: eleven rows across the four receipt types, written before
+   * step 72 made them born-resolved. The twelfth unresolved info row -- a
+   * `circuit_breaker_reset` with `source: "wrangler-d1"` -- is deliberately NOT
+   * here: no code path can produce that source, so it is a manual artifact, and
+   * that type is out of scope regardless.
+   */
+  const LIVE_SHAPE = [
+    { bot: "tp-a", alert_type: "take_profit" },
+    { bot: "tp-a", alert_type: "take_profit" },
+    { bot: "tp-b", alert_type: "take_profit" },
+    { bot: "tp-b", alert_type: "take_profit" },
+    { bot: "tp-c", alert_type: "take_profit" },
+    { bot: "lf-a", alert_type: "liquidation_filled" },
+    { bot: "lf-b", alert_type: "liquidation_filled" },
+    { bot: "ln-a", alert_type: "liquidation_noop" },
+    { bot: "ln-b", alert_type: "liquidation_noop" },
+    { bot: "pr-a", alert_type: "position_repaired" },
+    { bot: "pr-b", alert_type: "position_repaired" },
+  ];
+
+  async function seedLiveShape(): Promise<void> {
+    const bots = [...new Set(LIVE_SHAPE.map((entry) => entry.bot))];
+    for (const bot of bots) {
+      await db.botInstances.insert(
+        botInstanceRow({ id: `${bot}-${suffix}`, account_label: `acct-${suffix}` }),
+      );
+    }
+    for (const [index, entry] of LIVE_SHAPE.entries()) {
+      await db.alerts.insert(
+        alertRow({
+          id: `receipt-${index}-${suffix}`,
+          bot_instance_id: `${entry.bot}-${suffix}`,
+          alert_type: entry.alert_type,
+          severity: "info",
+          resolved: false,
+          created_at: T0 + index,
+        }),
+      );
+    }
+  }
+
+  it("reports exactly the operator's eleven receipt rows, and writes nothing", async () => {
+    await seedLiveShape();
+
+    const res = await api("POST", ROUTE);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.outcome).toBe("would_resolve");
+    expect(res.body.data.committed).toBe(false);
+    expect(res.body.data.alerts).toHaveLength(11);
+    const byType = res.body.data.alerts.reduce(
+      (acc: Record<string, number>, a: { alertType: string }) => {
+        acc[a.alertType] = (acc[a.alertType] ?? 0) + 1;
+        return acc;
+      },
+      {},
+    );
+    expect(byType).toEqual({
+      take_profit: 5,
+      liquidation_filled: 2,
+      liquidation_noop: 2,
+      position_repaired: 2,
+    });
+    expect(res.body.data.botIds).toHaveLength(9);
+    // Report mode writes NOTHING.
+    expect(await db.alerts.count({ resolved: false })).toBe(11);
+    expect(await db.auditLog.count({ action: "alerts.stale_receipt_backfill" })).toBe(0);
+  });
+
+  it("resolves all eleven on commit, and records the correction in audit_log", async () => {
+    await seedLiveShape();
+
+    const res = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(res.body.data.outcome).toBe("resolved");
+    expect(res.body.data.committed).toBe(true);
+    expect(await db.alerts.count({ resolved: false })).toBe(0);
+    // Resolved, not deleted.
+    expect(await db.alerts.count({})).toBe(11);
+
+    const audit = await db.auditLog.findMany({
+      where: { action: "alerts.stale_receipt_backfill" },
+    });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.actor).toBe(HUMAN);
+    expect(audit[0]!.target_bot_instance_id).toBeNull();
+    const details = audit[0]!.details_json as unknown as { resolved_alert_ids: string[] };
+    expect(details.resolved_alert_ids).toHaveLength(11);
+  });
+
+  it("NEVER touches circuit_breaker_reset or global_kill_switch_reset", async () => {
+    // Same SHAPE as a receipt, deliberately outside the family: step 72 does not
+    // mark them either, and the two halves have to agree about what a receipt
+    // is. The `wrangler-d1` source on the real row is also proof it never came
+    // from the alert-raising code path at all.
+    await db.alerts.insert(
+      alertRow({
+        id: `cbr-${suffix}`,
+        bot_instance_id: null,
+        alert_type: "circuit_breaker_reset",
+        severity: "info",
+        source: "wrangler-d1",
+      }),
+    );
+    await db.alerts.insert(
+      alertRow({
+        id: `gks-${suffix}`,
+        bot_instance_id: null,
+        alert_type: "global_kill_switch_reset",
+        severity: "info",
+        source: "dashboard",
+      }),
+    );
+
+    const res = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(res.body.data.outcome).toBe("no_change");
+    expect(await db.alerts.count({ alert_type: "circuit_breaker_reset", resolved: false })).toBe(1);
+    expect(
+      await db.alerts.count({ alert_type: "global_kill_switch_reset", resolved: false }),
+    ).toBe(1);
+  });
+
+  it("NEVER touches a condition alert on the same bot as a receipt", async () => {
+    // The cross-contamination guard step 66 built, applied to this family. These
+    // describe base that really moved and was really never attributed; that
+    // stays true whatever else happens to the bot.
+    const id = `mix-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({ id, account_label: `acct-${suffix}` }),
+    );
+    await db.alerts.insert(
+      alertRow({
+        id: `mx-receipt-${suffix}`,
+        bot_instance_id: id,
+        alert_type: "take_profit",
+        severity: "info",
+      }),
+    );
+    const keep = [
+      "order_state_drift",
+      "cancel_fill_discrepancy",
+      "unattributable_fill",
+      "cancel_failed",
+      "poll_blind",
+      "halt_manual",
+    ];
+    for (const [index, alertType] of keep.entries()) {
+      await db.alerts.insert(
+        alertRow({ id: `mx-keep-${index}-${suffix}`, bot_instance_id: id, alert_type: alertType }),
+      );
+    }
+
+    const res = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(res.body.data.alerts).toHaveLength(1);
+    expect(res.body.data.alerts[0].alertType).toBe("take_profit");
+    for (const alertType of keep) {
+      expect(await db.alerts.count({ alert_type: alertType, resolved: false })).toBe(1);
+    }
+  });
+
+  it("is idempotent: a second commit reports no_change and writes no second audit row", async () => {
+    await seedLiveShape();
+    await api("POST", `${ROUTE}?commit=true`);
+
+    const again = await api("POST", `${ROUTE}?commit=true`);
+
+    expect(again.body.data.outcome).toBe("no_change");
+    expect(again.body.data.committed).toBe(false);
+    expect(await db.auditLog.count({ action: "alerts.stale_receipt_backfill" })).toBe(1);
+  });
+
+  it("rejects a malformed ?commit value rather than guessing", async () => {
+    const res = await api("POST", `${ROUTE}?commit=maybe`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("invalid_field");
+  });
+});

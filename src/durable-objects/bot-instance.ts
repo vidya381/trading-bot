@@ -2358,6 +2358,9 @@ export class BotInstance extends DurableObject<Env> {
         `${before.averageEntryPrice} -> ${after.averageEntryPrice}. The sold leg's realized ` +
         `${toDecimalString(soldPnl)} ${config.capitalAsset} was booked; the stale exit pointer ` +
         `was cleared. Requested by ${actor}.`,
+      // A receipt of a completed repair. The before/after it reports is a fact
+      // about a write that already happened.
+      resolved: true,
     });
 
     await this.#audit(
@@ -3376,6 +3379,10 @@ export class BotInstance extends DurableObject<Env> {
         category: "trading",
         alertType: "liquidation_noop",
         message: "liquidatePosition was called but the position is already flat; nothing to sell",
+        // A receipt that the click landed and found nothing to do. The condition
+        // it reports -- the position is flat -- was already true when it was
+        // checked, and is not a problem to begin with.
+        resolved: true,
       });
       return { status: "halted", action: "nothing_to_liquidate" };
     }
@@ -4189,6 +4196,11 @@ export class BotInstance extends DurableObject<Env> {
       message:
         `cycle ${completed.cycleCount} closed at ${toDecimalString(exit.price)} for a gross ` +
         `${toDecimalString(gross)} ${config.capitalAsset}`,
+      // A receipt: this cycle is closed. Deliberately NOT the same thing as the
+      // `halt_take_profit_reached` row a non-auto-restarting bot also gets --
+      // that one describes a bot sitting halted awaiting review, which resume or
+      // close legitimately ends.
+      resolved: true,
     });
     if (stranded > ZERO) {
       // SEPARATE FROM THE TAKE-PROFIT ALERT ABOVE, which is an `info` the
@@ -4285,6 +4297,9 @@ export class BotInstance extends DurableObject<Env> {
         `the human-triggered liquidation sold ${toDecimalString(exit.filledQuantity)} at ` +
         `${toDecimalString(exit.price)} for a gross ${toDecimalString(gross)} ${config.capitalAsset}. ` +
         `The bot stays halted.`,
+      // A receipt: the sell filled. That the bot stays halted is reported by its
+      // own `halt_*` row, which has a real lifecycle; this one does not.
+      resolved: true,
     });
     if (stranded > ZERO) {
       await this.#alert(config, {
@@ -5571,6 +5586,32 @@ export class BotInstance extends DurableObject<Env> {
       category: AlertRow["category"];
       alertType: string;
       message: string;
+      /**
+       * Born resolved, for an alert that is a RECEIPT rather than an INCIDENT
+       * (step 72). Defaults to false: an alert is an open condition unless it
+       * says otherwise, which is what every existing caller means.
+       *
+       * WHAT THE DISTINCTION IS. `resolved` answers "is this still going on?".
+       * Most alerts here describe a CONDITION -- drift that is still true, a
+       * venue still unreachable, a bot still halted -- and something later
+       * closes them. A few describe an EVENT that was already complete at the
+       * instant it was recorded: a cycle closed, a liquidation filled, a repair
+       * committed, a click that found nothing to do. Nothing closes those,
+       * because there is nothing to close, and until this flag existed they sat
+       * `resolved: false` forever -- inflating the one number an operator reads
+       * to decide what is on fire, while describing things that had already
+       * finished.
+       *
+       * NOT A SUPPRESSION, and the three consumers were checked rather than
+       * assumed. The notification dispatcher selects on `notified_at IS NULL`
+       * and never reads `resolved`, so the outbound ping is unaffected.
+       * `GET /api/alerts` applies no default `resolved` filter, so the row is
+       * still listed. `driftAlerts.ts` and `pollAlerts.ts` gate on their own
+       * alert-type sets, neither of which contains any of these. What changes
+       * is `statusCounts.ts`'s unresolved COUNT, which is exactly the number
+       * that was wrong.
+       */
+      resolved?: boolean;
     },
   ): Promise<void> {
     const row: AlertRow = {
@@ -5581,7 +5622,7 @@ export class BotInstance extends DurableObject<Env> {
       bot_instance_id: config.botInstanceId,
       source: BOT_ALERT_SOURCE,
       message: alert.message,
-      resolved: false,
+      resolved: alert.resolved ?? false,
       created_at: this.#now(),
       // Step 8: not yet seen by the notification dispatcher. Recording the
       // alert here is unconditional (section 10); the outbound ping is the

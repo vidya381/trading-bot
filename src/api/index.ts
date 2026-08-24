@@ -116,6 +116,12 @@ const ROUTES: readonly Route[] = [
     "/api/maintenance/resolve-stale-halt-alerts",
     handlers.resolveStaleHaltAlerts,
   ),
+  // Step 73: the receipt family's counterpart. One-time, operator-triggered.
+  route(
+    "POST",
+    "/api/maintenance/resolve-stale-receipt-alerts",
+    handlers.resolveStaleReceiptAlerts,
+  ),
   route("GET", "/api/reconciliation", handlers.listReconciliationRuns),
 ];
 

@@ -217,6 +217,31 @@ describe("DCA liquidation (sections 6.3, 7.2)", () => {
     expect(exchange.placed).toHaveLength(0);
     const alerts = await db.alerts.findMany({ where: { alert_type: "liquidation_noop" } });
     expect(alerts).toHaveLength(1);
+
+    // STEP 72: born resolved. This is a RECEIPT -- the click landed and there
+    // was nothing to sell -- not an open incident, and nothing would ever have
+    // closed it. It used to sit `resolved: false` forever, inflating the one
+    // number an operator reads to decide what needs attention.
+    expect(alerts[0]!.resolved).toBe(true);
+    // AND NOT SUPPRESSED, which is the half worth asserting: the notification
+    // dispatcher selects on `notified_at IS NULL` and never reads `resolved`,
+    // so the outbound ping is completely unaffected by the line above.
+    expect(alerts[0]!.notified_at).toBeNull();
+    const pending = await db.alerts.findMany({ where: { notified_at: null } });
+    expect(pending.map((row) => row.id)).toContain(alerts[0]!.id);
+  });
+
+  it("still raises CONDITION alerts unresolved: the default is unchanged", async () => {
+    // The guard on step 72's blast radius. Only receipts were reclassified; an
+    // alert that describes something still going on must still arrive open, or
+    // the change would have quietly emptied the operator's queue.
+    await run((bot) => bot.create(dcaCreation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.halt("manual", "review", ACTOR));
+
+    const halts = await db.alerts.findMany({ where: { alert_type: "halt_manual" } });
+    expect(halts).toHaveLength(1);
+    expect(halts[0]!.resolved).toBe(false);
   });
 
   it("does not double-sell when a liquidation is already live", async () => {
