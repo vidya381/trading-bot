@@ -139,9 +139,57 @@ describe("parseOrderStatus", () => {
       cumulativeQuoteQuantity: ZERO,
       state: "pending",
       createdAt: 1_700_000_000_000,
-      updatedAt: 1_700_000_000_000,
     });
     expect(status.fills).toBeUndefined();
+  });
+
+  it("OMITS updatedAt entirely, rather than echoing creation time back as one", () => {
+    // THE ASSERTION THAT FLIPPED. This used to read
+    // `updatedAt: 1_700_000_000_000` -- the same value as `createdAt`, because
+    // the parser fabricated one to satisfy the type. Gemini sends no last-update
+    // time, and reconciliation's terminated-order tolerance computes
+    // `at - updatedAt`: fed creation time it measured the order's TOTAL AGE, so
+    // the tolerance never applied to any Gemini order older than sixty seconds.
+    const status = parseOrderStatus(RESTING_ORDER);
+
+    expect(status.updatedAt).toBeUndefined();
+    // THE KEY IS ABSENT, not present-and-undefined. Asserted separately because
+    // the two are different facts and only this one survives a JSON round trip
+    // into a Durable Object or an audit row.
+    expect("updatedAt" in status).toBe(false);
+    // And `createdAt` is still reported, so this is a refusal to invent a value
+    // rather than a loss of the one Gemini really does send.
+    expect(status.createdAt).toBe(1_700_000_000_000);
+  });
+
+  it("still omits updatedAt on the captured live payload, fills and all", () => {
+    // Against the REAL field set rather than a hand-written fixture, and with
+    // trades present -- because `max(trades[].timestampms)` is a real exchange
+    // time and the deliberate decision was NOT to derive `updatedAt` from it
+    // (it covers a fill-termination and not a cancel or expiry with no fills).
+    const withTrades = {
+      ...CAPTURED_WRAPPED_STATUS[0],
+      is_live: false,
+      executed_amount: "0.00077893",
+      avg_execution_price: "64190.42",
+      trades: [
+        {
+          tid: 99,
+          price: "64190.42",
+          amount: "0.00077893",
+          fee_amount: "0.01",
+          fee_currency: "USD",
+          timestampms: 1_785_484_999_999,
+        },
+      ],
+    };
+
+    const status = parseOrderStatus(withTrades);
+
+    expect(status.state).toBe("filled");
+    expect(status.fills).toHaveLength(1);
+    expect(status.fills![0]!.executedAt).toBe(1_785_484_999_999);
+    expect("updatedAt" in status).toBe(false);
   });
 
   it("derives cumulative quote value from avg price x executed amount", () => {

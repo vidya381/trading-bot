@@ -541,11 +541,42 @@ export function parseOrderResult(body: unknown): OrderResult {
 /**
  * Parse an order as reported by `POST /v1/order/status`.
  *
- * Gemini reports a single `timestampms` (the order's), so `createdAt` takes it
- * and `updatedAt` defaults to the same value -- there is no separate last-update
- * time in the payload. `fills` is populated only when the caller asked for
- * `include_trades`; otherwise it is left absent, exactly as on the Binance side,
- * because an empty array would falsely assert "no executions".
+ * Gemini reports a single `timestampms` -- the order's CREATION time -- so
+ * `createdAt` takes it and **`updatedAt` is OMITTED**, because Gemini supplies no
+ * last-update time and this parser will not invent one.
+ *
+ * THE FIELD SET IS THE EVIDENCE, not the reference docs. The captured live
+ * payload in this module's tests carries, in full: `avg_execution_price`,
+ * `client_order_id`, `exchange`, `executed_amount`, `id`, `is_cancelled`,
+ * `is_hidden`, `is_live`, `options`, `order_id`, `original_amount`, `price`,
+ * `remaining_amount`, `side`, `symbol`, `timestamp`, `timestampms`, `trades`,
+ * `type`, `was_forced`. The only temporal values there are `timestamp` /
+ * `timestampms` (the same creation instant in two units) and each trade's own
+ * `timestampms`. State arrives as the BOOLEANS `is_live` / `is_cancelled`, which
+ * say THAT the order changed and never WHEN. There is no update, cancel or
+ * transition time to read.
+ *
+ * WHY OMITTING BEATS WHAT THIS USED TO DO. It used to set `updatedAt = createdAt`
+ * to satisfy the type. That is the same fabrication `parseCancelledOrder` on the
+ * BINANCE side refuses for `createdAt`, in the same words -- "a fabricated value
+ * that looks authoritative" -- and it had a live consequence: reconciliation's
+ * terminated-order tolerance measures `at - updatedAt`, so on Gemini it measured
+ * the order's whole life and the tolerance never applied to anything older than a
+ * minute. Absence is a fact a consumer can branch on; a plausible wrong number is
+ * not. See `OrderStatus.updatedAt`.
+ *
+ * DELIBERATELY NOT DERIVED FROM `trades`. `max(trades[].timestampms)` is a real
+ * exchange time and IS the termination instant for an order that ended by
+ * filling -- but it is absent for a cancel or expiry with no fills, and earlier
+ * than the truth for a cancel after a partial fill. It would cover some terminal
+ * states and silently leave the rest on the old broken footing: one venue with
+ * two behaviours, the harder case uncovered. The consumer-side fallback covers
+ * all four states with one mechanism, so this stays absent rather than
+ * partially populated.
+ *
+ * `fills` is populated only when the caller asked for `include_trades`; otherwise
+ * it is left absent, exactly as on the Binance side, because an empty array would
+ * falsely assert "no executions".
  */
 export function parseOrderStatus(body: unknown): OrderStatus {
   const context = "order status";
@@ -558,7 +589,7 @@ export function parseOrderStatus(body: unknown): OrderStatus {
     clientOrderId: requireString(record, "client_order_id", context),
     ...(fills !== undefined ? { fills } : {}),
     createdAt,
-    updatedAt: createdAt,
+    // No `updatedAt` key at all -- not `undefined`, not `createdAt`. See above.
   };
 }
 

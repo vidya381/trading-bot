@@ -300,8 +300,31 @@ export interface OrderStatus {
   /**
    * Last change the exchange reported. For a cancellation this is the moment the
    * cancel took effect, which is exactly the instant `filledQuantity` describes.
+   *
+   * OPTIONAL, for exactly the reason `createdAt` above is: not every venue
+   * reports one, and echoing a different timestamp back in its place is a
+   * fabricated value that looks authoritative. Gemini's `/v1/order/status`
+   * carries a single `timestampms` -- the order's CREATION time -- and no
+   * transition time of any kind (confirmed field-by-field against a captured
+   * live payload; see `gemini/parse.test.ts`), so its parser leaves this ABSENT
+   * rather than reporting creation time as a last update.
+   *
+   * THE BUG THAT MADE THIS OPTIONAL. Until it was, Gemini's parser satisfied the
+   * type by setting `updatedAt = createdAt`, and reconciliation's terminated-order
+   * tolerance -- which forgives an order that left the book within
+   * `timingWindowMs` -- computed `at - updatedAt` against it. On Gemini that
+   * measured the order's TOTAL AGE, so no Gemini order older than sixty seconds
+   * could ever qualify and the tolerance was silently inoperative on the venue.
+   *
+   * A CONSUMER MEASURING RECENCY MUST HANDLE ITS ABSENCE, and must not
+   * substitute another timestamp for it. Both available substitutes were
+   * evaluated and rejected: creation time makes the window dead (the bug above),
+   * and receipt time makes it universal, silencing real drift on every
+   * terminated order. `liveOrderFindings` in `reconciliation/reconcile.ts` is the
+   * worked example -- it falls back to a mechanism that reads no venue clock at
+   * all rather than inventing one.
    */
-  updatedAt: Timestamp;
+  updatedAt?: Timestamp;
 }
 
 /** A balance for one asset on the exchange account. */

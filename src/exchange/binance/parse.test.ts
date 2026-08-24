@@ -478,6 +478,24 @@ describe("parseOrderStatus", () => {
     expect(parseOrderStatus(body).updatedAt).toBe(1499827319559);
   });
 
+  it("REPORTS A REAL updateTime, distinct from creation time", () => {
+    // The counterpart to Gemini's "omits updatedAt entirely", and the parser-level
+    // half of the guard that making `OrderStatus.updatedAt` OPTIONAL did not
+    // quietly stop Binance populating it. The default fixture has
+    // `time === updateTime`, which cannot tell the two apart, so this moves one.
+    //
+    // Binance is the venue whose behaviour must not change: it reports its
+    // transitions honestly, so reconciliation keeps computing a real age from
+    // this value and keeps its 60-second window. Whether that window should
+    // eventually be retired in favour of the venue-independent mechanism is a
+    // live design question and deliberately NOT decided here.
+    const status = parseOrderStatus(orderStatusBody({ updateTime: 1_500_000_000_000 }));
+
+    expect(status.updatedAt).toBe(1_500_000_000_000);
+    expect(status.createdAt).toBe(1499827319559);
+    expect("updatedAt" in status).toBe(true);
+  });
+
   it("rejects a non-object payload", () => {
     expect(() => parseOrderStatus(null)).toThrow(ParseError);
     expect(() => parseOrderStatus([])).toThrow(ParseError);

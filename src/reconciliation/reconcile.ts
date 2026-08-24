@@ -823,30 +823,98 @@ async function liveOrderFindings(
     }
 
     const status = outcome.value;
-    const age = at - status.updatedAt;
-    if (age >= 0 && age <= thresholds.timingWindowMs) {
-      // Section 9's own example of minor drift: "a fill recorded a few seconds
-      // late". The order resolved inside the window, so the object simply has
-      // not been told yet.
-      pending.push({
-        finding: {
-          kind: "order_recently_terminated",
-          scope: "bot",
-          botInstanceId: bot.id,
-          asset: null,
-          detail:
-            `${clientOrderId} left the book ${age}ms ago as ${status.state} with ` +
-            `${toDecimalString(status.filledQuantity)} filled, inside the ` +
-            `${thresholds.timingWindowMs}ms timing window. Treated as a late fill, not ` +
-            `drift; the bot's own fill path will record it.`,
-          // No magnitude: a fill recorded late is usually the WHOLE order, and
-          // section 9 names exactly that as minor.
-        },
-      });
+
+    // THE BRANCH IS ON DATA PRESENCE, NOT ON WHICH VENUE SENT IT, and that is
+    // the whole design rather than a stylistic preference. `updatedAt` is
+    // optional on `OrderStatus` because Gemini's order-status payload carries no
+    // last-update time -- only the order's creation instant and a pair of state
+    // booleans. Testing `config.exchange === "gemini"` would put a safety
+    // decision on a string in the module that has twice refused to do exactly
+    // that (the halt-reason prose in step 58, the finding-match prose in step
+    // 61), and it would silently pick the wrong path the day a third venue is
+    // added. Asking the payload whether it brought a clock cannot go stale.
+    if (status.updatedAt !== undefined) {
+      // A REAL LAST-UPDATE TIME (Binance's `updateTime`). Unchanged, deliberately
+      // and completely: same age arithmetic, same window, same two outcomes. A
+      // venue that reports its transitions honestly keeps the tolerance that was
+      // built for it, and fixing the venue that does not must not cost it
+      // anything.
+      const age = at - status.updatedAt;
+      if (age >= 0 && age <= thresholds.timingWindowMs) {
+        // Section 9's own example of minor drift: "a fill recorded a few seconds
+        // late". The order resolved inside the window, so the object simply has
+        // not been told yet.
+        pending.push({
+          finding: {
+            kind: "order_recently_terminated",
+            scope: "bot",
+            botInstanceId: bot.id,
+            asset: null,
+            detail:
+              `${clientOrderId} left the book ${age}ms ago as ${status.state} with ` +
+              `${toDecimalString(status.filledQuantity)} filled, inside the ` +
+              `${thresholds.timingWindowMs}ms timing window. Treated as a late fill, not ` +
+              `drift; the bot's own fill path will record it.`,
+            // No magnitude: a fill recorded late is usually the WHOLE order, and
+            // section 9 names exactly that as minor.
+          },
+        });
+        continue;
+      }
+
+      pending.push(...driftAgainst(bot, local, status, `it is no longer on the book`));
       continue;
     }
 
-    pending.push(...driftAgainst(bot, local, status, `it is no longer on the book`));
+    // NO LAST-UPDATE TIME FROM THE VENUE (Gemini). "How long ago did this
+    // terminate" is not answerable from this payload, and BOTH ways of answering
+    // it anyway were evaluated and rejected, because they fail in opposite
+    // directions and each is worse than the other's failure:
+    //
+    //  - order-CREATION time (what Gemini's parser used to fabricate): `age` is
+    //    the order's whole life, so the window NEVER applies to anything older
+    //    than a minute and the tolerance is dead on the venue;
+    //  - RECEIPT time: `age` is always ~0, so the window ALWAYS applies, which
+    //    would silence real, persistent drift on every terminated order on the
+    //    venue, unconditionally. Strictly worse than the bug it would fix.
+    //
+    // So this reaches for the mechanism that needs no clock at all: THE SAME
+    // run-to-run memory the live branch above uses, called the same way, reading
+    // the same `seenUnconfirmed` set built by the same query. A first sighting is
+    // `order_drift_unconfirmed` -- minor, no alert row, no halt, but written to
+    // this run's findings list, which is what makes it remembered. A sighting
+    // this account's runs have already seen inside `unconfirmedWindowMs`
+    // escalates to `order_state_drift` and halts, unconditionally: no severity
+    // check, no poll-health check, no retry budget.
+    //
+    // That is what makes this safe in both directions at once. It cannot become
+    // "never applies", because a first sighting has no prior audit row by
+    // construction and `order_drift_unconfirmed` has its ceiling PINNED at minor.
+    // It cannot become "always applies", because the second sighting escalates
+    // with nothing gating it -- so the worst case for a genuine persistent drift
+    // on a clockless venue is that it halts one five-minute cycle later than it
+    // would on Binance, never that it is forgiven twice.
+    //
+    // A NOTE ON WHAT IS NO LONGER EMITTED HERE: a clockless venue can no longer
+    // produce `order_recently_terminated`, since deciding that an order left the
+    // book RECENTLY is precisely the judgement it cannot make. Nothing is lost
+    // behaviourally -- that kind is minor, raises no alert row and halts nothing,
+    // and the case where local and remote AGREE still produces no finding at all,
+    // because `driftAgainst` returns empty on a match.
+    const alreadySeenTerminated = seenUnconfirmed.has(`${bot.id}::${clientOrderId}`);
+    pending.push(
+      ...driftAgainst(
+        bot,
+        local,
+        status,
+        alreadySeenTerminated
+          ? `it is no longer on the book, and still disagreeing on a later run, so the ` +
+            `bot's own 30s poll has not resolved it`
+          : `it is no longer on the book, and this venue reports no last-update time, so ` +
+            `whether it terminated recently is decided by whether a later run still finds it`,
+        alreadySeenTerminated ? "order_state_drift" : "order_drift_unconfirmed",
+      ),
+    );
   }
 
   return pending;

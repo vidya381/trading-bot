@@ -104,6 +104,29 @@ export class FakeExchange implements RestExchangeClient {
    */
   readonly fillsByOrder = new Map<string, Fill[]>();
   /**
+   * Whether this venue reports a last-update time on the ORDER-READING
+   * endpoints -- `true` models Binance, `false` models Gemini.
+   *
+   * WHY THIS HAD TO EXIST BEFORE THE GEMINI FIX COULD BE TESTED. This fake set
+   * `updatedAt` unconditionally on every response, so it could model only a venue
+   * that reports one. The whole Gemini defect -- a payload carrying no
+   * last-update time, and reconciliation deciding what to do about that -- was
+   * therefore INEXPRESSIBLE in the suite: every test that thought it was
+   * exercising the terminated-order tolerance was exercising the Binance path.
+   *
+   * DEFAULTS TO `true`, so every existing test keeps the venue it was written
+   * against and nothing has to be touched to keep passing.
+   *
+   * IT DELIBERATELY DOES NOT REACH `cancelOrder`, and that asymmetry is the fake
+   * being faithful rather than being lazy. Gemini has no last-update time in
+   * `/v1/order/status` (`parseOrderStatus` omits it) but DOES have one on a
+   * cancellation, because `parseCancelledOrder` stamps receipt time -- the
+   * instant this system observed the cancel it issued. A switch that also
+   * silenced `cancelOrder` would model a venue that does not exist and would let
+   * `#recordCancellation`'s fallback be "covered" by a case it can never see.
+   */
+  reportsUpdateTime = true;
+  /**
    * What `getCurrentPrice` returns, for the human-triggered liquidation path
    * (step 10.3), which fetches a fresh price rather than being driven by a price
    * event. Non-zero by default so a marketable limit is constructible; a test
@@ -288,7 +311,7 @@ export class FakeExchange implements RestExchangeClient {
               ? "partially_filled"
               : "pending",
         createdAt: this.now,
-        updatedAt: this.now,
+        ...(this.reportsUpdateTime ? { updatedAt: this.now } : {}),
         ...(fills !== undefined ? { fills } : {}),
       },
       at: this.now,
@@ -324,7 +347,10 @@ export class FakeExchange implements RestExchangeClient {
         // No `fills` array: the open-orders endpoint does not return one
         // (step 3). The fake stays faithful about that.
         createdAt: this.now,
-        updatedAt: this.now,
+        // Same venue, same endpoint family: Gemini's `/v1/orders` is parsed by
+        // `parseOrderStatusList`, which maps `parseOrderStatus` over the array,
+        // so a venue with no last-update time has none here either.
+        ...(this.reportsUpdateTime ? { updatedAt: this.now } : {}),
       });
     }
     return { ok: true, value: open, at: this.now };

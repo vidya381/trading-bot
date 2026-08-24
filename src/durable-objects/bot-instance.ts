@@ -2768,7 +2768,15 @@ export class BotInstance extends DurableObject<Env> {
       return false;
     }
 
-    const ended = closeOrder(order, remote.state, remote.updatedAt);
+    // `?? this.#now()` is RECEIPT TIME, and it is the honest value rather than a
+    // fallback of convenience. `OrderStatus.updatedAt` is optional because Gemini
+    // reports no last-update time at all, and what this line is stamping is the
+    // LOCAL record's "when this bot recorded the order closed" -- which receipt
+    // time describes exactly. Before the field became optional, Gemini's parser
+    // fabricated `updatedAt = createdAt`, so every Gemini order closed here --
+    // and every `orders.updated_at` row mirrored from it -- permanently recorded
+    // the order's CREATION time as its last update.
+    const ended = closeOrder(order, remote.state, remote.updatedAt ?? this.#now());
     await this.#putOrder(ended);
     await this.#mirrorOrderUpdate(ended);
 
@@ -5170,10 +5178,20 @@ export class BotInstance extends DurableObject<Env> {
       return false;
     }
 
-    const cancelled = closeOrder(order, "cancelled", remote.updatedAt);
+    // `now` finally does something. It has been a parameter this method took and
+    // discarded (`void now;`) since it was written, and this is what it was for:
+    // `OrderStatus.updatedAt` is optional, so a venue that reports no last-update
+    // time falls back to this sweep's own clock.
+    //
+    // In practice the fallback does not fire on either venue today -- BOTH
+    // cancellation parsers supply a real instant (Binance's `transactTime`,
+    // Gemini's receipt time), because a cancellation this system issued is one
+    // whose moment it necessarily observed. That is exactly why it is written as
+    // a fallback and not as a replacement: the value the venue reports is better
+    // than the value this clock holds, and it is still used whenever it exists.
+    const cancelled = closeOrder(order, "cancelled", remote.updatedAt ?? now);
     await this.#putOrder(cancelled);
     await this.#mirrorOrderUpdate(cancelled);
-    void now;
     return true;
   }
 

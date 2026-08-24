@@ -2022,6 +2022,54 @@ describe("checkOpenOrders (the resting-order observation gap)", () => {
     expect(row!.status).toBe("cancelled");
   });
 
+  it("dates a fold to RECEIPT time when the venue reports no last-update time", async () => {
+    // THE DATA-QUALITY HALF OF THE GEMINI FIX, and it is a separate defect from
+    // the reconciliation tolerance even though it has the same root cause.
+    //
+    // `#foldTerminalState` stamps the closed record with `remote.updatedAt` and
+    // `#mirrorOrderUpdate` writes that into `orders.updated_at` in D1, where the
+    // dashboard reads it. While Gemini's parser fabricated `updatedAt =
+    // createdAt`, every Gemini order the poll closed after an exchange-side
+    // cancel or expiry PERMANENTLY recorded its own creation time as its last
+    // update -- an order that rested for five minutes and was then cancelled
+    // claimed it had last changed at the moment it was placed.
+    //
+    // The clocks are deliberately separated so the assertion can tell the two
+    // apart: the venue's clock stays at placement time (it has nothing else to
+    // report), while this object's own clock advances five minutes.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.reportsUpdateTime = false;
+    exchange.resting.get(clientOrderId)!.cancelled = true;
+    clock = T0 + 300_000; // The bot observes the cancellation five minutes later.
+
+    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(result.closed).toEqual([clientOrderId]);
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.status).toBe("cancelled");
+    // Receipt time: when this bot recorded the order closed, which is the only
+    // thing it honestly knows.
+    expect(row!.updated_at).toBe(T0 + 300_000);
+    // And explicitly NOT the creation time the old fabrication produced.
+    expect(row!.updated_at).not.toBe(T0);
+  });
+
+  it("still prefers the venue's own last-update time when it reports one", async () => {
+    // The other side of the same line, so the fallback cannot quietly become a
+    // replacement. A venue that DOES report a transition time is believed, and
+    // this object's clock does not overwrite it.
+    const clientOrderId = await runningWithRestingOrder();
+    exchange.reportsUpdateTime = true;
+    exchange.now = T0 + 120_000; // The venue says the cancel took effect here.
+    exchange.resting.get(clientOrderId)!.cancelled = true;
+    clock = T0 + 300_000; // The bot only notices three minutes after that.
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const row = await db.orders.findOne({ client_order_id: clientOrderId });
+    expect(row!.updated_at).toBe(T0 + 120_000);
+  });
+
   it("leaves an unattributable fill's order open rather than closing it", async () => {
     // Cancelled on the exchange AND filled beyond what was recorded, with no
     // per-fill detail: the bot-44400a shape exactly. Reported, not closed.
