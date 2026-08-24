@@ -752,3 +752,135 @@ describe("openOrderIds survives a slot-based rebuild (maintained, not re-derived
     expect(slotsNow).not.toContain(retainedId);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The stale ladder: a resolved order's rung must not outlive it
+// ---------------------------------------------------------------------------
+
+/**
+ * The OPPOSITE-direction defect to everything above, and its root.
+ *
+ * `#recordCancellation` closed a grid order's record and left its RUNG
+ * standing, because nothing in the cancel sweep touched the ladder and the only
+ * function that clears a single slot -- `#foldTerminalState` -- is reached only
+ * from the poll, which reads `openOrderIds` and therefore never looks at an
+ * order the sweep just removed from it. A manually halted grid bot then sat
+ * holding rungs for orders that were cancelled, resolved and gone, and every
+ * write that built the tracked list from those slots put the dead ids BACK.
+ *
+ * Fixed at the source rather than at each reader: `closeOrder` has exactly two
+ * call sites in this object, `#foldTerminalState` (which always cleared the
+ * slot) and `#recordCancellation` (which now does), so a non-null slot names an
+ * order this bot still believes is live.
+ */
+describe("a resolved order's ladder rung does not outlive it", () => {
+  async function gridWithPosition(): Promise<void> {
+    await run((bot) => bot.createGrid(gridCreation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    const buyAt95 = exchange.placed.find((o) => o.price === m("95"))!.clientOrderId;
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+  }
+
+  /**
+   * A manual halt whose sweep resolves everything but ONE order: the one-shot
+   * cancel failure retains the first, the rest cancel cleanly. That is the state
+   * that used to leave a ladder full of dead rungs beside a single live id.
+   */
+  async function haltRetainingOne(): Promise<{ retained: string; resolved: string[] }> {
+    await gridWithPosition();
+    const trackedBefore = (await run((bot) => bot.snapshot())).state.openOrderIds;
+    exchange.nextCancelFailure = { kind: "transport", message: "connection reset" };
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const halted = await run((bot) => bot.snapshot());
+    expect(halted.state.openOrderIds.length).toBe(1);
+    const retained = halted.state.openOrderIds[0]!;
+    const resolved = trackedBefore.filter((id) => id !== retained);
+    expect(resolved.length).toBeGreaterThan(0);
+    return { retained, resolved };
+  }
+
+  it("the halt sweep clears the rungs of the orders it resolved", async () => {
+    // THE ROOT FIX, asserted directly. The rung follows the resolution.
+    const { retained, resolved } = await haltRetainingOne();
+
+    const halted = await run((bot) => bot.snapshot());
+    const rungs = halted.state
+      .ladder!.slots.filter((slot) => slot !== null)
+      .map((slot) => slot!.clientOrderId);
+    // Exactly the unresolved one, and nothing else: what the sweep could not
+    // confirm keeps BOTH its id and its rung, which is entry 57/64's retention
+    // intact rather than weakened.
+    expect(rungs).toEqual([retained]);
+    for (const id of resolved) expect(rungs).not.toContain(id);
+  });
+
+  it("a resolved order is not resurrected when a retained order folds terminal", async () => {
+    // SITE 2868's named scenario. The poll finally reads the retained order and
+    // finds it cancelled on the venue; folding it used to rebuild the tracked
+    // list from a ladder still holding the dead rungs.
+    const { retained, resolved } = await haltRetainingOne();
+
+    exchange.resting.get(retained)!.cancelled = true;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const after = await run((bot) => bot.snapshot());
+    for (const id of resolved) expect(after.state.openOrderIds).not.toContain(id);
+    // And the retained order resolved per its OWN outcome: it really was
+    // cancelled, so it leaves the list and its rung with it.
+    expect(after.state.openOrderIds).not.toContain(retained);
+    expect(after.state.openOrderIds).toEqual([]);
+    expect(after.state.ladder!.slots.every((slot) => slot === null)).toBe(true);
+  });
+
+  it("a resolved order is not resurrected by a later placement", async () => {
+    // SITE 4707's version of the same resurrection, via a different trigger.
+    // This is the assertion that FAILED when it was first written against the
+    // maintained-list fix alone -- the ladder term still carried the dead ids.
+    // Closing the source is what makes it pass.
+    const { retained, resolved } = await haltRetainingOne();
+
+    await run((bot) => bot.resume(ACTOR));
+    exchange.currentPrice = m("100");
+    // The retained order fills, planning a replacement whose placement claims a
+    // rung -- the write under test.
+    await run((bot) => bot.onFill(retained, exchange.fillFor(retained)));
+
+    const after = await run((bot) => bot.snapshot());
+    for (const id of resolved) expect(after.state.openOrderIds).not.toContain(id);
+    expect(after.state.openOrderIds).not.toContain(retained);
+  });
+
+  it("UNREGRESSED: a clean halt leaves no tracked ids and no rungs", async () => {
+    // The ordinary path: everything cancels, so everything goes -- ids and rungs
+    // together, asserted as exact equality rather than absence of failure.
+    await gridWithPosition();
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    const halted = await run((bot) => bot.snapshot());
+    expect(halted.state.openOrderIds).toEqual([]);
+    expect(halted.state.ladder!.slots.filter((slot) => slot !== null)).toEqual([]);
+  });
+
+  it("UNREGRESSED: an ordinary terminal fold removes exactly that order", async () => {
+    // Site 2868 on a running bot, where it has always been reached: one rung
+    // ends on the venue, the poll folds it, and the tracked list is exactly the
+    // rungs that remain -- same ids, same level order.
+    await gridWithPosition();
+    const before = await run((bot) => bot.snapshot());
+    const ending = before.state.openOrderIds[0]!;
+
+    exchange.resting.get(ending)!.cancelled = true;
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.status).toBe("running");
+    const rungs = after.state
+      .ladder!.slots.filter((slot) => slot !== null)
+      .map((slot) => slot!.clientOrderId);
+    expect(after.state.openOrderIds).toEqual(rungs);
+    expect(after.state.openOrderIds).not.toContain(ending);
+    expect(after.state.openOrderIds.length).toBe(before.state.openOrderIds.length - 1);
+  });
+});

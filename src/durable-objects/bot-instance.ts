@@ -2856,8 +2856,29 @@ export class BotInstance extends DurableObject<Env> {
 
     const state = await this.#state();
     if (config.strategy === "grid" && state.ladder !== undefined) {
-      // The ladder owns `openOrderIds` for a grid, so clearing the slot IS the
-      // removal; filtering the array directly would be undone by the next fill.
+      // CLEAR THE RUNG, AND REMOVE THE ID BY NAME -- two effects of one
+      // resolution, written as two, which is the change here.
+      //
+      // This used to say "the ladder owns `openOrderIds` for a grid, so
+      // clearing the slot IS the removal; filtering the array directly would be
+      // undone by the next fill", and it ASSIGNED the whole list from the slots
+      // on that reasoning. The premise was true only while every other write
+      // re-derived the same way; none of them do any more, so a direct filter is
+      // now stable and the assignment is the only thing left putting ids back.
+      //
+      // AND IT DID PUT THEM BACK. Assigning from the slots means every rung the
+      // ladder holds joins the tracked list, including rungs left standing for
+      // orders a halt sweep had already resolved -- so folding ONE genuinely
+      // unresolved order resurrected its long-dead neighbours. The sweep no
+      // longer leaves those rungs behind (see `#cancelOpenOrders`), which
+      // removes the source; this removes the mechanism, so neither alone has to
+      // be trusted.
+      //
+      // A TERMINAL FOLD CREATES NOTHING. It resolves exactly one order, so the
+      // list loses exactly one id and gains none -- the same maintained
+      // discipline `#applyGridFillToOrder` and `#placeGridOrder` now use,
+      // in its simplest possible form. Both branches below now treat
+      // `openOrderIds` identically; only the rung is grid-specific.
       const levelIndex = levelOf(state.ladder, clientOrderId);
       if (levelIndex >= 0) {
         await this.#mutateState((current) => {
@@ -2865,7 +2886,11 @@ export class BotInstance extends DurableObject<Env> {
             index === levelIndex ? null : slot,
           );
           const ladder: GridLadder = { ...current.ladder!, slots };
-          return { ...current, ladder, openOrderIds: ladderOpenOrderIds(ladder) };
+          return {
+            ...current,
+            ladder,
+            openOrderIds: current.openOrderIds.filter((id) => id !== clientOrderId),
+          };
         });
         return true;
       }
@@ -5512,11 +5537,50 @@ export class BotInstance extends DurableObject<Env> {
     // it had not recorded. Both want exactly the same treatment here -- keep
     // the id, keep the poll on it -- which is why they share the list rather
     // than getting a second one.
+    //
+    // AND THE LADDER LEARNS OF IT TOO, which it never used to. This method
+    // closed a grid order's record and left its RUNG STANDING: nothing here
+    // touched the ladder, and the only thing that clears a single slot --
+    // `#foldTerminalState` -- is reached solely from the poll, which reads only
+    // `openOrderIds` and therefore never looks at an order this sweep just
+    // removed from it. So a manually halted grid bot sat indefinitely with
+    // rungs naming orders that were cancelled, resolved and gone.
+    //
+    // WHAT THAT STALE LADDER THEN LIED TO. Every consumer that reads the slots
+    // as "what is live" read a ladder that was not:
+    //
+    //  - the three writes that build `openOrderIds` from the slots put those
+    //    dead ids BACK on the tracked list -- resurrection, the exact opposite
+    //    of the loss the same three writes were fixed for;
+    //  - `uncoveredInventoryFindings` sums SELL slots as cover, so a cancelled
+    //    sell's rung counted as protection that does not exist -- a false
+    //    NEGATIVE in the one detector written to find uncovered inventory;
+    //  - `#placeGridOrder`'s pre-send check reads an occupied level and refuses
+    //    to replace a rung whose occupant is long gone.
+    //
+    // FIXING IT HERE RATHER THAN AT EACH READER is what makes the invariant
+    // provable instead of assumed: `closeOrder` has exactly TWO call sites in
+    // this object -- `#foldTerminalState`, which already clears the slot, and
+    // this one, which now does. With both closed, a non-null slot names an
+    // order this bot still believes is live, and every reader of the ladder
+    // gets that for free without a fourth copy of the same guard.
+    //
+    // IT CANNOT REINTRODUCE ENTRY 57/64's PROBLEM, and the reason is that it
+    // reuses THIS set rather than a second opinion about it. `resolved` is
+    // precisely the ids `#recordCancellation` returned TRUE for, plus the ones
+    // the loop skipped as already terminal. Everything in `stillOpen` -- the
+    // unconfirmed cancellation, and the record the gate refused to close over
+    // an unrecorded fill -- keeps its id on the list AND keeps its rung. The
+    // slot follows the resolution; it never leads it.
     const resolved = new Set(state.openOrderIds.filter((id) => !stillOpen.includes(id)));
-    await this.#mutateState((current) => ({
-      ...current,
-      openOrderIds: current.openOrderIds.filter((id) => !resolved.has(id)),
-    }));
+    await this.#mutateState((current) => {
+      const openOrderIds = current.openOrderIds.filter((id) => !resolved.has(id));
+      if (current.ladder === undefined) return { ...current, openOrderIds };
+      const slots = current.ladder.slots.map((slot) =>
+        slot !== null && resolved.has(slot.clientOrderId) ? null : slot,
+      );
+      return { ...current, ladder: { ...current.ladder, slots }, openOrderIds };
+    });
   }
 
   /**
