@@ -619,6 +619,26 @@ export interface PipelineResult {
   readonly detail?: string;
 }
 
+/**
+ * The `action` prefix `#placeGridOrder` reports when an order is now RESTING on
+ * the exchange, and the predicate that reads it back.
+ *
+ * Spelled once, in one place, because the whole of step 3's cover depends on
+ * telling "placed" from "not placed" correctly and the two used to be told apart
+ * by listing the failures. Listing failures fails OPEN: every outcome nobody
+ * remembered to list read as success, which is precisely how `skipped`,
+ * `throttled`, `unresolved`, `recover` and `aborted` were each dropped while
+ * `replaced-sell` was reported to the caller. Recognising the one SUCCESS shape
+ * fails closed instead -- an outcome this does not know is treated as "no order
+ * is resting", which at worst re-queues an intent that a later drain finds its
+ * level already occupied and leaves queued, visibly.
+ */
+const GRID_PLACED_ACTION_PREFIX = "placed-";
+
+export function gridOrderWasPlaced(result: PipelineResult): boolean {
+  return result.action.startsWith(GRID_PLACED_ACTION_PREFIX);
+}
+
 export interface BotSnapshot {
   readonly config: BotConfig;
   readonly state: BotRuntimeState;
@@ -4409,6 +4429,24 @@ export class BotInstance extends DurableObject<Env> {
     intent: GridOrderIntent,
     limitPrice: Money,
     priority: RequestPriority,
+    /**
+     * Whether an unconstructible order writes its own alert row.
+     *
+     * FALSE FOR THE DRAIN, and only for the drain. `order_not_constructible` is
+     * an unconditional insert, which is right for a first attempt -- a discrete
+     * event, one row. The queue now RETAINS an intent until it actually places,
+     * so a replacement that is unconstructible for a lasting reason (dust under
+     * the venue's minimum, most often) is re-attempted on every poll and after
+     * every fold, and an unconditional insert there is step 18's measured
+     * alert-flood at one row per attempt forever.
+     *
+     * Nothing is lost by silencing the retries: the first attempt already wrote
+     * the row naming the reason, and the ONGOING condition is carried by
+     * `grid_replacement_queued`, a standing alert that states itself once and
+     * stays open while the queue is non-empty. The event and the condition are
+     * reported by the mechanism suited to each.
+     */
+    alertOnUnconstructible = true,
   ): Promise<PipelineResult> {
     let state = await this.#state();
     const now = this.#now();
@@ -4437,12 +4475,14 @@ export class BotInstance extends DurableObject<Env> {
       { rounding: "adjust" },
     );
     if (!adjusted.valid) {
-      await this.#alert(config, {
-        severity: "warning",
-        category: "trading",
-        alertType: "order_not_constructible",
-        message: `${intent.side} at grid level ${intent.levelIndex} skipped: ${adjusted.reason}`,
-      });
+      if (alertOnUnconstructible) {
+        await this.#alert(config, {
+          severity: "warning",
+          category: "trading",
+          alertType: "order_not_constructible",
+          message: `${intent.side} at grid level ${intent.levelIndex} skipped: ${adjusted.reason}`,
+        });
+      }
       return { status: "running", action: "skipped", detail: adjusted.code };
     }
 
@@ -4577,7 +4617,11 @@ export class BotInstance extends DurableObject<Env> {
     for (const fill of result.fills) {
       await this.onFill(decision.clientOrderId, fill);
     }
-    return { status: "running", action: `placed-${intent.side}-${intent.levelIndex}`, detail: decision.clientOrderId };
+    return {
+      status: "running",
+      action: `${GRID_PLACED_ACTION_PREFIX}${intent.side}-${intent.levelIndex}`,
+      detail: decision.clientOrderId,
+    };
   }
 
   /**
@@ -4656,7 +4700,15 @@ export class BotInstance extends DurableObject<Env> {
         fill.price,
         fill.quantity,
         effect.fullyFilled,
-        displaced ? { slot: currentLevel.slot, ownsSlot: false } : {},
+        {
+          // `effect.order`, not `order`: the post-application record, so the
+          // execution being folded right now is already in the list. Reading
+          // the pre-application `order` would leave the replacement short by
+          // exactly the fill that triggered it -- the same undercover this
+          // change exists to close, one slice smaller.
+          orderFills: effect.order.fills,
+          ...(displaced ? { slot: currentLevel.slot, ownsSlot: false } : {}),
+        },
       );
       return {
         ...current,
@@ -4681,17 +4733,30 @@ export class BotInstance extends DurableObject<Env> {
       // priority: rebuilding the ladder is ordinary work, not a risk exit.
       const placed = await this.#placeGridOrder(config, plan.replacement, plan.replacement.price, "routine");
       if (placed.status === "halted") return placed;
-      if (placed.action === "slot_occupied") {
-        // The target level still holds a live order -- typically one that has
-        // filled in this same instant and has not been folded yet. QUEUED, not
-        // dropped: the level frees up as soon as that fill is folded, and the
-        // drain places it then. Dropping it is what left bot-4xcq8p holding
-        // base with no sell resting against it.
+      if (!gridOrderWasPlaced(placed)) {
+        // NOTHING IS RESTING, WHATEVER THE REASON. This used to queue only
+        // `slot_occupied` and drop the rest -- `skipped` (the sell was not
+        // constructible, typically dust under the venue's minimum),
+        // `throttled`, `unresolved` (transport), `recover` (the idempotency
+        // guard wants the previous attempt resolved first) and `aborted` (the
+        // bot left `running` mid-flight) -- while still reporting
+        // `replaced-sell` to the caller. Every one of those five is base the
+        // buy acquired with no sell against it, and replace-on-fill is the only
+        // thing that ever places a grid sell: it does not re-run for a rung
+        // already missed, so a dropped intent is cover lost permanently.
+        //
+        // The queue is the right home for all of them and not a stretch of it:
+        // its entries are already "a rung this bot owes the ladder", the drain
+        // already retries them on every poll and after every fold, and
+        // `grid_replacement_queued` already says out loud that base is held with
+        // nothing resting against it. A reason that never clears stays queued
+        // and stays alerted -- which is the honest end state for, say, dust
+        // below the venue minimum, and is what Stage D's repair will act on.
         await this.#queueReplacement(config, plan.replacement);
         return {
           status: next.status,
           action: `queued-${plan.replacement.side}`,
-          detail: `${order.clientOrderId}: ${placed.detail}`,
+          detail: `${order.clientOrderId}: ${placed.action}${placed.detail === undefined ? "" : ` -- ${placed.detail}`}`,
         };
       }
       // A fold may have freed a level that an earlier intent was waiting on.
@@ -4810,19 +4875,38 @@ export class BotInstance extends DurableObject<Env> {
       if (current.status !== "running") break;
       if ((current.ladder?.slots[intent.levelIndex] ?? null) !== null) continue;
 
-      const placed = await this.#placeGridOrder(config, intent, intent.price, "routine");
-      if (placed.action === "slot_occupied") continue; // Lost a race; try again later.
-      // Placed, skipped, throttled or halted -- in every one of those the intent
-      // has had its turn and must not be replayed. A transport failure is the
-      // one case `#placeGridOrder` leaves genuinely unresolved, and recovery
-      // owns that through the idempotency guard, not this queue.
+      const placed = await this.#placeGridOrder(config, intent, intent.price, "routine", false);
+      // REMOVED ONLY ONCE AN ORDER IS ACTUALLY RESTING. This used to remove on
+      // every outcome except `slot_occupied`, on the reasoning that "the intent
+      // has had its turn and must not be replayed" -- and that is reversed here
+      // deliberately, because it made the queue a one-shot retry rather than an
+      // obligation. A replacement throttled by the rate limiter, or skipped as
+      // unconstructible, or left unresolved by a transport failure, was tried
+      // once and then forgotten, and the base it was meant to sell stayed held
+      // with nothing against it. That is the same loss the fold site was
+      // dropping; fixing one door and leaving the other open fixes neither.
+      //
+      // REPLAY IS SAFE, which is what makes retention affordable: every attempt
+      // goes through `#placeGridOrder`, whose pre-send check refuses an occupied
+      // level before anything is sent, and whose idempotency guard answers
+      // `recover` rather than sending a second order when a previous attempt is
+      // unresolved. So a retried intent cannot become a duplicate resting order.
+      //
+      // A reason that never clears therefore stays queued forever, and that is
+      // intended rather than tolerated: `grid_replacement_queued` below is a
+      // STANDING alert, so it states the condition once and keeps stating it
+      // while it is true, which is exactly the report a human needs in order to
+      // act on inventory the ladder cannot cover by itself.
+      if (!gridOrderWasPlaced(placed)) {
+        if (placed.status === "halted") break;
+        continue;
+      }
       await this.#mutateState((cur) => ({
         ...cur,
         pendingReplacements: (cur.pendingReplacements ?? []).filter(
           (pending) => pending.levelIndex !== intent.levelIndex,
         ),
       }));
-      if (placed.status === "halted") break;
     }
 
     state = await this.#state();

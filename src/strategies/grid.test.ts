@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fromDecimalString as m, ZERO } from "../shared/money";
 import {
+  acquisitionOf,
   breakoutPrice,
   buildLevels,
   claimSlot,
@@ -332,6 +333,187 @@ describe("replace-on-fill (section 6.2 step 3)", () => {
 
   it("refuses a fill against a level with no live order", () => {
     expect(() => planFill(placedLadder(), params, 2, m("100"), m("1"), true)).toThrow(/no live order/);
+  });
+});
+
+describe("sizing a replacement sell across several executions (the uncovered-inventory leak)", () => {
+  // THE BUG, IN ONE SENTENCE. `fullyFilled` is true on an order's LAST
+  // execution, not only on its only one, so a buy that filled in slices ran
+  // this branch once, holding the last slice's quantity -- and the sell was
+  // sized from that. The rest stayed held with nothing resting against it, and
+  // nothing re-runs replace-on-fill for a rung already missed.
+  //
+  // bot-3trlgb reached this from an ordinary, entirely successful fill: no
+  // cancellation, no slot collision, no repair. That is why these tests fold
+  // the fills the way the object really does -- one call per execution -- rather
+  // than asserting the final call in isolation.
+
+  it("sells everything the buy acquired, not just the execution that completed it", () => {
+    // A buy for 1.0 at level 1, filling 0.4 then 0.6.
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1"));
+    const first = { price: m("94"), quantity: m("0.4") };
+    const second = { price: m("95"), quantity: m("0.6") };
+
+    // Execution 1: partial. Position moves, order still rests, no replacement.
+    const partial = planFill(ladder, params, 1, first.price, first.quantity, false);
+    expect(partial.replacement).toBeNull();
+    expect(partial.ladder.heldQuantity).toBe(m("0.4"));
+
+    // Execution 2: completes the order. The whole history goes in.
+    const plan = planFill(partial.ladder, params, 1, second.price, second.quantity, true, {
+      orderFills: [first, second],
+    });
+
+    // The position is 1.0, and the sell resting against it is 1.0.
+    expect(plan.ladder.heldQuantity).toBe(m("1"));
+    expect(plan.replacement!.quantity).toBe(m("1"));
+    expect(plan.replacement!.quantity).toBe(plan.ladder.heldQuantity);
+
+    // THE PINNED "BEFORE". The old code passed `fillQuantity` straight through,
+    // so this was 0.6 -- covering the completing execution and abandoning the
+    // 0.4 that came first. Named explicitly so the regression is impossible to
+    // reintroduce quietly.
+    expect(plan.replacement!.quantity).not.toBe(second.quantity);
+    expect(plan.ladder.heldQuantity - plan.replacement!.quantity).toBe(ZERO);
+  });
+
+  it("carries the quantity-weighted average price as the cost basis, not the last fill's", () => {
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1"));
+    const first = { price: m("94"), quantity: m("0.4") };
+    const second = { price: m("95"), quantity: m("0.6") };
+
+    const partial = planFill(ladder, params, 1, first.price, first.quantity, false);
+    const plan = planFill(partial.ladder, params, 1, second.price, second.quantity, true, {
+      orderFills: [first, second],
+    });
+
+    // (94 x 0.4 + 95 x 0.6) / 1.0 = 94.6. Not 95 (the last fill), and not 94.5
+    // (the unweighted mean of the two prices) -- the slices are different sizes.
+    expect(plan.replacement!.costBasis).toBe(m("94.6"));
+    expect(plan.replacement!.costBasis).not.toBe(second.price);
+    expect(plan.replacement!.costBasis).not.toBe(m("94.5"));
+  });
+
+  it("weights correctly when the average does not divide evenly", () => {
+    // 0.1 @ 94 + 0.2 @ 95 = 28.4 over 0.3 -> 94.666... half-even at scale 8.
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "0.3"));
+    const first = { price: m("94"), quantity: m("0.1") };
+    const second = { price: m("95"), quantity: m("0.2") };
+
+    const partial = planFill(ladder, params, 1, first.price, first.quantity, false);
+    const plan = planFill(partial.ladder, params, 1, second.price, second.quantity, true, {
+      orderFills: [first, second],
+    });
+
+    expect(plan.replacement!.quantity).toBe(m("0.3"));
+    expect(plan.replacement!.costBasis).toBe(m("94.66666667"));
+  });
+
+  it("handles three executions, because nothing bounds an order to two", () => {
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "0.9"));
+    const fills = [
+      { price: m("94"), quantity: m("0.2") },
+      { price: m("95"), quantity: m("0.3") },
+      { price: m("96"), quantity: m("0.4") },
+    ];
+
+    let current = placedLadder({ slots: ladder.slots });
+    current = planFill(current, params, 1, fills[0]!.price, fills[0]!.quantity, false).ladder;
+    current = planFill(current, params, 1, fills[1]!.price, fills[1]!.quantity, false).ladder;
+    const plan = planFill(current, params, 1, fills[2]!.price, fills[2]!.quantity, true, {
+      orderFills: fills,
+    });
+
+    // 18.8 + 28.5 + 38.4 = 85.7 over 0.9 -> 95.22222222 half-even.
+    expect(plan.replacement!.quantity).toBe(m("0.9"));
+    expect(plan.ladder.heldQuantity).toBe(m("0.9"));
+    expect(plan.replacement!.costBasis).toBe(m("95.22222222"));
+  });
+
+  it("is bit-identical to the old behaviour on a single-execution full fill", () => {
+    // THE UNREGRESSION GUARD for the one path that was already correct. The
+    // history-aware call and the historyless one must agree exactly here, which
+    // is what makes the change additive rather than a rewrite of the common case.
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1.05"));
+    const only = { price: m("95"), quantity: m("1.05") };
+
+    const withHistory = planFill(ladder, params, 1, only.price, only.quantity, true, {
+      orderFills: [only],
+    });
+    const withoutHistory = planFill(ladder, params, 1, only.price, only.quantity, true);
+
+    expect(withHistory.replacement).toEqual(withoutHistory.replacement);
+    expect(withHistory.replacement).toMatchObject({
+      levelIndex: 2,
+      side: "sell",
+      price: m("100"),
+      quantity: m("1.05"),
+      costBasis: m("95"),
+    });
+    expect(withHistory.ladder).toEqual(withoutHistory.ladder);
+  });
+
+  it("REFUSES to size a multi-execution fill when no history was supplied", () => {
+    // Not a fallback, on purpose. Sizing from this execution under-covers the
+    // position (the original bug); sizing from the order's requested quantity
+    // over-covers it. There is no honest third answer, so it refuses.
+    const ladder = withSlot(placedLadder(), 1, buySlot("buy-1", "1"));
+    const partial = planFill(ladder, params, 1, m("94"), m("0.4"), false);
+
+    expect(() => planFill(partial.ladder, params, 1, m("95"), m("0.6"), true)).toThrow(
+      /more than one execution/,
+    );
+  });
+
+  it("leaves the SELL side alone: its replacement buy is sized from params, not fills", () => {
+    // The sell half never had this bug -- a replacement buy's quantity comes from
+    // `quantityForLevel(orderSize, price)`, not from what filled -- and this pins
+    // that the fix did not reach across into it.
+    const ladder = withSlot(
+      placedLadder({ heldQuantity: m("1"), heldCost: m("95") }),
+      2,
+      sellSlot("sell-1", "1", "95"),
+    );
+    const firstHalf = planFill(ladder, params, 2, m("100"), m("0.4"), false);
+    const plan = planFill(firstHalf.ladder, params, 2, m("100"), m("0.6"), true, {
+      orderFills: [
+        { price: m("100"), quantity: m("0.4") },
+        { price: m("100"), quantity: m("0.6") },
+      ],
+    });
+
+    expect(plan.replacement).toMatchObject({ levelIndex: 1, side: "buy", price: m("95") });
+    expect(plan.replacement!.quantity).toBe(quantityForLevel(params.orderSize, m("95")));
+    // Both executions realized their own profit as they landed: 5 over 1.0 base.
+    expect(firstHalf.realized + plan.realized).toBe(m("5"));
+  });
+});
+
+describe("acquisitionOf", () => {
+  it("returns a single execution unchanged", () => {
+    expect(acquisitionOf([{ price: m("95"), quantity: m("1.05") }])).toEqual({
+      price: m("95"),
+      quantity: m("1.05"),
+    });
+  });
+
+  it("sums quantity and weights price by it", () => {
+    expect(
+      acquisitionOf([
+        { price: m("94"), quantity: m("0.4") },
+        { price: m("95"), quantity: m("0.6") },
+      ]),
+    ).toEqual({ price: m("94.6"), quantity: m("1") });
+  });
+
+  it("is order-independent: the same executions in any sequence weigh the same", () => {
+    const a = { price: m("94"), quantity: m("0.4") };
+    const b = { price: m("95"), quantity: m("0.6") };
+    expect(acquisitionOf([a, b])).toEqual(acquisitionOf([b, a]));
+  });
+
+  it("refuses an empty history rather than dividing by zero", () => {
+    expect(() => acquisitionOf([])).toThrow(GridError);
   });
 });
 

@@ -49,8 +49,18 @@ export function testFilters(overrides: Partial<SymbolFilters> = {}): SymbolFilte
   };
 }
 
-function failure<T>(message: string, kind: "transport" | "exchange_error", at: Timestamp): ExchangeOutcome<T> {
-  return { ok: false, kind, message, retryable: kind === "transport", at };
+/**
+ * `rate_limited` is included because it is a real outcome a CALLER has to
+ * handle, even though a real venue never sends it: the rate-limited wrapper
+ * (`exchange/rate-limited.ts`) produces it in front of the venue when the budget
+ * is spent. Modelling it here lets a test drive a throttled placement without
+ * having to exhaust a real `RateLimiter` Durable Object, which is a property of
+ * the limiter rather than of the code under test.
+ */
+type ForcedFailureKind = "transport" | "exchange_error" | "rate_limited";
+
+function failure<T>(message: string, kind: ForcedFailureKind, at: Timestamp): ExchangeOutcome<T> {
+  return { ok: false, kind, message, retryable: kind !== "exchange_error", at };
 }
 
 /** A resting order, as this fake exchange sees it. */
@@ -73,7 +83,7 @@ export class FakeExchange implements RestExchangeClient {
   readonly resting = new Map<string, RestingOrder>();
 
   /** Set to force the next `placeOrder` to fail, then cleared. */
-  nextPlaceFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
+  nextPlaceFailure: { kind: ForcedFailureKind; message: string } | null = null;
   /** Set to force the next `cancelOrder` to fail, then cleared. */
   nextCancelFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /** Set to force EVERY `cancelOrder` to fail. Stays set until cleared. */

@@ -563,14 +563,44 @@ async function reconcileOrders(
  * wrong is not a disagreement at all -- it is an absence, and only the ladder's
  * own shape reveals it.
  *
- * TWO WAYS TO REACH IT, which is why this is not filed as one bug's regression
- * test. The slot collision fixed in `claimSlot` is one. `applyMissedFills` is
- * the other, and that one is BY DESIGN: it folds fills on a halted bot with
- * `placeReplacement: false` and honestly leaves the rungs empty. A bot resumed
- * after such a repair carries uncovered inventory and nothing says so.
+ * MANY WAYS TO REACH IT, and no count is given here on purpose. This said "TWO
+ * WAYS" and named the `claimSlot` slot collision and `applyMissedFills`; an
+ * investigation into two live bots then found three more, one of which -- a buy
+ * filling in several executions, where replace-on-fill sized the sell from the
+ * final execution alone -- was not an edge case at all but the ORDINARY path,
+ * needing no cancellation, no collision and no repair to fire. The specific
+ * routes have been closed since (see `acquisitionOf` in `strategies/grid.ts`,
+ * and the replacement queue in `bot-instance.ts`), but the lesson is the count:
+ * an exhaustive list here was wrong within weeks of being written and read as
+ * authoritative while it was wrong.
  *
- * Deliberately silent on a HALTED bot: its ladder has been swept on purpose and
- * a human is already the one holding it. Silent too when a liquidation is live
+ * So this detector is deliberately CAUSE-BLIND. It asks one question of the
+ * ladder's own shape -- is more base held than resting sells cover -- and that
+ * question stays correct however the gap arrived, including by routes nobody
+ * has thought of yet. It is a standing condition worth detecting on its own,
+ * not a regression test for any particular defect. `applyMissedFills` remains
+ * the one route that is BY DESIGN: it folds fills on a halted bot with
+ * `placeReplacement: false` and honestly leaves the rungs empty.
+ *
+ * RUNS ON A HALTED BOT TOO, which is a reversal of what this used to do and of
+ * the reasoning that went with it: "its ladder has been swept on purpose and a
+ * human is already the one holding it." Both halves proved false in practice. A
+ * halt sweep cancels orders; it does not sell what the bot already holds, so
+ * uncovered base survives the halt exactly as it was. And "a human is holding
+ * it" assumed the human had been told -- but this was the only thing that would
+ * have told them, and skipping halted bots is precisely why two of them sat
+ * uncovered and unreported. Detection is cheap and silence was not.
+ *
+ * DETECTION ONLY, on a halted bot as on a running one. Section 9's standing
+ * rule is unchanged: reconciliation halts and alerts and never auto-corrects.
+ * The meaningful tier's action is `haltBot`, and `halt` is idempotent -- an
+ * already-halted bot returns `already_halted` and changes nothing -- so a
+ * halted bot found here gains an alert and nothing else. Nothing is cancelled,
+ * nothing is placed. Repairing the ladder is a separate, human-triggered
+ * action.
+ *
+ * `stopped` is not a case here: `RECONCILED_STATUSES` excludes it upstream, so
+ * no snapshot of one ever reaches this. Still silent when a liquidation is live
  * (`exitOrderId`), because that sell is precisely the cover this looks for.
  */
 function uncoveredInventoryFindings(
@@ -579,7 +609,6 @@ function uncoveredInventoryFindings(
 ): PendingFinding[] {
   const ladder = snapshot.state.ladder;
   if (ladder === undefined) return []; // Not a grid bot.
-  if (snapshot.state.status !== "running") return [];
   if (snapshot.state.exitOrderId !== null) return [];
   if (ladder.heldQuantity <= ZERO) return [];
 

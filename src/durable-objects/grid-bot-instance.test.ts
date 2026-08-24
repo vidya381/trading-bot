@@ -19,7 +19,7 @@ import { freshDatabase } from "../db/test-helpers";
 import { fromDecimalString as m, ZERO } from "../shared/money";
 import type { Price } from "../shared/exchange-client";
 import type { GridParams } from "../strategies/grid";
-import type { BotInstance, CreateGridBotRequest } from "./bot-instance";
+import { gridOrderWasPlaced, type BotInstance, type CreateGridBotRequest } from "./bot-instance";
 import { FakeExchange, TEST_PAIR } from "./fake-exchange";
 import { inBot, noopFeed, rateLimiterStub } from "./test-helpers";
 
@@ -226,6 +226,226 @@ describe("replace-on-fill through the object (section 6.2 step 3)", () => {
     // The trade was mirrored to D1.
     const trades = await db.trades.findMany({ where: { bot_instance_id: BOT_ID } });
     expect(trades.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("Stage A: a buy filling in several executions is fully covered", () => {
+  // The leak, at the object rather than in the pure layer. `fullyFilled` is true
+  // on an order's LAST execution, so replace-on-fill ran once and sized the sell
+  // from that execution alone; everything acquired earlier stayed held with
+  // nothing resting against it, permanently. bot-3trlgb reached this state from
+  // an ordinary successful fill -- no cancellation, no collision, no repair.
+
+  it("rests a sell for the WHOLE acquired position, not the completing slice", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    const ordered = exchange.resting.get(buyAt95)!.request.quantity;
+
+    // Two executions at different prices, together completing the order.
+    const firstQty = m("0.4");
+    const restQty = ordered - firstQty;
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95, { quantity: firstQty, price: m("94") })));
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95, { quantity: restQty, price: m("95") })));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const held = snapshot.state.ladder!.heldQuantity;
+    expect(held).toBe(ordered);
+
+    const sells = exchange.placed.filter((o) => o.side === "sell");
+    expect(sells).toHaveLength(1);
+    // THE INVARIANT THAT WAS BROKEN: everything held has a sell against it.
+    expect(sells[0]!.quantity).toBe(held);
+    // And the pinned "before": the old code sized this from the last execution.
+    expect(sells[0]!.quantity).not.toBe(restQty);
+  });
+
+  it("carries a weighted cost basis, strictly between the two execution prices", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    const ordered = exchange.resting.get(buyAt95)!.request.quantity;
+    const firstQty = m("0.4");
+
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95, { quantity: firstQty, price: m("94") })));
+    await run((bot) =>
+      bot.onFill(buyAt95, exchange.fillFor(buyAt95, { quantity: ordered - firstQty, price: m("96") })),
+    );
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const sellSlot = snapshot.state.ladder!.slots.find((slot) => slot?.side === "sell")!;
+    // Neither execution's own price: a weighted blend of both. Bounded rather
+    // than pinned to a constant here -- the exact weighting is pinned in
+    // `strategies/grid.test.ts`, and what this asserts is that the object really
+    // handed the whole history across the boundary.
+    expect(sellSlot.costBasis!).toBeGreaterThan(m("94"));
+    expect(sellSlot.costBasis!).toBeLessThan(m("96"));
+  });
+
+  it("leaves the single-execution path exactly as it was", async () => {
+    // The one path already proven clean (entry 63). Asserted here as well as in
+    // the pure layer because the object is what changed around it.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    const ordered = exchange.resting.get(buyAt95)!.request.quantity;
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    const sells = exchange.placed.filter((o) => o.side === "sell");
+    expect(sells).toHaveLength(1);
+    expect(sells[0]!.quantity).toBe(ordered);
+    expect(sells[0]!.price).toBe(m("100"));
+    expect(snapshot.state.ladder!.heldQuantity).toBe(ordered);
+    expect(snapshot.state.ladder!.slots[2]!.costBasis).toBe(m("95"));
+  });
+
+  it("still rests nothing while the buy is only partially filled", async () => {
+    // Unchanged and correct: the order is still live, so the sell is not owed
+    // yet. Only a COMPLETED buy owes its rung.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95, { quantity: m("0.4") })));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.ladder!.heldQuantity).toBe(m("0.4"));
+    expect(exchange.placed.filter((o) => o.side === "sell")).toHaveLength(0);
+    expect(snapshot.state.ladder!.slots[1]).not.toBeNull();
+  });
+});
+
+describe("Stage B: a replacement that cannot be placed is queued, never dropped", () => {
+  // All five of these used to be dropped while the fold reported `replaced-sell`
+  // to its caller. Each one is base the buy acquired with no sell against it,
+  // and nothing re-runs replace-on-fill for a rung already missed.
+
+  it("classifies every non-placement outcome as 'nothing is resting'", () => {
+    // The branch that decides queue-vs-drop, over every shape
+    // `#placeGridOrder` can return. `recover` and `aborted` are covered here
+    // rather than end to end: one needs a clientOrderId sequence collision and
+    // the other needs the bot to leave `running` mid-flight, neither of which a
+    // test can induce without reaching inside the object.
+    for (const action of ["slot_occupied", "skipped", "throttled", "unresolved", "recover", "aborted"]) {
+      expect(gridOrderWasPlaced({ status: "running", action })).toBe(false);
+    }
+    // And the success shape `#placeGridOrder` actually mints.
+    expect(gridOrderWasPlaced({ status: "running", action: "placed-sell-2" })).toBe(true);
+    expect(gridOrderWasPlaced({ status: "running", action: "placed-buy-1" })).toBe(true);
+    // Fails CLOSED: an outcome nobody listed is treated as not placed.
+    expect(gridOrderWasPlaced({ status: "running", action: "something_new" })).toBe(false);
+  });
+
+  it("queues a THROTTLED replacement and does not claim it was placed", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.nextPlaceFailure = { kind: "rate_limited", message: "budget spent" };
+
+    const result = await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    expect(result.action).toBe("queued-sell");
+    expect(result.action).not.toBe("replaced-sell");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.pendingReplacements).toHaveLength(1);
+    expect(snapshot.state.pendingReplacements![0]).toMatchObject({ levelIndex: 2, side: "sell" });
+    expect(exchange.placed.filter((o) => o.side === "sell")).toHaveLength(0);
+  });
+
+  it("queues an UNRESOLVED (transport) replacement and does not claim it was placed", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.nextPlaceFailure = { kind: "transport", message: "socket hang up" };
+
+    const result = await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    expect(result.action).toBe("queued-sell");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.pendingReplacements).toHaveLength(1);
+  });
+
+  it("queues a SKIPPED (unconstructible) replacement and does not claim it was placed", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    // Raise the venue's minimum above the replacement's size, so the sell
+    // cannot be constructed at all. This is the dust shape: the sell is owed
+    // and cannot be placed, which is exactly the state a human has to resolve.
+    exchange.filters = { ...exchange.filters, minQuantity: m("100") };
+
+    const result = await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    expect(result.action).toBe("queued-sell");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.pendingReplacements).toHaveLength(1);
+    expect(exchange.placed.filter((o) => o.side === "sell")).toHaveLength(0);
+  });
+
+  it("keeps a queued replacement across a drain that still cannot place it", async () => {
+    // The other half of the fix. The drain used to REMOVE an intent on every
+    // outcome except `slot_occupied` -- "it has had its turn" -- which turned
+    // the queue into a one-shot retry and lost the cover one poll later.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.filters = { ...exchange.filters, minQuantity: m("100") };
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+    expect((await run((bot) => bot.snapshot())).state.pendingReplacements).toHaveLength(1);
+
+    // A second fold drains; the sell is still unconstructible.
+    const buyAt90 = placedAtPrice("90");
+    await run((bot) => bot.onFill(buyAt90, exchange.fillFor(buyAt90, { quantity: m("0.1") })));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.pendingReplacements).toHaveLength(1);
+  });
+
+  it("places the queued replacement once it becomes placeable, and only then forgets it", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.nextPlaceFailure = { kind: "rate_limited", message: "budget spent" };
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+    expect((await run((bot) => bot.snapshot())).state.pendingReplacements).toHaveLength(1);
+
+    // The next fold drains the queue, and this time nothing is forcing a failure.
+    const buyAt90 = placedAtPrice("90");
+    await run((bot) => bot.onFill(buyAt90, exchange.fillFor(buyAt90, { quantity: m("0.1") })));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.pendingReplacements ?? []).toHaveLength(0);
+    const sells = exchange.placed.filter((o) => o.side === "sell");
+    expect(sells).toHaveLength(1);
+    expect(sells[0]!.price).toBe(m("100"));
+  });
+
+  it("raises the standing alert while a replacement stays queued", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.filters = { ...exchange.filters, minQuantity: m("100") };
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    // The alert is raised by the DRAIN, which the queuing fold returns before
+    // reaching -- so it lands on the next drain (the poll, every 30s, or the
+    // next fold) rather than at the instant of queuing. Unchanged from how
+    // `slot_occupied` has always behaved, and asserted here so the delay is a
+    // recorded property rather than a surprise.
+    const buyAt90 = placedAtPrice("90");
+    await run((bot) => bot.onFill(buyAt90, exchange.fillFor(buyAt90, { quantity: m("0.1") })));
+
+    const alerts = await db.alerts.findMany({ where: { alert_type: "grid_replacement_queued" } });
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    expect(alerts[0]!.message).toContain("nothing resting against");
+  });
+
+  it("writes ONE unconstructible alert, not one per retry", async () => {
+    // The flood B's retention would otherwise create: the drain runs on every
+    // poll and after every fold, and `order_not_constructible` is an
+    // unconditional insert. The first attempt reports the event; the ongoing
+    // condition is carried by the standing `grid_replacement_queued` above.
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    exchange.filters = { ...exchange.filters, minQuantity: m("100") };
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    const buyAt90 = placedAtPrice("90");
+    await run((bot) => bot.onFill(buyAt90, exchange.fillFor(buyAt90, { quantity: m("0.1") })));
+    await run((bot) => bot.onFill(buyAt90, exchange.fillFor(buyAt90, { quantity: m("0.1") })));
+
+    const alerts = await db.alerts.findMany({ where: { alert_type: "order_not_constructible" } });
+    expect(alerts).toHaveLength(1);
   });
 });
 

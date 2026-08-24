@@ -316,6 +316,29 @@ export interface PlanFillOptions {
    * same class of silent loss `claimSlot` exists to prevent.
    */
   readonly ownsSlot?: boolean;
+  /**
+   * EVERY execution applied to the filled order, including the one being
+   * folded right now. Supplied by the Durable Object from `TrackedOrder.fills`.
+   *
+   * WHAT IT IS FOR, and it is not an optimisation. A replacement sell must be
+   * sized against everything the buy ACQUIRED, and an order can acquire its
+   * quantity across several executions -- `fullyFilled` is true only on the
+   * last of them. Sizing from that last execution alone sells one slice and
+   * leaves the earlier ones held with nothing resting against them, which is
+   * the `uncovered_held_inventory` condition reconciliation detects after the
+   * fact and cannot repair.
+   *
+   * The order's own record is the ONLY place this history exists: the ladder
+   * knows what an order was placed FOR (`GridSlot.quantity`), never what it
+   * filled. So it has to be handed in.
+   *
+   * Optional in the TYPE and mandatory in PRACTICE for any order that filled in
+   * more than one execution: `planFill` refuses that case rather than guessing
+   * at it (see `acquisitionOf`). Every existing single-execution call is
+   * unaffected, because for those the history and the single fill agree by
+   * construction.
+   */
+  readonly orderFills?: readonly GridFillRecord[];
 }
 
 /** Everything the price-update planner looks at, gathered so it stays pure. */
@@ -755,6 +778,90 @@ export function decide(input: GridDecisionInput): GridPriceAction {
 // ---------------------------------------------------------------------------
 
 /**
+ * One execution's price and quantity -- as much of a `Fill` as sizing needs.
+ *
+ * Deliberately NOT `Fill` itself. That type lives in `exchange-client.ts` and
+ * carries a trade id, a fee, a fee asset and a timestamp, none of which this
+ * layer has any business reading. Structural typing means a real `Fill` is
+ * accepted wherever this is asked for, at no cost to either side.
+ */
+export interface GridFillRecord {
+  readonly price: Money;
+  readonly quantity: Money;
+}
+
+/**
+ * What a buy actually acquired across every execution, and the one price that
+ * describes it.
+ *
+ * The price is the QUANTITY-WEIGHTED average of the executions, not the mean of
+ * their prices and not the last one. Those differ whenever the slices differ in
+ * size, and the difference lands directly in realized profit: this value becomes
+ * the replacement sell's `costBasis`, which is what the eventual round trip is
+ * measured against. A sell carrying the final slice's price would book the
+ * earlier slices' profit against a basis they were never bought at.
+ *
+ * Computed as `sum(price x quantity) / sum(quantity)`, half-even at both steps,
+ * matching how `planFill` already values a single execution (`mul(fillPrice,
+ * fillQuantity, "half-even")`). For one execution it returns that execution
+ * unchanged -- exactly what the old code did -- which is what makes this safe to
+ * apply to every full buy fill rather than only to the multi-execution ones.
+ */
+export function acquisitionOf(fills: readonly GridFillRecord[]): GridFillRecord {
+  let quantity = ZERO;
+  let notional = ZERO;
+  for (const fill of fills) {
+    quantity += fill.quantity;
+    notional += mul(fill.price, fill.quantity, "half-even");
+  }
+  if (quantity <= ZERO) {
+    throw new GridError(
+      "invalid_parameter",
+      `an order's fill history must contain at least one execution, got ${fills.length}`,
+    );
+  }
+  return { quantity, price: divideRounded(notional * ONE, quantity, "half-even") };
+}
+
+/**
+ * The acquisition a replacement sell is sized from, or a refusal.
+ *
+ * IT REFUSES RATHER THAN GUESSES, and the gate is exact rather than cautious.
+ * `fullyFilled` with `fillQuantity` short of the order's own quantity means
+ * earlier executions exist -- that is the only way to arrive here -- so without
+ * the history there is no honest number to sell, and the two available guesses
+ * are both wrong in ways that cost real money. Sizing from the single execution
+ * under-covers the position (the bug this exists to close). Sizing from
+ * `slot.quantity` over-covers it: the order's REQUESTED quantity is not what it
+ * filled, so on a partially-filled-then-cancelled buy that would rest a sell for
+ * base the bot never bought.
+ *
+ * When the numbers agree -- one execution, or a caller that supplied the
+ * history -- nothing is refused and nothing changes. That is what keeps this
+ * additive: the single-execution path returns exactly the pair the old code
+ * used, so it cannot have moved.
+ */
+function acquisitionFor(
+  slot: GridSlot,
+  fillPrice: Money,
+  fillQuantity: Money,
+  orderFills: readonly GridFillRecord[] | undefined,
+): GridFillRecord {
+  if (orderFills !== undefined) return acquisitionOf(orderFills);
+  if (fillQuantity < slot.quantity) {
+    throw new GridError(
+      "invalid_parameter",
+      `buy ${slot.clientOrderId} filled ${toDecimalString(fillQuantity)} on the execution that ` +
+        `completed an order for ${toDecimalString(slot.quantity)}, so it filled in more than one ` +
+        `execution, and no fill history was supplied to size the replacement sell from. ` +
+        `Refusing rather than sizing from this execution alone, which would leave the earlier ` +
+        `ones held with no sell against them.`,
+    );
+  }
+  return { price: fillPrice, quantity: fillQuantity };
+}
+
+/**
  * Fold a fill against a ladder order into the ladder, and say what to place next.
  *
  * Section 6.2 step 3: a filled buy places a new sell one grid level ABOVE; a
@@ -814,6 +921,24 @@ export function planFill(
       return { ladder: next, replacement: null, realized: ZERO };
     }
 
+    // WHAT THE WHOLE ORDER ACQUIRED, not what this one execution did.
+    //
+    // `fillQuantity` is a SINGLE execution. `fullyFilled` says the order has
+    // finished, and an order finishes on its last execution, not its only one --
+    // so on a buy that filled as 0.0004 + 0.0006 this branch runs once, with
+    // `fillQuantity` 0.0006. Sizing the sell from it rested 0.0006 against a
+    // position of 0.0010 and left the first slice held with nothing selling it,
+    // permanently: nothing re-runs replace-on-fill for a rung already missed.
+    // Two live bots reached that state, one of them from an ordinary, entirely
+    // successful multi-execution fill with no cancellation anywhere in it.
+    //
+    // The position arithmetic above is deliberately NOT changed and must not be:
+    // it runs on every fill, partial ones included, and has always been right
+    // (each execution moves `heldQuantity` as it lands). Only the replacement --
+    // planned once, at the end -- was reading a per-execution number where it
+    // needed a per-order one.
+    const acquired = acquisitionFor(slot, fillPrice, fillQuantity, options.orderFills);
+
     // Only clear a level this order still owns. A displaced order's level now
     // belongs to someone else, and clearing it would repeat the eviction.
     if (ownsSlot) next = withSlot(next, levelIndex, null);
@@ -830,10 +955,11 @@ export function planFill(
         levelIndex: sellIndex,
         side: "sell",
         price: ladder.levels[sellIndex]!,
-        // Sell exactly the base this buy acquired, carrying the buy's price as
-        // the cost basis so the eventual sell's profit is exact.
-        quantity: fillQuantity,
-        costBasis: fillPrice,
+        // Sell exactly the base this buy acquired, carrying the buy's
+        // quantity-weighted average price as the cost basis so the eventual
+        // sell's profit is exact across every execution that contributed.
+        quantity: acquired.quantity,
+        costBasis: acquired.price,
       },
       realized: ZERO,
     };

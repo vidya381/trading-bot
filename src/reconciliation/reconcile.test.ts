@@ -1824,8 +1824,18 @@ describe("a grid bot holding base with no sell against it", () => {
     expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
   });
 
-  it("stays silent on a halted bot, whose ladder was swept on purpose", async () => {
-    // A human already holds this one, and the halt cleared the slots itself.
+  // --- Stage C: halted bots are detected too. ----------------------------
+  //
+  // This block replaces a test that pinned the OPPOSITE behaviour ("stays
+  // silent on a halted bot, whose ladder was swept on purpose"). Its reasoning
+  // was that a halt sweeps the ladder and a human already holds the bot. Both
+  // halves were false: a halt cancels resting orders but never sells what the
+  // bot already holds, so uncovered base survives a halt untouched; and the
+  // human only "already holds it" if something told them, which this was the
+  // only thing that would have done. Two live bots sat uncovered and
+  // unreported behind that early return.
+
+  it("is found on a HALTED bot, whose halt cancelled orders but sold nothing", async () => {
     snapshots.set(
       "grid-btc-1",
       snapshotFor("grid-btc-1", [], {
@@ -1836,7 +1846,103 @@ describe("a grid bot holding base with no sell against it", () => {
     );
 
     const result = await reconcileAccount(ports(), ACCOUNT);
-    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(false);
+
+    const finding = result.findings.find((f) => f.kind === "uncovered_held_inventory");
+    expect(finding).toBeDefined();
+    expect(finding!.tier).toBe("meaningful");
+    expect(finding!.botInstanceId).toBe("grid-btc-1");
+    expect(finding!.detail).toContain("1.05000000");
+  });
+
+  it("writes the alert row for a halted bot, which is the whole point of finding it", async () => {
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        status: "halted",
+        haltReason: "manual",
+        ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+      }),
+    );
+
+    await reconcileAccount(ports(), ACCOUNT);
+
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "reconciliation_meaningful_uncovered_held_inventory" },
+    });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.bot_instance_id).toBe("grid-btc-1");
+    expect(alerts[0]!.resolved).toBe(false);
+  });
+
+  it("DETECTS ONLY on a halted bot: nothing is placed and nothing is cancelled", async () => {
+    // Section 9's standing rule, unchanged by widening detection: reconciliation
+    // halts and alerts and never auto-corrects. Finding uncovered inventory must
+    // not put a sell on the exchange to cover it -- that is a separate,
+    // human-triggered repair. Asserted against the exchange itself rather than
+    // against an intention, so a future "helpful" corrective call fails here.
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        status: "halted",
+        haltReason: "manual",
+        ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+      }),
+    );
+    const placedBefore = exchange.placed.length;
+    const cancelledBefore = exchange.cancelled.length;
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(true);
+    expect(exchange.placed.length).toBe(placedBefore);
+    expect(exchange.cancelled.length).toBe(cancelledBefore);
+  });
+
+  it("counts only SELL cover: a resting buy does not defend a held position", async () => {
+    // The live shape, and a real coverage gap found by mutation testing: a grid
+    // holding base almost always has buys still resting below it. Summing every
+    // slot instead of only the sells would read those buys as cover and report
+    // the ladder healthy -- the detector's one question answered backwards, on
+    // the most common ladder there is.
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        ladder: ladderWith({
+          heldQuantity: m("1.05"),
+          heldCost: m("99.75"),
+          slots: [
+            { side: "buy", clientOrderId: "buy-low", costBasis: null, quantity: m("2") },
+            null,
+            null,
+            null,
+            null,
+          ],
+        }),
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const finding = result.findings.find((f) => f.kind === "uncovered_held_inventory");
+    expect(finding).toBeDefined();
+    // The resting buy of 2 covers nothing: all 1.05 is exposed.
+    expect(finding!.detail).toContain("1.05000000");
+  });
+
+  it("still finds it on a RUNNING bot: widening detection did not narrow it", async () => {
+    // The unregression guard for the status gate's removal. A `!== "running"`
+    // early return replaced by `=== "halted"` would pass every halted-bot test
+    // above and silently lose the original case.
+    snapshots.set(
+      "grid-btc-1",
+      snapshotFor("grid-btc-1", [], {
+        status: "running",
+        ladder: ladderWith({ heldQuantity: m("1.05"), heldCost: m("99.75") }),
+      }),
+    );
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+    expect(result.findings.some((f) => f.kind === "uncovered_held_inventory")).toBe(true);
   });
 
   it("stays silent while a liquidation sell is live, which IS the cover", async () => {
