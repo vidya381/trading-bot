@@ -17,6 +17,7 @@ import type { Database } from "../db/database";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
+import type { MarketPriceLister } from "../workers/market-price";
 import type { AssessModel } from "../research/assess";
 import type { DeriveModel } from "../research/derive";
 
@@ -46,6 +47,14 @@ export interface ApiContext {
    * answer different questions of the venue and only one of them is cached.
    */
   readonly candleLister: CandleLister;
+  /**
+   * Reaches an account's exchange for ONE spot price, for a halted bot's
+   * "where is the market now" tile. Injected for `candleLister`'s reason: no
+   * test may fall through to a live venue call. Separate from `candleLister`
+   * because it asks a different question (a single current price, not a
+   * window) and is called on a different route.
+   */
+  readonly marketPriceLister: MarketPriceLister;
   /**
    * Reaches Workers AI for the Assess stage (section 21.4). Injected for the
    * same reason `candleLister` is, and one reason stronger: a test that fell

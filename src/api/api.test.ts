@@ -40,6 +40,7 @@ import { handleApiRequest } from "./index";
 import { generateSigningKey, signAccessJwt, type SigningKey } from "./test-helpers";
 import type { SymbolLister, SymbolDetailLister } from "../workers/symbols";
 import type { CandleLister } from "../workers/candles";
+import type { MarketPriceLister } from "../workers/market-price";
 import type { AssessModel } from "../research/assess";
 import type { DeriveModel } from "../research/derive";
 import { proposals } from "../db/schema";
@@ -160,6 +161,13 @@ interface ApiCall {
   readonly symbolLister?: SymbolLister;
   /** Inject the candles endpoint's lister, for the same reason. */
   readonly candleLister?: CandleLister;
+  /**
+   * Inject the halted-bot market-price lister. DEFAULTED below to one that
+   * refuses, rather than left undefined: `getBot` calls it for every halted,
+   * unarchived bot, and an undefined port would fall through to
+   * `envMarketPriceLister` and attempt a REAL venue call from the suite.
+   */
+  readonly marketPriceLister?: MarketPriceLister;
   /** Inject bot creation's per-symbol details lister, for the same reason. */
   readonly symbolDetailLister?: SymbolDetailLister;
   /** Inject the assess endpoint's model, so NO test ever reaches a paid vendor. */
@@ -195,6 +203,7 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
     access: { now: () => clock, fetchJwks: async () => key.jwks, jwksCache },
     ...(call.symbolLister !== undefined ? { symbolLister: call.symbolLister } : {}),
     ...(call.candleLister !== undefined ? { candleLister: call.candleLister } : {}),
+    marketPriceLister: call.marketPriceLister ?? refusingMarketPriceLister,
     ...(call.symbolDetailLister !== undefined
       ? { symbolDetailLister: call.symbolDetailLister }
       : {}),
@@ -204,6 +213,21 @@ async function api(method: string, path: string, call: ApiCall = {}): Promise<{ 
   });
   return { status: response.status, body: await response.json() };
 }
+
+/**
+ * The suite-wide default market-price port: it never reaches a venue.
+ *
+ * A non-ok outcome, not a thrown error, because that is what an unreachable
+ * exchange really produces and `marketPriceFor` is supposed to fold it to
+ * `null`. A test that WANTS a price supplies its own lister.
+ */
+const refusingMarketPriceLister: MarketPriceLister = async (_account, _pair, _env, now) => ({
+  ok: false,
+  kind: "exchange_error",
+  message: "no market price port injected in this test",
+  retryable: false,
+  at: now(),
+});
 
 async function seedBalance(account: string, total = "10000"): Promise<void> {
   await seedPlaceholderTotalBalance(

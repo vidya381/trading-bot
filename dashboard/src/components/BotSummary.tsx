@@ -21,7 +21,7 @@ import type { ReactNode } from "react";
 import type { BotDetail } from "../api/types";
 import { StatusBadge } from "./StatusBadge";
 import { Unit } from "./Unit";
-import { baseAssetOf, formatMoney, formatQuantity, signOf } from "../format";
+import { baseAssetOf, formatMoney, formatQuantity, formatTime, signOf } from "../format";
 
 const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   positive: "text-emerald-300",
@@ -63,6 +63,21 @@ function positionValue(bot: BotDetail): { value: string | null; hint?: string } 
     };
   }
   return { value: held };
+}
+
+/**
+ * What to say under the frozen price.
+ *
+ * A halted bot's `lastPrice` stopped advancing when it unsubscribed from its
+ * feed, and saying so -- with the time -- is the difference between a number
+ * that looks broken and one that is explained. `lastPriceAt` is the tick it
+ * froze on, which is exactly the moment being described.
+ */
+function currentPriceHint(bot: BotDetail): string | undefined {
+  if (bot.state?.lastPrice == null) return "no price yet";
+  if (bot.status !== "halted") return undefined;
+  const at = bot.state.lastPriceAt;
+  return at === null ? "frozen at halt" : `frozen at halt · ${formatTime(at)}`;
 }
 
 export function BotSummary({ bot }: { bot: BotDetail }) {
@@ -127,7 +142,24 @@ export function BotSummary({ bot }: { bot: BotDetail }) {
           {formatMoney(bot.allocatedCapital)}
           <Unit>{bot.capitalAsset}</Unit>
         </Stat>
-        <Stat label="Current price" hint={currentPrice === null ? "no price yet" : undefined}>
+        {/*
+          * TWO PRICES, NEVER MERGED, and the labels do the work of keeping them
+          * apart.
+          *
+          * "Current price" is `state.lastPrice` -- the price this bot last
+          * TRADED against, and the number the PnL figures beside it are
+          * computed from. On a halted bot it is correctly FROZEN at the moment
+          * it stopped, which is deliberate design, not staleness.
+          *
+          * "Market price" is a separately fetched spot price, shown only for a
+          * halted bot, so the operator can see where the market actually is
+          * before deciding whether to resume. It feeds no calculation anywhere.
+          *
+          * The frozen one keeps its own hint saying WHEN it froze, because a
+          * bare number with no "as of" beside a live one is precisely what made
+          * a correctly-frozen price look broken.
+          */}
+        <Stat label="Current price" hint={currentPriceHint(bot)}>
           {currentPrice === null ? (
             <span className="text-zinc-600">—</span>
           ) : (
@@ -137,6 +169,12 @@ export function BotSummary({ bot }: { bot: BotDetail }) {
             </>
           )}
         </Stat>
+        {bot.marketPrice !== null && (
+          <Stat label="Market price" hint={`as of ${formatTime(bot.marketPrice.at)}`}>
+            {formatMoney(bot.marketPrice.price)}
+            <Unit>{bot.capitalAsset}</Unit>
+          </Stat>
+        )}
       </div>
     </section>
   );

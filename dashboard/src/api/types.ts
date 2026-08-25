@@ -374,9 +374,33 @@ export interface Trade {
 }
 
 /** The full detail of one bot (`botDetail` in serialize.ts). */
+/**
+ * A spot price fetched for a HALTED bot, so an operator can see where the
+ * market is before deciding whether to resume.
+ *
+ * DELIBERATELY NOT `state.lastPrice`, and the two must never be conflated.
+ * `lastPrice` is the price this bot last traded against -- what `unrealizedPnl`
+ * and the grid ladder are computed from -- and it is correctly FROZEN at the
+ * moment the bot halted. This is a separate, freshly-fetched number that feeds
+ * no calculation at all.
+ *
+ * `at` is not optional. A price with no "as of" is what made a correctly-frozen
+ * `lastPrice` look broken, which is why this feature exists at all.
+ */
+export interface MarketPrice {
+  readonly price: string;
+  readonly at: number;
+}
+
 export interface BotDetail extends Bot {
   readonly config: BotConfig | null;
   readonly state: BotRuntimeState | null;
+  /**
+   * Null for every bot that is not halted-and-unarchived, and null when the
+   * fetch failed. Both mean the same thing to this screen: no current market
+   * price is available, so do not render one.
+   */
+  readonly marketPrice: MarketPrice | null;
   readonly orders: readonly Order[];
   readonly trades: readonly Trade[];
   readonly alerts: readonly Alert[];

@@ -36,6 +36,7 @@ import {
   type SymbolDetailLister,
 } from "../workers/symbols";
 import { envCandleLister, type CandleLister } from "../workers/candles";
+import { envMarketPriceLister, type MarketPriceLister } from "../workers/market-price";
 import type { AssessModel } from "../research/assess";
 import type { DeriveModel } from "../research/derive";
 
@@ -143,6 +144,8 @@ export interface ApiOptions {
   readonly symbolLister?: SymbolLister;
   /** Injected by tests so the candles endpoint makes no live exchange call. */
   readonly candleLister?: CandleLister;
+  /** Injected by tests so the halted-bot market price makes no live call. */
+  readonly marketPriceLister?: MarketPriceLister;
   /**
    * Injected by tests so the assess endpoint makes NO live model call. Absent in
    * the Worker, where `getAccountAssess` builds the real one from `env.AI`.
@@ -234,6 +237,7 @@ export async function handleApiRequest(
       botNamespace: requireBotNamespace(env, options.botNamespace),
       symbolLister: options.symbolLister ?? envSymbolLister,
       candleLister: options.candleLister ?? envCandleLister,
+      marketPriceLister: options.marketPriceLister ?? envMarketPriceLister,
       ...(options.assessModel === undefined ? {} : { assessModel: options.assessModel }),
       ...(options.deriveModel === undefined ? {} : { deriveModel: options.deriveModel }),
       symbolDetailLister: options.symbolDetailLister ?? envSymbolDetailLister,

@@ -40,6 +40,7 @@ import {
   resubmittedAssessmentView,
   PROPOSAL_LIST_COLUMNS,
   type BotFees,
+  type MarketPrice,
 } from "./serialize";
 import { replayProposal } from "./proposal-replay";
 import { parseProposalQuery, proposalListWhere, proposalPage } from "./proposal-query";
@@ -334,7 +335,70 @@ export async function getBot(ctx: ApiContext): Promise<Response> {
     // the list page; one query path is how that stays true.
     feesFor(ctx, id),
   ]);
-  return ok(botDetail(row, snapshot, orders, trades, alerts, fees));
+  return ok(botDetail(row, snapshot, orders, trades, alerts, fees, await marketPriceFor(ctx, row)));
+}
+
+/**
+ * A current market price, but ONLY for a bot that is halted and reachable.
+ *
+ * ── WHO GETS ONE, AND WHY EACH EXCLUSION IS AN EXCLUSION ──
+ *
+ *  - `halted`      -> YES. Its own price froze when it unsubscribed, and the
+ *                    operator is looking at it to decide whether to RESUME.
+ *                    That decision needs to know where the market is.
+ *  - `running`     -> NO. It has a live feed; `lastPrice` is its own, current,
+ *                    and the number every PnL figure beside it is computed
+ *                    from. A second, differently-sourced price on the same
+ *                    screen would invite exactly the confusion this avoids.
+ *  - `created`     -> NO. It has never had a price, and `lastPrice: null`
+ *                    renders as an honest "no price yet". Painting a market
+ *                    price over that would answer a question it was not asked
+ *                    and hide the one true thing the tile says.
+ *  - `stopped`     -> NO. Terminal; capital released; nothing to resume.
+ *  - `archived`    -> NO, whatever its status. Resume is REFUSED for an
+ *                    archived bot (`assertNotArchived`, 409 `bot_archived`)
+ *                    until it is explicitly unarchived, so a live price would
+ *                    answer a question the operator cannot yet act on.
+ *
+ * ── WHY THE FAILURE IS SWALLOWED ──
+ *
+ * This is a decoration on a detail view, not the view. `GET /api/bots/:id`
+ * answered without a venue call for its whole life and must keep answering when
+ * the venue is unreachable -- an operator looking at a halted bot during an
+ * exchange outage needs its orders, alerts and position MORE than usual, not a
+ * 502. So a failed fetch becomes `null`, which renders as no market price, and
+ * section 5.6 is satisfied by not inventing one rather than by shouting.
+ *
+ * ── COST ──
+ *
+ * One unsigned public REST read per detail-page poll, and only while a human is
+ * on that page. Nothing is fetched for the LIST endpoint -- `listBots` is
+ * deliberately untouched, because doing this per row would turn one screen into
+ * one venue call per halted bot per tick.
+ */
+/**
+ * EXPORTED FOR ITS TESTS, deliberately, and this is the alternative to the
+ * thing that would otherwise happen: a test file re-stating the gate
+ * (`archived || status !== "halted"`) as its own copy, which is a second
+ * implementation free to drift from this one -- the exact failure entry 44
+ * names. The gate is the whole safety property here, so the test exercises THIS
+ * function or it is testing nothing.
+ */
+export async function marketPriceFor(
+  ctx: Pick<ApiContext, "marketPriceLister" | "env" | "now">,
+  row: BotInstanceRow,
+): Promise<MarketPrice | null> {
+  if (row.archived || row.status !== "halted") return null;
+  if (!isExchangeId(row.exchange)) return null;
+
+  const outcome = await ctx.marketPriceLister(
+    { label: row.account_label, exchange: row.exchange },
+    row.pair,
+    ctx.env,
+    ctx.now,
+  );
+  if (!outcome.ok) return null;
+  return { price: toDecimalString(outcome.value.price), at: outcome.value.at };
 }
 
 /**

@@ -717,6 +717,28 @@ export function botSummary(row: BotInstanceRow, snapshot: BotSnapshot | null, fe
  * `jsonSafe` because they are the camelCase strategy shapes whose money must be
  * rendered; the histories use the explicit row views.
  */
+/**
+ * A spot price fetched for a bot that is not receiving its own.
+ *
+ * DELIBERATELY A SEPARATE SHAPE from `lastPrice`, and the separation is the
+ * whole point. `lastPrice` is *the price this bot last traded against* -- it
+ * feeds `unrealizedPnl`, the grid ladder's divider, and every PnL figure on the
+ * screen. This is *where the market is right now*, fetched for a halted bot so
+ * an operator can decide whether to resume without leaving the dashboard.
+ * Merging them would silently change what every existing PnL number means.
+ *
+ * `at` is NOT optional and never defaulted. A bare price with no "as of" is
+ * exactly what made a correctly-frozen `lastPrice` look broken, which is the
+ * observation that produced this whole feature -- so the timestamp travels with
+ * the number, and a renderer that wants one has the other.
+ */
+export interface MarketPrice {
+  /** The venue's spot price, as a decimal string. */
+  readonly price: string;
+  /** When this system received it. Section 5.6's "when we heard". */
+  readonly at: number;
+}
+
 export function botDetail(
   row: BotInstanceRow,
   snapshot: BotSnapshot | null,
@@ -724,9 +746,17 @@ export function botDetail(
   trades: readonly TradeRow[],
   alerts: readonly AlertRow[],
   fees: BotFees,
+  /**
+   * Null whenever one was not fetched OR the fetch failed. Both are the same
+   * fact to a reader -- "no current market price is available" -- and section
+   * 5.6 forbids inventing one, so neither is filled in with a guess. WHICH of
+   * the two it was is the handler's business, not the screen's.
+   */
+  marketPrice: MarketPrice | null = null,
 ) {
   return {
     ...botSummary(row, snapshot, fees),
+    marketPrice,
     config: snapshot === null ? null : jsonSafe(snapshot.config),
     state: snapshot === null ? null : jsonSafe(snapshot.state),
     orders: orders.map(orderView),
