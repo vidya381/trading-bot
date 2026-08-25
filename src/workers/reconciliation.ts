@@ -102,6 +102,7 @@ import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import {
   reconcileAccount,
   type DriftThresholds,
+  type HaltBotOutcome,
   type ReconciliationRunResult,
 } from "../reconciliation";
 import type { RestExchangeClient, Timestamp } from "../shared/exchange-client";
@@ -376,13 +377,15 @@ export async function runScheduledReconciliation(
         thresholds: options.thresholds,
         snapshotBot: async (botInstanceId: string): Promise<BotSnapshot | null> =>
           await stubFor(botInstanceId).snapshotIfCreated(),
-        haltBot: async (botInstanceId: string, detail: string): Promise<void> => {
+        haltBot: async (botInstanceId: string, detail: string): Promise<HaltBotOutcome> => {
           // `manual` is the documented reason for a halt driven by section
           // 7.3 or 7.4 rather than by the strategy's own rules, and the
           // detail carries which run concluded it. `halt` is idempotent:
           // an already-halted bot returns `already_halted` and changes
-          // nothing.
-          await stubFor(botInstanceId).halt("manual", detail, "reconciliation");
+          // nothing -- returned rather than discarded so a breaker trip can
+          // report what it stopped apart from what was already stopped.
+          const result = await stubFor(botInstanceId).halt("manual", detail, "reconciliation");
+          return result.action === "already_halted" ? "already_halted" : "halted";
         },
       },
       accountLabel,

@@ -21,6 +21,7 @@
 
 import { databaseFrom } from "../db";
 import type { BotInstance } from "../durable-objects/bot-instance";
+import type { HaltBotOutcome } from "../reconciliation/circuit-breaker";
 import {
   resetGlobalKillSwitch,
   tripGlobalKillSwitch,
@@ -92,9 +93,15 @@ export async function tripGlobalKillSwitchFromEnv(
     actor: request.actor,
     now: now(),
     newId,
-    haltBot: async (botInstanceId: string, detail: string): Promise<void> => {
-      // `halt` is idempotent: an already-halted bot returns `already_halted`.
-      await stubFor(botInstanceId).halt("manual", detail, "kill-switch");
+    haltBot: async (botInstanceId: string, detail: string): Promise<HaltBotOutcome> => {
+      // `halt` is idempotent: an already-halted bot returns `already_halted`
+      // having written nothing at all -- no state change, no alert, no audit
+      // row. That answer is RETURNED rather than discarded so the sweep can
+      // report what it actually stopped separately from what was already
+      // stopped; the switch now sweeps halted bots too, and folding the two
+      // together would inflate the count a human reads in an emergency.
+      const result = await stubFor(botInstanceId).halt("manual", detail, "kill-switch");
+      return result.action === "already_halted" ? "already_halted" : "halted";
     },
   });
 

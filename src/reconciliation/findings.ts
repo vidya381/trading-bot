@@ -83,7 +83,39 @@ export type FindingKind =
   /** sum(bot allocations) disagrees with capital_ledger.total_allocated. */
   | "ledger_allocation_drift"
   /** A grid bot holds base with no sell resting against any of it. */
-  | "uncovered_held_inventory";
+  | "uncovered_held_inventory"
+  /**
+   * A bot's D1 status and its OWN status disagree, seen for the FIRST time.
+   *
+   * The bot-status counterpart of `order_drift_unconfirmed`, and it exists for
+   * the identical reason: this job reads the `bot_instances` rows and the
+   * objects' snapshots at two different instants, so a `start`, `resume` or
+   * `halt` landing between those two reads presents as a disagreement while
+   * being a perfectly healthy transition in flight. Logged, never alerted,
+   * never halts, never corrects; it escalates to one of the two kinds below if
+   * a later run still finds the SAME disagreement. See `botStatusFindings`.
+   */
+  | "bot_status_unconfirmed"
+  /**
+   * CONFIRMED: the object believes it is `running` while D1 says otherwise.
+   *
+   * The dangerous polarity, and the reason this comparison exists at all. Both
+   * emergency stops choose whom to halt by reading D1 for
+   * `status IN ('created','running')`, so a bot whose row says `halted` while
+   * its object is live is invisible to the global kill switch AND the account
+   * circuit breaker while being fully capable of placing orders. A real testnet
+   * bot sat in exactly this state; see `docs/open-items/resume-split-brain.md`.
+   */
+  | "bot_status_drift"
+  /**
+   * CONFIRMED: the object is not `running` while D1 says it is.
+   *
+   * The safe polarity -- nothing trades on D1's opinion, because every
+   * order-placing site reads the object's own state -- but still a mirror that
+   * lies to every human and every query that reads it. Corrected FROM the
+   * object, per section 8.1.
+   */
+  | "bot_status_mirror_stale";
 
 /**
  * The two links that tie `shared/alert-types.ts` -- which the DASHBOARD also
@@ -194,6 +226,31 @@ export const TIER_FLOOR: Readonly<Record<FindingKind, DriftClassification>> = {
   // deliberately leaves rungs empty -- so it is a standing condition worth
   // detecting on its own, not a proxy for one defect.
   uncovered_held_inventory: "meaningful",
+
+  // MINOR, for the reason `order_drift_unconfirmed` above is minor, applied to
+  // a different pair of observers. This job reads the `bot_instances` rows once
+  // at the top of a run and each object's snapshot later in the same run, and
+  // every status transition writes those two stores one after the other -- so a
+  // transition in flight across that gap IS a disagreement, and it is also
+  // completely healthy. Halting on a first sighting would halt bots a human
+  // resumed seconds earlier, which is entry 57's mistake exactly.
+  bot_status_unconfirmed: "minor",
+
+  // MEANINGFUL, and this is the kind the whole comparison exists for. The
+  // object believes it is running while D1 says it is not, which means both
+  // emergency stops -- they select on `status IN ('created','running')` -- will
+  // pass over a bot that is live. "A specific bot's believed position doesn't
+  // match reality" is section 9's meaningful, and a bot whose very existence is
+  // hidden from the kill switch is the strongest form of it that is still about
+  // one bot rather than the account.
+  bot_status_drift: "meaningful",
+
+  // MINOR, and for the same reason `mirror_drift` is: both stores are this
+  // system's own, the object is the source of truth (section 8.1), and the
+  // mirror being behind is what step 6's deliberate write ordering produces on
+  // a crash. Nothing is at risk on the exchange and nothing trades on the row,
+  // so the tier's action is a write, not a halt.
+  bot_status_mirror_stale: "minor",
 };
 
 /**
@@ -253,6 +310,20 @@ export const TIER_CEILING: Readonly<Record<FindingKind, DriftClassification>> = 
   // Already severe by kind; the ceiling is only ever reached from below.
   unknown_open_order: "severe",
   unknown_order_fill: "severe",
+  // PINNED AT MINOR, for `order_drift_unconfirmed`'s reason verbatim: the kind
+  // means "not yet confirmed", so letting magnitude promote it would act on
+  // exactly the evidence the kind exists to call insufficient.
+  bot_status_unconfirmed: "minor",
+  // Bot-scoped, and about two of this system's own stores. A bot invisible to
+  // the kill switch needs that bot halted and a human told; latching the whole
+  // account over one row's staleness would be a worse outcome than the drift.
+  bot_status_drift: "meaningful",
+  // PINNED AT MINOR, and the pin is load-bearing rather than modest: this
+  // kind's tier action is a WRITE TO D1, and a kind whose action is a write
+  // must never be promotable into a tier whose action is a halt. It carries no
+  // magnitude today; the pin makes that a property of the kind rather than of
+  // the one call site that happens not to attach one.
+  bot_status_mirror_stale: "minor",
 };
 
 /**
@@ -323,6 +394,19 @@ export interface Finding {
    * nothing tests -- the trap step 58 recorded and refused.
    */
   readonly clientOrderId?: string;
+  /**
+   * The two statuses a bot-status finding compared, as `"<d1>/<object>"`.
+   *
+   * Carried STRUCTURALLY for the identical reason `clientOrderId` above is, and
+   * this is the second instance of that reason rather than a new one: the
+   * run-to-run confirmation has to recognise THE SAME disagreement across two
+   * runs, and it reads the previous run's findings back out of its audit row.
+   * The direction is part of the identity -- a bot seen `halted/running` and
+   * then `running/halted` has flapped rather than persisted, and escalating
+   * that would be confirming one condition with evidence of a different one --
+   * so both statuses are in the key, and neither is recovered by reading prose.
+   */
+  readonly statusPair?: string;
   /**
    * The `alerts.id` this finding was read from, when it came from step 6
    * rather than from an observation made this run. Set means: this run

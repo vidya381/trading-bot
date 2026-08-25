@@ -19,6 +19,7 @@ import {
 } from "./circuit-breaker";
 import type { Database } from "../db/database";
 import { botInstanceRow, freshDatabase } from "../db/test-helpers";
+import type { HaltBotOutcome } from "./circuit-breaker";
 
 let db: Database;
 let ids = 0;
@@ -39,12 +40,26 @@ async function seedBots(): Promise<void> {
   );
 }
 
-function recordingHalt(): { halted: string[]; port: (id: string, detail: string) => Promise<void> } {
+/**
+ * A halt port that reports what it did, as the production wiring does.
+ *
+ * `BotInstance.#halt` answers `already_halted` -- writing nothing at all -- for
+ * a bot that is already halted, and the real port passes that back so the sweep
+ * can separate what it stopped from what was already stopped. Since the sweep
+ * now visits halted bots too (3c), a double that swallowed the answer would let
+ * `haltedBotIds` quietly absorb them and change what that list means.
+ */
+function recordingHalt(): {
+  halted: string[];
+  port: (id: string, detail: string) => Promise<HaltBotOutcome>;
+} {
   const halted: string[] = [];
   return {
     halted,
     port: async (id) => {
       halted.push(id);
+      const row = await db.botInstances.findOne({ id });
+      return row?.status === "halted" ? "already_halted" : "halted";
     },
   };
 }
@@ -165,7 +180,15 @@ describe("tripping", () => {
     });
 
     expect(second.newlyTripped).toBe(false);
+    // UNCHANGED by 3c, and that is the point: the re-sweep now also visits
+    // `dca-btc-1`, which the first trip really did halt, but it lands in
+    // `alreadyHaltedBotIds` rather than inflating the list that answers "what
+    // was still running when this sweep reached it".
     expect(second.haltedBotIds).toEqual(["dca-eth-1"]);
+    expect(second.alreadyHaltedBotIds).toEqual(["dca-btc-1"]);
+    // And the live one was reached FIRST: a sequential sweep must not spend
+    // round trips on already-stopped bots ahead of one that is still trading.
+    expect(halt.halted[0]).toBe("dca-eth-1");
   });
 
   it("does not abort the sweep when one bot cannot be halted", async () => {

@@ -89,10 +89,77 @@ export class CircuitBreakerError extends Error {
  * Implementations must be idempotent. `BotInstance.halt` already is: halting
  * an already-halted bot returns `already_halted` and changes nothing.
  */
-export type HaltBotPort = (botInstanceId: string, detail: string) => Promise<void>;
+export type HaltBotPort = (
+  botInstanceId: string,
+  detail: string,
+) => Promise<HaltBotOutcome | void>;
 
-/** Statuses whose bots are still capable of trading and so must be halted. */
+/**
+ * What a halt actually did, when the port bothers to say.
+ *
+ * `void` is still accepted, and that is deliberate rather than lax: a port that
+ * does not report cannot be distinguished from one that halted something, so an
+ * unreported halt is counted as a halt -- the meaning `haltedBotIds` has always
+ * had. Production wiring returns the real answer; a test double that does not
+ * care simply keeps returning nothing.
+ */
+export type HaltBotOutcome = "halted" | "already_halted";
+
+/**
+ * Statuses whose bots D1 believes are still capable of trading.
+ *
+ * NOT the set the sweep halts -- see `SWEPT_STATUSES`. This one answers "is
+ * there anything here for a breaker to DO", which is a different question and
+ * has two callers that depend on it staying narrow: the dashboard's "this will
+ * halt N bots" preview, and `reconcile.ts`'s guard on re-sweeping an
+ * already-latched account. Widening THIS constant would make that guard
+ * permanently true on every latched account -- tripping halts every bot, so a
+ * latched account always has halted bots -- and the five-minute re-sweep would
+ * write a `circuit_breaker.swept` audit row forever, which is precisely what
+ * the guard's own comment says it exists to prevent.
+ */
 const ACTIVE_STATUSES = ["created", "running"] as const;
+
+/**
+ * Statuses the sweep actually visits -- `ACTIVE_STATUSES` plus `halted`.
+ *
+ * WHY `halted` IS SWEPT despite D1 saying those bots are already stopped. D1's
+ * status is a MIRROR of the bot's own, and tonight's `bot-gvtr1a` proved the
+ * two can disagree: a bot whose row said `halted` was internally `running`,
+ * receiving prices and able to trade. Selecting targets by the mirror alone
+ * means an emergency stop is only as good as the mirror's accuracy, and the one
+ * moment that matters is the moment you cannot afford to find out it was wrong.
+ * Sweeping `halted` too costs one extra idempotent RPC per already-halted bot
+ * and removes the dependency entirely.
+ *
+ * This is INSURANCE, not the fix. The known cause of that disagreement is fixed
+ * (the resume write order) and detected (the bot-status comparison in
+ * `reconcile.ts`); this covers causes not yet found, without waiting for a
+ * detector pass to have run first.
+ *
+ * `stopped` is NOT here, and must not be: `BotInstance.#halt` THROWS on a
+ * stopped bot ("its capital is released"), so sweeping one would not be a
+ * harmless no-op -- it would land in `failures` and report a false alarm on
+ * every pull. `archived` is not filtered on at all, in either direction: it is
+ * orthogonal to status by design, and an archived bot whose object is secretly
+ * live is exactly as dangerous as any other.
+ */
+export const SWEPT_STATUSES = ["created", "running", "halted"] as const;
+
+/**
+ * The sweep order: everything D1 believes is live FIRST.
+ *
+ * The loop below is sequential -- one awaited cross-object RPC per bot -- so
+ * every bot visited before a genuinely running one delays stopping it. Adding
+ * halted bots to the set must not slow down the emergency path, so they go
+ * last. The row order the query returns is unspecified, which is why this is
+ * not left to it.
+ */
+export function emergencySweepOrder(bots: readonly BotInstanceRow[]): BotInstanceRow[] {
+  const live = (bot: BotInstanceRow): boolean =>
+    (ACTIVE_STATUSES as readonly string[]).includes(bot.status);
+  return [...bots.filter(live), ...bots.filter((bot) => !live(bot))];
+}
 
 export interface TripRequest {
   readonly accountLabel: string;
@@ -110,8 +177,22 @@ export interface TripRequest {
 export interface TripResult {
   /** False when the account was already tripped by an earlier run. */
   readonly newlyTripped: boolean;
-  /** Bots this call successfully halted. */
+  /**
+   * Bots this call actually stopped -- ones that were still live when it
+   * reached them. UNCHANGED IN MEANING by the halted-bot sweep, deliberately:
+   * this number is read by a human deciding whether an emergency is contained,
+   * and quietly folding already-stopped bots into it would inflate the one
+   * figure that answers "how much was still running".
+   */
   readonly haltedBotIds: readonly string[];
+  /**
+   * Bots the sweep visited and found ALREADY halted.
+   *
+   * Reported separately rather than merged above, and rather than not reported
+   * at all: it is the evidence that the insurance pass actually ran and covered
+   * them, which is otherwise invisible.
+   */
+  readonly alreadyHaltedBotIds: readonly string[];
   /**
    * Bots this call tried and failed to halt, with the failure.
    *
@@ -192,20 +273,24 @@ export async function tripAccountCircuitBreaker(
   // Sweep every bot still capable of trading. Read AFTER the latch is written,
   // so a bot created in the gap is either blocked by `assertAccountArmed` or
   // already visible here.
-  const bots = await db.botInstances.findMany({
-    where: { account_label: accountLabel, status: { in: [...ACTIVE_STATUSES] } },
-  });
+  const bots = emergencySweepOrder(
+    await db.botInstances.findMany({
+      where: { account_label: accountLabel, status: { in: [...SWEPT_STATUSES] } },
+    }),
+  );
 
   const haltedBotIds: string[] = [];
+  const alreadyHaltedBotIds: string[] = [];
   const failures: { botInstanceId: string; message: string }[] = [];
 
   for (const bot of bots) {
     try {
-      await haltBot(
+      const outcome = await haltBot(
         bot.id,
         `account circuit breaker tripped for ${accountLabel}: ${reason}`,
       );
-      haltedBotIds.push(bot.id);
+      if (outcome === "already_halted") alreadyHaltedBotIds.push(bot.id);
+      else haltedBotIds.push(bot.id);
     } catch (error) {
       // Deliberately does not rethrow. One unreachable bot must not leave the
       // other ten running -- the same reasoning as step 6's cancel loop.
@@ -257,13 +342,14 @@ export async function tripAccountCircuitBreaker(
       run_id: runId,
       newly_tripped: newlyTripped,
       halted: haltedBotIds,
+      already_halted: alreadyHaltedBotIds,
       failed: failures,
     },
     created_at: now,
   };
   await db.auditLog.insert(audit);
 
-  return { newlyTripped, haltedBotIds, failures };
+  return { newlyTripped, haltedBotIds, alreadyHaltedBotIds, failures };
 }
 
 /**

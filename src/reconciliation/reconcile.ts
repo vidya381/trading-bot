@@ -274,6 +274,9 @@ export async function reconcileAccount(
         // STRUCTURED, and load-bearing rather than decorative: this is what a
         // later run matches on to escalate an unconfirmed live-order drift.
         client_order_id: finding.clientOrderId ?? null,
+        // Structured for the same reason, and read back by the same scan: it
+        // is how a later run recognises the SAME status disagreement.
+        status_pair: finding.statusPair ?? null,
         source_alert_id: finding.sourceAlertId ?? null,
       })),
       halted: outcome.haltedBotIds,
@@ -538,6 +541,11 @@ async function reconcileOrders(
     const d1Orders = await db.orders.findMany({ where: { bot_instance_id: bot.id } });
 
     pending.push(...mirrorFindings(db, bot, snapshot, d1Orders));
+    // The bot-level counterpart of `mirrorFindings`, and it sits here rather
+    // than in its own pass so it reads the snapshot this loop already fetched:
+    // the comparison costs no extra cross-object RPC on the ordinary run where
+    // the two stores agree.
+    pending.push(...(await botStatusFindings(ports, bot, snapshot, seenUnconfirmed)));
     pending.push(...uncoveredInventoryFindings(bot, snapshot));
 
     if (remoteOpen !== null) {
@@ -728,6 +736,165 @@ function mirrorFindings(
 }
 
 /**
+ * D1's `bot_instances.status` against the object's own `state.status`.
+ *
+ * THE GAP THIS CLOSES. `mirrorFindings` above compares this system's two stores
+ * ORDER BY ORDER and has never compared the bot's own status, and nothing else
+ * did either: before this function, `snapshot.state.status` was read by nothing
+ * outside the Durable Object itself. Live testnet bot `bot-gvtr1a` sat with
+ * `bot_instances.status = 'halted'` while its object said `running` --
+ * subscribed to its price feed, receiving prices, and INVISIBLE to both
+ * emergency stops, because the global kill switch and the account circuit
+ * breaker each select their targets with `status IN ('created','running')`.
+ * Reconciliation held both values in hand on every pass and compared neither.
+ * See `docs/open-items/resume-split-brain.md`.
+ *
+ * ── WHY BOTH DIRECTIONS ARE CONFIRMED ACROSS TWO RUNS, INCLUDING THE SAFE ONE ──
+ *
+ * The design this was built from had the safe polarity (object not running, D1
+ * says running) auto-correct on FIRST sighting, on the reasoning that it is
+ * only a stale mirror and `mirror_drift` corrects those immediately. Building
+ * it showed that to be wrong, and dangerously so.
+ *
+ * `#resumePass` now writes D1 FIRST and the object second (step 3a). So a
+ * perfectly healthy resume, caught by this job in the window between its two
+ * writes, presents as EXACTLY the safe polarity: the row already says
+ * `running`, the object still says `halted`. Correcting the row "back" to
+ * `halted` there would overwrite a live human resume -- and the object would
+ * then finish its own write and become `running`, leaving `running`/`halted`:
+ * the dangerous state, MANUFACTURED BY THE DETECTOR out of a healthy
+ * transition. The one thing this function exists to find, it would have
+ * created.
+ *
+ * So neither direction acts on a first sighting. Both are recorded as
+ * `bot_status_unconfirmed` and both need the same disagreement, in the same
+ * direction, on a later run. The status pair is part of the memory key, so a
+ * bot that flapped between two different disagreements never confirms either.
+ *
+ * ── AND BOTH ARE RE-VERIFIED IMMEDIATELY BEFORE ACTING ──
+ *
+ * `bots` is read once at the top of a run and each snapshot later, so by the
+ * time a disagreement is confirmed both halves are already old. Confirming
+ * re-reads BOTH -- the row and the object -- and drops the finding entirely if
+ * they now agree or now disagree differently. What remains unclosed, and is
+ * stated rather than papered over: `act()` runs after every finding is
+ * collected and classified, so a transition landing in THAT gap is still
+ * possible. It is bounded by having to have presented the identical
+ * disagreement a full run earlier, which a transition in flight cannot do.
+ */
+async function botStatusFindings(
+  ports: ReconciliationPorts,
+  bot: BotInstanceRow,
+  snapshot: BotSnapshot,
+  seenUnconfirmed: UnconfirmedMemory,
+): Promise<PendingFinding[]> {
+  const { db } = ports;
+  const observed = statusPairOf(bot.status, snapshot.state.status);
+  if (observed === null) return [];
+
+  const key = `${bot.id}::${observed}`;
+  if (!seenUnconfirmed.has("bot_status_unconfirmed", key)) {
+    return [
+      {
+        finding: {
+          kind: "bot_status_unconfirmed",
+          scope: "bot",
+          botInstanceId: bot.id,
+          asset: null,
+          statusPair: observed,
+          detail:
+            `bot ${bot.id}: D1 says ${bot.status}, its Durable Object says ` +
+            `${snapshot.state.status}. First sighting -- a status transition writes those two ` +
+            `stores one after the other, so one in flight across this run's two reads looks ` +
+            `exactly like this. Recorded, not acted on; a later run that finds the same ` +
+            `disagreement escalates it.`,
+        },
+      },
+    ];
+  }
+
+  // Confirmed by a previous run. Re-read both halves before doing anything.
+  const [fresh, freshSnapshot] = await Promise.all([
+    db.botInstances.findOne({ id: bot.id }),
+    ports.snapshotBot(bot.id),
+  ]);
+  if (fresh === null || freshSnapshot === null) return [];
+  // A row that reached `stopped` between the two reads belongs to
+  // `releaseBotCapital` alone -- its capital is released and `#mirrorStatus`
+  // refuses to write over it for the same reason. Nothing to reconcile.
+  if (fresh.status === "stopped") return [];
+  const current = statusPairOf(fresh.status, freshSnapshot.state.status);
+  if (current !== observed) return [];
+
+  // THE DANGEROUS DIRECTION: the object is live and the row hides it from both
+  // emergency stops. Halt it -- which cancels its resting orders, mirrors the
+  // row, alerts and audits, and does NOT liquidate: the position is preserved
+  // for a human, exactly as a kill-switch halt preserves one.
+  if (freshSnapshot.state.status === "running") {
+    return [
+      {
+        finding: {
+          kind: "bot_status_drift",
+          scope: "bot",
+          botInstanceId: bot.id,
+          asset: null,
+          statusPair: current,
+          detail:
+            `bot ${bot.id} believes it is RUNNING while D1 says ${fresh.status}. Confirmed ` +
+            `across two runs. Both emergency stops select bots to halt by reading D1 for ` +
+            `created/running, so this bot is live and invisible to the global kill switch and ` +
+            `to its account's circuit breaker. Halting it converges both stores; its position ` +
+            `is left untouched for review.`,
+        },
+      },
+    ];
+  }
+
+  // THE SAFE DIRECTION: nothing trades on the row, but it lies to every human
+  // and every query that reads it. Correct it FROM the object (section 8.1),
+  // and NEVER the other way -- resuming a bot because a mirror said so would
+  // put it back to trading on no human's decision.
+  const objectStatus = freshSnapshot.state.status;
+  return [
+    {
+      finding: {
+        kind: "bot_status_mirror_stale",
+        scope: "bot",
+        botInstanceId: bot.id,
+        asset: null,
+        statusPair: current,
+        detail:
+          `bot ${bot.id}: D1 says ${fresh.status}, the object says ${objectStatus}. Confirmed ` +
+          `across two runs. The object is the source of truth (section 8.1), so the row is ` +
+          `corrected from it. The object is NOT touched -- a stale mirror is never a reason ` +
+          `to put a bot back to trading.`,
+      },
+      correct: async () => {
+        // Conditional on the row still saying what it said, so a transition
+        // landing between the re-read above and this write loses the race
+        // rather than being overwritten by it. `#mirrorStatus`'s own
+        // `ne: "stopped"` guard is preserved for the same reason it exists
+        // there: a released bot's status belongs to `releaseBotCapital` alone.
+        await db.botInstances.update(
+          { id: bot.id, status: fresh.status },
+          {
+            status: objectStatus,
+            halt_reason: freshSnapshot.state.haltReason,
+            halted_at: freshSnapshot.state.haltedAt,
+            updated_at: ports.now(),
+          },
+        );
+      },
+    },
+  ];
+}
+
+/** `"<d1>/<object>"`, or null when the two agree. */
+function statusPairOf(d1Status: string, objectStatus: string): string | null {
+  return d1Status === objectStatus ? null : `${d1Status}/${objectStatus}`;
+}
+
+/**
  * Live orders this account's own RECENT RUNS already reported as an unconfirmed
  * disagreement, as `${botInstanceId}::${clientOrderId}`.
  *
@@ -758,14 +925,68 @@ function mirrorFindings(
  *
  * A minor finding is deliberately enough to remember with: it is written to that
  * findings list like any other, while raising no alert row and halting nothing.
+ *
+ * ── GENERALISED AT STEP 3b, from one hard-coded kind to a table ──
+ *
+ * This scan read exactly one kind (`order_drift_unconfirmed`) and required a
+ * `client_order_id`, because an order was the only thing that had ever needed
+ * confirming twice. The bot-status comparison needs the identical mechanism
+ * keyed on something else, and the choice was one generalised reader or a
+ * second parallel one. It is one, deliberately: two readers would mean two
+ * audit-log scans per run for one question, two places to keep the recorded
+ * finding shape in step with, and the standing risk that a later fix to the
+ * window or the row cap lands on only one of them. `CONFIRMABLE_KINDS` is now
+ * the single place naming which kinds confirm across runs and how each one says
+ * "the same condition" -- adding a third is one entry, and the `satisfies`
+ * ties every key to a real `FindingKind`.
  */
+
+/** One finding as `reconcileAccount` records it into `audit_log.details_json`. */
+interface RecordedFinding {
+  readonly kind?: unknown;
+  readonly bot_instance_id?: unknown;
+  readonly client_order_id?: unknown;
+  readonly status_pair?: unknown;
+}
+
+/**
+ * The kinds that participate in run-to-run confirmation, and how each one
+ * identifies the same condition across two runs.
+ *
+ * A `null` key means this recorded finding cannot be matched (a field the kind
+ * needs is missing from an older audit row), which is treated as "not seen
+ * before" -- the direction that costs an extra run rather than an unearned
+ * escalation.
+ */
+const CONFIRMABLE_KINDS = {
+  order_drift_unconfirmed: (finding: RecordedFinding): string | null =>
+    typeof finding.bot_instance_id === "string" && typeof finding.client_order_id === "string"
+      ? `${finding.bot_instance_id}::${finding.client_order_id}`
+      : null,
+  bot_status_unconfirmed: (finding: RecordedFinding): string | null =>
+    typeof finding.bot_instance_id === "string" && typeof finding.status_pair === "string"
+      ? `${finding.bot_instance_id}::${finding.status_pair}`
+      : null,
+} satisfies Record<string, (finding: RecordedFinding) => string | null> &
+  Partial<Record<FindingKind, unknown>>;
+
+type ConfirmableKind = keyof typeof CONFIRMABLE_KINDS;
+
+/** What a run remembers of the runs before it. */
+interface UnconfirmedMemory {
+  has(kind: ConfirmableKind, key: string): boolean;
+}
+
 async function unconfirmedDriftFromRecentRuns(
   db: Database,
   accountLabel: string,
   at: Timestamp,
   windowMs: number,
-): Promise<ReadonlySet<string>> {
-  const seen = new Set<string>();
+): Promise<UnconfirmedMemory> {
+  const seen = new Map<ConfirmableKind, Set<string>>();
+  for (const kind of Object.keys(CONFIRMABLE_KINDS) as ConfirmableKind[]) {
+    seen.set(kind, new Set<string>());
+  }
   const rows = await db.auditLog.findMany({
     // THE TIME BOUND IS HERE, IN SQL, and this is the only thing that bounds
     // how far back the memory reaches. It used to be a `break` in the loop
@@ -787,17 +1008,17 @@ async function unconfirmedDriftFromRecentRuns(
   for (const row of rows) {
     const details = row.details_json as {
       account_label?: unknown;
-      findings?: readonly { kind?: unknown; bot_instance_id?: unknown; client_order_id?: unknown }[];
+      findings?: readonly RecordedFinding[];
     };
     if (details.account_label !== accountLabel) continue;
     for (const finding of details.findings ?? []) {
-      if (finding.kind !== "order_drift_unconfirmed") continue;
-      if (typeof finding.bot_instance_id !== "string") continue;
-      if (typeof finding.client_order_id !== "string") continue;
-      seen.add(`${finding.bot_instance_id}::${finding.client_order_id}`);
+      const kind = finding.kind;
+      if (typeof kind !== "string" || !(kind in CONFIRMABLE_KINDS)) continue;
+      const key = CONFIRMABLE_KINDS[kind as ConfirmableKind](finding);
+      if (key !== null) seen.get(kind as ConfirmableKind)!.add(key);
     }
   }
-  return seen;
+  return { has: (kind, key) => seen.get(kind)?.has(key) === true };
 }
 
 /** Orders the object believes are live, against what the exchange reports. */
@@ -806,7 +1027,7 @@ async function liveOrderFindings(
   bot: BotInstanceRow,
   snapshot: BotSnapshot,
   remoteOpen: readonly OrderStatus[],
-  seenUnconfirmed: ReadonlySet<string>,
+  seenUnconfirmed: UnconfirmedMemory,
 ): Promise<PendingFinding[]> {
   const pending: PendingFinding[] = [];
   const localById = new Map(snapshot.orders.map((order) => [order.clientOrderId, order]));
@@ -838,7 +1059,7 @@ async function liveOrderFindings(
       // becomes real drift. Escalation is unconditional at that point: see
       // `unconfirmedDriftFromRecentRuns` for why waiting is bounded and why it
       // cannot become "never halts".
-      const alreadySeen = seenUnconfirmed.has(`${bot.id}::${clientOrderId}`);
+      const alreadySeen = seenUnconfirmed.has("order_drift_unconfirmed", `${bot.id}::${clientOrderId}`);
       pending.push(
         ...driftAgainst(
           bot,
@@ -927,7 +1148,10 @@ async function liveOrderFindings(
     // And an order that terminated and AGREES still produces no finding at all,
     // because `driftAgainst` returns empty on a match. The tolerance is about
     // disagreements only.
-    const alreadySeenTerminated = seenUnconfirmed.has(`${bot.id}::${clientOrderId}`);
+    const alreadySeenTerminated = seenUnconfirmed.has(
+      "order_drift_unconfirmed",
+      `${bot.id}::${clientOrderId}`,
+    );
     pending.push(
       ...driftAgainst(
         bot,

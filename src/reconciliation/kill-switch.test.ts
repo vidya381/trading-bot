@@ -12,6 +12,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Database } from "../db/database";
 import { botInstanceRow, freshDatabase } from "../db/test-helpers";
+import type { HaltBotOutcome } from "./circuit-breaker";
 import {
   assertGlobalArmed,
   GlobalKillSwitchError,
@@ -30,9 +31,21 @@ let halted: string[];
 let idCounter: number;
 
 /** A recording halt port; the account breaker's tests use the same shape. */
+/**
+ * A halt port that reports what it did, exactly as the production wiring does.
+ *
+ * `BotInstance.#halt` returns `already_halted` -- having written nothing -- for
+ * a bot that is already halted, and the real port passes that answer back so
+ * the sweep can separate what it stopped from what was already stopped. A
+ * double that swallowed it would let `haltedBotIds` silently absorb the halted
+ * bots this sweep now visits, which is the exact meaning-drift the split of the
+ * two lists exists to prevent.
+ */
 function recordingHalt() {
-  return async (botInstanceId: string): Promise<void> => {
+  return async (botInstanceId: string): Promise<HaltBotOutcome> => {
     halted.push(botInstanceId);
+    const row = await db.botInstances.findOne({ id: botInstanceId });
+    return row?.status === "halted" ? "already_halted" : "halted";
   };
 }
 
@@ -68,9 +81,14 @@ describe("tripping the switch", () => {
     await insertBot("a1", "acct-a", "running");
     await insertBot("a2", "acct-a", "created");
     await insertBot("b1", "acct-b", "running");
-    // Neither of these is swept: a stopped bot is closed, a halted bot is
-    // already stopped from trading.
+    // A stopped bot is NOT swept: `#halt` throws on one ("its capital is
+    // released"), so visiting it would report a false failure on every pull.
     await insertBot("a3", "acct-a", "stopped");
+    // A halted bot IS swept, and this is the 3c change. D1's status is a
+    // MIRROR of the bot's own and the two can disagree -- a row saying
+    // `halted` can front an object that is internally running and trading.
+    // The switch must not depend on the mirror being right at the one moment
+    // it cannot afford to be wrong. Visiting one costs an idempotent RPC.
     await insertBot("b2", "acct-b", "halted");
 
     const result = await tripGlobalKillSwitch(db, {
@@ -82,9 +100,15 @@ describe("tripping the switch", () => {
     });
 
     expect(result.newlyTripped).toBe(true);
-    // Both accounts, only the active bots.
-    expect(halted.sort()).toEqual(["a1", "a2", "b1"]);
+    // Every bot on both accounts EXCEPT the stopped one was visited.
+    expect(halted.sort()).toEqual(["a1", "a2", "b1", "b2"]);
+    expect(halted).not.toContain("a3");
+    // THE REPORTING SPLIT, and the reason it exists: `haltedBotIds` still means
+    // what it has always meant -- what this pull actually stopped -- so the
+    // number a human reads in an emergency did not change meaning when the
+    // sweep widened. The already-halted bot is reported separately.
     expect(result.haltedBotIds.slice().sort()).toEqual(["a1", "a2", "b1"]);
+    expect(result.alreadyHaltedBotIds).toEqual(["b2"]);
 
     // The latch is real and its own record.
     expect(await isGloballyTripped(db)).toBe(true);

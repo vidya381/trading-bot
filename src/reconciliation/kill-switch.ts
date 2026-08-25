@@ -41,7 +41,7 @@
 import { NON_HUMAN_ACTORS } from "../capital";
 import type { Database } from "../db/database";
 import type { AlertRow, AuditLogRow, BotInstanceRow, GlobalKillSwitchRow } from "../db/schema";
-import type { HaltBotPort } from "./circuit-breaker";
+import { emergencySweepOrder, SWEPT_STATUSES, type HaltBotPort } from "./circuit-breaker";
 
 /** The single row always lives at this id (migration 0005 pins it with CHECK). */
 const SINGLETON_ID = 1;
@@ -67,6 +67,11 @@ export class GlobalKillSwitchError extends Error {
 }
 
 /** Statuses whose bots are still capable of trading and so must be halted. */
+/**
+ * What the switch reports as still capable of trading, for the dashboard's
+ * "this will halt N bots" preview. NARROW on purpose -- see the same constant
+ * in `circuit-breaker.ts` for why the sweep's own set is a different one.
+ */
 const ACTIVE_STATUSES = ["created", "running"] as const;
 
 export interface GlobalTripRequest {
@@ -82,8 +87,13 @@ export interface GlobalTripRequest {
 export interface GlobalTripResult {
   /** False when the switch was already tripped by an earlier call. */
   readonly newlyTripped: boolean;
-  /** Bots this call successfully halted, across every account. */
+  /**
+   * Bots this call actually stopped, across every account. Unchanged in meaning
+   * by the halted-bot sweep -- see `TripResult.haltedBotIds`.
+   */
   readonly haltedBotIds: readonly string[];
+  /** Bots the sweep visited and found ALREADY halted. */
+  readonly alreadyHaltedBotIds: readonly string[];
   /**
    * Bots this call tried and failed to halt, with the failure. Non-empty is not
    * a reason to abort: a kill switch that stops at the first unreachable bot
@@ -167,17 +177,26 @@ export async function tripGlobalKillSwitch(
   // Sweep every bot still capable of trading, across EVERY account. Read AFTER
   // the latch is written, so a bot created in the gap is either blocked by
   // `assertGlobalArmed` or already visible here.
-  const bots = await db.botInstances.findMany({
-    where: { status: { in: [...ACTIVE_STATUSES] } },
-  });
+  // `SWEPT_STATUSES`, not `ACTIVE_STATUSES`: `halted` is swept too, because D1's
+  // status is a mirror and a bot whose row says `halted` can be internally
+  // running (tonight's `bot-gvtr1a`). An emergency stop must not depend on the
+  // mirror being right. `emergencySweepOrder` keeps the bots D1 believes are
+  // live at the front, so the insurance never delays the real work.
+  const bots = emergencySweepOrder(
+    await db.botInstances.findMany({
+      where: { status: { in: [...SWEPT_STATUSES] } },
+    }),
+  );
 
   const haltedBotIds: string[] = [];
+  const alreadyHaltedBotIds: string[] = [];
   const failures: { botInstanceId: string; message: string }[] = [];
 
   for (const bot of bots) {
     try {
-      await haltBot(bot.id, `global kill switch pulled: ${reason.trim()}`);
-      haltedBotIds.push(bot.id);
+      const outcome = await haltBot(bot.id, `global kill switch pulled: ${reason.trim()}`);
+      if (outcome === "already_halted") alreadyHaltedBotIds.push(bot.id);
+      else haltedBotIds.push(bot.id);
     } catch (error) {
       // Does not rethrow: one unreachable bot must not leave the rest running.
       failures.push({
@@ -222,13 +241,14 @@ export async function tripGlobalKillSwitch(
       reason: reason.trim(),
       newly_tripped: newlyTripped,
       halted: haltedBotIds,
+      already_halted: alreadyHaltedBotIds,
       failed: failures,
     },
     created_at: now,
   };
   await db.auditLog.insert(audit);
 
-  return { newlyTripped, haltedBotIds, failures };
+  return { newlyTripped, haltedBotIds, alreadyHaltedBotIds, failures };
 }
 
 /**

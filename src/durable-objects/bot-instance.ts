@@ -3301,13 +3301,61 @@ export class BotInstance extends DurableObject<Env> {
     // a bot stopped belongs -- an append-only log, not a mutable status column
     // that the next halt would overwrite anyway. `start` has always cleared
     // both (see above); resume was the inconsistent one.
+    // D1 FIRST, THEN THE OBJECT -- and this is a REVERSAL of the order these two
+    // writes were in, made deliberately, on the evidence of a real testnet bot.
+    //
+    // WHAT WENT WRONG WITH THE OTHER ORDER. `bot-gvtr1a` sat with
+    // `bot_instances.status = 'halted'` in D1 while its own state said
+    // `running` -- subscribed to its price feed, `lastPriceAt` advancing, no
+    // `bot.resumed` audit row anywhere. That is this method, interrupted between
+    // its two status writes. There is no transaction available to prevent it:
+    // Durable Object storage and D1 are separate stores, `#mutateState` is
+    // durable the moment it returns, and `#outsidePoll` is a counter with no
+    // rollback. So the interruption cannot be prevented -- only AIMED.
+    //
+    // WHY THIS DIRECTION IS THE SAFE ONE, and it is not a matter of taste. Both
+    // emergency stops -- the global kill switch (7.4) and the account circuit
+    // breaker (7.3) -- choose whom to halt by reading D1 for
+    // `status IN ('created','running')` (`kill-switch.ts`, `circuit-breaker.ts`).
+    // `halted` is the ONE non-terminal status neither sweep selects. So the old
+    // order's interruption left a bot that was genuinely live and genuinely
+    // INVISIBLE to both of the controls that exist to stop it. This order's
+    // interruption leaves D1 saying `running` and the object saying `halted`:
+    // the sweeps still see it, halting it is a no-op because it already is, and
+    // -- the part that actually matters -- NOTHING ANYWHERE STARTS TRADING
+    // BECAUSE D1 SAYS SO. `#onPriceUpdatePass` reads this object's own state and
+    // returns `ignored` before it reaches any order-placing site, and no code
+    // outside this object reads `snapshot.state.status` at all. A stale
+    // `running` row can mislead a human; it cannot place an order.
+    //
+    // The same interruption is already harmless on the two neighbouring
+    // transitions, which is why only this one moved: `start` leaves D1 at
+    // `created`, which both sweeps DO select, and `#halt` leaves D1 at
+    // `running`, likewise. `resume` was the only transition that could aim the
+    // failure at the one status neither sweep looks at.
+    //
+    // THIS ORDER IS PINNED BY A TEST (`resume-write-order.test.ts`), because it
+    // is otherwise a property held by nothing: the two lines look
+    // interchangeable, and swapping them back reopens the hole silently.
+    //
+    // WHAT THIS DOES NOT DO: it does not make a mismatch impossible, only
+    // survivable, and nothing here DETECTS one. Reconciliation still never
+    // compares `bot_instances.status` against `snapshot.state.status` --
+    // `mirrorFindings` compares orders only -- so a bot already in the bad state
+    // (`bot-gvtr1a` is one) is not repaired by this change and a mismatch in the
+    // new, safe direction does not self-heal either: a sweep's `halt` on an
+    // already-halted object returns `already_halted` BEFORE `#mirrorStatus`, so
+    // it never converges the two stores. That detector is a separate, designed,
+    // not-yet-built step -- `docs/open-items/resume-split-brain.md`, part 3b --
+    // and convergence is deliberately left to it rather than widened into
+    // `#halt` here.
+    await this.#mirrorStatus(config, "running", null, null, now);
     await this.#mutateState((current) => ({
       ...current,
       status: "running",
       haltReason: null,
       haltedAt: null,
     }));
-    await this.#mirrorStatus(config, "running", null, null, now);
 
     // Step 27, and the same principle as the paragraph above applied one layer
     // out. Clearing `halt_reason` stopped the BOT ROW advertising a failure that
