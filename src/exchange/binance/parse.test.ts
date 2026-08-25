@@ -484,11 +484,14 @@ describe("parseOrderStatus", () => {
     // quietly stop Binance populating it. The default fixture has
     // `time === updateTime`, which cannot tell the two apart, so this moves one.
     //
-    // Binance is the venue whose behaviour must not change: it reports its
-    // transitions honestly, so reconciliation keeps computing a real age from
-    // this value and keeps its 60-second window. Whether that window should
-    // eventually be retired in favour of the venue-independent mechanism is a
-    // live design question and deliberately NOT decided here.
+    // WHY THE VALUE IS STILL PARSED TRUTHFULLY, now that nothing decides on it.
+    // The 60-second window this used to feed is gone, and reconciliation's
+    // halt/forgive outcome reads no venue clock on any exchange -- it confirms a
+    // terminated disagreement from one run to the next instead. So this is
+    // pinned as a RECORD, not as an input to a safety decision: `updatedAt` is
+    // written through to `orders.updated_at` and read by the dashboard, and a
+    // parser that quietly reported creation time here would make that column
+    // lie. A venue clock may inform records; it may not inform decisions.
     const status = parseOrderStatus(orderStatusBody({ updateTime: 1_500_000_000_000 }));
 
     expect(status.updatedAt).toBe(1_500_000_000_000);

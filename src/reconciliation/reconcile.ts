@@ -310,11 +310,27 @@ export async function reconcileAccount(
 const RECONCILIATION_SOURCE = "reconciliation";
 
 /**
- * How many recent `reconciliation.run` rows to scan for a previous unconfirmed
- * sighting. Generous against `unconfirmedWindowMs` (two five-minute turns), so
- * the time bound is what actually decides and this is only a query cap.
+ * A CEILING ON THE SCAN, NOT A BOUND ON IT. The bound is the `created_at`
+ * predicate in the query below; this only stops a pathological `audit_log` from
+ * being read into memory wholesale.
+ *
+ * THE NAME IS LOAD-BEARING. The previous one -- `RECENT_RUN_SCAN` -- read as
+ * "how far back we look", and that misreading is exactly what produced the
+ * defect this value was raised to close. `audit_log` has no account column, so
+ * the account filter is a POST-filter in JavaScript while `LIMIT` is applied in
+ * SQL across every account's rows. One cron tick writes ONE ROW PER ACCOUNT, so
+ * at the old value of 20 an eleventh account pushed this account's previous run
+ * out of the scan, `alreadySeen` was permanently false, and nothing ever
+ * escalated -- silently, because a minor finding raises no alert row by design.
+ *
+ * THE HEADROOM ARITHMETIC. Rows inside the window are
+ * `accounts x (unconfirmedWindowMs / cron interval)` = `accounts x (600s / 300s)`
+ * = `2 x accounts`. At 500 this supports 250 accounts, against the ~10 the old
+ * value did. `reconcile.test.ts` pins that relationship, so raising the account
+ * count past what this supports fails the suite rather than failing in
+ * production.
  */
-const RECENT_RUN_SCAN = 20;
+export const RECENT_RUN_SCAN_CAP = 500;
 
 /**
  * Raise a finding's alert ONCE per open incident.
@@ -526,15 +542,7 @@ async function reconcileOrders(
 
     if (remoteOpen !== null) {
       pending.push(
-        ...(await liveOrderFindings(
-          ports,
-          bot,
-          snapshot,
-          remoteOpen,
-          at,
-          thresholds,
-          seenUnconfirmed,
-        )),
+        ...(await liveOrderFindings(ports, bot, snapshot, remoteOpen, seenUnconfirmed)),
       );
     }
   }
@@ -725,12 +733,17 @@ function mirrorFindings(
  *
  * THE ASYMMETRY THIS EXISTS TO CLOSE. Two observers watch the same order at
  * different cadences: the owning bot polls it every THIRTY SECONDS, this job
- * looks every FIVE MINUTES. The terminated-order branch already forgives the gap
- * between them -- `timingWindowMs` calls a recent termination "a late fill, not
- * drift; the bot's own fill path will record it". The LIVE branch forgave
- * nothing, so a fill that landed between two poll passes was reported as
- * meaningful drift and halted the bot, for a disagreement the poll would have
- * cleared seconds later by its real fill id. That is what halted two real bots.
+ * looks every FIVE MINUTES. The LIVE branch originally forgave nothing, so a
+ * fill that landed between two poll passes was reported as meaningful drift and
+ * halted the bot, for a disagreement the poll would have cleared seconds later
+ * by its real fill id. That is what halted two real bots.
+ *
+ * The terminated-order branch forgave the same gap with a 60-second window
+ * measured against the venue's own `updatedAt`. That window is GONE: it could
+ * only work on a venue that reported a real transition time, it inverted into an
+ * immediate halt whenever a venue's clock ran fast, and it made the safety
+ * outcome depend on per-venue payload quality. Both branches now share THIS
+ * memory, so there is one mechanism and one bound for every exchange.
  *
  * WHY THE MEMORY LIVES IN `audit_log` AND NOT SOMEWHERE NEW. This job is
  * structurally BLIND to the other observer: `BotSnapshot` carries `config`,
@@ -754,13 +767,24 @@ async function unconfirmedDriftFromRecentRuns(
 ): Promise<ReadonlySet<string>> {
   const seen = new Set<string>();
   const rows = await db.auditLog.findMany({
-    where: { action: "reconciliation.run" },
+    // THE TIME BOUND IS HERE, IN SQL, and this is the only thing that bounds
+    // how far back the memory reaches. It used to be a `break` in the loop
+    // below, which could not work: `LIMIT` is applied AFTER `WHERE` and AFTER
+    // `ORDER BY`, so a tick writing one row per account exhausted the row
+    // budget on the current tick before the loop ever reached a prior one.
+    //
+    // It is also cheaper than what it replaces. There is no index on `action`
+    // (`migrations/0001_initial_schema.sql` indexes `created_at`,
+    // `target_bot_instance_id` and `actor`), so the old query walked
+    // `created_at` backwards filtering on `action` until it accumulated enough
+    // matches, unbounded in how far it could walk. This is a bounded index
+    // range.
+    where: { action: "reconciliation.run", created_at: { gte: at - windowMs } },
     orderBy: [{ column: "created_at", direction: "desc" }],
-    limit: RECENT_RUN_SCAN,
+    limit: RECENT_RUN_SCAN_CAP,
   });
 
   for (const row of rows) {
-    if (row.created_at < at - windowMs) break; // Ordered, so nothing older follows.
     const details = row.details_json as {
       account_label?: unknown;
       findings?: readonly { kind?: unknown; bot_instance_id?: unknown; client_order_id?: unknown }[];
@@ -782,8 +806,6 @@ async function liveOrderFindings(
   bot: BotInstanceRow,
   snapshot: BotSnapshot,
   remoteOpen: readonly OrderStatus[],
-  at: Timestamp,
-  thresholds: DriftThresholds,
   seenUnconfirmed: ReadonlySet<string>,
 ): Promise<PendingFinding[]> {
   const pending: PendingFinding[] = [];
@@ -853,83 +875,58 @@ async function liveOrderFindings(
 
     const status = outcome.value;
 
-    // THE BRANCH IS ON DATA PRESENCE, NOT ON WHICH VENUE SENT IT, and that is
-    // the whole design rather than a stylistic preference. `updatedAt` is
-    // optional on `OrderStatus` because Gemini's order-status payload carries no
-    // last-update time -- only the order's creation instant and a pair of state
-    // booleans. Testing `config.exchange === "gemini"` would put a safety
-    // decision on a string in the module that has twice refused to do exactly
-    // that (the halt-reason prose in step 58, the finding-match prose in step
-    // 61), and it would silently pick the wrong path the day a third venue is
-    // added. Asking the payload whether it brought a clock cannot go stale.
-    if (status.updatedAt !== undefined) {
-      // A REAL LAST-UPDATE TIME (Binance's `updateTime`). Unchanged, deliberately
-      // and completely: same age arithmetic, same window, same two outcomes. A
-      // venue that reports its transitions honestly keeps the tolerance that was
-      // built for it, and fixing the venue that does not must not cost it
-      // anything.
-      const age = at - status.updatedAt;
-      if (age >= 0 && age <= thresholds.timingWindowMs) {
-        // Section 9's own example of minor drift: "a fill recorded a few seconds
-        // late". The order resolved inside the window, so the object simply has
-        // not been told yet.
-        pending.push({
-          finding: {
-            kind: "order_recently_terminated",
-            scope: "bot",
-            botInstanceId: bot.id,
-            asset: null,
-            detail:
-              `${clientOrderId} left the book ${age}ms ago as ${status.state} with ` +
-              `${toDecimalString(status.filledQuantity)} filled, inside the ` +
-              `${thresholds.timingWindowMs}ms timing window. Treated as a late fill, not ` +
-              `drift; the bot's own fill path will record it.`,
-            // No magnitude: a fill recorded late is usually the WHOLE order, and
-            // section 9 names exactly that as minor.
-          },
-        });
-        continue;
-      }
-
-      pending.push(...driftAgainst(bot, local, status, `it is no longer on the book`));
-      continue;
-    }
-
-    // NO LAST-UPDATE TIME FROM THE VENUE (Gemini). "How long ago did this
-    // terminate" is not answerable from this payload, and BOTH ways of answering
-    // it anyway were evaluated and rejected, because they fail in opposite
+    // VENUE CLOCKS MAY INFORM RECORDS, NEVER DECISIONS. Whether this bot halts
+    // over a terminated order does not read `updatedAt` on any venue -- there is
+    // no branch on whether the payload brought a clock, and no age arithmetic
+    // anywhere in this function. `liveOrderFindings` takes no `at` and no
+    // `thresholds` precisely so that this is enforced by the compiler rather
+    // than by convention: reintroducing a timestamp comparison here means first
+    // re-plumbing a clock into the signature, which is a visible, reviewable act
+    // instead of a one-line slip.
+    //
+    // WHY "HOW LONG AGO DID THIS TERMINATE" IS NOT ASKED AT ALL. Both ways of
+    // answering it were evaluated and rejected, because they fail in opposite
     // directions and each is worse than the other's failure:
     //
-    //  - order-CREATION time (what Gemini's parser used to fabricate): `age` is
-    //    the order's whole life, so the window NEVER applies to anything older
-    //    than a minute and the tolerance is dead on the venue;
+    //  - order-CREATION time (what Gemini's parser used to fabricate, and what
+    //    Binance's parser still falls back to): `age` is the order's whole life,
+    //    so the window NEVER applies to anything older than a minute and the
+    //    tolerance is dead on the venue;
     //  - RECEIPT time: `age` is always ~0, so the window ALWAYS applies, which
-    //    would silence real, persistent drift on every terminated order on the
-    //    venue, unconditionally. Strictly worse than the bug it would fix.
+    //    would silence real, persistent drift on every terminated order,
+    //    unconditionally. Strictly worse than the bug it would fix, because the
+    //    bug is loud and this is silent.
     //
-    // So this reaches for the mechanism that needs no clock at all: THE SAME
-    // run-to-run memory the live branch above uses, called the same way, reading
-    // the same `seenUnconfirmed` set built by the same query. A first sighting is
+    // Neither works because both answer the question with a timestamp that does
+    // not encode it. So the question is abandoned rather than re-answered, and
+    // this uses the mechanism that needs no clock at all: THE SAME run-to-run
+    // memory the live branch above uses, called the same way, reading the same
+    // `seenUnconfirmed` set built by the same query. A first sighting is
     // `order_drift_unconfirmed` -- minor, no alert row, no halt, but written to
     // this run's findings list, which is what makes it remembered. A sighting
     // this account's runs have already seen inside `unconfirmedWindowMs`
     // escalates to `order_state_drift` and halts, unconditionally: no severity
     // check, no poll-health check, no retry budget.
     //
-    // That is what makes this safe in both directions at once. It cannot become
-    // "never applies", because a first sighting has no prior audit row by
-    // construction and `order_drift_unconfirmed` has its ceiling PINNED at minor.
-    // It cannot become "always applies", because the second sighting escalates
-    // with nothing gating it -- so the worst case for a genuine persistent drift
-    // on a clockless venue is that it halts one five-minute cycle later than it
-    // would on Binance, never that it is forgiven twice.
+    // BOTH FAILURE MODES STAY CLOSED, now for every venue rather than one. It
+    // cannot become "never applies", because a first sighting has no prior audit
+    // row by construction and `order_drift_unconfirmed` has its ceiling PINNED
+    // at minor, so magnitude cannot promote it. It cannot become "always
+    // applies", because the second sighting escalates with nothing gating it.
+    // (The third road into "never applies" was through the MEMORY rather than
+    // the clock -- a row-limited scan that could not see a prior sighting once
+    // enough accounts ticked between two runs. See `RECENT_RUN_SCAN_CAP`.)
     //
-    // A NOTE ON WHAT IS NO LONGER EMITTED HERE: a clockless venue can no longer
-    // produce `order_recently_terminated`, since deciding that an order left the
-    // book RECENTLY is precisely the judgement it cannot make. Nothing is lost
-    // behaviourally -- that kind is minor, raises no alert row and halts nothing,
-    // and the case where local and remote AGREE still produces no finding at all,
-    // because `driftAgainst` returns empty on a match.
+    // WHAT THIS COSTS, stated rather than elided: a genuine persistent drift now
+    // halts AT MOST ONE ~5-MINUTE CYCLE LATER than the timestamp path did on a
+    // venue that reported one -- never indefinitely, and never twice forgiven.
+    // That is the identical trade step 61 made deliberately for the live branch,
+    // on the evidence of two real bots halted for a disagreement their own 30s
+    // poll was about to resolve.
+    //
+    // And an order that terminated and AGREES still produces no finding at all,
+    // because `driftAgainst` returns empty on a match. The tolerance is about
+    // disagreements only.
     const alreadySeenTerminated = seenUnconfirmed.has(`${bot.id}::${clientOrderId}`);
     pending.push(
       ...driftAgainst(
@@ -939,8 +936,8 @@ async function liveOrderFindings(
         alreadySeenTerminated
           ? `it is no longer on the book, and still disagreeing on a later run, so the ` +
             `bot's own 30s poll has not resolved it`
-          : `it is no longer on the book, and this venue reports no last-update time, so ` +
-            `whether it terminated recently is decided by whether a later run still finds it`,
+          : `it is no longer on the book, and this is the first run to see it, so whether ` +
+            `it terminated recently is decided by whether a later run still finds it`,
         alreadySeenTerminated ? "order_state_drift" : "order_drift_unconfirmed",
       ),
     );

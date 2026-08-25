@@ -78,9 +78,8 @@ describe("tier floors", () => {
     expect(classified.escalated).toBe(false);
   });
 
-  it("puts the mirror and the timing window at minor", () => {
+  it("puts the mirror at minor", () => {
     expect(TIER_FLOOR.mirror_drift).toBe("minor");
-    expect(TIER_FLOOR.order_recently_terminated).toBe("minor");
   });
 
   it("puts a balance residual at minor, letting the numbers decide the tier", () => {
@@ -224,7 +223,6 @@ describe("magnitude escalates but never downgrades", () => {
     // on `Magnitude.reference` for why.
     expect(classifyFinding(finding({ kind: "cancel_fill_discrepancy" })).tier).toBe("meaningful");
     expect(classifyFinding(finding({ kind: "mirror_drift" })).tier).toBe("minor");
-    expect(classifyFinding(finding({ kind: "order_recently_terminated" })).tier).toBe("minor");
     expect(classifyFinding(finding({ kind: "order_state_drift" })).tier).toBe("meaningful");
   });
 

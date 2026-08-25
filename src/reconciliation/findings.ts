@@ -59,8 +59,6 @@ import { abs, ONE, ZERO, type Money } from "../shared/money";
 export type FindingKind =
   /** D1's mirror disagrees with the Durable Object's own state. */
   | "mirror_drift"
-  /** An order left the book inside the timing window: section 9's "fill recorded late". */
-  | "order_recently_terminated"
   /** The exchange and the bot disagree about an order's state or filled quantity. */
   | "order_state_drift"
   /**
@@ -116,11 +114,6 @@ export const TIER_FLOOR: Readonly<Record<FindingKind, DriftClassification>> = {
   // in that gap produces exactly this and nothing is actually wrong on the
   // exchange. Auto-correcting it is the whole point.
   mirror_drift: "minor",
-
-  // Section 9's own example of minor: "a fill recorded a few seconds late".
-  // Detection decides whether an order qualifies, using `timingWindowMs`; by
-  // the time a finding carries this kind, that judgement is already made.
-  order_recently_terminated: "minor",
 
   // Section 9's own definition of meaningful: "a specific bot's believed
   // position doesn't match reality".
@@ -234,9 +227,6 @@ export const TIER_CEILING: Readonly<Record<FindingKind, DriftClassification>> = 
   // Both stores are this system's own. However wrong the mirror is, the
   // exchange is not involved and nothing is at risk there.
   mirror_drift: "meaningful",
-  // A large unrecorded fill inside the timing window is worth promoting out of
-  // "noise", but it is still one order on one bot.
-  order_recently_terminated: "meaningful",
   // Section 9's own words, honoured literally.
   order_state_drift: "meaningful",
   // PINNED AT MINOR, deliberately, and it is the only kind whose ceiling equals
@@ -350,7 +340,7 @@ export interface ClassifiedFinding extends Finding {
 }
 
 /**
- * Per-account tuning for the two magnitude thresholds and the timing window.
+ * Per-account tuning for the two magnitude thresholds and the run-to-run window.
  *
  * Percentages are scale-8 Money holding the percentage itself, not a rate --
  * the same convention as `bot_instances.stop_loss_pct`, where 2.5% is
@@ -362,17 +352,11 @@ export interface DriftThresholds {
   /** At or above this fraction, ANY finding becomes severe. */
   readonly severePct: Money;
   /**
-   * How recently an order may have left the book for its disappearance to be
-   * section 9's "fill recorded a few seconds late" rather than real drift.
-   *
-   * Read by detection in `reconcile.ts`, not by `classifyFinding` -- but it
-   * belongs beside the other two, because all three are the same decision
-   * (how much divergence is noise) expressed in different units.
-   */
-  readonly timingWindowMs: number;
-  /**
-   * How far back to look for a previous unconfirmed sighting of the same live
-   * order before escalating it to real drift.
+   * How far back to look for a previous unconfirmed sighting of the same order
+   * before escalating it to real drift. Applies to orders still on the book and
+   * to orders that have left it alike -- since the terminated branch stopped
+   * consulting venue clocks, this is the ONLY time bound in the mechanism, and
+   * `reconcile.ts` puts it into the run-history query's WHERE clause.
    *
    * The third member of the same family as the two above -- how much divergence
    * is noise -- expressed in runs rather than in units or in an instant. Read by
@@ -394,15 +378,10 @@ export interface DriftThresholds {
  * this is deliberately not hair-trigger -- but note that the events section 9
  * actually names as severe (unexpected orders) reach that tier by KIND and do
  * not depend on this number at all.
- *
- * `timingWindowMs` at 60s: a comfortable multiple of the round trip to the
- * exchange plus one reconciliation pipeline, and well inside the 5-minute cron
- * interval, so a genuinely stuck order cannot hide inside the window.
  */
 export const DEFAULT_DRIFT_THRESHOLDS: DriftThresholds = {
   meaningfulPct: ONE / 10n, // 0.1
   severePct: 2n * ONE, // 2.0
-  timingWindowMs: 60_000,
   // 600s: two turns of the five-minute cron, so a run that could not read the
   // venue (section 5.6 skips it entirely, and no finding is recorded for an
   // order it never saw) does not silently reset the escalation to a first

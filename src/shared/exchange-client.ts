@@ -311,18 +311,22 @@ export interface OrderStatus {
    *
    * THE BUG THAT MADE THIS OPTIONAL. Until it was, Gemini's parser satisfied the
    * type by setting `updatedAt = createdAt`, and reconciliation's terminated-order
-   * tolerance -- which forgives an order that left the book within
-   * `timingWindowMs` -- computed `at - updatedAt` against it. On Gemini that
-   * measured the order's TOTAL AGE, so no Gemini order older than sixty seconds
-   * could ever qualify and the tolerance was silently inoperative on the venue.
+   * tolerance -- a 60-second window it no longer has -- computed `at - updatedAt`
+   * against it. On Gemini that measured the order's TOTAL AGE, so no Gemini order
+   * older than sixty seconds could ever qualify and the tolerance was silently
+   * inoperative on the venue.
    *
-   * A CONSUMER MEASURING RECENCY MUST HANDLE ITS ABSENCE, and must not
-   * substitute another timestamp for it. Both available substitutes were
-   * evaluated and rejected: creation time makes the window dead (the bug above),
-   * and receipt time makes it universal, silencing real drift on every
-   * terminated order. `liveOrderFindings` in `reconciliation/reconcile.ts` is the
-   * worked example -- it falls back to a mechanism that reads no venue clock at
-   * all rather than inventing one.
+   * NO SAFETY DECISION READS THIS FIELD ON ANY VENUE. Reconciliation no longer
+   * asks "how long ago did this terminate" at all: both available substitutes
+   * were evaluated and rejected -- creation time makes a window dead (the bug
+   * above), receipt time makes it universal, silencing real drift on every
+   * terminated order -- so the question was abandoned rather than re-answered.
+   * `liveOrderFindings` in `reconciliation/reconcile.ts` decides entirely on a
+   * run-to-run memory that reads no venue clock, for every exchange alike.
+   *
+   * The field is still parsed truthfully where a venue reports it, because it is
+   * RECORDED: it is written to `orders.updated_at` and read by the dashboard. A
+   * venue clock may inform records; it may not inform decisions.
    */
   updatedAt?: Timestamp;
 }

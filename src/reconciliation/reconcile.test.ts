@@ -21,6 +21,7 @@ import { readCircuitBreaker } from "./circuit-breaker";
 import { DEFAULT_DRIFT_THRESHOLDS } from "./findings";
 import {
   EMPTY_BALANCE_SET_ALERT,
+  RECENT_RUN_SCAN_CAP,
   reconcileAccount,
   type ReconciliationPorts,
 } from "./reconcile";
@@ -32,6 +33,7 @@ import type { Database } from "../db/database";
 import type { AlertRow } from "../db/schema";
 import {
   alertRow,
+  auditLogRow,
   botInstanceRow,
   capitalLedgerRow,
   freshDatabase,
@@ -329,13 +331,18 @@ describe("minor drift", () => {
     expect(details).toContain(result.runId);
   });
 
-  it("treats an order that left the book inside the timing window as a late fill", async () => {
+  it("a terminated order is unconfirmed on its first sighting, whatever the venue's clock says", async () => {
     await seedBot("dca-btc-1");
     await seedLedger("400");
     await seedBaseline("USDT", "5000");
     exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
 
-    // Placed, then filled 5 seconds ago -- well inside the 60s window.
+    // Placed, then filled 5 seconds ago. That five-second age was the single
+    // strongest case the retired 60s window had, and it no longer buys anything:
+    // the first sighting is unconfirmed because it is FIRST, not because of what
+    // the clock says. The tier and the halt outcome are unchanged from when the
+    // window decided them, which is worth keeping visible -- forgiveness on a
+    // first sighting is not what this change takes away.
     await exchange.placeOrder({
       pair: TEST_PAIR,
       clientOrderId: "v1-dca-btc-1-0",
@@ -366,13 +373,18 @@ describe("minor drift", () => {
 
     const result = await reconcileAccount(ports(), ACCOUNT);
 
-    const finding = result.findings.find((entry) => entry.kind === "order_recently_terminated");
+    const finding = result.findings.find((entry) => entry.kind === "order_drift_unconfirmed");
     expect(finding).toBeDefined();
     expect(finding!.tier).toBe("minor");
     expect(result.haltedBotIds).toEqual([]);
+    // The retired kind, asserted absent as a raw string: it is gone from
+    // `FindingKind` entirely, so this pins that nothing revives the vocabulary.
+    expect(result.findings.some((entry) => (entry.kind as string) === "order_recently_terminated")).toBe(
+      false,
+    );
   });
 
-  it("does NOT treat the same order as minor once it is outside the window", async () => {
+  it("a terminated order still halts, one run later", async () => {
     await seedBot("dca-btc-1");
     await seedLedger("400");
     await seedBaseline("USDT", "5000");
@@ -387,7 +399,8 @@ describe("minor drift", () => {
       quantity: m("0.01"),
     });
     exchange.fillFor("v1-dca-btc-1-0");
-    // Ten minutes ago: the bot should have recorded it long since.
+    // Ten minutes ago: the bot should have recorded it long since, and the
+    // retired window would have condemned it outright on the first run.
     exchange.now = T0 - 600_000;
 
     const order = trackedOrder();
@@ -407,11 +420,21 @@ describe("minor drift", () => {
       }),
     );
 
-    const result = await reconcileAccount(ports(), ACCOUNT);
+    // A GENUINE BEHAVIOUR CHANGE, not a rename: a first sighting no longer
+    // halts. What this test always cared about -- that an old termination is
+    // not forgiven indefinitely -- survives intact; only WHEN it is enforced
+    // moves by one run.
+    const first = await reconcileAccount(ports(), ACCOUNT);
 
-    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
-    expect(result.tier).toBe("meaningful");
-    expect(result.haltedBotIds).toEqual(["dca-btc-1"]);
+    expect(first.findings.some((entry) => entry.kind === "order_drift_unconfirmed")).toBe(true);
+    expect(first.tier).toBe("minor");
+    expect(first.haltedBotIds).toEqual([]);
+
+    const second = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(second.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
+    expect(second.tier).toBe("meaningful");
+    expect(second.haltedBotIds).toEqual(["dca-btc-1"]);
   });
 });
 
@@ -1495,28 +1518,49 @@ describe("a live order's disagreement is not drift on first sight", () => {
     expect(result.haltedBotIds).toEqual([]);
   });
 
-  it("leaves the TERMINATED-order branch exactly as it was", async () => {
-    // The 60s `timingWindowMs` and its `order_recently_terminated` finding are
-    // deliberately untouched by this step. `driftAgainst` is shared by both
-    // branches, so this asserts the shared function still reports the
-    // terminated case as real drift rather than inheriting the new tolerance.
+  it("the terminated branch and the live branch now share one mechanism", async () => {
+    // Step 61 wrote this as `leaves the TERMINATED-order branch exactly as it
+    // was`, guarding against the terminated case silently inheriting the live
+    // case's new tolerance. Its premise -- that the two branches deliberately
+    // differ -- is exactly what this change reverses, so the assertion becomes
+    // SAMENESS rather than difference, and there is no window to step over.
+    //
+    // What step 61 actually cared about survives and is strictly stronger:
+    // `driftAgainst` is shared by both paths, and neither path is quietly
+    // running on a different tolerance from the other.
     await exchange.cancelOrder(TEST_PAIR, "v1-dca-btc-1-0");
-    clock += DEFAULT_DRIFT_THRESHOLDS.timingWindowMs + 1;
     driftingLiveOrder();
 
-    const result = await reconcileAccount(ports(), ACCOUNT);
+    // A TERMINATED disagreement: gone from the book entirely.
+    const firstTerminated = await reconcileAccount(ports(), ACCOUNT);
+    expect(firstTerminated.findings.some((e) => e.kind === "order_drift_unconfirmed")).toBe(true);
+    expect(firstTerminated.haltedBotIds).toEqual([]);
 
-    // Gone from the book, outside the window: real drift on the FIRST run.
-    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
-    expect(result.haltedBotIds).toEqual(["dca-btc-1"]);
+    const secondTerminated = await reconcileAccount(ports(), ACCOUNT);
+    expect(secondTerminated.findings.some((e) => e.kind === "order_state_drift")).toBe(true);
+    expect(secondTerminated.haltedBotIds).toEqual(["dca-btc-1"]);
+  });
+
+  it("a LIVE disagreement produces the same two kinds, in the same order", async () => {
+    // The other half of the pair above, on an order still ON the book. Same
+    // kind on the first sighting, same kind on the second: one mechanism.
+    driftingLiveOrder();
+
+    const first = await reconcileAccount(ports(), ACCOUNT);
+    expect(first.findings.some((e) => e.kind === "order_drift_unconfirmed")).toBe(true);
+    expect(first.haltedBotIds).toEqual([]);
+
+    const second = await reconcileAccount(ports(), ACCOUNT);
+    expect(second.findings.some((e) => e.kind === "order_state_drift")).toBe(true);
+    expect(second.haltedBotIds).toEqual(["dca-btc-1"]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// The terminated-order tolerance on a venue with no last-update time (Gemini)
+// The terminated-order tolerance, on every venue alike
 // ---------------------------------------------------------------------------
 
-describe("a terminated order on a venue that reports no last-update time", () => {
+describe("a terminated order that the owning bot has not recorded", () => {
   beforeEach(async () => {
     await seedBot("dca-btc-1");
     await seedLedger("400");
@@ -1556,33 +1600,39 @@ describe("a terminated order on a venue that reports no last-update time", () =>
     );
   }
 
-  it("PINS THE BUG: a fabricated updatedAt halts on the first sighting, with no forgiveness", async () => {
-    // THE ORIGINAL GEMINI DEFECT, reproduced through the fake rather than
-    // described. Gemini's parser used to set `updatedAt = createdAt`, so this is
-    // that payload exactly: a venue that DOES report a last-update time, whose
-    // reported value IS the order's creation instant, ten minutes old.
+  it("THE BUG CLASS IS DEAD: a fabricated updatedAt is now harmless", async () => {
+    // THE ORIGINAL GEMINI PAYLOAD, FED IN UNCHANGED. Byte for byte the setup
+    // that entry 68 wrote to pin the mechanism being replaced: a venue that DOES
+    // report a last-update time, whose reported value IS the order's creation
+    // instant, ten minutes old.
     //
-    // `age` is then the order's whole life rather than time since it terminated,
-    // it clears the 60s window every time, and the tolerance the window exists to
-    // provide never applies to any Gemini order older than a minute. The bot
-    // halts on the FIRST sighting of a disagreement its own 30-second poll was
-    // about to resolve -- which is the false-alarm halt step 61 fixed for live
-    // orders and could not fix here.
-    //
-    // This test does not fail after the fix, and is not meant to: it pins the
-    // MECHANISM, so that the characterisation survives as evidence of what the
-    // fabricated timestamp did. The test below is the same scenario on a venue
-    // reporting the truth, and that is where the behaviour changes.
+    // That payload used to halt a bot on the FIRST sighting of a disagreement
+    // its own 30-second poll was about to resolve, because `age` was the order's
+    // whole life and cleared the 60s window every time. Nothing about the
+    // payload has changed. The outcome is now correct anyway, because no clock
+    // is consulted at all -- which is the property that makes a NEW exchange
+    // safe on the day it is added, asserted against the exact payload that
+    // proved it was not.
     exchange.reportsUpdateTime = true;
     exchange.now = T0 - 600_000; // updatedAt === createdAt === ten minutes ago.
     driftingTerminatedOrder();
 
-    const result = await reconcileAccount(ports(), ACCOUNT);
+    const first = await reconcileAccount(ports(), ACCOUNT);
 
-    expect(result.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
-    expect(result.findings.some((entry) => entry.kind === "order_recently_terminated")).toBe(false);
-    expect(result.tier).toBe("meaningful");
-    expect(result.haltedBotIds).toEqual(["dca-btc-1"]);
+    const finding = first.findings.find((entry) => entry.kind === "order_drift_unconfirmed");
+    expect(finding).toBeDefined();
+    expect(finding!.tier).toBe("minor");
+    expect(first.findings.some((entry) => entry.kind === "order_state_drift")).toBe(false);
+    expect(first.haltedBotIds).toEqual([]);
+    expect(halted).toEqual([]);
+    expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("running");
+
+    // And it still escalates, so "harmless" is not "ignored".
+    const second = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(second.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
+    expect(second.tier).toBe("meaningful");
+    expect(second.haltedBotIds).toEqual(["dca-btc-1"]);
     expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("halted");
   });
 
@@ -1686,37 +1736,239 @@ describe("a terminated order on a venue that reports no last-update time", () =>
     expect(finding!.detail).toMatch(/Delta 0\.01000000 of 0\.01000000/);
   });
 
-  it("BINANCE IS UNAFFECTED: a real updateTime keeps both halves of its window", async () => {
-    // The regression guard the design session named as test 4, asserting BOTH
-    // halves in one body so a future edit cannot satisfy half of it. A venue that
-    // reports its transitions honestly must keep exactly the tolerance it had --
-    // fixing the venue that does not report them must cost it nothing.
+  it("BINANCE IS NOW LIKE EVERY VENUE: a real updateTime changes nothing, in either direction", async () => {
+    // Entry 68 built the original of this test precisely so this change could
+    // not be made silently, asserting BOTH halves of the retired window in one
+    // body. It has done its job, so it is rewritten rather than deleted -- and
+    // both halves stay in one body for the same reason they always did: a future
+    // edit must not be able to satisfy half of it. The property being asserted --
+    // that the outcome does not depend on the timestamp -- is a statement about
+    // the PAIR, not about either half alone.
+    //
+    // ⚠ THE ORDER OF THE TWO HALVES IS LOAD-BEARING AND IS INVERTED FROM THE
+    // ORIGINAL. The old halves were independent, because the window decided each
+    // run from scratch. Under run-to-run they are NOT: run one writes an
+    // `order_drift_unconfirmed` row that run two reads back as a second sighting.
+    // Running the old-timestamp case FIRST, on fresh memory, is what makes both
+    // assertions genuinely flip. Had the young case run first it would have
+    // written the memory, and the old case would then halt because it was the
+    // SECOND SIGHTING rather than because of anything a timestamp did -- passing
+    // while asserting nothing about this change.
+    //
+    // `reportsUpdateTime` is deliberately TRUE throughout: the venue really does
+    // report a transition time, and the point is that it now makes no difference.
     exchange.reportsUpdateTime = true;
 
-    // HALF ONE -- inside the 60s window: minor, forgiven, on the FIRST run, and
-    // NOT routed through the clockless fallback.
-    exchange.now = T0 - 5_000;
+    // HALF ONE -- an OLD, real `updateTime`, far outside the retired 60s window.
+    // THIS ASSERTION FLIPS: it used to halt on the first run.
+    exchange.now = T0 - 600_000; // ten minutes: the old window would condemn it
     driftingTerminatedOrder();
 
-    const inside = await reconcileAccount(ports(), ACCOUNT);
+    const first = await reconcileAccount(ports(), ACCOUNT);
 
-    const forgiven = inside.findings.find((entry) => entry.kind === "order_recently_terminated");
-    expect(forgiven).toBeDefined();
-    expect(forgiven!.tier).toBe("minor");
-    expect(inside.findings.some((entry) => entry.kind === "order_drift_unconfirmed")).toBe(false);
-    expect(inside.haltedBotIds).toEqual([]);
+    const unconfirmed = first.findings.find((entry) => entry.kind === "order_drift_unconfirmed");
+    expect(unconfirmed).toBeDefined();
+    expect(unconfirmed!.tier).toBe("minor");
+    expect(first.findings.some((entry) => entry.kind === "order_state_drift")).toBe(false);
+    expect(first.haltedBotIds).toEqual([]);
+    expect(halted).toEqual([]);
     expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("running");
+    expect(await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" })).toHaveLength(
+      0,
+    );
 
-    // HALF TWO -- outside the window: real drift, halting, on the FIRST run. No
-    // first-sighting grace is inherited from the fallback path.
-    exchange.now = T0 - (DEFAULT_DRIFT_THRESHOLDS.timingWindowMs + 1);
+    // Remembered STRUCTURALLY, on the field rather than in the prose -- this is
+    // what half two matches on.
+    const [run] = await db.auditLog.findMany({ where: { action: "reconciliation.run" } });
+    const details = run!.details_json as unknown as {
+      findings: { kind: string; client_order_id: string | null }[];
+    };
+    expect(
+      details.findings.some(
+        (entry) =>
+          entry.kind === "order_drift_unconfirmed" && entry.client_order_id === "v1-dca-btc-1-0",
+      ),
+    ).toBe(true);
 
-    const outside = await reconcileAccount(ports(), ACCOUNT);
+    // HALF TWO -- a YOUNG, real `updateTime`, well inside the retired 60s
+    // window. THIS ASSERTION ALSO FLIPS: it used to be forgiven as
+    // `order_recently_terminated`, indefinitely. A fresh five-second-old
+    // termination on a venue reporting a real transition time is the single
+    // strongest case the old window had; it must now produce a halt. If it does
+    // not, the timestamp is still being consulted somewhere.
+    exchange.now = T0 - 5_000; // five seconds: the old window would forgive it
 
-    expect(outside.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
-    expect(outside.findings.some((entry) => entry.kind === "order_drift_unconfirmed")).toBe(false);
-    expect(outside.tier).toBe("meaningful");
-    expect(outside.haltedBotIds).toEqual(["dca-btc-1"]);
+    const second = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(second.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
+    expect(second.tier).toBe("meaningful");
+    expect(second.haltedBotIds).toEqual(["dca-btc-1"]);
+    expect((await db.botInstances.findOne({ id: "dca-btc-1" }))!.status).toBe("halted");
+    const raised = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.message).toMatch(/still disagreeing on a later run/);
+
+    // THE ASSERTION THAT TIES BOTH HALVES TO THE ACTUAL CHANGE. The retired kind
+    // is gone from `FindingKind` entirely, so this compares raw strings.
+    expect(first.findings.some((e) => (e.kind as string) === "order_recently_terminated")).toBe(
+      false,
+    );
+    expect(second.findings.some((e) => (e.kind as string) === "order_recently_terminated")).toBe(
+      false,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The run-history scan's bound (the prerequisite: time predicate + row cap)
+// ---------------------------------------------------------------------------
+
+describe("the run-history scan that the escalation remembers through", () => {
+  beforeEach(async () => {
+    await seedBot("dca-btc-1");
+    await seedLedger("400");
+    await seedBaseline("USDT", "5000");
+    exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
+    await exchange.placeOrder({
+      pair: TEST_PAIR,
+      clientOrderId: "v1-dca-btc-1-0",
+      side: "buy",
+      type: "limit",
+      price: m("65000"),
+      quantity: m("0.01"),
+    });
+    // Filled in full on the exchange, so it has LEFT the book: the terminated
+    // branch, which is the path that depends entirely on this memory.
+    exchange.fillFor("v1-dca-btc-1-0");
+    await db.orders.insert(
+      orderRow({
+        id: "v1-dca-btc-1-0",
+        bot_instance_id: "dca-btc-1",
+        client_order_id: "v1-dca-btc-1-0",
+        price: m("65000"),
+        quantity: m("0.01"),
+        filled_quantity: ZERO,
+        status: "pending",
+      }),
+    );
+  });
+
+  /** The bot still believes nothing filled, on an order that has left the book. */
+  function driftingTerminatedOrder(): void {
+    const order = trackedOrder();
+    snapshots.set(
+      "dca-btc-1",
+      snapshotFor("dca-btc-1", [order], { openOrderIds: [order.clientOrderId] }),
+    );
+  }
+
+  /**
+   * Other accounts' `reconciliation.run` rows, as one cron tick really writes
+   * them: `workers/reconciliation.ts` loops over accounts and each pass writes
+   * its own row, so an 11+ account deployment puts this many rows between two
+   * of THIS account's runs.
+   *
+   * Synthesised rather than driven through real `reconcileAccount` calls: the
+   * scan reads only `action`, `created_at` and `details_json`, so this tests the
+   * bound and not everything else a run does.
+   */
+  async function fillerRuns(count: number, from: number): Promise<void> {
+    for (let i = 0; i < count; i += 1) {
+      await db.auditLog.insert(
+        auditLogRow({
+          id: `al-filler-${i}`,
+          actor: "reconciliation",
+          action: "reconciliation.run",
+          details_json: {
+            run_id: `run-filler-${i}`,
+            account_label: `other-${i + 1}`,
+            tier: "none",
+            findings: [],
+          },
+          created_at: from + i + 1,
+        }),
+      );
+    }
+  }
+
+  it("PINS THE PREREQUISITE: escalation survives other accounts filling the row budget", async () => {
+    // THE DEFECT, REPRODUCED. `audit_log` has no account column, so the account
+    // filter is a POST-filter in JavaScript while `LIMIT` is applied in SQL
+    // across every account's rows. One cron tick writes one row per account, so
+    // reaching this account's previous run means traversing every other
+    // account's newer rows first. Past the cap the prior sighting is invisible,
+    // `alreadySeen` is permanently false, and NOTHING EVER ESCALATES -- with no
+    // alert, because a minor finding raises no row by design.
+    //
+    // That is entry 68's rejected "always applies / never halts" mode, reached
+    // by scale rather than by logic. Under universal run-to-run every venue
+    // rides this memory, which is why it is fixed in the same change.
+    exchange.reportsUpdateTime = false;
+    exchange.now = T0 - 600_000;
+    driftingTerminatedOrder();
+
+    // The genuine first sighting, which writes this account's real row.
+    const first = await reconcileAccount(ports(), ACCOUNT);
+    expect(first.findings.some((entry) => entry.kind === "order_drift_unconfirmed")).toBe(true);
+    expect(first.haltedBotIds).toEqual([]);
+
+    // Thirty other accounts tick after it, all inside the window. Comfortably
+    // past the old cap of 20, and a realistic 11+ account deployment.
+    await fillerRuns(30, clock);
+
+    clock += 300_000; // one cron interval
+    const second = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(second.findings.some((entry) => entry.kind === "order_state_drift")).toBe(true);
+    expect(second.tier).toBe("meaningful");
+    expect(second.haltedBotIds).toEqual(["dca-btc-1"]);
+    const raised = await alerts({ alert_type: "reconciliation_meaningful_order_state_drift" });
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.message).toMatch(/still disagreeing on a later run/);
+  });
+
+  it("the scan cap does not bind at the documented supported account count", () => {
+    // PINS THE HEADROOM ARITHMETIC IN A TEST, not only in the constant's
+    // comment, so raising the supported account count past what the cap allows
+    // fails here rather than failing silently in production -- which is the
+    // shape the original defect had.
+    //
+    // The cron interval is `*/5 * * * *` in `wrangler.jsonc` (the two `crons`
+    // blocks, at the Worker and its staging environment). It is not a
+    // TypeScript constant today, so it is carried here as a named local rather
+    // than inventing a shared constant for this one assertion.
+    const CRON_INTERVAL_MS = 300_000;
+    const SUPPORTED_ACCOUNTS = 250;
+
+    // One `reconciliation.run` row per account per tick, and the window spans
+    // this many ticks. Lowering the cap or raising `unconfirmedWindowMs` means
+    // raising the cap to match.
+    const ticksInWindow = DEFAULT_DRIFT_THRESHOLDS.unconfirmedWindowMs / CRON_INTERVAL_MS;
+    expect(SUPPORTED_ACCOUNTS * ticksInWindow).toBeLessThanOrEqual(RECENT_RUN_SCAN_CAP);
+
+    // And that the cap is genuinely above the count the old value supported --
+    // the regression that started this.
+    expect(RECENT_RUN_SCAN_CAP).toBeGreaterThan(20);
+  });
+
+  it("the time bound still has an upper edge, at high row counts", async () => {
+    // The opposite direction, and what proves the SQL predicate carries the
+    // semantics the deleted JS `break` carried rather than the bound simply
+    // being gone: an ancient sighting must not escalate a fresh disagreement,
+    // however many rows sit inside the window.
+    exchange.reportsUpdateTime = false;
+    exchange.now = T0 - 600_000;
+    driftingTerminatedOrder();
+
+    await reconcileAccount(ports(), ACCOUNT);
+    await fillerRuns(30, clock);
+
+    clock += DEFAULT_DRIFT_THRESHOLDS.unconfirmedWindowMs + 1;
+    const second = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(second.findings.some((entry) => entry.kind === "order_drift_unconfirmed")).toBe(true);
+    expect(second.findings.some((entry) => entry.kind === "order_state_drift")).toBe(false);
+    expect(second.haltedBotIds).toEqual([]);
   });
 });
 

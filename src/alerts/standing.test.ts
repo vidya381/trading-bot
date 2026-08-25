@@ -332,15 +332,19 @@ describe("reconciliation's cron and the bot's poll share ONE lifecycle", () => {
       checked_at: T0 - 300_000,
     });
 
-    // Past reconciliation's 60-second timing window, so the order that left the
-    // book is real drift rather than section 9's "a fill recorded a few seconds
-    // late" -- which is minor, auto-corrected, and deliberately raises no row.
+    // Well clear of the order's own timestamps. Reconciliation no longer reads a
+    // venue clock at all: a terminated disagreement is `order_drift_unconfirmed`
+    // (minor, no alert row) on its FIRST sighting and escalates to real drift
+    // only when a later run still finds it. So the passes below that need the
+    // incident RAISED run reconciliation twice, and both runs sit inside
+    // `unconfirmedWindowMs` so the second confirms the first.
     clock += 600_000;
   });
 
   it("both writers really do raise, against the same bot", async () => {
     // Without this the assertions below could pass vacuously.
-    await reconciliationPass();
+    await reconciliationPass(); // first sighting: unconfirmed, no row
+    await reconciliationPass(); // still disagreeing: escalates and raises
     await pollPass();
 
     const drift = await openRows(DRIFT);
@@ -381,7 +385,8 @@ describe("reconciliation's cron and the bot's poll share ONE lifecycle", () => {
     // name this bot. A writer that could close another's row would be closing
     // an incident it never observed -- and the poll cannot see what
     // reconciliation compares (D1's mirror, the ledger, the account balance).
-    await reconciliationPass();
+    await reconciliationPass(); // first sighting: unconfirmed, no row
+    await reconciliationPass(); // still disagreeing: escalates and raises
     await pollPass();
 
     // The poll's own condition clears; reconciliation's does not.
@@ -399,6 +404,9 @@ describe("reconciliation's cron and the bot's poll share ONE lifecycle", () => {
     // closes one row and leaves the other, and the only thing distinguishing
     // them is ownership.
     await pollPass();
+    // The first sighting, so the pass below has something to confirm against and
+    // really does raise its own order-state incident.
+    await reconciliationPass();
     await raiseStandingAlert(db, () => "stale-balance-alert", {
       alertType: "reconciliation_meaningful_balance_drift",
       botInstanceId: BOT_ID,

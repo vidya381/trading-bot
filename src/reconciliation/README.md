@@ -41,7 +41,6 @@ whose amount and reference are the same asset at account scale.
 | Kind | Floor | Ceiling |
 | --- | --- | --- |
 | `mirror_drift` | minor | meaningful |
-| `order_recently_terminated` | minor | meaningful |
 | `balance_drift` | minor | **severe** |
 | `order_state_drift` | meaningful | meaningful |
 | `cancel_fill_discrepancy` | meaningful | meaningful |
