@@ -71,10 +71,18 @@ function priceAt(value: string): Price {
   return { pair: TEST_PAIR, price: m(value), at: clock };
 }
 
-async function run<T>(body: (bot: BotInstance) => Promise<T>): Promise<T> {
+/**
+ * `database` defaults to the suite's real D1. It is overridden only by the
+ * best-effort-reporting tests, which need one specific repository method to
+ * fail while everything else keeps working.
+ */
+async function run<T>(
+  body: (bot: BotInstance) => Promise<T>,
+  database: Database = db,
+): Promise<T> {
   return await inBot(objectName, async (instance) => {
     instance.attach({
-      db,
+      db: database,
       exchange,
       now: () => clock,
       newId: () => {
@@ -1266,6 +1274,154 @@ describe("the standing alert for a running bot with a dead ladder", () => {
     await run((bot) => bot.resume(ACTOR));
     await run((bot) => bot.onPriceUpdate(priceAt("100")));
     expect(await vacantAlerts()).toHaveLength(0);
+  });
+});
+
+/**
+ * The vacancy report is ADVISORY, and must never be able to stop trading.
+ *
+ * The live incident these cover: a Cloudflare storage blip failed the `alerts`
+ * read inside `raiseStandingAlert` -- for a bot idle below its own range, the
+ * only D1 call in the whole price-update pass -- and `#haltOnUnexpected` halted
+ * a bot that was doing exactly the right thing. See `#reportLadderVacancy`.
+ */
+describe("the vacancy report is best-effort and cannot halt the bot", () => {
+  /** Tonight's platform error, verbatim. */
+  const D1_TIMEOUT =
+    "D1_ERROR: D1 DB storage operation exceeded timeout which caused object to be reset.";
+
+  async function vacantAlerts(): Promise<{ resolved: boolean }[]> {
+    return await db.alerts.findMany({
+      where: { bot_instance_id: BOT_ID, alert_type: "grid_ladder_vacant" },
+    });
+  }
+
+  /**
+   * Methods are bound to the REAL instance rather than to the proxy: `Database`
+   * and `Repository` both hold `#` private fields, which resolve against the
+   * actual instance and would throw if `this` were the proxy.
+   */
+  function boundGet(target: object, prop: string | symbol): unknown {
+    const value = Reflect.get(target, prop) as unknown;
+    return typeof value === "function" ? value.bind(target) : value;
+  }
+
+  /** The real database, with ONE repository method replaced by a thrower. */
+  function dbFailing(
+    real: Database,
+    table: "alerts" | "orders",
+    method: string,
+    message: string,
+  ): Database {
+    const repository = new Proxy(real[table] as object, {
+      get: (target, prop) =>
+        prop === method
+          ? async () => {
+              throw new Error(message);
+            }
+          : boundGet(target, prop),
+    });
+    return new Proxy(real, {
+      get: (target, prop) => (prop === table ? repository : boundGet(target, prop)),
+    });
+  }
+
+  it("does not halt when the vacancy alert's own D1 read fails", async () => {
+    // THE EXACT LIVE INCIDENT. Spot at 85 is below the lowest line (90) and
+    // above the stop-loss (81): the gate fires, nothing is placed, and the
+    // vacancy report runs -- whose `alerts` read is the only D1 call this pass
+    // makes.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    const result = await run(
+      (bot) => bot.onPriceUpdate(priceAt("85")),
+      dbFailing(db, "alerts", "findMany", D1_TIMEOUT),
+    );
+
+    // The pass completed normally, exactly as if the report had never run.
+    expect(result.status).toBe("running");
+    expect(result.action).toBe("placed_initial_ladder");
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.status).toBe("running");
+    expect(snapshot.state.haltReason ?? null).toBeNull();
+
+    // D1 agrees: no halt was mirrored, and no halt alert was written.
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("running");
+    expect(
+      await db.alerts.findMany({ where: { bot_instance_id: BOT_ID, category: "system" } }),
+    ).toHaveLength(0);
+
+    // Nothing is lost: the gate re-fires every tick, so the next pass -- with
+    // D1 healthy again -- reports the vacancy it could not report before.
+    await run((bot) => bot.onPriceUpdate(priceAt("86")));
+    const raised = await vacantAlerts();
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.resolved).toBe(false);
+  });
+
+  it("does not halt when the RESOLVE half's D1 read fails", async () => {
+    // The other branch of the same method. A recovering bot whose ladder is no
+    // longer vacant reaches `resolveClearedStandingAlerts`, which reads `alerts`
+    // too -- and must be just as unable to halt the bot.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("85")));
+    expect((await vacantAlerts())[0]!.resolved).toBe(false);
+
+    const result = await run(
+      (bot) => bot.onPriceUpdate(priceAt("100")),
+      dbFailing(db, "alerts", "findMany", D1_TIMEOUT),
+    );
+
+    expect(result.status).toBe("running");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.status).toBe("running");
+    // The ladder was still built -- the failure touched only the reporting.
+    expect(snapshot.state.ladder!.slots.filter((slot) => slot !== null).length).toBeGreaterThan(0);
+  });
+
+  it("leaves the ordinary path completely unregressed", async () => {
+    // The full raise-then-resolve lifecycle, with a healthy database, still
+    // behaves exactly as it did before the `catch` existed.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    await run((bot) => bot.onPriceUpdate(priceAt("85")));
+    const raised = await vacantAlerts();
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.resolved).toBe(false);
+
+    // Standing, not per-tick: still exactly one row.
+    await run((bot) => bot.onPriceUpdate(priceAt("86")));
+    expect(await vacantAlerts()).toHaveLength(1);
+
+    // Back into range: placed, and the incident closes.
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(result.action).toBe("placed_initial_ladder");
+    const after = await vacantAlerts();
+    expect(after).toHaveLength(1);
+    expect(after[0]!.resolved).toBe(true);
+  });
+
+  it("still halts on an unrelated failure in the same pass", async () => {
+    // THE SCOPE CHECK. The `catch` covers the vacancy report and nothing else:
+    // a D1 failure on the order mirror -- a real trading write, in the same
+    // pass, reached from the same `try` -- must still halt the bot.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    const result = await run(
+      (bot) => bot.onPriceUpdate(priceAt("100")),
+      dbFailing(db, "orders", "insert", D1_TIMEOUT),
+    );
+
+    expect(result.status).toBe("halted");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.status).toBe("halted");
+    expect(snapshot.state.haltReason).toContain("unhandled_error");
+    expect(snapshot.state.haltReason).toContain("exceeded timeout");
   });
 });
 

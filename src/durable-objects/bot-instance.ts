@@ -4705,36 +4705,84 @@ export class BotInstance extends DurableObject<Env> {
    * never clears suppresses every future alert of that type for that bot,
    * forever. So the recovering case resolves here rather than relying on some
    * other pass to notice.
+   *
+   * ── BEST-EFFORT, AND THIS METHOD THEREFORE NEVER THROWS ──
+   *
+   * A REAL INCIDENT, the night this was written. `raiseStandingAlert` reads
+   * `alerts` from D1, and for a bot idle below its own range that read is the
+   * ONLY D1 call in the entire price-update pass -- everything else the pass
+   * touches (`#config`, `#state`, `#mutateState`) is `ctx.storage`. It sits
+   * inside the `try` whose sole handler is `#haltOnUnexpected`. So when a
+   * Cloudflare storage blip returned `D1_ERROR: D1 DB storage operation
+   * exceeded timeout which caused object to be reset`, a healthy, correctly
+   * idle grid bot was HALTED by the failure of the very alert whose only job
+   * was to say "I am idle and this is fine".
+   *
+   * That is a severity inversion: an advisory status report must never have the
+   * power to stop trading. So every failure here is swallowed and the pass
+   * continues exactly as if the report had not been attempted. Nothing
+   * downstream depends on it -- this is the terminal statement of the
+   * `place_initial_ladder` branch, the `PipelineResult` was computed before it,
+   * and this writes only to `alerts`: no DO storage, no ladder state, no
+   * orders. Nothing is lost by skipping a tick either, because the vacancy gate
+   * re-fires on EVERY tick while the condition holds, so the next minute tries
+   * again.
+   *
+   * THE WHOLE BODY, not just the D1 line. `#state()` is a storage read that
+   * cannot usefully halt a bot at this point -- the pass has already read it
+   * successfully and already decided -- so narrowing the `catch` would only
+   * leave a second way for a report to halt a bot it has no business halting.
+   *
+   * CAUGHT HERE AND NOT IN `standing.ts`, deliberately. `raiseStandingAlert`
+   * and `resolveClearedStandingAlerts` are shared with `poll_blind`,
+   * `poll_blind_escalated` and reconciliation's critical findings, and those
+   * MUST keep failing loudly -- swallowing there would hide a bot that has gone
+   * genuinely blind. The narrow fix is the call site, and only this call site.
+   *
+   * LOGGED, NOT ALERTED. An alert row is a D1 write, which is the thing that
+   * just failed; raising one here would reintroduce exactly the risk this
+   * `catch` exists to remove. `console.error` reaches Workers Logs
+   * (`observability` is enabled) and cannot throw. The stack is included
+   * because `#haltOnUnexpected` records only `name: message`, and its absence
+   * is what made the original incident hard to place.
    */
   async #reportLadderVacancy(config: GridConfig): Promise<void> {
-    const state = await this.#state();
-    const ladder = state.ladder;
-    if (ladder === undefined) return;
+    try {
+      const state = await this.#state();
+      const ladder = state.ladder;
+      if (ladder === undefined) return;
 
-    if (!vacantLadder(ladder, gridOutstanding(state))) {
-      // The rebuild worked (or the ladder was never the problem). Close any
-      // incident this bot has open, and write nothing when there is none.
-      await resolveClearedStandingAlerts(this.#db(), {
-        source: BOT_ALERT_SOURCE,
-        owns: (alertType) => alertType === LADDER_VACANT_ALERT_TYPE,
-        stillOpen: new Set<string>(),
-        observed: true,
-        inScope: (botInstanceId) => botInstanceId === config.botInstanceId,
+      if (!vacantLadder(ladder, gridOutstanding(state))) {
+        // The rebuild worked (or the ladder was never the problem). Close any
+        // incident this bot has open, and write nothing when there is none.
+        await resolveClearedStandingAlerts(this.#db(), {
+          source: BOT_ALERT_SOURCE,
+          owns: (alertType) => alertType === LADDER_VACANT_ALERT_TYPE,
+          stillOpen: new Set<string>(),
+          observed: true,
+          inScope: (botInstanceId) => botInstanceId === config.botInstanceId,
+        });
+        return;
+      }
+
+      await this.#raiseStanding(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: LADDER_VACANT_ALERT_TYPE,
+        message:
+          `grid bot ${config.botInstanceId} is running with an EMPTY ladder: every level is ` +
+          `unoccupied, nothing is held, and nothing is outstanding. This pass tried to rebuild it ` +
+          `and placed no orders -- either every order was throttled or unconstructible, or spot is ` +
+          `below the lowest grid line so there is nothing to place yet. The bot is watching price ` +
+          `and will place the moment that changes; until then it is not trading.`,
       });
-      return;
+    } catch (error) {
+      console.error("grid_ladder_vacant reporting failed; the bot is unaffected", {
+        botInstanceId: config.botInstanceId,
+        error,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
     }
-
-    await this.#raiseStanding(config, {
-      severity: "warning",
-      category: "trading",
-      alertType: LADDER_VACANT_ALERT_TYPE,
-      message:
-        `grid bot ${config.botInstanceId} is running with an EMPTY ladder: every level is ` +
-        `unoccupied, nothing is held, and nothing is outstanding. This pass tried to rebuild it ` +
-        `and placed no orders -- either every order was throttled or unconstructible, or spot is ` +
-        `below the lowest grid line so there is nothing to place yet. The bot is watching price ` +
-        `and will place the moment that changes; until then it is not trading.`,
-    });
   }
 
   /**
