@@ -18,6 +18,7 @@ import {
   quantityForLevel,
   stopLossPrice,
   topRungGap,
+  vacantLadder,
   validateGridParams,
   withSlot,
   type GridConfig,
@@ -59,6 +60,19 @@ function gridParams(overrides: Partial<GridParams> = {}): GridParams {
 /** A ladder with `placed` true and a given set of live slots, for decide()/planFill tests. */
 function placedLadder(overrides: Partial<GridLadder> = {}): GridLadder {
   return { ...emptyLadder(params), placed: true, ...overrides };
+}
+
+/**
+ * A placed ladder that is actually WORKING -- one live rung, so it is not vacant.
+ *
+ * `placedLadder()` alone is `placed: true` with every slot null, which is
+ * precisely the dead-ladder state `vacantLadder` now matches. Tests that mean
+ * "an ordinary running grid" have to say so, or they assert the rebuild path
+ * while reading as though they assert `hold`.
+ */
+function workingLadder(overrides: Partial<GridLadder> = {}): GridLadder {
+  const base = placedLadder(overrides);
+  return withSlot(base, 1, buySlot("v1-grid-btc-1-live", "1.05"));
 }
 
 function buySlot(clientOrderId: string, quantity: string): GridSlot {
@@ -208,40 +222,129 @@ describe("initial ladder (section 6.2 step 2)", () => {
 
 describe("decide (price-driven, section 6.2)", () => {
   it("asks for the initial ladder while unplaced", () => {
-    const action = decide({ config, ladder: emptyLadder(params), price: m("100") });
+    const action = decide({ config, ladder: emptyLadder(params), price: m("100"), outstanding: false });
     expect(action.kind).toBe("place_initial_ladder");
   });
 
   it("holds a placed ladder that is inside its bounds", () => {
-    expect(decide({ config, ladder: placedLadder(), price: m("100") }).kind).toBe("hold");
+    expect(decide({ config, ladder: workingLadder(), price: m("100"), outstanding: false }).kind).toBe("hold");
   });
 
   it("stops out below the lowest line, before any other check", () => {
-    const action = decide({ config, ladder: placedLadder({ heldQuantity: m("2") }), price: m("81") });
+    const action = decide({
+      config,
+      ladder: placedLadder({ heldQuantity: m("2") }),
+      price: m("81"),
+      outstanding: false,
+    });
     expect(action).toMatchObject({ kind: "stop_loss", heldQuantity: m("2") });
   });
 
   it("declares an upside breakout when breakoutTakeProfit is on", () => {
-    const action = decide({ config, ladder: placedLadder({ heldQuantity: m("1") }), price: m("115") });
+    const action = decide({
+      config,
+      ladder: placedLadder({ heldQuantity: m("1") }),
+      price: m("115"),
+      outstanding: false,
+    });
     expect(action).toMatchObject({ kind: "breakout_take_profit", heldQuantity: m("1") });
   });
 
   it("leaves the bot idle above the ladder when breakoutTakeProfit is off", () => {
     const off: GridConfig = { ...config, params: gridParams({ breakoutTakeProfit: false }) };
-    expect(decide({ config: off, ladder: placedLadder(), price: m("115") }).kind).toBe("hold");
+    expect(decide({ config: off, ladder: workingLadder(), price: m("115"), outstanding: false }).kind).toBe(
+      "hold",
+    );
   });
 
   it("takes profit once accumulated realized profit reaches the target", () => {
     const withTarget: GridConfig = { ...config, params: gridParams({ takeProfitAmount: m("50") }) };
-    const ladder = placedLadder({ realizedGross: m("50"), heldQuantity: m("1") });
-    expect(decide({ config: withTarget, ladder, price: m("100") }).kind).toBe("take_profit");
+    const ladder = workingLadder({ realizedGross: m("50"), heldQuantity: m("1") });
+    expect(decide({ config: withTarget, ladder, price: m("100"), outstanding: false }).kind).toBe("take_profit");
+  });
+
+  it("rebuilds a VACANT placed ladder -- the halted-then-resumed case", () => {
+    // The defect this whole change exists for: `placed` is true (the bot did
+    // place a ladder once), every slot was nulled by a wholesale clear, and
+    // nothing is held or outstanding. Before the fix this returned `hold`,
+    // forever, on a bot that was genuinely running and watching price.
+    const action = decide({ config, ladder: placedLadder(), price: m("100"), outstanding: false });
+    expect(action.kind).toBe("place_initial_ladder");
+    // And it asks for real orders, not an empty list: every level below spot.
+    expect(action.kind === "place_initial_ladder" && action.orders.length).toBe(2);
   });
 
   it("prefers the stop-loss over the breakout if both somehow read true", () => {
     // A degenerate price cannot be both, but the ORDER of checks is what is
     // asserted: stop-loss is evaluated first no matter what.
-    const action = decide({ config, ladder: placedLadder(), price: m("50") });
+    const action = decide({ config, ladder: placedLadder(), price: m("50"), outstanding: false });
     expect(action.kind).toBe("stop_loss");
+  });
+});
+
+describe("vacantLadder (the rebuild condition)", () => {
+  it("is true for a placed ladder with no rungs, nothing held and nothing outstanding", () => {
+    expect(vacantLadder(placedLadder(), false)).toBe(true);
+  });
+
+  it("is FALSE while any rung is live -- a partly placed ladder is a working one", () => {
+    expect(vacantLadder(workingLadder(), false)).toBe(false);
+  });
+
+  it("is FALSE while base is held -- that is uncovered inventory, a human's call", () => {
+    // An initial ladder is BUYS ONLY, so rebuilding here would trade around
+    // base that has no sell resting against it and paper over the one detector
+    // written to find exactly that.
+    expect(vacantLadder(placedLadder({ heldQuantity: m("0.5") }), false)).toBe(false);
+  });
+
+  it("is FALSE while anything is outstanding -- unresolved business on the exchange", () => {
+    expect(vacantLadder(placedLadder(), true)).toBe(false);
+  });
+
+  it("holds rather than rebuilding when outstanding, even with an empty ladder", () => {
+    expect(decide({ config, ladder: placedLadder(), price: m("100"), outstanding: true }).kind).toBe(
+      "hold",
+    );
+  });
+});
+
+describe("the gate ORDER: risk exits are evaluated before any rebuild", () => {
+  // Each of these is a bot that is simultaneously eligible to rebuild (vacant,
+  // or never placed) AND past a risk threshold. Rebuilding first would place a
+  // full ladder and cancel it on the very next tick, every cycle, forever.
+
+  it("exits on the stop-loss rather than rebuilding a vacant ladder", () => {
+    const action = decide({ config, ladder: placedLadder(), price: m("81"), outstanding: false });
+    expect(action.kind).toBe("stop_loss");
+  });
+
+  it("exits on the breakout rather than rebuilding a vacant ladder", () => {
+    const action = decide({ config, ladder: placedLadder(), price: m("115"), outstanding: false });
+    expect(action.kind).toBe("breakout_take_profit");
+  });
+
+  it("takes profit rather than rebuilding a vacant ladder", () => {
+    // The `#gridExit` on take-profit clears the slots; it does NOT clear
+    // `realizedGross`. So a bot resumed after one is vacant AND still over its
+    // target -- the churn case, exactly.
+    const withTarget: GridConfig = { ...config, params: gridParams({ takeProfitAmount: m("50") }) };
+    const ladder = placedLadder({ realizedGross: m("50") });
+    const action = decide({ config: withTarget, ladder, price: m("100"), outstanding: false });
+    expect(action.kind).toBe("take_profit");
+  });
+
+  it("exits a FRESH bot below its stop-loss instead of looping on the placement gate", () => {
+    // The (f) interaction. A never-placed bot below its lowest line has no
+    // orders to place, so with placement first it would re-enter that gate on
+    // every tick and never reach this exit at all.
+    const action = decide({ config, ladder: emptyLadder(params), price: m("81"), outstanding: false });
+    expect(action.kind).toBe("stop_loss");
+  });
+
+  it("exits a FRESH bot above its breakout without placing a ladder first", () => {
+    const action = decide({ config, ladder: emptyLadder(params), price: m("115"), outstanding: false });
+    expect(action.kind).toBe("breakout_take_profit");
   });
 });
 

@@ -145,6 +145,7 @@ import {
   levelOf,
   openOrderIds as ladderOpenOrderIds,
   planFill,
+  vacantLadder,
   validateGridParams,
   withSlot,
   type GridConfig,
@@ -637,6 +638,51 @@ const GRID_PLACED_ACTION_PREFIX = "placed-";
 
 export function gridOrderWasPlaced(result: PipelineResult): boolean {
   return result.action.startsWith(GRID_PLACED_ACTION_PREFIX);
+}
+
+/**
+ * The standing incident raised when a running grid bot's ladder is dead and the
+ * rebuild could not revive it.
+ *
+ * DELIBERATELY NOT IN `POLL_STANDING_ALERT_TYPES`. That set names the conditions
+ * the POLL re-derives on every pass, and is what licenses the poll to close
+ * them. This one is re-derived by the PRICE PASS instead -- see
+ * `#reportLadderVacancy` for why a snapshot observer is the wrong place for it
+ * -- and its own site owns both halves of the lifecycle. Adding it to that set
+ * would let a poll that never evaluated the condition close a live incident.
+ */
+const LADDER_VACANT_ALERT_TYPE = "grid_ladder_vacant";
+
+/**
+ * Whether a grid bot has unresolved exchange business outside its ladder.
+ *
+ * Read by `vacantLadder` through `GridDecisionInput.outstanding`, and computed
+ * here rather than there because all three fields live in `BotRuntimeState`,
+ * which the pure strategy layer cannot see. The mirror of the `hasOpenOrder`
+ * expression the DCA branch of `#onPriceUpdatePass` passes to `decide`.
+ *
+ * EXPORTED FOR ITS OWN TESTS, and the reason is worth stating: only ONE of the
+ * three terms is independently reachable end to end. On the grid path
+ * `exitOrderId` is only ever set for a quantity that was held (`#gridExit`
+ * places a liquidation sell only when `heldQuantity > ZERO`) and is cleared by
+ * the same fill that takes the position flat; a queued replacement likewise
+ * exists because a buy filled and its sell could not be placed, so base is
+ * held. In both cases `heldQuantity` already refuses the rebuild and the term
+ * is defence in depth. Testing them through a bot would mean contriving a state
+ * this system cannot actually produce -- so they are tested here, directly,
+ * against the contract this function states rather than against a fixture.
+ *
+ * The third term, `openOrderIds`, IS independently reachable: a `#gridExit`
+ * clears every rung while a cancellation that could not be confirmed keeps its
+ * id on the list, leaving a flat bot with no rungs and real unresolved business
+ * on the exchange. That one has an end-to-end test.
+ */
+export function gridOutstanding(state: BotRuntimeState): boolean {
+  return (
+    state.openOrderIds.length > 0 ||
+    state.exitOrderId !== null ||
+    (state.pendingReplacements ?? []).length > 0
+  );
 }
 
 export interface BotSnapshot {
@@ -4534,13 +4580,42 @@ export class BotInstance extends DurableObject<Env> {
   async #gridOnPrice(config: GridConfig, price: Price): Promise<PipelineResult> {
     const state = await this.#state();
     const ladder = state.ladder!;
-    const action = gridDecide({ config, ladder, price: price.price });
+    const action = gridDecide({
+      config,
+      ladder,
+      price: price.price,
+      outstanding: gridOutstanding(state),
+    });
 
     switch (action.kind) {
       case "hold":
         return { status: "running", action: "hold" };
-      case "place_initial_ladder":
-        return await this.#placeInitialLadder(config, action.orders);
+      case "place_initial_ladder": {
+        const result = await this.#placeInitialLadder(config, action.orders);
+        // THE ONLY SITE THAT OBSERVES THIS CONDITION, and deliberately so.
+        //
+        // The gate above fired, so at this instant the bot either had never
+        // placed or had a dead ladder. `#reportLadderVacancy` re-reads what the
+        // attempt actually achieved: rungs now resting closes any open incident,
+        // a still-empty ladder opens one. Both halves of the standing lifecycle
+        // in one owner, which `alerts/standing.ts` requires -- taking only the
+        // raise half is strictly worse than an unconditional insert.
+        //
+        // NOT IN THE POLL, which is where `grid_replacement_queued`'s twin
+        // lives. The poll is a repeated snapshot reader, and a legitimately
+        // resumed bot is `running` with a vacant ladder until its first price
+        // tick lands -- a correct, transient state a snapshot observer would
+        // alert on every single healthy resume. Reached from here, the
+        // condition is only ever evaluated AFTER a real price evaluation
+        // declined to place, so that window does not exist.
+        //
+        // NOT ON THE `hold` PATH either: a healthy ladder cannot have raised
+        // this, and calling the resolve half every tick for every grid bot
+        // would put an `alerts` query on the hot path to close a row that is
+        // never open.
+        if (result.status === "running") await this.#reportLadderVacancy(config);
+        return result;
+      }
       case "stop_loss":
         return await this.#gridExit(config, "stop_loss", action.detail, price);
       case "breakout_take_profit":
@@ -4558,6 +4633,26 @@ export class BotInstance extends DurableObject<Env> {
    * fills the remaining levels rather than double-placing the ones already live.
    * `placed` is set true only once no order was throttled; a throttle leaves it
    * false so the next price update completes the ladder.
+   *
+   * AND ONLY IF SOMETHING WAS ACTUALLY PLACED. `initialLadderOrders` breaks at
+   * the first level priced at or above spot, so a grid STARTED while spot sits
+   * below its lowest line -- but above the stop-loss, which would otherwise have
+   * exited it -- is handed an empty list. This used to run the loop zero times,
+   * find `throttled` still false, and latch `placed: true` having placed
+   * nothing: a bot advertising a ladder it had never built, in the one field
+   * (`state.ladder.placed`, mirrored to the API) an operator reads to answer
+   * that exact question.
+   *
+   * The trading consequence is separately covered -- a zero-order pass leaves
+   * the ladder vacant and flat, which `vacantLadder` matches, so the bot
+   * re-evaluates each tick and places the moment price rises into range. This
+   * guard is about the flag telling the truth, and about the third exposure
+   * staying closed if that condition is ever narrowed.
+   *
+   * IT REQUIRES `decide`'s REORDER TO SHIP WITH IT. While placement was the
+   * FIRST gate, refusing to latch here meant a fresh bot below its stop-loss
+   * re-entered this method on every tick with nothing to place and never reached
+   * the stop-loss check at all. With the exits evaluated first, that bot halts.
    */
   async #placeInitialLadder(config: GridConfig, orders: readonly GridOrderIntent[]): Promise<PipelineResult> {
     let throttled = false;
@@ -4569,8 +4664,7 @@ export class BotInstance extends DurableObject<Env> {
       if (result.action === "throttled" || result.action === "unresolved") throttled = true;
     }
 
-    if (!throttled) {
-      const current = await this.#state();
+    if (!throttled && orders.length > 0) {
       await this.#mutateState((latest) => ({
         ...latest,
         ladder: { ...latest.ladder!, placed: true },
@@ -4581,6 +4675,66 @@ export class BotInstance extends DurableObject<Env> {
       action: throttled ? "initial_ladder_partial" : "placed_initial_ladder",
       detail: `${orders.length} buy levels below spot`,
     };
+  }
+
+  /**
+   * Raise or clear the standing incident for a running grid bot with a dead
+   * ladder, from what a placement attempt ACTUALLY achieved.
+   *
+   * Called at exactly one site: immediately after `#placeInitialLadder` on the
+   * price path. That timing is the whole design. `vacantLadder` normally lasts
+   * microseconds -- the same tick that observes it rebuilds it -- so reaching
+   * here with the ladder STILL vacant means the rebuild ran and put nothing on
+   * the exchange. The reasons it can are all real and all worth a human's
+   * attention:
+   *
+   *  - every order was throttled by section 5.4's budget;
+   *  - every order was refused as unconstructible against the symbol filters;
+   *  - the order list was EMPTY because spot sits below the lowest grid line,
+   *    so the bot is genuinely idle until price comes back into range.
+   *
+   * The third is not a fault, which is why this is a `warning` and not a
+   * `critical`: the bot is behaving correctly and has nothing to do. What makes
+   * it worth stating is that from outside it is indistinguishable from the
+   * defect this whole change exists to fix -- a running grid bot with an empty
+   * ladder -- and an operator who has just been burned by that deserves to be
+   * told which one they are looking at rather than left to infer it.
+   *
+   * BOTH HALVES, TOGETHER, ALWAYS. `alerts/standing.ts` is explicit that taking
+   * only the raise half is worse than an unconditional insert: one row that
+   * never clears suppresses every future alert of that type for that bot,
+   * forever. So the recovering case resolves here rather than relying on some
+   * other pass to notice.
+   */
+  async #reportLadderVacancy(config: GridConfig): Promise<void> {
+    const state = await this.#state();
+    const ladder = state.ladder;
+    if (ladder === undefined) return;
+
+    if (!vacantLadder(ladder, gridOutstanding(state))) {
+      // The rebuild worked (or the ladder was never the problem). Close any
+      // incident this bot has open, and write nothing when there is none.
+      await resolveClearedStandingAlerts(this.#db(), {
+        source: BOT_ALERT_SOURCE,
+        owns: (alertType) => alertType === LADDER_VACANT_ALERT_TYPE,
+        stillOpen: new Set<string>(),
+        observed: true,
+        inScope: (botInstanceId) => botInstanceId === config.botInstanceId,
+      });
+      return;
+    }
+
+    await this.#raiseStanding(config, {
+      severity: "warning",
+      category: "trading",
+      alertType: LADDER_VACANT_ALERT_TYPE,
+      message:
+        `grid bot ${config.botInstanceId} is running with an EMPTY ladder: every level is ` +
+        `unoccupied, nothing is held, and nothing is outstanding. This pass tried to rebuild it ` +
+        `and placed no orders -- either every order was throttled or unconstructible, or spot is ` +
+        `below the lowest grid line so there is nothing to place yet. The bot is watching price ` +
+        `and will place the moment that changes; until then it is not trading.`,
+    });
   }
 
   /**

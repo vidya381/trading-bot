@@ -53,9 +53,21 @@
  * endpoint, on a bot that may still be halted, would put orders on the exchange
  * without the consent the operator withheld by leaving it halted -- resuming
  * trading through the back door. The consequence is real and permanent enough to
- * state plainly: the rung comes back EMPTY, and nothing places it later either,
- * because `#placeInitialLadder` only ever runs once (`placed: true`). Re-placing
- * that level is a separate manual decision.
+ * state plainly: the rung comes back EMPTY, and nothing places it later either.
+ * That is still true, but the REASON changed and the old one is no longer a fact
+ * about this system: it used to be "`#placeInitialLadder` only ever runs once
+ * (`placed: true`)", which was a real defect -- a grid bot whose ladder was
+ * cleared wholesale and later resumed never rebuilt it at all, and two live bots
+ * sat inert because of it. `decide` now rebuilds a ladder that is VACANT as well
+ * as one that was never placed (see `vacantLadder`), so a wholesale clear is
+ * self-correcting on the next tick.
+ *
+ * This path is deliberately NOT covered by that, and the exclusion is what keeps
+ * this warning honest: the repair leaves base HELD with an empty rung, and
+ * `vacantLadder` refuses to rebuild while anything is held -- rebuilding would
+ * place buys around inventory that has no sell against it. So the rung stays
+ * empty until a human acts, and re-placing that level is still a separate manual
+ * decision. See `docs/open-items/grid-ladder-placed-latch.md`.
  *
  * The honest upside is stated too: this leaves no PHANTOM order. `planFill`
  * clears the filled level's slot itself and returns the replacement as a separate

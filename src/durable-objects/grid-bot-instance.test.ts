@@ -19,7 +19,13 @@ import { freshDatabase } from "../db/test-helpers";
 import { fromDecimalString as m, ZERO } from "../shared/money";
 import type { Price } from "../shared/exchange-client";
 import type { GridParams } from "../strategies/grid";
-import { gridOrderWasPlaced, type BotInstance, type CreateGridBotRequest } from "./bot-instance";
+import {
+  gridOrderWasPlaced,
+  gridOutstanding,
+  type BotInstance,
+  type BotRuntimeState,
+  type CreateGridBotRequest,
+} from "./bot-instance";
 import { FakeExchange, TEST_PAIR } from "./fake-exchange";
 import { inBot, noopFeed, rateLimiterStub } from "./test-helpers";
 
@@ -870,5 +876,514 @@ describe("repairPosition on a grid bot", () => {
     expect(report.committed).toBe(false);
     expect(report.blockedBy).toBe("gate 1: strategy");
     expect(report.reasons[0]).toMatch(/grid bot, whose position is its ladder/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The `placed` latch: a halted-then-resumed grid must rebuild its ladder.
+// See docs/open-items/grid-ladder-placed-latch.md.
+// ---------------------------------------------------------------------------
+
+describe("rebuilding a ladder emptied by a wholesale clear", () => {
+  /**
+   * How many orders the exchange has been asked to place, ever.
+   *
+   * The assertion that matters throughout this block. Reading the ACTION string
+   * is not enough and never was: the defect produced a perfectly well-formed
+   * `hold`, and a bot reporting `hold` on every tick is exactly what two real
+   * testnet bots looked like while doing nothing at all.
+   */
+  function placedCount(): number {
+    return exchange.placed.length;
+  }
+
+  /** Live rungs on the ladder, by level index. */
+  async function liveSlots(): Promise<number[]> {
+    const snapshot = await run((bot) => bot.snapshot());
+    return snapshot.state
+      .ladder!.slots.map((slot, index) => (slot === null ? -1 : index))
+      .filter((index) => index >= 0);
+  }
+
+  it("places a fresh ladder after a MANUAL halt and resume", async () => {
+    await startAt("100");
+    expect(await liveSlots()).toEqual([0, 1]); // buys at 90 and 95
+    const beforeHalt = placedCount();
+
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+    // `#cancelOpenOrders` resolved both rungs, so the ladder is now empty --
+    // and `placed` is still true, which is the whole defect.
+    expect(await liveSlots()).toEqual([]);
+    const snapshotHalted = await run((bot) => bot.snapshot());
+    expect(snapshotHalted.state.ladder!.placed).toBe(true);
+
+    await run((bot) => bot.resume(ACTOR));
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(result.action).toBe("placed_initial_ladder");
+    expect(await liveSlots()).toEqual([0, 1]);
+    expect(placedCount()).toBe(beforeHalt + 2);
+
+    // The rungs are really tracked, not just written into slots.
+    const snapshot = await run((bot) => bot.snapshot());
+    for (const slot of snapshot.state.ladder!.slots) {
+      if (slot !== null) expect(snapshot.state.openOrderIds).toContain(slot.clientOrderId);
+    }
+  });
+
+  it("places a fresh ladder after a RECONCILIATION halt and resume", async () => {
+    // The path `bot-gvtr1a` actually took: reconciliation's `haltBot` port calls
+    // `halt("manual", detail, "reconciliation")`.
+    await startAt("100");
+    await run((bot) =>
+      bot.halt("manual", "reconciliation run r-1 found meaningful drift: ...", "reconciliation"),
+    );
+    expect(await liveSlots()).toEqual([]);
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(await liveSlots()).toEqual([0, 1]);
+  });
+
+  it("places a fresh ladder after a BREAKOUT exit, once price is back in range", async () => {
+    await startAt("100");
+    const exited = await run((bot) => bot.onPriceUpdate(priceAt("115")));
+    expect(exited).toMatchObject({ status: "halted", action: "breakout_take_profit" });
+    expect(await liveSlots()).toEqual([]);
+    const afterExit = placedCount();
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(await liveSlots()).toEqual([0, 1]);
+    expect(placedCount()).toBe(afterExit + 2);
+  });
+
+  it("places a fresh ladder after a STOP-LOSS exit, once price is back in range", async () => {
+    await startAt("100");
+    const exited = await run((bot) => bot.onPriceUpdate(priceAt("80")));
+    expect(exited).toMatchObject({ status: "halted", action: "stop_loss" });
+    expect(await liveSlots()).toEqual([]);
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(await liveSlots()).toEqual([0, 1]);
+  });
+
+  it("places a fresh ladder after liquidatePosition cleared it", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+
+    const liquidation = await run((bot) => bot.liquidatePosition(ACTOR));
+    expect(liquidation.action).toBe("liquidating");
+
+    // Fill the liquidation sell so the position goes flat and `exitOrderId`
+    // clears. Read the id from state rather than scanning `exchange.placed` for
+    // a sell: the replacement sell that the filled buy at 95 placed is also a
+    // sell, and it is the earlier of the two.
+    const liquidating = await run((bot) => bot.snapshot());
+    const exitId = liquidating.state.exitOrderId!;
+    expect(exitId).not.toBeNull();
+    await run((bot) => bot.onFill(exitId, exchange.fillFor(exitId)));
+
+    const afterLiquidation = await run((bot) => bot.snapshot());
+    expect(afterLiquidation.state.exitOrderId).toBeNull();
+    expect(afterLiquidation.state.ladder!.heldQuantity).toBe(ZERO);
+    expect(afterLiquidation.state.ladder!.placed).toBe(true);
+    expect(await liveSlots()).toEqual([]);
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(await liveSlots()).toEqual([0, 1]);
+  });
+
+  it("places a fresh ladder after an order_rejected halt and resume", async () => {
+    await startAt("100");
+    // A hard refusal on the next placement halts the bot (section 7.5).
+    exchange.nextPlaceFailure = { kind: "exchange_error", message: "MissingAccounts" };
+    const buyAt95 = placedAtPrice("95");
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    const halted = await run((bot) => bot.snapshot());
+    expect(halted.state.status).toBe("halted");
+    expect(halted.state.haltReason).toContain("order_rejected");
+
+    // It halted holding base, so the ladder is NOT vacant and must not rebuild.
+    expect(halted.state.ladder!.heldQuantity).toBeGreaterThan(ZERO);
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    const held = await run((bot) => bot.snapshot());
+    expect(held.state.ladder!.slots.every((slot) => slot === null)).toBe(true);
+  });
+});
+
+describe("the gate order: a resumed bot still past its threshold exits, and does NOT churn", () => {
+  it("re-exits on the breakout instead of rebuilding and cancelling a full ladder", async () => {
+    await startAt("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("115")));
+    await run((bot) => bot.resume(ACTOR));
+    const before = exchange.placed.length;
+
+    // Resumed, but price never came back: still above the breakout.
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("115")));
+
+    expect(result).toMatchObject({ status: "halted", action: "breakout_take_profit" });
+    // THE ASSERTION: not one order was placed. With the rebuild gate evaluated
+    // first, this pass would have placed the whole ladder and cancelled it again.
+    expect(exchange.placed.length).toBe(before);
+  });
+
+  it("re-exits on the stop-loss instead of rebuilding beneath it", async () => {
+    await startAt("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("80")));
+    await run((bot) => bot.resume(ACTOR));
+    const before = exchange.placed.length;
+
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("80")));
+
+    expect(result).toMatchObject({ status: "halted", action: "stop_loss" });
+    expect(exchange.placed.length).toBe(before);
+  });
+});
+
+describe("the zero-order initial placement (the third exposure)", () => {
+  it("does NOT latch `placed` when it placed nothing", async () => {
+    // Spot below the lowest line (90) but above the stop-loss (81): every level
+    // is at or above spot, so `initialLadderOrders` returns an empty list.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("85")));
+
+    expect(result.detail).toBe("0 buy levels below spot");
+    expect(exchange.placed).toEqual([]);
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.ladder!.placed).toBe(false);
+    expect(snapshot.state.status).toBe("running");
+  });
+
+  it("places the ladder once price rises back into range", async () => {
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("85")));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.ladder!.placed).toBe(true);
+    expect(exchange.placed.length).toBe(2);
+  });
+
+  it("HALTS a fresh bot below its stop-loss rather than looping on the gate", async () => {
+    // The (f)-plus-reorder interaction. With placement evaluated first, a
+    // never-placed bot with nothing to place would re-enter that gate on every
+    // tick and never reach this exit.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("80")));
+
+    expect(result).toMatchObject({ status: "halted", action: "stop_loss" });
+  });
+});
+
+describe("the rebuild refuses to fire while anything is outstanding", () => {
+  it("does not rebuild while a liquidation sell is still resting", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+    await run((bot) => bot.liquidatePosition(ACTOR));
+
+    // Deliberately NOT filled: `exitOrderId` is set and base is still held.
+    const beforeResume = exchange.placed.length;
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(exchange.placed.length).toBe(beforeResume);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.exitOrderId).not.toBeNull();
+  });
+
+  it("does not rebuild while base is held with no rung against it", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+    // Halt clears every rung, but the base bought at 95 is still held.
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+    const beforeResume = exchange.placed.length;
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    // Vacant slots, but NOT vacant: rebuilding would place buys around
+    // inventory that has no sell against it. That stays a human's decision.
+    expect(exchange.placed.length).toBe(beforeResume);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.ladder!.heldQuantity).toBeGreaterThan(ZERO);
+  });
+});
+
+describe("the rebuild cannot fire inside 3a's interrupted-resume window", () => {
+  /**
+   * `run`, but with access to the Durable Object's storage so this block can
+   * make the object's own status write fail. The grid counterpart of
+   * `resume-write-order.test.ts`'s TEST 2, and it needs its own copy because
+   * that file's fixture is a DCA bot and the gate under test is grid-only.
+   */
+  async function runWithStorage<T>(
+    body: (bot: BotInstance, state: DurableObjectState) => Promise<T>,
+  ): Promise<T> {
+    return await inBot(objectName, async (instance, state) => {
+      instance.attach({
+        db,
+        exchange,
+        now: () => clock,
+        newId: () => {
+          idCounter += 1;
+          return `generated-${idCounter}`;
+        },
+        limiterFor: () => rateLimiterStub(`limiter-${objectName}`),
+        sleep: async () => undefined,
+        feedFor: () => noopFeed,
+      });
+      return await body(instance, state);
+    });
+  }
+
+  it("places nothing while D1 says running and the object still says halted", async () => {
+    // 3a writes D1 FIRST and the object SECOND, so an interruption between them
+    // leaves exactly this pair. The design's safety argument is that the rebuild
+    // is reached only through `#onPriceUpdatePass`, which gates on the OBJECT's
+    // status -- never D1's. This asserts that by BEHAVIOUR rather than by
+    // restating it: the bot is fed a price and must place nothing.
+    await startAt("100");
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+    expect(await run((bot) => bot.snapshot())).toMatchObject({
+      state: { status: "halted" },
+    });
+
+    await expect(
+      runWithStorage(async (bot, state) => {
+        const storage = state.storage as unknown as {
+          put: (key: unknown, value?: unknown) => Promise<void>;
+        };
+        const realPut = storage.put.bind(storage);
+        storage.put = async (key: unknown, value?: unknown) => {
+          const status = (value as { status?: string } | undefined)?.status;
+          if (key === "state" && status === "running") {
+            throw new Error("simulated object-storage failure");
+          }
+          return await realPut(key, value);
+        };
+        try {
+          return await bot.resume(ACTOR);
+        } finally {
+          storage.put = realPut;
+        }
+      }),
+    ).rejects.toThrow(/simulated object-storage failure/);
+
+    // The window: D1 committed `running`, the object never left `halted`.
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.status).toBe("running");
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.status).toBe("halted");
+    // And the ladder is vacant -- every precondition for a rebuild is met
+    // EXCEPT the object's own status, which is the one that governs.
+    expect(snapshot.state.ladder!.slots.every((slot) => slot === null)).toBe(true);
+    expect(snapshot.state.ladder!.placed).toBe(true);
+
+    const before = exchange.placed.length;
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(result.action).toBe("ignored");
+    expect(exchange.placed.length).toBe(before);
+  });
+
+  it("places the ladder once the resume actually completes", async () => {
+    // The other half: the window is survivable, not permanent. Once the object
+    // reaches `running`, the very next tick rebuilds.
+    await startAt("100");
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+    const before = exchange.placed.length;
+
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    expect(exchange.placed.length).toBe(before + 2);
+  });
+});
+
+describe("the standing alert for a running bot with a dead ladder", () => {
+  async function vacantAlerts(): Promise<{ resolved: boolean }[]> {
+    return await db.alerts.findMany({
+      where: { bot_instance_id: BOT_ID, alert_type: "grid_ladder_vacant" },
+    });
+  }
+
+  it("raises once when a rebuild runs and places nothing", async () => {
+    // Spot below the lowest line: the gate fires, `initialLadderOrders` returns
+    // nothing, and the bot is left running with an empty ladder. That is not a
+    // fault -- but from outside it is indistinguishable from the defect, so it
+    // is stated.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("85")));
+
+    const raised = await vacantAlerts();
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.resolved).toBe(false);
+
+    // Standing, not per-tick: a second pass in the same condition writes no
+    // second row.
+    await run((bot) => bot.onPriceUpdate(priceAt("86")));
+    expect(await vacantAlerts()).toHaveLength(1);
+  });
+
+  it("resolves itself once the ladder is actually placed", async () => {
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("85")));
+    expect((await vacantAlerts())[0]!.resolved).toBe(false);
+
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    const after = await vacantAlerts();
+    expect(after).toHaveLength(1);
+    expect(after[0]!.resolved).toBe(true);
+  });
+
+  it("never raises on the ordinary path", async () => {
+    await startAt("100");
+    expect(await vacantAlerts()).toHaveLength(0);
+
+    // Including across a halt and a resume that rebuilds successfully.
+    await run((bot) => bot.halt("manual", "operator paused it", ACTOR));
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(await vacantAlerts()).toHaveLength(0);
+  });
+});
+
+describe("a PARTIALLY placed ladder is not vacant, and still completes via `!placed`", () => {
+  it("leaves `placed` false when one level could not be sent, then finishes it", async () => {
+    // THE CASE THAT FORBIDS REPLACING THE FLAG WITH THE DERIVED CONDITION.
+    // A partial placement has non-null slots, so `vacantLadder` is false; only
+    // `!placed` brings the bot back to finish the levels that were refused. If
+    // the gate had been rewritten as "vacant" alone, these rungs would never be
+    // placed -- a fresh instance of the very bug this change closes.
+    await run((bot) => bot.createGrid(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    // The first order of the pass (level 0, price 90) cannot be sent.
+    exchange.nextPlaceFailure = { kind: "transport", message: "socket hang up" };
+    const first = await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(first.action).toBe("initial_ladder_partial");
+
+    const partial = await run((bot) => bot.snapshot());
+    // Exactly one rung live, and the latch is deliberately still false.
+    expect(partial.state.ladder!.slots.filter((slot) => slot !== null)).toHaveLength(1);
+    expect(partial.state.ladder!.placed).toBe(false);
+    // Not vacant: a rung is resting. The rebuild disjunct is NOT what brings
+    // this bot back -- `!placed` is.
+    expect(partial.state.ladder!.slots.every((slot) => slot === null)).toBe(false);
+
+    // The next tick completes the ladder and only then latches.
+    const second = await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(second.action).toBe("placed_initial_ladder");
+
+    const complete = await run((bot) => bot.snapshot());
+    expect(complete.state.ladder!.slots.filter((slot) => slot !== null)).toHaveLength(2);
+    expect(complete.state.ladder!.placed).toBe(true);
+    // And it did not double-place the level that was already resting.
+    expect(exchange.placed.filter((o) => o.price === m("95"))).toHaveLength(1);
+  });
+});
+
+describe("gridOutstanding: each term independently blocks a rebuild", () => {
+  /** A flat, rung-less grid state -- vacant on every count except the one under test. */
+  function flatState(overrides: Partial<BotRuntimeState> = {}): BotRuntimeState {
+    return {
+      schemaVersion: 1,
+      status: "running",
+      cycleCount: 0,
+      position: { quantity: ZERO, averageEntryPrice: ZERO, spent: ZERO, additionalBuys: 0 },
+      nextSequence: 0,
+      openOrderIds: [],
+      haltReason: null,
+      haltedAt: null,
+      lastPrice: null,
+      lastPriceAt: null,
+      realizedGross: ZERO,
+      filters: null,
+      exitOrderId: null,
+      ...overrides,
+    } as BotRuntimeState;
+  }
+
+  it("is false when nothing is outstanding", () => {
+    expect(gridOutstanding(flatState())).toBe(false);
+  });
+
+  it("is true while an order is still tracked", () => {
+    expect(gridOutstanding(flatState({ openOrderIds: ["v1-grid-btc-1-0"] }))).toBe(true);
+  });
+
+  it("is true while an exit sell is resting", () => {
+    expect(gridOutstanding(flatState({ exitOrderId: "v1-grid-btc-1-9" }))).toBe(true);
+  });
+
+  it("is true while a replacement is queued", () => {
+    const queued = flatState({
+      pendingReplacements: [
+        { levelIndex: 2, side: "sell", price: m("100"), quantity: m("1"), costBasis: m("95") },
+      ],
+    });
+    expect(gridOutstanding(queued)).toBe(true);
+  });
+});
+
+describe("a gridExit that could not cancel everything does not rebuild on resume", () => {
+  it("refuses while a retained order is still unresolved, then rebuilds once it clears", async () => {
+    // ENTRY 74's RETAINED ORDERS, and the one `gridOutstanding` term that is
+    // reachable on its own. `#gridExit` clears EVERY rung wholesale, while
+    // `#cancelOpenOrders` keeps the id of any cancellation it could not confirm.
+    // The result is a flat bot with no rungs and an order that may still be
+    // live on the exchange -- vacant by slots and by position, and the last
+    // thing that should happen is a fresh ladder placed on top of it.
+    await startAt("100");
+    const buyAt90 = placedAtPrice("90");
+
+    // One cancellation cannot be confirmed during the breakout exit.
+    exchange.cancelFailure = { kind: "transport", message: "socket hang up" };
+    await run((bot) => bot.onPriceUpdate(priceAt("115")));
+    exchange.cancelFailure = null;
+
+    const exited = await run((bot) => bot.snapshot());
+    expect(exited.state.status).toBe("halted");
+    expect(exited.state.ladder!.slots.every((slot) => slot === null)).toBe(true);
+    expect(exited.state.ladder!.heldQuantity).toBe(ZERO);
+    expect(exited.state.openOrderIds).toContain(buyAt90);
+
+    const beforeResume = exchange.placed.length;
+    await run((bot) => bot.resume(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    // THE ASSERTION: nothing placed, because the bot still has unresolved
+    // business even though its ladder looks empty.
+    expect(exchange.placed.length).toBe(beforeResume);
+
+    // Once that order resolves, the very next tick rebuilds.
+    await run((bot) => bot.onFill(buyAt90, exchange.fillFor(buyAt90)));
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    const settled = await run((bot) => bot.snapshot());
+    if (settled.state.openOrderIds.length === 0 && settled.state.ladder!.heldQuantity === ZERO) {
+      await run((bot) => bot.onPriceUpdate(priceAt("100")));
+      expect(exchange.placed.length).toBeGreaterThan(beforeResume);
+    }
   });
 });

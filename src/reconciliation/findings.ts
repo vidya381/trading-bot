@@ -216,8 +216,15 @@ export const TIER_FLOOR: Readonly<Record<FindingKind, DriftClassification>> = {
   // What is wrong is that the strategy has stopped managing what it bought: the
   // rung that was supposed to close that round trip is not on the exchange, and
   // section 6.2's replace-on-fill is the only thing that would ever put it
-  // there. It cannot self-heal, because `decide` only places a ladder when
-  // `placed` is false, so this state persists until a human acts.
+  // there. It cannot self-heal, and the reason is narrower than it used to be
+  // stated. This comment used to read "`decide` only places a ladder when
+  // `placed` is false" -- which was true, and was a defect in its own right: a
+  // ladder cleared wholesale never came back. `decide` now also rebuilds a
+  // VACANT ladder (see `vacantLadder`). But a bot with UNCOVERED HELD INVENTORY
+  // is by definition not vacant, and `vacantLadder` refuses to rebuild while
+  // anything is held precisely so an initial ladder -- which is buys only -- is
+  // never placed around base the strategy has stopped managing. So this
+  // condition still persists until a human acts.
   //
   // Meaningful rather than severe: the bot's stop-loss and breakout exits still
   // read `heldQuantity` directly and still cover the position, so this is a bot

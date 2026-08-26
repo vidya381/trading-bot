@@ -347,6 +347,20 @@ export interface GridDecisionInput {
   readonly ladder: GridLadder;
   /** The latest usable price. Section 5.6 governs what counts as usable. */
   readonly price: Money;
+  /**
+   * Whether this bot has ANY unresolved exchange state outside the ladder --
+   * a tracked open order, a resting exit sell, or a queued replacement.
+   *
+   * Supplied by the caller rather than read here, exactly as DCA's `decide`
+   * takes `hasOpenOrder`: those three live in `BotRuntimeState`, which this
+   * module deliberately cannot see. A boolean keeps the separation intact and
+   * costs the caller one expression (`gridOutstanding`).
+   *
+   * It exists for `vacantLadder` below, and only for it. A ladder with no rungs
+   * is only safe to REBUILD if the bot has nothing else outstanding; see that
+   * function for what each of the three would mean if it were ignored.
+   */
+  readonly outstanding: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +674,67 @@ export function levelOf(ladder: GridLadder, clientOrderId: string): number {
   return ladder.slots.findIndex((slot) => slot?.clientOrderId === clientOrderId);
 }
 
+/**
+ * Is this ladder DEAD -- every rung empty, nothing held, nothing outstanding?
+ *
+ * WHY THIS EXISTS. `placed` is a one-way latch: `emptyLadder` sets it false at
+ * creation, `#placeInitialLadder` sets it true once, and nothing ever sets it
+ * back. Every wholesale-clear path -- `#gridExit`, `liquidatePosition`, and the
+ * `#cancelOpenOrders` sweep every `#halt` runs -- nulls the slots and leaves the
+ * latch alone. So a grid bot halted for ANY reason and later resumed came back
+ * `running`, watching price, with an empty ladder and a flag saying the ladder
+ * had already been built, and `decide` returned `hold` on every tick for the
+ * rest of its life. Two real testnet bots (`bot-qgo39d`, `bot-gvtr1a`) sat in
+ * exactly that state. See `docs/open-items/grid-ladder-placed-latch.md`.
+ *
+ * The fix is NOT to reset the latch at each clear site -- that is forward-only,
+ * misses a bot already in the state, and leaves the next clear site to remember.
+ * It is to stop treating the latch as the only answer to "does this ladder need
+ * building" and ASK THE LADDER, on every tick, against live state.
+ *
+ * ── THIS IS A DISJUNCT, NOT A REPLACEMENT, AND THAT IS LOAD-BEARING ──
+ *
+ * `decide` gates on `!placed || vacantLadder(...)`. The latch keeps the one job
+ * it does correctly: `#placeInitialLadder` leaves it FALSE when any order was
+ * throttled, so the next tick re-enters and completes the remaining levels. A
+ * partially placed ladder has non-null slots, so it is not vacant -- deriving
+ * the condition INSTEAD of keeping the flag would refuse to re-enter and strand
+ * the throttled rungs permanently, which is a fresh instance of the very bug
+ * this function exists to close.
+ *
+ * ── WHY EACH CONJUNCT, AND WHAT IGNORING IT WOULD DO ──
+ *
+ *  - EVERY SLOT NULL. A partly populated ladder is a WORKING ladder. Asking
+ *    "is any level below spot empty" instead would fire on a healthy grid --
+ *    a filled buy legitimately leaves its level empty while its replacement
+ *    sell rests one level up -- and re-placing there would put a second order
+ *    against base already bought and already covered.
+ *  - NOTHING HELD. Vacant AND holding is `uncovered_held_inventory`'s
+ *    condition: base with no sell resting against it. An initial ladder is
+ *    BUYS ONLY (decision 1), so rebuilding there would resume trading around
+ *    orphaned inventory the strategy has stopped managing, and paper over the
+ *    one detector written to find it. That case is a human decision.
+ *  - NOTHING OUTSTANDING. Three separate things, all meaning "this bot has
+ *    unresolved business on the exchange": a tracked open order (a cancellation
+ *    that could not be CONFIRMED, or a record the fill-count gate refused to
+ *    close), a resting exit sell (`exitOrderId` -- rebuilding beneath a
+ *    liquidation would buy back what is being sold), or a queued replacement
+ *    (the ladder is mid-repair, not dead).
+ *
+ * On a healthy running grid this is essentially unreachable, which is the
+ * property that makes it safe to act on: `planFill` is symmetric -- a filled buy
+ * at level `i` places a sell at `i+1`, a filled sell at `i` places a buy at
+ * `i-1` -- so every fill produces a replacement and the ladder sustains itself.
+ * The two branches that produce none are the top-level buy (which leaves base
+ * held, excluded here) and the bottom-level sell (unreachable: a sell is only
+ * ever placed at `levelIndex + 1`, so level 0 can never hold one).
+ */
+export function vacantLadder(ladder: GridLadder, outstanding: boolean): boolean {
+  if (outstanding) return false;
+  if (ladder.heldQuantity !== ZERO) return false;
+  return ladder.slots.every((slot) => slot === null);
+}
+
 /** clientOrderIds of every live order on the ladder, in level order. */
 export function openOrderIds(ladder: GridLadder): string[] {
   const ids: string[] = [];
@@ -708,30 +783,50 @@ export function initialLadderOrders(ladder: GridLadder, params: GridParams, pric
  * ORDER OF CHECKS, which is the part that matters -- risk exits ahead of routine
  * work, exactly as DCA orders its own:
  *
- *  1. Initial placement, if the ladder has not been placed yet. There is no risk
- *     exit to lose a race to before any order exists.
- *  2. Stop-loss, before every other running check. A downside break must not
- *     lose a race to anything.
- *  3. Upside breakout (only if `breakoutTakeProfit`), so the bot cashes out
+ *  1. Stop-loss, before every other check. A downside break must not lose a
+ *     race to anything.
+ *  2. Upside breakout (only if `breakoutTakeProfit`), so the bot cashes out
  *     rather than sitting idle above its own ladder.
- *  4. Take-profit on accumulated realized profit, if configured.
+ *  3. Take-profit on accumulated realized profit, if configured.
+ *  4. Ladder placement, if the ladder has not been placed yet OR is vacant.
  *  5. Otherwise hold. Everything else -- the replace-on-fill that builds and
  *     rebuilds the ladder -- is driven by fills, not by price, and lives in
  *     `planFill`.
+ *
+ * ── PLACEMENT MOVED FROM FIRST TO FOURTH, AND WHY THAT REVERSES A DECISION ──
+ *
+ * This list used to open with placement, justified as: "There is no risk exit to
+ * lose a race to before any order exists." That argued placing first was
+ * HARMLESS, not that it was NECESSARY -- and it was true only while the gate
+ * could fire on a FRESH bot and nothing else. `vacantLadder` widens the gate to
+ * a bot that has been halted, swept and resumed, and at that point placing first
+ * stops being harmless in three concrete ways:
+ *
+ *  - A bot halted on `take_profit` still has `realizedGross >= takeProfitAmount`
+ *    when it is resumed: the exit cleared the slots, not the profit. Placement
+ *    first would rebuild the entire ladder and hit the take-profit on the very
+ *    next tick -- N real orders placed and immediately cancelled, every cycle.
+ *  - A bot halted on `stop_loss` and resumed while price is still below the stop
+ *    does the same thing, and pays a spread for it each time round.
+ *  - A FRESH bot started below its stop-loss places nothing (every level is
+ *    above spot, so `initialLadderOrders` returns none) and, now that a
+ *    zero-order pass no longer latches `placed`, would re-enter this gate on
+ *    every tick and NEVER REACH the stop-loss check at all.
+ *
+ * Ordering the exits first fixes all three, and improves the fresh-bot case it
+ * was originally written for: a bot created with spot already past its breakout
+ * now exits without first placing and cancelling a full ladder.
+ *
+ * The exits are safe to evaluate before any order exists, which is what makes
+ * the move free: all three read `ladder.levels` and `ladder.realizedGross`, both
+ * of which are built at creation and are never a function of what is resting.
  */
 export function decide(input: GridDecisionInput): GridPriceAction {
-  const { config, ladder, price } = input;
+  const { config, ladder, price, outstanding } = input;
   const { params } = config;
 
   if (price <= ZERO) {
     throw new GridError("invalid_parameter", `price must be positive, got ${price}`);
-  }
-
-  if (!ladder.placed) {
-    return {
-      kind: "place_initial_ladder",
-      orders: initialLadderOrders(ladder, params, price),
-    };
   }
 
   const stopLoss = stopLossPrice(params, ladder.levels);
@@ -767,6 +862,28 @@ export function decide(input: GridDecisionInput): GridPriceAction {
       detail:
         `accumulated realized profit ${ladder.realizedGross} reached the target ` +
         `${params.takeProfitAmount} (section 6.2 step 6)`,
+    };
+  }
+
+  // TWO INDEPENDENT REASONS TO BUILD A LADDER, and neither subsumes the other.
+  //
+  //  - `!placed` -- the bot has never completed an initial placement. Unchanged
+  //    from the original gate, and still the driver for the throttle retry:
+  //    `#placeInitialLadder` leaves the latch false whenever an order was
+  //    throttled, so the next tick returns here and fills in the levels that
+  //    were refused budget.
+  //  - `vacantLadder` -- the ladder has no rungs, nothing is held, and nothing
+  //    is outstanding. That is a ladder some wholesale clear emptied, on a bot
+  //    that came back running. The latch says `true` and is no longer telling
+  //    the truth about anything a trader cares about.
+  //
+  // A partial placement satisfies the first and NOT the second (its placed
+  // levels are non-null), which is exactly why both are needed. See
+  // `vacantLadder` for the full argument.
+  if (!ladder.placed || vacantLadder(ladder, outstanding)) {
+    return {
+      kind: "place_initial_ladder",
+      orders: initialLadderOrders(ladder, params, price),
     };
   }
 

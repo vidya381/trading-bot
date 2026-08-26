@@ -656,8 +656,12 @@ describe("openOrderIds survives a slot-based rebuild (maintained, not re-derived
     expect(resumed.state.status).toBe("running");
     for (const id of retained) expect(resumed.state.openOrderIds).toContain(id);
 
-    // REPLACE-ON-FILL is the route, not a fresh ladder: `decide` rebuilds only
-    // while `placed` is false, so a resumed grid does not re-place its rungs. A
+    // REPLACE-ON-FILL is the route, not a fresh ladder -- and here that is a
+    // property of the FIXTURE, not of `decide`. This bot resumes holding base and
+    // still carrying retained orders, so `vacantLadder` is false twice over and
+    // the rebuild gate does not fire. (When it was written this said "`decide`
+    // rebuilds only while `placed` is false", stated as a general rule; it was
+    // one, and it was the bug behind two permanently inert live bots.) A
     // retained BUY filling on the now-running bot plans its paired sell, and
     // `#placeGridOrder` claims that slot -- which is the write under test.
     exchange.currentPrice = m("100");
