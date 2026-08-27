@@ -59,6 +59,39 @@ export interface PriceFeedPort {
   unsubscribe(botInstanceId: string): Promise<void>;
 }
 
+/** One subscriber's registry row, as `status()` reports it. */
+export interface PriceFeedSubscriberStatus {
+  readonly botInstanceId: string;
+  /** Failed deliveries since this bot's last successful one. See `#fanOut`. */
+  readonly consecutiveFailures: number;
+}
+
+/**
+ * Everything an operator can ask a feed about itself, read-only.
+ *
+ * There was previously NO way to inspect a running feed at all: the subscriber
+ * registry lives in this object's own SQLite (invisible to D1), the socket and
+ * alarm are runtime state, and a Durable Object namespace cannot be enumerated.
+ * A feed holding a dead subscriber and burning duration was undiagnosable from
+ * outside. This is that missing read.
+ */
+export interface PriceFeedStatus {
+  /** Null once the feed has been stopped, or before its first subscriber. */
+  readonly config: PriceFeedConfig | null;
+  /** Whether a live outbound socket is held right now. */
+  readonly connected: boolean;
+  /** The armed alarm's instant, or null when disarmed. The leak, made visible. */
+  readonly alarmAt: number | null;
+  /** Whether `stopFeed` has latched this feed against self-reconnect. */
+  readonly stopped: boolean;
+  readonly watermark: number | null;
+  readonly reconnectAttempts: number;
+  readonly blindSince: number | null;
+  readonly escalated: boolean;
+  readonly subscriberCount: number;
+  readonly subscribers: readonly PriceFeedSubscriberStatus[];
+}
+
 /**
  * The only state that must survive eviction. `#current`, the live socket, and
  * `#primed` are deliberately NOT here — they are rebuilt from the exchange's
@@ -100,6 +133,19 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const SLOW_RETRY_MS = 60_000;
 /** A blind feed louder after this long: stop-losses are unmonitored meanwhile. */
 const BLIND_ESCALATION_MS = 30 * 60_000;
+/**
+ * Consecutive failed deliveries to ONE subscriber before it is unsubscribed.
+ *
+ * Five, matching `MAX_RECONNECT_ATTEMPTS`' spirit rather than its mechanism:
+ * both say "this has failed enough times that it is a condition, not a blip".
+ * At one closed candle a minute that is ~5 minutes of proven-dead delivery
+ * before a subscriber is dropped, which is far longer than any transient
+ * cross-object RPC failure and far shorter than the forever this used to be.
+ *
+ * A SUCCESSFUL delivery resets the count, so a bot that fails once and recovers
+ * is never pruned. See `#fanOut`.
+ */
+const MAX_FANOUT_FAILURES = 5;
 
 /** The minimal socket surface this object drives; the transport is injected. */
 export interface FeedSocket {
@@ -179,6 +225,21 @@ export async function openOutboundSocket(
   return {
     send: (data) => ws.send(data),
     close: () => {
+      // DETACH BEFORE CLOSING, and this ordering is the whole point.
+      //
+      // `ws.close()` dispatches a `close` event, which this transport has wired
+      // to `onClose` -> `#onSocketClosed` -> `#scheduleReconnect`. So a feed
+      // tearing itself down was asking, through its own teardown, to be
+      // reconnected -- and `#scheduleReconnect` re-arms the alarm
+      // unconditionally, which is how a stopped feed came back to life with no
+      // subscribers and stayed awake indefinitely.
+      //
+      // Removing the listeners first means the event has nowhere to land. The
+      // `#stopped` latch in the object is the second layer (it covers a close
+      // event from a socket this transport did not create, e.g. an injected
+      // test double), and `alarm()`'s zero-subscriber check is the third.
+      ws.removeEventListener("close", onClose);
+      ws.removeEventListener("error", onClose);
       try {
         ws.close();
       } catch {
@@ -204,14 +265,48 @@ export class PriceFeed extends DurableObject<Env> {
   #current: Candle | null = null;
   #primed = false;
   #lastMessageAt = 0;
+  /**
+   * "This feed has been torn down and must not resurrect itself."
+   *
+   * Set by `stopFeed`, cleared ONLY by a deliberate `startFeed`. Deliberately
+   * NOT cleared at the end of `stopFeed`: the race it defends against is a
+   * `close` event arriving AFTER `stopFeed` has finished (its `deleteAlarm` is
+   * the last statement), so a flag that lifts when `stopFeed` returns would be
+   * down for exactly the window that matters.
+   *
+   * In-memory rather than persisted, and that is correct: it guards one
+   * teardown against its own in-flight socket events. An eviction drops the
+   * socket, so there is no event left to guard, and a woken feed with no
+   * subscribers is caught by `alarm()` instead.
+   */
+  #stopped = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     // The durable subscriber registry: a real SQLite table, so it survives
     // eviction and gives set semantics (and idempotency) for free.
+    //
+    // `consecutive_failures` is per-subscriber fan-out health (see `#fanOut`).
+    // It lives in the table rather than in memory so it survives eviction --
+    // an in-memory counter would reset every time the object was evicted, which
+    // for a feed whose only subscriber is dead is exactly when it gets evicted.
     ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS subscribers (bot_instance_id TEXT PRIMARY KEY)",
+      "CREATE TABLE IF NOT EXISTS subscribers (" +
+        "bot_instance_id TEXT PRIMARY KEY, " +
+        "consecutive_failures INTEGER NOT NULL DEFAULT 0)",
     );
+    // Feeds that already exist were created with the one-column table, and a
+    // Durable Object class carries no migration mechanism -- the constructor IS
+    // the migration point. SQLite has no `ADD COLUMN IF NOT EXISTS`, and the
+    // statement throws when the column is already present, so that throw is the
+    // "already migrated" signal rather than an error to report.
+    try {
+      ctx.storage.sql.exec(
+        "ALTER TABLE subscribers ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+      );
+    } catch {
+      /* already migrated */
+    }
     // Nothing may forward against an unread watermark, so this blocks rather than
     // racing the first message.
     ctx.blockConcurrencyWhile(async () => {
@@ -251,6 +346,9 @@ export class PriceFeed extends DurableObject<Env> {
    * `subscribe` calls this when the first subscriber arrives.
    */
   async startFeed(config: PriceFeedConfig): Promise<void> {
+    // The ONLY thing that lifts the teardown latch. A feed comes back because a
+    // subscriber asked for it, never because one of its own sockets closed.
+    this.#stopped = false;
     await this.configure(config);
     await this.#ensureConnected();
   }
@@ -265,15 +363,35 @@ export class PriceFeed extends DurableObject<Env> {
    * watermark as a reconnect gap and backfill up to a day of candles that nobody
    * was listening for. (A transient reconnect does NOT call `stopFeed`, so it keeps
    * its watermark and backfills correctly — see `#onSocketClosed`.)
+   *
+   * ── THE CONFIG IS CLEARED TOO, AND THE ORDER OF THIS METHOD IS LOAD-BEARING ──
+   *
+   * This object used to leave `config` set and delete its alarm in the middle of
+   * the teardown. Both were how a stopped feed came back: a `close` event from
+   * its own `socket.close()` re-armed the alarm after `deleteAlarm` had already
+   * run, and the surviving config then let `#ensureConnected` open a REAL socket
+   * for a feed with zero subscribers, re-arming every 15s forever.
+   *
+   * So, in order: latch first (nothing may reconnect from here), drop the socket
+   * reference BEFORE closing it (a re-entrant `#onSocketClosed` sees null),
+   * clear the config (a stray alarm now hits `#ensureConnected`'s `config ===
+   * null` guard and returns), and delete the alarm LAST, after everything that
+   * could re-arm has already run.
+   *
+   * `reconnectAttempts` / `blindSince` / `escalated` are deliberately left
+   * alone: a successful reopen already clears them (`#ensureConnected`), and
+   * resetting them here would change when `price_feed_blind` fires.
    */
   async stopFeed(): Promise<void> {
-    this.#socket?.close();
+    this.#stopped = true;
+    const socket = this.#socket;
     this.#socket = null;
     this.#current = null;
     this.#primed = false;
-    this.#state = { ...this.#state, watermark: null };
+    socket?.close();
+    this.#state = { ...this.#state, config: null, watermark: null };
     await this.#persist();
-    await this.ctx.storage.deleteAlarm();
+    await this.#armAlarm(null);
   }
 
   /**
@@ -289,9 +407,14 @@ export class PriceFeed extends DurableObject<Env> {
   async subscribe(botInstanceId: string, config: PriceFeedConfig): Promise<void> {
     const before = this.#subscriberCount();
     this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO subscribers (bot_instance_id) VALUES (?)",
+      "INSERT OR IGNORE INTO subscribers (bot_instance_id, consecutive_failures) VALUES (?, 0)",
       botInstanceId,
     );
+    // A re-subscribe starts clean. `INSERT OR IGNORE` leaves an existing row
+    // untouched, so without this a bot that halted mid-failure-streak and later
+    // resumed would carry those failures into its new subscription and could be
+    // pruned by deliveries it never missed.
+    this.#resetFailures(botInstanceId);
     if (before === 0 && this.#subscriberCount() > 0) {
       await this.startFeed(config);
     } else {
@@ -313,6 +436,39 @@ export class PriceFeed extends DurableObject<Env> {
     if (before > 0 && this.#subscriberCount() === 0) {
       await this.stopFeed();
     }
+  }
+
+  /**
+   * What this feed is doing, right now (RPC). READ-ONLY: it opens nothing,
+   * arms nothing, and writes nothing.
+   *
+   * Note that merely CALLING this instantiates the object if it was evicted --
+   * unavoidable, since a Durable Object cannot be observed from outside itself.
+   * That costs one short invocation and, because no branch here arms an alarm,
+   * the object goes straight back to sleep. Asking a feed how it is does not
+   * wake it up for good.
+   */
+  async status(): Promise<PriceFeedStatus> {
+    const rows = this.ctx.storage.sql
+      .exec<{ bot_instance_id: string; consecutive_failures: number }>(
+        "SELECT bot_instance_id, consecutive_failures FROM subscribers ORDER BY bot_instance_id",
+      )
+      .toArray();
+    return {
+      config: this.#state.config,
+      connected: this.#socket !== null,
+      alarmAt: await this.ctx.storage.getAlarm(),
+      stopped: this.#stopped,
+      watermark: this.#state.watermark,
+      reconnectAttempts: this.#state.reconnectAttempts,
+      blindSince: this.#state.blindSince,
+      escalated: this.#state.escalated,
+      subscriberCount: rows.length,
+      subscribers: rows.map((row) => ({
+        botInstanceId: row.bot_instance_id,
+        consecutiveFailures: row.consecutive_failures,
+      })),
+    };
   }
 
   /**
@@ -423,6 +579,13 @@ export class PriceFeed extends DurableObject<Env> {
     const price: Price = { pair: candle.pair, price: candle.close, at };
     await this.#deps.forward(price);
 
+    // The fan-out can END this feed: pruning the last failing subscriber calls
+    // `unsubscribe`, which calls `stopFeed`, which resets the watermark exactly
+    // so a restart re-primes fresh. Writing the watermark back here would undo
+    // that and make the next start read as a reconnect, backfilling history
+    // nobody asked for.
+    if (this.#stopped) return;
+
     this.#state = { ...this.#state, watermark: candle.closeTime };
     await this.#persist();
   }
@@ -471,6 +634,12 @@ export class PriceFeed extends DurableObject<Env> {
 
   /** A socket closed or errored (or was found stale): drop it and reconnect. */
   async #onSocketClosed(): Promise<void> {
+    // A close event belonging to a teardown we ourselves performed. The
+    // transport already removes its listeners before closing, so in production
+    // this event should not arrive at all; this catches the cases that bypass
+    // that path -- an injected socket double, or an event already queued when
+    // `stopFeed` ran. Reconnecting here is precisely the leak.
+    if (this.#stopped) return;
     this.#socket?.close();
     this.#socket = null;
     this.#current = null;
@@ -526,12 +695,36 @@ export class PriceFeed extends DurableObject<Env> {
    * The single alarm handler, multiplexed over connection state (one alarm per
    * DO, so heartbeat and reconnect cannot each own one).
    *
+   *  - NO SUBSCRIBERS ⇒ stop. See below.
    *  - Connected and fresh  ⇒ re-arm the health check.
    *  - Connected but stale (no frame within `STALENESS_MS`) ⇒ the socket died
    *    silently; tear it down and reconnect.
    *  - No socket (a scheduled reconnect, or a wake after eviction) ⇒ reconnect.
+   *
+   * ── THE ZERO-SUBSCRIBER CHECK IS THE BACKSTOP, AND IT COMES FIRST ──
+   *
+   * Every other branch of this handler re-arms, so an alarm on a feed nobody is
+   * listening to is a timer that runs forever, holding an object (and, once it
+   * reconnects, an un-hibernatable outbound socket) in memory for no reader.
+   * That is the billed leak this whole change exists to end.
+   *
+   * It is deliberately a check on the CURRENT registry rather than on how the
+   * feed got here: it closes not just the two known causes -- a failed
+   * `unsubscribe` RPC that left a dead subscriber behind, and a self-inflicted
+   * reconnect after `stopFeed` -- but any future gap that leaves a feed running
+   * with an empty registry, whatever its cause.
+   *
+   * The one thing it must NOT do is kill a feed that still has a live bot on it.
+   * A subscriber that is halted, unreachable, or failing delivery still COUNTS
+   * here; only an empty registry stops the feed. Losing prices is a trading
+   * risk, so the connection outlives every failure short of having no reader
+   * left at all.
    */
   override async alarm(): Promise<void> {
+    if (this.#subscriberCount() === 0) {
+      await this.stopFeed();
+      return;
+    }
     if (this.#socket !== null) {
       if (this.#deps.now() - this.#lastMessageAt > STALENESS_MS) {
         await this.#onSocketClosed();
@@ -554,32 +747,77 @@ export class PriceFeed extends DurableObject<Env> {
    * or break delivery to the others. A non-running bot's `onPriceUpdate` returns
    * `"ignored"` — a SUCCESSFUL RPC — so a stale subscriber needs no special-casing.
    *
-   * A delivery that actually REJECTS is recorded as a `system` alert naming the
-   * bot (in the message — the `bot_instance_id` column is a foreign key that an
-   * orphaned bot would violate), and the subscriber is DELIBERATELY NOT pruned. A
-   * fan-out exception is not a reliable
-   * "permanently dead" signal — it is more often transient — and auto-pruning a live
-   * bot on a transient error would silently blind its stop-loss, with nothing to
-   * re-subscribe it until it halts and resumes. A genuinely orphaned subscriber is
-   * section 9 reconciliation's concern, not the per-candle hot path's. See
-   * decision-log 14.4.
+   * ── FAILURE HANDLING: ALERT EVERY TIME, PRUNE ON A STREAK ──
+   *
+   * A delivery that REJECTS is recorded as a `system` alert naming the bot, and
+   * its consecutive-failure count is incremented. A SUCCESSFUL delivery resets
+   * that count to zero, so only an unbroken run of failures accumulates.
+   *
+   * At `MAX_FANOUT_FAILURES` in a row the subscriber is UNSUBSCRIBED. The old
+   * behaviour never pruned at all, on the reasoning that a fan-out exception is
+   * usually transient and auto-pruning a live bot would silently blind its
+   * stop-loss. That reasoning holds for ONE failure and is what the streak
+   * requirement preserves -- but it left no path out for a permanently dead
+   * subscriber, and the comment that once stood here deferred that case to
+   * "section 9 reconciliation's concern". No such reconciliation was ever
+   * written. The result, measured: six halted and stopped bots still holding
+   * live subscriber rows, each keeping its feed's alarm chain alive with nothing
+   * listening.
+   *
+   * Pruning the LAST subscriber takes the feed down through `unsubscribe`'s own
+   * `stopFeed`, which is the point -- that is the leak closing.
    */
   async #fanOut(price: Price): Promise<void> {
     const ids = this.#subscriberIds();
     if (ids.length === 0) return;
 
     const results = await Promise.allSettled(ids.map((id) => this.#deps.deliver(id, price)));
+
+    // Collected, then acted on after the loop: `unsubscribe` can call
+    // `stopFeed`, and tearing the feed down while still deciding what to do
+    // about the other subscribers would read their state mid-teardown.
+    const doomed: string[] = [];
+
     for (let i = 0; i < results.length; i++) {
+      const id = ids[i]!;
       const result = results[i]!;
-      if (result.status === "rejected") {
-        const reason = result.reason as Error | undefined;
-        await this.#alert(
-          "warning",
-          "system",
-          "price_feed_fanout_failed",
-          `delivering a price to bot ${ids[i]} failed: ${reason?.message ?? String(result.reason)}`,
-        );
+
+      if (result.status === "fulfilled") {
+        // Includes a non-running bot's `"ignored"` -- a successful RPC. A
+        // subscriber that can be reached is healthy whatever it did with the
+        // price.
+        this.#resetFailures(id);
+        continue;
       }
+
+      const reason = result.reason as Error | undefined;
+      const failures = this.#recordFailure(id);
+      await this.#alert(
+        "warning",
+        "system",
+        "price_feed_fanout_failed",
+        `delivering a price to bot ${id} failed ` +
+          `(${failures} consecutive, pruned at ${MAX_FANOUT_FAILURES}): ` +
+          `${reason?.message ?? String(result.reason)}`,
+        id,
+      );
+      if (failures >= MAX_FANOUT_FAILURES) doomed.push(id);
+    }
+
+    for (const id of doomed) {
+      // Alerted BEFORE the unsubscribe, while `#configLabel()` can still name
+      // the market -- dropping the last subscriber clears the config.
+      await this.#alert(
+        "warning",
+        "system",
+        "price_feed_subscriber_pruned",
+        `bot ${id} failed ${MAX_FANOUT_FAILURES} consecutive price deliveries on ` +
+          `${this.#configLabel()} and has been unsubscribed. It receives no further prices ` +
+          `until it is resumed, which re-subscribes it. If this bot is running, its ` +
+          `stop-loss is no longer being evaluated and it needs a human.`,
+        id,
+      );
+      await this.unsubscribe(id);
     }
   }
 
@@ -605,12 +843,59 @@ export class PriceFeed extends DurableObject<Env> {
       .one().n;
   }
 
+  /** One subscriber's consecutive failures, or 0 if it is not (or no longer) one. */
+  #failuresFor(botInstanceId: string): number {
+    const rows = this.ctx.storage.sql
+      .exec<{ consecutive_failures: number }>(
+        "SELECT consecutive_failures FROM subscribers WHERE bot_instance_id = ?",
+        botInstanceId,
+      )
+      .toArray();
+    return rows[0]?.consecutive_failures ?? 0;
+  }
+
+  /** Count one failed delivery and return the new streak length. */
+  #recordFailure(botInstanceId: string): number {
+    this.ctx.storage.sql.exec(
+      "UPDATE subscribers SET consecutive_failures = consecutive_failures + 1 " +
+        "WHERE bot_instance_id = ?",
+      botInstanceId,
+    );
+    return this.#failuresFor(botInstanceId);
+  }
+
+  /** Clear a subscriber's streak. A no-op for one already at zero. */
+  #resetFailures(botInstanceId: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE subscribers SET consecutive_failures = 0 " +
+        "WHERE bot_instance_id = ? AND consecutive_failures != 0",
+      botInstanceId,
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
 
-  async #armAlarm(at: Timestamp): Promise<void> {
-    await this.ctx.storage.setAlarm(at);
+  /**
+   * The one place this object's alarm is set or cleared.
+   *
+   * `null` means DISARM, mirroring `BotInstance`'s `#armAlarm`. Before this the
+   * signature was non-nullable and there was no disarm branch at all: the only
+   * `deleteAlarm` in the file was inlined at the end of `stopFeed`, so every
+   * other path could re-arm and none could stand down. A timer with no way to
+   * stop is the shape of the leak.
+   *
+   * Reads the current alarm first and writes only on a change, so a re-arm to
+   * the same instant is not a storage write.
+   */
+  async #armAlarm(at: Timestamp | null): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (at === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    if (current !== at) await this.ctx.storage.setAlarm(at);
   }
 
   async #persist(): Promise<void> {
@@ -623,18 +908,32 @@ export class PriceFeed extends DurableObject<Env> {
   }
 
   /**
-   * Record a feed-level alert in D1 (section 10). `bot_instance_id` is always null:
-   * these are feed concerns, not one bot's, AND the column is a foreign key into
-   * `bot_instances`, so a fan-out failure attributed to an orphaned/deleted bot
-   * (which has no row — the very case worth alerting on) would violate it. The
-   * failing bot's id therefore travels in the MESSAGE. The outbound notification is
+   * Record a feed-level alert in D1 (section 10). The outbound notification is
    * the dispatcher's separate job, exactly as `BotInstance.#alert` leaves it.
+   *
+   * ── `botInstanceId` IS NOW PASSED WHERE ONE IS KNOWN ──
+   *
+   * This used to hardcode `bot_instance_id: null` on every row, with the failing
+   * bot's id interpolated into the free-text `message` and nowhere else. The
+   * stated reason was that the column is a foreign key into `bot_instances` and
+   * an orphaned or DELETED bot would violate it. There is no bot-deletion path
+   * anywhere in this system -- bots are archived, never removed -- so every id
+   * reaching here resolves, and the column stayed null for a case that cannot
+   * happen. The cost was real: `price_feed_fanout_failed` could not be joined,
+   * filtered, or counted per bot, and did not appear on its bot's detail page.
+   *
+   * The fallback below is not defending that old reasoning; it is defending the
+   * hot path. This runs inside `#fanOut`, and a throw here would propagate out
+   * through `#forwardClosed` before the watermark advances -- turning a
+   * constraint failure into a stuck, endlessly-retried candle. An alert is this
+   * object's only voice, so losing its attribution beats losing the alert.
    */
   async #alert(
     severity: AlertRow["severity"],
     category: AlertRow["category"],
     alertType: string,
     message: string,
+    botInstanceId: string | null = null,
   ): Promise<void> {
     const config = this.#state.config;
     const row: AlertRow = {
@@ -642,13 +941,21 @@ export class PriceFeed extends DurableObject<Env> {
       severity,
       category,
       alert_type: alertType,
-      bot_instance_id: null,
+      bot_instance_id: botInstanceId,
       source: config === null ? "price-feed" : `price-feed:${config.exchange}:${config.pair}`,
       message,
       resolved: false,
       created_at: this.#deps.now(),
       notified_at: null,
     };
-    await databaseFrom(this.env).alerts.insert(row);
+    const db = databaseFrom(this.env);
+    try {
+      await db.alerts.insert(row);
+    } catch (error) {
+      if (botInstanceId === null) throw error;
+      // The id is in `message` either way, so the row is still readable by a
+      // human -- it just cannot be joined on.
+      await db.alerts.insert({ ...row, bot_instance_id: null });
+    }
   }
 }

@@ -3393,3 +3393,65 @@ export async function listReconciliationRuns(ctx: ApiContext): Promise<Response>
     })),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Price feed inspection (step 14 D's missing read)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/price-feeds -- every price feed that can exist, and what it is doing.
+ *
+ * ── WHY THIS CANNOT SIMPLY "LIST THE LIVE FEEDS" ──
+ *
+ * A Durable Object namespace cannot be enumerated, and `idFromName` is one-way:
+ * there is no API that returns the feeds that exist, and no way to recover a
+ * name from an id. So the candidate list is DERIVED, from the only place that
+ * records which markets this system has ever subscribed to -- the distinct
+ * `(exchange, pair)` pairs across `bot_instances`. A feed is addressed by
+ * `"<exchange>:<pair>"` (`BotInstance.#feedFromEnv`), so that set is exactly the
+ * set of feed names any bot can have brought into being.
+ *
+ * ARCHIVED AND STOPPED BOTS ARE INCLUDED, deliberately. Their feeds are the ones
+ * most likely to be leaking -- a feed still awake for a bot that stopped trading
+ * is the whole condition this endpoint exists to make visible. Filtering to
+ * running bots would hide precisely the rows worth reading.
+ *
+ * READ-ONLY, but not free: `status()` instantiates each feed object if it was
+ * evicted. That is one short invocation per market with no alarm armed, so
+ * nothing is woken for good. See `PriceFeed.status`.
+ */
+export async function listPriceFeeds(ctx: ApiContext): Promise<Response> {
+  const namespace = ctx.env.PRICE_FEED;
+  if (namespace === undefined) {
+    throw new ApiError(
+      503,
+      "no_price_feed_binding",
+      "no PRICE_FEED binding in this environment. Only testnet and production declare one; " +
+        "a deploy with no --env has neither a database nor any feeds.",
+    );
+  }
+
+  const rows = await ctx.db.botInstances.findMany();
+  const keys = [
+    ...new Set(rows.map((row) => `${row.exchange}:${row.pair}`)),
+  ].sort();
+
+  return ok(
+    await Promise.all(
+      keys.map(async (key) => {
+        const status = await namespace.get(namespace.idFromName(key)).status();
+        return {
+          /** The Durable Object name. `idFromName(key)` addresses this feed. */
+          key,
+          ...status,
+          /**
+           * The condition worth acting on, named rather than left for the reader
+           * to derive: an armed alarm with nothing listening is a feed billing
+           * duration for no reader.
+           */
+          leaking: status.subscriberCount === 0 && status.alarmAt !== null,
+        };
+      }),
+    ),
+  );
+}

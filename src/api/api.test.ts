@@ -27,7 +27,7 @@ import {
   tradeRow,
 } from "../db/test-helpers";
 import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
-import { inBot, rateLimiterStub } from "../durable-objects/test-helpers";
+import { inBot, inFeed, rateLimiterStub } from "../durable-objects/test-helpers";
 import type { BotInstance } from "../durable-objects/bot-instance";
 import { tripAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { reconcileAccount } from "../reconciliation/reconcile";
@@ -7504,5 +7504,95 @@ describe("resolve-stale-receipt-alerts", () => {
     const res = await api("POST", `${ROUTE}?commit=maybe`);
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("invalid_field");
+  });
+});
+
+/**
+ * GET /api/price-feeds -- the feed inspection endpoint (the leak's missing read).
+ *
+ * A `PriceFeed`'s subscriber registry lives in its OWN SQLite, its socket and
+ * alarm are runtime state, and a Durable Object namespace cannot be enumerated.
+ * So before this route there was no way, from anywhere, to see that a feed was
+ * still awake for a bot that had stopped trading. These drive the real endpoint
+ * against real feed objects.
+ */
+describe("GET /api/price-feeds", () => {
+  const CONFIG = { exchange: "gemini", pair: "BTCUSD" } as const;
+
+  /** A feed key nothing else in this file touches. */
+  const feedKey = (pair: string) => `gemini:${pair}`;
+
+  it("lists a feed per distinct (exchange, pair) across bot_instances, with its subscribers", async () => {
+    const id = `pf-a-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({ id, exchange: "gemini", pair: "BTCUSD", status: "running" }),
+    );
+    await inFeed(feedKey("BTCUSD"), async (feed) => {
+      feed.attach({ connect: async () => ({ send: () => {}, close: () => {} }) });
+      await feed.subscribe(id, CONFIG);
+    });
+
+    const res = await api("GET", "/api/price-feeds");
+
+    expect(res.status).toBe(200);
+    const feed = res.body.data.find((row: any) => row.key === "gemini:BTCUSD");
+    expect(feed).toBeDefined();
+    expect(feed.subscriberCount).toBe(1);
+    expect(feed.subscribers).toEqual([{ botInstanceId: id, consecutiveFailures: 0 }]);
+    expect(feed.config).toEqual(CONFIG);
+    expect(feed.connected).toBe(true);
+    // A feed with a live subscriber is doing its job, not leaking.
+    expect(feed.leaking).toBe(false);
+  });
+
+  it("flags a feed that is armed with no subscribers as leaking -- the condition this exists to surface", async () => {
+    const id = `pf-b-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({
+        id,
+        exchange: "gemini",
+        pair: "ETHUSD",
+        status: "halted",
+        // Migration 0001's `halt_requires_reason` CHECK: a halted row carries both.
+        halt_reason: "manual: operator stopped it",
+        halted_at: T0,
+      }),
+    );
+    // The leak's shape: an armed alarm and an empty registry. Reproduced by
+    // emptying the registry behind the feed's back, exactly as a failed
+    // unsubscribe RPC or a stray reconnect would leave it.
+    await inFeed(feedKey("ETHUSD"), async (feed, state) => {
+      feed.attach({ connect: async () => ({ send: () => {}, close: () => {} }) });
+      await feed.subscribe(id, { exchange: "gemini", pair: "ETHUSD" });
+      state.storage.sql.exec("DELETE FROM subscribers");
+    });
+
+    const res = await api("GET", "/api/price-feeds");
+
+    const feed = res.body.data.find((row: any) => row.key === "gemini:ETHUSD");
+    expect(feed.subscriberCount).toBe(0);
+    expect(feed.alarmAt).not.toBeNull();
+    expect(feed.leaking).toBe(true);
+  });
+
+  it("includes archived and stopped bots' markets, which are the ones most likely to leak", async () => {
+    await db.botInstances.insert(
+      botInstanceRow({
+        id: `pf-c-${suffix}`,
+        exchange: "gemini",
+        pair: "LTCUSD",
+        status: "stopped",
+        archived: true,
+      }),
+    );
+
+    const res = await api("GET", "/api/price-feeds");
+
+    expect(res.body.data.map((row: any) => row.key)).toContain("gemini:LTCUSD");
+  });
+
+  it("requires authentication like every other route", async () => {
+    const res = await api("GET", "/api/price-feeds", { token: null });
+    expect(res.status).toBe(401);
   });
 });

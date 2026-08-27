@@ -124,6 +124,11 @@ const ROUTES: readonly Route[] = [
     handlers.resolveStaleReceiptAlerts,
   ),
   route("GET", "/api/reconciliation", handlers.listReconciliationRuns),
+  // Step 14 D's missing READ. The subscriber registry lives inside each PriceFeed
+  // object's own SQLite -- invisible to D1 -- and its socket and alarm are runtime
+  // state, so a feed still awake for a bot that stopped trading could not be seen
+  // from outside at all. This is the only way to inspect one.
+  route("GET", "/api/price-feeds", handlers.listPriceFeeds),
 ];
 
 /**

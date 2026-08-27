@@ -63,8 +63,14 @@
  *    by the poll's own resolve half. Closing them here would give one row two
  *    owners, which is the drift `/src/alerts` exists to prevent.
  *  - `order_state_drift` is reconciliation's, ingested.
- *  - `price_feed_fanout_failed` is the `PriceFeed` object's, under its own
- *    `source`, and is excluded twice over.
+ *  - `price_feed_fanout_failed` and `price_feed_subscriber_pruned` are the
+ *    `PriceFeed` object's, under its own `source`. These USED to be excluded
+ *    twice over -- by `source` and by carrying a null `bot_instance_id`. The
+ *    second exclusion is gone: the feed now attributes them to the failing bot,
+ *    so they DO appear on that bot's detail page and in a query by bot id. The
+ *    `source` filter below is what still keeps them out of a resume's sweep, and
+ *    it is now load-bearing on its own. `isHaltAlertType` excludes them a second
+ *    time regardless, since neither starts with `halt_`.
  */
 
 import type { Database } from "../db";
