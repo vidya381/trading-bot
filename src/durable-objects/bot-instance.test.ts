@@ -1193,9 +1193,22 @@ describe("close (section 8.5)", () => {
   });
 
   it("cannot release the same capital twice", async () => {
+    // ⚠ THE SECOND CLOSE NO LONGER THROWS. It used to raise the ledger's
+    // `bot_already_stopped` out of `close()`; `#closePass` now tolerates that
+    // ONE code and continues, so a close that died partway through its cleanup
+    // can be finished by retrying it. See the "second close finishes the
+    // cleanup" test for the whole argument.
+    //
+    // WHAT THIS TEST STILL ASSERTS IS UNCHANGED AND IS THE POINT: no capital
+    // moves twice. The ledger's conditional update is the mutual exclusion and
+    // it is untouched -- `total_allocated` is the same after the second call as
+    // after the first, and `action` names which call did the releasing.
     await openPosition("100");
-    await run((bot) => bot.close(ACTOR));
-    await expect(run((bot) => bot.close(ACTOR))).rejects.toThrow(/already stopped/);
+    expect(await run((bot) => bot.close(ACTOR))).toMatchObject({ action: "closed" });
+
+    const second = await run((bot) => bot.close(ACTOR));
+    expect(second).toMatchObject({ status: "stopped", action: "already_stopped" });
+
     const ledger = await db.capitalLedger.findOne({ account_label: "main", asset: "USDT" });
     expect(ledger!.total_allocated).toBe(ZERO);
   });
@@ -4001,5 +4014,263 @@ describe("a completed cycle accounts for base its exit could not sell", () => {
     expect(after.state.cycleCount).toBe(0); // a liquidation is not a cycle
     const audit = await db.auditLog.findMany({ where: { action: "bot.liquidation_filled" } });
     expect(audit[0]!.details_json).toMatchObject({ unmodelled_base: "0.00000519" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * The `bot-xs0ufw` halt: a transition that committed while its cleanup did not.
+ *
+ * A stop-loss halt wrote `status = 'halted'` and its `halt_reason` correctly and
+ * then threw partway down the run of bare `await`s that followed, which left a
+ * sell order uncancelled, no `bot.halted` audit row, and the object still
+ * subscribed to its `PriceFeed`. Every step after the status write is
+ * INDEPENDENT of the others, so the first failure had no business deciding how
+ * much of the halt happened.
+ *
+ * These tests fix the property that was missing rather than the specific throw
+ * that exposed it: each step is failed in turn and the OTHERS are asserted to
+ * have run anyway. Where a step is failed here through D1 rather than through
+ * the exchange, that is because D1 is what actually failed in the incident and
+ * is the dependency every one of these steps shares.
+ */
+describe("halt and close cleanup survives a throw in one step", () => {
+  const D1_TIMEOUT =
+    "D1_ERROR: D1 DB storage operation exceeded timeout which caused object to be reset.";
+
+  /**
+   * Methods are bound to the REAL instance rather than to the proxy: `Database`,
+   * `Repository` and `FakeExchange` all hold `#` private fields, which resolve
+   * against the actual instance and would throw if `this` were the proxy.
+   */
+  function boundGet(target: object, prop: string | symbol): unknown {
+    const value = Reflect.get(target, prop) as unknown;
+    return typeof value === "function" ? value.bind(target) : value;
+  }
+
+  /** The real database, with ONE repository method replaced by a thrower. */
+  function dbFailing(real: Database, table: "auditLog", method: string): Database {
+    const repository = new Proxy(real[table] as object, {
+      get: (target, prop) =>
+        prop === method
+          ? async () => {
+              throw new Error(D1_TIMEOUT);
+            }
+          : boundGet(target, prop),
+    });
+    return new Proxy(real, {
+      get: (target, prop) => (prop === table ? repository : boundGet(target, prop)),
+    }) as Database;
+  }
+
+  /**
+   * The real database, with `auditLog.insert` failing for ONE action only.
+   *
+   * `releaseBotCapital` writes its own `capital.released` row, so failing every
+   * audit insert fails the RELEASE -- a different step, before the point of no
+   * return -- rather than the close's own audit row. This fails exactly the one
+   * step under test.
+   */
+  function dbFailingAudit(real: Database, action: string): Database {
+    const repository = new Proxy(real.auditLog as object, {
+      get: (target, prop) =>
+        prop === "insert"
+          ? async (row: { action: string }) => {
+              if (row.action === action) throw new Error(D1_TIMEOUT);
+              return await real.auditLog.insert(row as never);
+            }
+          : boundGet(target, prop),
+    });
+    return new Proxy(real, {
+      get: (target, prop) => (prop === "auditLog" ? repository : boundGet(target, prop)),
+    }) as Database;
+  }
+
+  /** The real fake exchange, with `cancelOrder` replaced by a thrower. */
+  function exchangeFailingCancel(real: FakeExchange): FakeExchange {
+    return new Proxy(real, {
+      get: (target, prop) =>
+        prop === "cancelOrder"
+          ? async () => {
+              throw new Error("TypeError: Cannot read properties of undefined");
+            }
+          : boundGet(target, prop),
+    }) as FakeExchange;
+  }
+
+  /**
+   * `run`, but with the database, exchange and feed individually replaceable.
+   *
+   * The file's own `run` fixes the first two, and every test here needs to fail
+   * exactly one of them while the ASSERTIONS still read through the real
+   * database.
+   */
+  async function runWith<T>(
+    body: (bot: BotInstance) => Promise<T>,
+    overrides: { db?: Database; exchange?: FakeExchange; feed?: PriceFeedPort } = {},
+  ): Promise<T> {
+    return await inBot(objectName, async (instance) => {
+      instance.attach({
+        db: overrides.db ?? db,
+        exchange: overrides.exchange ?? exchange,
+        now: () => clock,
+        newId: () => {
+          idCounter += 1;
+          return `generated-${idCounter}`;
+        },
+        limiterFor: () => rateLimiterStub(`limiter-${objectName}`),
+        sleep: async () => undefined,
+        feedFor: () => overrides.feed ?? noopFeed,
+      });
+      return await body(instance);
+    });
+  }
+
+  /** A started bot holding a position, with one order still resting. */
+  async function withRestingOrder(): Promise<string> {
+    await openPosition("100");
+    await run((bot) => bot.onPriceUpdate(priceAt("95")));
+    return exchange.placed[1]!.clientOrderId;
+  }
+
+  it("still unsubscribes and writes the audit row when the cancel sweep throws", async () => {
+    const resting = await withRestingOrder();
+    const feed = recordingFeed();
+
+    const result = await runWith((bot) => bot.halt("stop_loss", "price 79", ACTOR), {
+      exchange: exchangeFailingCancel(exchange),
+      feed: feed.port,
+    });
+
+    // The halt HAPPENED -- that is not in question and never was.
+    expect(result.status).toBe("halted");
+    expect(result.action).toBe("halted");
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("halted");
+
+    // THE REGRESSION. Both of these were skipped in the incident.
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+    expect(await db.auditLog.count({ action: "bot.halted", target_bot_instance_id: BOT_ID })).toBe(1);
+    expect(await db.alerts.count({ alert_type: "halt_stop_loss" })).toBe(1);
+
+    // The order really is still open, and the result says cleanup was partial
+    // rather than reporting an ordinary halt.
+    expect((await db.orders.findOne({ id: resting }))!.status).toBe("pending");
+    expect(result.detail).toContain("cancel_open_orders");
+    const failures = await db.alerts.findMany({ where: { alert_type: "cleanup_step_failed" } });
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.severity).toBe("critical");
+    expect(failures[0]!.message).toContain("cancel_open_orders");
+  });
+
+  it("still cancels orders and unsubscribes when the audit write throws", async () => {
+    const resting = await withRestingOrder();
+    const feed = recordingFeed();
+
+    const result = await runWith((bot) => bot.halt("stop_loss", "price 79", ACTOR), {
+      db: dbFailing(db, "auditLog", "insert"),
+      feed: feed.port,
+    });
+
+    expect(result.status).toBe("halted");
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("halted");
+
+    // THE REGRESSION, from the other side: the step that threw is LATER in the
+    // sequence than the cancel sweep, so this direction proves the wrapping is
+    // per-step rather than a single try/catch around the tail.
+    expect(exchange.cancelled).toEqual([resting]);
+    expect((await db.orders.findOne({ id: resting }))!.status).toBe("cancelled");
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+
+    // The audit row genuinely did not land, and that is reported rather than
+    // silently swallowed.
+    expect(await db.auditLog.count({ action: "bot.halted", target_bot_instance_id: BOT_ID })).toBe(0);
+    expect(result.detail).toContain("halt_audit");
+    expect(await db.alerts.count({ alert_type: "cleanup_step_failed" })).toBe(1);
+  });
+
+  it("re-halting an already-halted bot clears a subscription a first halt leaked", async () => {
+    await openPosition("100");
+
+    // The leak, reproduced exactly: the first halt's unsubscribe fails, so the
+    // bot is halted AND still subscribed. Every later call sees `already_halted`.
+    const feed = recordingFeed();
+    let failNext = true;
+    const flaky: PriceFeedPort = {
+      subscribe: feed.port.subscribe,
+      unsubscribe: async (botInstanceId) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error(D1_TIMEOUT);
+        }
+        await feed.port.unsubscribe(botInstanceId);
+      },
+    };
+
+    await runWith((bot) => bot.halt("manual", "first", ACTOR), { feed: flaky });
+    expect(feed.unsubscribes).toEqual([]);
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("halted");
+
+    // THE SELF-HEAL. This is what the kill switch and reconciliation already do
+    // to every bot they sweep, and what an operator does by hand; before the
+    // unsubscribe moved above the early return it walked past the leak.
+    const second = await runWith((bot) => bot.halt("manual", "second", ACTOR), { feed: flaky });
+
+    expect(second.action).toBe("already_halted");
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+
+    // It self-heals the SUBSCRIPTION and nothing else: no second halt alert, no
+    // second audit row, and the recorded reason is still the first halt's.
+    expect(await db.alerts.count({ alert_type: "halt_manual" })).toBe(1);
+    expect(await db.auditLog.count({ action: "bot.halted", target_bot_instance_id: BOT_ID })).toBe(1);
+    expect(second.detail).toMatch(/^manual: first/);
+  });
+
+  it("a second close finishes the cleanup instead of raising bot_already_stopped", async () => {
+    // ⚠ THE DELIBERATE API BEHAVIOUR CHANGE. A second close used to throw
+    // `bot_already_stopped` from the ledger BEFORE reaching any cleanup, which
+    // meant a close that died partway through could never be completed by
+    // retrying it -- every retry died on the same line. It now returns
+    // `already_stopped` and runs the cleanup the first pass skipped.
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    const feed = recordingFeed();
+    const first = await runWith((bot) => bot.close(ACTOR), { feed: feed.port });
+    expect(first.action).toBe("closed");
+
+    const ledger = await db.capitalLedger.findOne({ account_label: "main", asset: "USDT" });
+    const second = await runWith((bot) => bot.close(ACTOR), { feed: feed.port });
+
+    expect(second).toMatchObject({ status: "stopped", action: "already_stopped" });
+    // NO CAPITAL MOVED TWICE. The ledger's mutual exclusion is untouched; only
+    // the cleanup after it ran again.
+    const after = await db.capitalLedger.findOne({ account_label: "main", asset: "USDT" });
+    expect(after!.total_allocated).toBe(ledger!.total_allocated);
+    expect(feed.unsubscribes).toEqual([BOT_ID, BOT_ID]);
+  });
+
+  it("still unsubscribes a close whose audit write throws, and says cleanup was partial", async () => {
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    const feed = recordingFeed();
+    const result = await runWith((bot) => bot.close(ACTOR), {
+      db: dbFailingAudit(db, "bot.closed"),
+      feed: feed.port,
+    });
+
+    // The close COMMITTED: capital is released and the row is stopped. That is
+    // the point of no return and it is behind us, which is exactly why the
+    // steps after it must not be abandoned.
+    expect(result).toMatchObject({ status: "stopped", action: "closed" });
+    expect((await db.botInstances.findOne({ id: BOT_ID }))!.status).toBe("stopped");
+
+    // A stopped bot is read by NO scheduled job -- not the poll, not
+    // reconciliation -- so a step skipped here is skipped permanently.
+    expect(feed.unsubscribes).toEqual([BOT_ID]);
+    expect(await db.auditLog.count({ action: "bot.closed", target_bot_instance_id: BOT_ID })).toBe(0);
+    expect(result.detail).toContain("close_audit");
+    expect(await db.alerts.count({ alert_type: "cleanup_step_failed" })).toBe(1);
   });
 });

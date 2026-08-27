@@ -109,6 +109,7 @@ import { fromDecimalString, toDecimalString, ZERO, type Money } from "../shared/
 import { resetAccountCircuitBreaker } from "../reconciliation/circuit-breaker";
 import { readGlobalKillSwitch } from "../reconciliation/kill-switch";
 import { isHaltAlertType, isReceiptAlertType } from "../shared/alert-types";
+import { findInactiveBotsWithOpenOrders } from "../db/integrity";
 import {
   resetGlobalKillSwitchFromEnv,
   tripGlobalKillSwitchFromEnv,
@@ -1028,11 +1029,26 @@ export async function liquidateBot(ctx: ApiContext): Promise<Response> {
  * double release), clears `openOrderIds`, audits `bot.closed`, and unsubscribes
  * from the price feed. It does NOT sell anything.
  *
- * ⚠ IT IS THE POINT OF NO RETURN FOR THE ALLOCATION. A second close raises
- * `bot_already_stopped` from the ledger, and nothing in this system moves a bot
- * back out of `stopped` -- re-funding a closed bot is not built. So this ends
- * the bot for capital purposes even though its history, config and position all
- * survive intact.
+ * ⚠ IT IS THE POINT OF NO RETURN FOR THE ALLOCATION. Nothing in this system
+ * moves a bot back out of `stopped` -- re-funding a closed bot is not built. So
+ * this ends the bot for capital purposes even though its history, config and
+ * position all survive intact.
+ *
+ * ⚠ BEHAVIOUR CHANGE: A SECOND CLOSE NOW SUCCEEDS (200), NOT 409.
+ *
+ * It used to raise `bot_already_stopped` from the ledger. `#closePass` now
+ * tolerates that ONE error code and continues, returning
+ * `action: "already_stopped"` with HTTP 200. No capital moves on the second
+ * call -- the ledger's mutual exclusion is untouched and still refuses the
+ * double release; what changed is only that the refusal no longer aborts the
+ * cleanup steps that follow it.
+ *
+ * WHY: a close that threw partway through its own cleanup left a bot stopped
+ * with an order uncancelled, no audit row, and a live feed subscription, and
+ * every retry died on this same line before reaching any of it. Making the
+ * retry corrective is the point. A caller that needs to distinguish the two
+ * cases reads `result.action`, which is `"closed"` on the release that actually
+ * moved capital and `"already_stopped"` on a cleanup-only pass.
  *
  * GATED ON A FLAT POSITION, exactly as `archive` is and through the same
  * function. This is a wider gate than `close()` itself imposes -- the object
@@ -1049,7 +1065,10 @@ export async function liquidateBot(ctx: ApiContext): Promise<Response> {
  *                                    object to refuse.
  *   - `position_held` (409)       -- still holding inventory; liquidate first.
  *   - `not_created` (404)         -- from the object: it holds no config.
- *   - `bot_already_stopped` (409) -- from the ledger: capital already released.
+ *
+ * `bot_already_stopped` (409) IS NO LONGER RAISED here; see the behaviour-change
+ * note above. `release_exceeds_allocated`, `unknown_bot_instance` and
+ * `allocation_conflict` from the ledger all still propagate untouched.
  * Deliberately NOT gated on `archived`: `assertNotArchived` exists to stop a
  * hidden bot TRADING, and closing is the opposite of trading. `halt` skips it
  * for the same reason.
@@ -3454,4 +3473,69 @@ export async function listPriceFeeds(ctx: ApiContext): Promise<Response> {
       }),
     ),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Integrity checks (read-only)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/integrity/inactive-bots-with-open-orders -- the invariant that a
+ * bot which is `halted` or `stopped` has no order still resting.
+ *
+ * ── WHY THIS ENDPOINT EXISTS ──
+ *
+ * The combination it reports should be impossible: `#halt` cancels every open
+ * order and `#closePass` refuses to release capital while any order is
+ * unresolved. It nevertheless happened -- a stop-loss halt marked a bot halted
+ * and then threw before its cancel sweep -- and NOTHING in this system noticed.
+ * Reconciliation could not: `RECONCILED_STATUSES` is `created`/`running`/
+ * `halted`, so it never reads a stopped bot at all, and its `mirrorFindings`
+ * compares the object's own order list against D1 rather than asking whether an
+ * order should exist given the bot's status. The 30-second poll could not
+ * either: `#pollArmed` excludes `stopped`, and a halted bot whose object lost
+ * track of an order is not polling for it.
+ *
+ * So this is a check with no other home. It reads D1 alone -- no Durable Object
+ * is woken, no exchange is called -- which is what makes it safe to hit at any
+ * time and what makes it able to see the stopped bots nothing else does.
+ *
+ * READ-ONLY, AND IT CORRECTS NOTHING. See `/src/db/integrity.ts`: the
+ * corrective action is an operator re-halting the bot, which now completes the
+ * cleanup its first halt skipped. Doing that automatically here would cancel
+ * live orders from a GET.
+ *
+ * NOT SCHEDULED. Wiring it into the reconciliation cron would mean widening
+ * `RECONCILED_STATUSES` to include `stopped`, which changes what that job
+ * considers in scope; that is a larger decision than this detector needed and
+ * is deliberately left open.
+ */
+export async function listInactiveBotsWithOpenOrders(ctx: ApiContext): Promise<Response> {
+  const findings = await findInactiveBotsWithOpenOrders(ctx.db);
+  return ok({
+    /**
+     * Named rather than left to `findings.length === 0`, because the useful
+     * reading of this endpoint is the boolean and a caller should not have to
+     * know that an empty array is the healthy answer.
+     */
+    healthy: findings.length === 0,
+    count: findings.length,
+    bots: findings.map((finding) => ({
+      bot_instance_id: finding.botInstanceId,
+      status: finding.status,
+      halted_at: finding.haltedAt,
+      open_orders: finding.openOrders.map((order) => ({
+        id: order.id,
+        client_order_id: order.client_order_id,
+        exchange_order_id: order.exchange_order_id,
+        side: order.side,
+        status: order.status,
+        price: toDecimalString(order.price),
+        quantity: toDecimalString(order.quantity),
+        filled_quantity: toDecimalString(order.filled_quantity),
+        created_at: order.created_at,
+        updated_at: order.updated_at,
+      })),
+    })),
+  });
 }

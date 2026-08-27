@@ -78,7 +78,7 @@ import {
   resolveHaltAlerts,
   standingAlertKey,
 } from "../alerts";
-import { createBotInstanceWithCapital, releaseBotCapital } from "../capital";
+import { CapitalError, createBotInstanceWithCapital, releaseBotCapital } from "../capital";
 import { databaseFrom, type Database } from "../db";
 import type { AlertRow, AuditLogRow, BotStatus, OrderRow, TradeRow } from "../db/schema";
 import { isExchangeId } from "../db/schema";
@@ -1141,16 +1141,111 @@ export class BotInstance extends DurableObject<Env> {
     try {
       await this.#feed(config.exchange, config.pair).unsubscribe(config.botInstanceId);
     } catch (error) {
-      await this.#alert(config, {
-        severity: "warning",
-        category: "system",
-        alertType: "price_feed_unsubscribe_failed",
-        message:
-          `could not unsubscribe bot ${config.botInstanceId} from its price feed ` +
-          `(${config.exchange}:${config.pair}): ${(error as Error).message}. The bot ` +
-          `has still left running; the stale subscriber is harmless and reconciliation-visible.`,
-      });
+      // THE REPORT GETS ITS OWN GUARD, and the reason is the whole point of the
+      // method. This alert is a D1 INSERT, and D1 is exactly the dependency
+      // most likely to be down at the moment a feed RPC has just failed -- a
+      // storage timeout takes both. Without this catch the reporting failure
+      // propagates out of a method whose contract is "never throws", and the
+      // caller loses every cleanup step after it: the halt's audit row, its
+      // status mirror, its cancellations. That is a strictly worse outcome
+      // than an unreported stale subscriber, which reconciliation sees anyway.
+      //
+      // `console.error` rather than a second alert, because the thing that just
+      // failed IS the alert path. There is nowhere left to write to.
+      try {
+        await this.#alert(config, {
+          severity: "warning",
+          category: "system",
+          alertType: "price_feed_unsubscribe_failed",
+          message:
+            `could not unsubscribe bot ${config.botInstanceId} from its price feed ` +
+            `(${config.exchange}:${config.pair}): ${(error as Error).message}. The bot ` +
+            `has still left running; the stale subscriber is harmless and reconciliation-visible.`,
+        });
+      } catch (alertError) {
+        console.error(
+          `bot ${config.botInstanceId}: price-feed unsubscribe failed ` +
+            `(${(error as Error).message}), AND the alert reporting it failed ` +
+            `(${(alertError as Error).message}). Both are lost to D1; the bot has ` +
+            `still left running.`,
+        );
+      }
     }
+  }
+
+  /**
+   * Run one CLEANUP step so that its failure cannot cancel the steps after it.
+   *
+   * WHAT THIS IS FOR, from the incident that produced it. A stop-loss halt on
+   * `bot-xs0ufw` wrote `status = 'halted'` and its `halt_reason` correctly and
+   * then threw somewhere in the run of bare `await`s that followed, which left
+   * that bot marked halted while a sell order stayed live on the exchange, no
+   * `bot.halted` audit row was ever written, and the object stayed subscribed
+   * to its `PriceFeed`. Every one of those steps is INDEPENDENT of the others
+   * -- cancelling orders does not need the audit row, unsubscribing does not
+   * need the mirror -- so sequencing them as bare `await`s made the first
+   * failure decide how much of the halt happened, which is not a decision any
+   * of them is entitled to make.
+   *
+   * THE DIVIDING LINE, and it is not "wrap everything". A step belongs here
+   * only if the transition is already COMMITTED and correct without it. The
+   * durable status write is therefore NOT wrapped on either path: on the halt
+   * it is the ordering guarantee the `#halt` header argues for, and on the
+   * close `releaseBotCapital` owns the point of no return. A bot that cannot
+   * record that it halted must fail loudly rather than proceed to tidy up
+   * after a halt that is not recorded anywhere.
+   *
+   * Returns the step's name when it failed and `undefined` when it did not, so
+   * the caller can report WHICH steps were skipped in its `PipelineResult`
+   * rather than reporting an unqualified success. The alert is best-effort in
+   * the same nested way `#unsubscribeFromFeed`'s is, and for the same reason:
+   * this is called on paths where D1 itself is a plausible culprit, and a
+   * reporting failure here would re-create precisely the bug being fixed.
+   */
+  async #cleanupStep(
+    config: BotConfigBase,
+    step: string,
+    run: () => Promise<void>,
+  ): Promise<string | undefined> {
+    try {
+      await run();
+      return undefined;
+    } catch (error) {
+      const message = (error as Error).message;
+      try {
+        await this.#alert(config, {
+          severity: "critical",
+          category: "system",
+          alertType: "cleanup_step_failed",
+          message:
+            `the ${step} step of a halt or close on bot ${config.botInstanceId} failed: ` +
+            `${message}. The transition itself stands and the remaining cleanup steps ` +
+            `still ran; this step did not, and nothing retries it automatically.`,
+        });
+      } catch (alertError) {
+        console.error(
+          `bot ${config.botInstanceId}: cleanup step ${JSON.stringify(step)} failed ` +
+            `(${message}), AND the alert reporting it failed ` +
+            `(${(alertError as Error).message}).`,
+        );
+      }
+      return step;
+    }
+  }
+
+  /**
+   * The `detail` a halt or close reports when some of its cleanup did not run.
+   *
+   * `undefined` when every step succeeded, so the ordinary result is unchanged
+   * and no existing assertion on it moves. When something failed the caller
+   * still reports the transition as having HAPPENED -- it did -- but says so
+   * with the failed steps named, which is the difference between a caller that
+   * knows cleanup was partial and one that has to infer it from the alerts.
+   */
+  #cleanupDetail(failed: readonly (string | undefined)[]): string | undefined {
+    const steps = failed.filter((step): step is string => step !== undefined);
+    if (steps.length === 0) return undefined;
+    return `cleanup incomplete: ${steps.join(", ")} failed`;
   }
 
   // -------------------------------------------------------------------------
@@ -3728,10 +3823,53 @@ export class BotInstance extends DurableObject<Env> {
 
     // Step 5 owns this: it flips the row to `stopped` conditionally, inspects
     // the changes count, and only then releases the reservation.
-    await releaseBotCapital(this.#db(), config.botInstanceId, { actor, now });
+    //
+    // `bot_already_stopped` IS TOLERATED HERE, SPECIFICALLY, AND ONLY IT.
+    //
+    // That error means the `bot_instances` row is ALREADY `stopped` -- the
+    // conditional update matched nothing. It is the ledger's mutual exclusion
+    // against a double release doing precisely its job, and the capital
+    // question is therefore already settled correctly: it was released once,
+    // and it is not being released again. What is NOT settled is everything
+    // below, and a previous close that threw partway through cleanup is one of
+    // the two ways to arrive here. Rethrowing would guarantee that such a bot
+    // can never finish closing, because every retry would die on the same line
+    // before reaching the steps that were skipped.
+    //
+    // So this is the close-path counterpart of `#halt`'s re-halt self-heal: the
+    // retry is what completes the cleanup. Both make an operator's obvious
+    // corrective action -- do it again -- actually corrective.
+    //
+    // NARROW ON PURPOSE. `release_exceeds_allocated` means the ledger and the
+    // bot rows disagree about real money and must NOT be swallowed;
+    // `unknown_bot_instance` means the row is gone; `allocation_conflict` means
+    // the write lost its race and the release genuinely has not happened. Each
+    // still propagates untouched. Only the "already done" case continues.
+    //
+    // ⚠ THIS CHANGES AN API CONTRACT. A second `POST /bots/:id/close` now
+    // returns 200 with `action: "already_stopped"` instead of 409
+    // `bot_already_stopped`. See `closeBot` in `/src/api/handlers.ts`, whose
+    // failure list is updated to match, and the decision-log entry for this
+    // change.
+    let alreadyStopped = false;
+    try {
+      await releaseBotCapital(this.#db(), config.botInstanceId, { actor, now });
+    } catch (error) {
+      if (!(error instanceof CapitalError) || error.code !== "bot_already_stopped") throw error;
+      alreadyStopped = true;
+    }
 
     const latest = await this.#state();
-    await this.#mutateState((current) => ({ ...current, status: "stopped", openOrderIds: [] }));
+
+    // EVERY STEP BELOW IS INDEPENDENTLY BEST-EFFORT (see `#cleanupStep`), for
+    // the same reason as on the halt path: the release above is the point of no
+    // return, and everything after it is tidying up after a close that HAS
+    // happened. On this path that matters more, not less -- a stopped bot is
+    // observed by nothing at all (no poll, no reconciliation), so a cleanup step
+    // skipped here is skipped permanently unless a human closes it again.
+    const stateFailed = await this.#cleanupStep(config, "stopped_state_write", async () => {
+      await this.#mutateState((current) => ({ ...current, status: "stopped", openOrderIds: [] }));
+    });
 
     // THE SECOND TRIGGER FOR AN OLD LIFECYCLE (step 65), and the reason it needs
     // one. `resolveHaltAlerts` has always had exactly one caller -- `#resumePass`
@@ -3767,31 +3905,57 @@ export class BotInstance extends DurableObject<Env> {
     // its own: everything above can refuse the close -- step 64's unresolved-
     // order gate, `releaseBotCapital`'s own guard -- and a bot that did NOT
     // close must keep its halt alert open.
-    const resolvedAlertIds = await resolveHaltAlerts(this.#db(), {
-      source: BOT_ALERT_SOURCE,
-      botInstanceId: config.botInstanceId,
+    let resolvedAlertIds: string[] = [];
+    const resolveFailed = await this.#cleanupStep(config, "resolve_halt_alerts", async () => {
+      resolvedAlertIds = await resolveHaltAlerts(this.#db(), {
+        source: BOT_ALERT_SOURCE,
+        botInstanceId: config.botInstanceId,
+      });
     });
 
-    await this.#audit(
-      config,
-      "bot.closed",
-      actor,
-      {
-        cycles_completed: latest.cycleCount,
-        // Recorded in the EXISTING close entry rather than as a second audit
-        // action, matching `bot.resumed`'s `resolved_halt_alert_ids`. One event
-        // closed these rows; one row should say so.
-        resolved_halt_alert_ids: resolvedAlertIds,
-      },
-      now,
+    // The audit row is written whether or not the resolve above succeeded, and
+    // it reports what was ACTUALLY resolved -- an empty list when the resolve
+    // failed, never a guess. The `cleanup_step_failed` alert names that failure
+    // separately; an audit entry claiming ids it did not close would be worse
+    // than one that closed none.
+    const auditFailed = await this.#cleanupStep(config, "close_audit", () =>
+      this.#audit(
+        config,
+        "bot.closed",
+        actor,
+        {
+          cycles_completed: latest.cycleCount,
+          // Recorded in the EXISTING close entry rather than as a second audit
+          // action, matching `bot.resumed`'s `resolved_halt_alert_ids`. One event
+          // closed these rows; one row should say so.
+          resolved_halt_alert_ids: resolvedAlertIds,
+        },
+        now,
+      ),
     );
 
     // Closing can go running -> stopped directly (bypassing #halt), so this is a
     // genuine "leaving running" point. Best-effort, like the halt path; a bot
     // closed from `created` (never subscribed) unsubscribes as a harmless no-op.
-    await this.#unsubscribeFromFeed(config);
+    const unsubscribeFailed = await this.#cleanupStep(config, "unsubscribe_from_feed", () =>
+      this.#unsubscribeFromFeed(config),
+    );
 
-    return { status: "stopped", action: "closed" };
+    // `already_stopped` rather than `closed` when the ledger had nothing left to
+    // release: the caller asked for a close and got one, but the capital moved
+    // on an earlier call and this pass only finished the cleanup. Reporting
+    // `closed` would tell an operator a release happened just now that did not.
+    const incomplete = this.#cleanupDetail([
+      stateFailed,
+      resolveFailed,
+      auditFailed,
+      unsubscribeFailed,
+    ]);
+    return {
+      status: "stopped",
+      action: alreadyStopped ? "already_stopped" : "closed",
+      ...(incomplete === undefined ? {} : { detail: incomplete }),
+    };
   }
 
   /** Everything this object knows about itself, for the dashboard and tests. */
@@ -5660,6 +5824,31 @@ export class BotInstance extends DurableObject<Env> {
     const state = await this.#state();
 
     if (state.status === "halted") {
+      // SELF-HEAL THE SUBSCRIPTION BEFORE RETURNING, and this is deliberately
+      // ABOVE the early return rather than below it.
+      //
+      // Re-halting an already-halted bot is not a mistake to be short-circuited:
+      // the global kill switch and reconciliation both do it on purpose, sweeping
+      // every bot they select without first asking which are already halted. That
+      // makes this the one code path that runs repeatedly against a bot in the
+      // broken state the incident produced -- halted, but still subscribed to its
+      // feed because a throw skipped the unsubscribe. Returning `already_halted`
+      // first meant those sweeps saw the leak and walked past it every time.
+      //
+      // Safe to repeat: `unsubscribe` is idempotent, and this method is
+      // best-effort by contract, so a second call on a bot that is already gone
+      // from the registry is a no-op that cannot throw.
+      //
+      // NOT `#mirrorStatus`, and NOT the cancel sweep, and both exclusions are
+      // deliberate. The D1 status mirror has a documented owner: `#resumePass`
+      // reserves that convergence for the detector described in
+      // `docs/open-items/resume-split-brain.md` part 3b, and widening it into
+      // `#halt` here is the exact change that comment declines to make. A cancel
+      // sweep would spend risk-exit rate budget on every kill-switch pass over
+      // every already-halted bot, and the 30-second poll already observes halted
+      // bots' open orders. The subscription has no such observer, which is why it
+      // is the one that moves.
+      await this.#unsubscribeFromFeed(config);
       return { status: "halted", action: "already_halted", detail: state.haltReason ?? undefined };
     }
     if (state.status === "stopped") {
@@ -5674,11 +5863,22 @@ export class BotInstance extends DurableObject<Env> {
       haltedAt: now,
     }));
 
+    // EVERY STEP BELOW IS INDEPENDENTLY BEST-EFFORT (see `#cleanupStep`). The
+    // status write above is not: it is the ordering guarantee this method's
+    // header argues for, and a halt that cannot be recorded must fail loudly.
+    // Everything after it is tidying up after a halt that HAS happened, and one
+    // failing must not take the others down with it -- which is exactly what a
+    // run of bare `await`s did on `bot-xs0ufw`.
+
     // 1. Cancel every open order.
-    await this.#cancelOpenOrders(config, state);
+    const cancelFailed = await this.#cleanupStep(config, "cancel_open_orders", () =>
+      this.#cancelOpenOrders(config, state),
+    );
 
     // 3. Mark the instance halted with a recorded reason, in D1 too.
-    await this.#mirrorStatus(config, "halted", recorded, now, now);
+    const mirrorFailed = await this.#cleanupStep(config, "mirror_status", () =>
+      this.#mirrorStatus(config, "halted", recorded, now, now),
+    );
 
     // 4. Fire an alert. Written to D1 unconditionally per section 10; the
     //    outbound Discord/Telegram notification and its KV cooldown are step 8.
@@ -5693,22 +5893,41 @@ export class BotInstance extends DurableObject<Env> {
     // is running again. The two must stay together the way `standing.ts`'s two
     // halves do; see `/src/alerts/halt.ts`.
     const positiveExit = reason === "take_profit_reached" || reason === "take_profit" || reason === "breakout_take_profit";
-    await this.#alert(config, {
-      severity: positiveExit ? "info" : "critical",
-      category: reason === "unhandled_error" ? "system" : "trading",
-      alertType: haltAlertType(reason),
-      message: recorded,
-    });
-    await this.#audit(config, "bot.halted", actor, { reason, detail }, now);
+    const alertFailed = await this.#cleanupStep(config, "halt_alert", () =>
+      this.#alert(config, {
+        severity: positiveExit ? "info" : "critical",
+        category: reason === "unhandled_error" ? "system" : "trading",
+        alertType: haltAlertType(reason),
+        message: recorded,
+      }),
+    );
+    const auditFailed = await this.#cleanupStep(config, "halt_audit", () =>
+      this.#audit(config, "bot.halted", actor, { reason, detail }, now),
+    );
 
     // The bot has left running: unsubscribe from the price feed (best-effort;
     // never blocks the halt). A DCA take-profit that AUTO-RESTARTS never reaches
     // here — it stays running — so it correctly stays subscribed.
-    await this.#unsubscribeFromFeed(config);
+    const unsubscribeFailed = await this.#cleanupStep(config, "unsubscribe_from_feed", () =>
+      this.#unsubscribeFromFeed(config),
+    );
 
     // 5. Never auto-resume: there is no path from `halted` back to `running`
     //    except `resume()`, which takes an actor.
-    return { status: "halted", action: "halted", detail: recorded };
+    //
+    // The `detail` still carries the halt reason when everything ran, because
+    // that is what every existing caller and test reads off it. It is REPLACED
+    // -- not appended to -- when cleanup was partial, so a caller cannot read a
+    // half-finished halt as an ordinary one; the reason is on the bot row and in
+    // the alert either way.
+    const incomplete = this.#cleanupDetail([
+      cancelFailed,
+      mirrorFailed,
+      alertFailed,
+      auditFailed,
+      unsubscribeFailed,
+    ]);
+    return { status: "halted", action: "halted", detail: incomplete ?? recorded };
   }
 
   /**

@@ -267,7 +267,9 @@ export function resumeBot(id: string, signal?: AbortSignal): Promise<ResumeRespo
  * The only action that releases an allocation, and it does not come back:
  * nothing moves a bot out of `stopped`. It cancels open orders but NEVER sells,
  * which is why it refuses a bot that still holds a position (`position_held`,
- * 409) -- liquidate by hand first. A second close is `bot_already_stopped`.
+ * 409) -- liquidate by hand first. A SECOND close succeeds (200) and reports
+ * `action: "already_stopped"`; it releases nothing and only finishes cleanup
+ * the first close may have skipped.
  */
 export function closeBot(id: string, signal?: AbortSignal): Promise<CloseResponse> {
   return requestJson<CloseResponse>(`/api/bots/${encodeURIComponent(id)}/close`, "POST", { signal });

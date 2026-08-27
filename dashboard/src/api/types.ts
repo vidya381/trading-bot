@@ -707,7 +707,10 @@ export interface ResumeResponse {
 // nothing in this system moves a bot back out of `stopped`. It refuses a bot
 // that still holds a position (`position_held`, 409) -- closing cancels orders
 // but never sells, so releasing capital from a bot carrying inventory would hand
-// back capital that is not cash. A second close is `bot_already_stopped` (409).
+// back capital that is not cash. A SECOND close now succeeds (200) with
+// `action: "already_stopped"` rather than raising `bot_already_stopped` (409):
+// no capital moves twice, but the retry completes any cleanup the first close
+// skipped. Read `action` to tell the two apart.
 // ---------------------------------------------------------------------------
 
 export interface CloseResult {

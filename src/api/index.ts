@@ -129,6 +129,14 @@ const ROUTES: readonly Route[] = [
   // state, so a feed still awake for a bot that stopped trading could not be seen
   // from outside at all. This is the only way to inspect one.
   route("GET", "/api/price-feeds", handlers.listPriceFeeds),
+  // A cross-table invariant no CHECK constraint can express and no scheduled
+  // job looks for: an inactive bot with an order still resting. Read-only and
+  // unscheduled; see the handler for why it has no other home.
+  route(
+    "GET",
+    "/api/integrity/inactive-bots-with-open-orders",
+    handlers.listInactiveBotsWithOpenOrders,
+  ),
 ];
 
 /**

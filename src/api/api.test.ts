@@ -1709,16 +1709,35 @@ describe("closing", () => {
   });
 
 
-  it("refuses a second close rather than releasing the same capital twice", async () => {
+  it("never releases the same capital twice, and a second close now succeeds", async () => {
+    // ⚠ DELIBERATE BEHAVIOUR CHANGE. This used to assert a 4xx: the ledger's
+    // `bot_already_stopped` propagated out of `close()` and the envelope mapped
+    // it to 409. `#closePass` now tolerates that ONE error code and carries on
+    // to its cleanup, so the second call returns 200 with
+    // `action: "already_stopped"`.
+    //
+    // WHY: a close that threw partway through its cleanup left a stopped bot
+    // with an order uncancelled, no audit row and a live feed subscription --
+    // and every retry died on the release line before reaching any of it, so
+    // the bot could never be finished. Making the retry corrective is the point.
+    //
+    // THE SAFETY PROPERTY THIS TEST EXISTS FOR IS UNCHANGED and is still
+    // asserted below: the ledger's conditional update is the mutual exclusion,
+    // it is untouched, and exactly ONE `capital.released` row is ever written.
     const account = `acct-${suffix}`;
     const id = `cl2${suffix}`;
     await haltedFlatBot(id, account);
-    expect((await api("POST", `/api/bots/${id}/close`)).status).toBe(200);
+    const first = await api("POST", `/api/bots/${id}/close`);
+    expect(first.status).toBe(200);
+    expect(first.body.data.result.action).toBe("closed");
 
     const second = await api("POST", `/api/bots/${id}/close`);
 
-    // The ledger's own mutual exclusion, surfaced rather than swallowed.
-    expect(second.status).toBeGreaterThanOrEqual(400);
+    expect(second.status).toBe(200);
+    expect(second.body.data.result).toMatchObject({
+      status: "stopped",
+      action: "already_stopped",
+    });
     expect(
       (await db.capitalLedger.findOne({ account_label: account, asset: "USDT" }))!.total_allocated,
     ).toBe(m("0"));
@@ -7594,5 +7613,119 @@ describe("GET /api/price-feeds", () => {
   it("requires authentication like every other route", async () => {
     const res = await api("GET", "/api/price-feeds", { token: null });
     expect(res.status).toBe(401);
+  });
+});
+
+/**
+ * GET /api/integrity/inactive-bots-with-open-orders -- the invariant nothing
+ * else in this system checks.
+ *
+ * A `halted` or `stopped` bot with an order still resting should be impossible:
+ * `#halt` cancels every open order and `#closePass` refuses to release capital
+ * while any order is unresolved. `bot-xs0ufw` nevertheless ended up in exactly
+ * that state and no poll, no reconciliation pass and no constraint noticed --
+ * `RECONCILED_STATUSES` never reads a stopped bot at all. This route is the
+ * detector.
+ */
+describe("GET /api/integrity/inactive-bots-with-open-orders", () => {
+  /** Only this test's own rows: the database is shared across the file. */
+  function mine(body: any): any[] {
+    return (body.data.bots as { bot_instance_id: string }[]).filter((bot) =>
+      bot.bot_instance_id.endsWith(`-${suffix}`),
+    );
+  }
+
+  it("reports a halted bot whose order was never cancelled", async () => {
+    const id = `int-halted-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({
+        id,
+        status: "halted",
+        halt_reason: "stop_loss: price 79",
+        halted_at: T0,
+      }),
+    );
+    await db.orders.insert(
+      orderRow({ id: `${id}-ord`, bot_instance_id: id, client_order_id: `${id}-cli`, status: "pending" }),
+    );
+
+    const res = await api("GET", "/api/integrity/inactive-bots-with-open-orders");
+
+    expect(res.status).toBe(200);
+    const found = mine(res.body);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ bot_instance_id: id, status: "halted", halted_at: T0 });
+    // Money is serialized as a decimal string, like every other endpoint.
+    expect(found[0].open_orders[0]).toMatchObject({
+      id: `${id}-ord`,
+      status: "pending",
+      price: "65000.00000000",
+    });
+  });
+
+  it("reports a stopped bot -- the case no scheduled job would ever see", async () => {
+    const id = `int-stopped-${suffix}`;
+    await db.botInstances.insert(botInstanceRow({ id, status: "stopped" }));
+    await db.orders.insert(
+      orderRow({
+        id: `${id}-ord`,
+        bot_instance_id: id,
+        client_order_id: `${id}-cli`,
+        status: "partially_filled",
+      }),
+    );
+
+    const res = await api("GET", "/api/integrity/inactive-bots-with-open-orders");
+    expect(mine(res.body).map((bot) => bot.bot_instance_id)).toEqual([id]);
+  });
+
+  it("says healthy when a running bot has a resting order and a halted one is clean", async () => {
+    const running = `int-run-${suffix}`;
+    const halted = `int-clean-${suffix}`;
+    await db.botInstances.insert(botInstanceRow({ id: running, status: "running" }));
+    await db.orders.insert(
+      orderRow({
+        id: `${running}-ord`,
+        bot_instance_id: running,
+        client_order_id: `${running}-cli`,
+        status: "pending",
+      }),
+    );
+    await db.botInstances.insert(
+      botInstanceRow({ id: halted, status: "halted", halt_reason: "manual: x", halted_at: T0 }),
+    );
+    await db.orders.insert(
+      orderRow({
+        id: `${halted}-ord`,
+        bot_instance_id: halted,
+        client_order_id: `${halted}-cli`,
+        status: "cancelled",
+      }),
+    );
+
+    const res = await api("GET", "/api/integrity/inactive-bots-with-open-orders");
+    expect(res.status).toBe(200);
+    expect(mine(res.body)).toEqual([]);
+  });
+
+  it("is read-only: it corrects nothing and refuses a POST", async () => {
+    const id = `int-ro-${suffix}`;
+    await db.botInstances.insert(
+      botInstanceRow({ id, status: "halted", halt_reason: "manual: x", halted_at: T0 }),
+    );
+    await db.orders.insert(
+      orderRow({ id: `${id}-ord`, bot_instance_id: id, client_order_id: `${id}-cli`, status: "pending" }),
+    );
+
+    await api("GET", "/api/integrity/inactive-bots-with-open-orders");
+
+    // The corrective action is an operator re-halting the bot, which now
+    // completes the cleanup. A GET that cancelled live orders would be a very
+    // surprising GET.
+    expect((await db.orders.findOne({ id: `${id}-ord` }))!.status).toBe("pending");
+    expect((await db.botInstances.findOne({ id }))!.status).toBe("halted");
+
+    const post = await api("POST", "/api/integrity/inactive-bots-with-open-orders");
+    expect(post.status).toBe(405);
   });
 });
