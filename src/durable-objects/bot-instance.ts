@@ -80,7 +80,7 @@ import {
 } from "../alerts";
 import { CapitalError, createBotInstanceWithCapital, releaseBotCapital } from "../capital";
 import { databaseFrom, type Database } from "../db";
-import type { AlertRow, AuditLogRow, BotStatus, OrderRow, TradeRow } from "../db/schema";
+import type { AlertRow, AuditLogRow, BotStatus, OrderRow, StrategyType, TradeRow } from "../db/schema";
 import { isExchangeId } from "../db/schema";
 import { resolveExchangeForAccount } from "../workers/exchange-dispatch";
 import { validateOrder } from "../exchange/binance/filters";
@@ -155,6 +155,16 @@ import {
   type GridParams,
   type GridSlot,
 } from "../strategies/grid";
+import {
+  TRAILING_STOP_SCHEMA_VERSION,
+  assertReadableSchema as assertReadableTrailingStopSchema,
+  decide as trailingStopDecide,
+  encodeTrailingStopParams,
+  validateTrailingStopParams,
+  type TrailingStopConfig,
+  type TrailingStopHaltReason,
+  type TrailingStopParams,
+} from "../strategies/trailing-stop";
 import { DurableObjectAttemptStore } from "./attempt-store";
 
 // ---------------------------------------------------------------------------
@@ -305,7 +315,7 @@ export interface BotInstanceDependencies {
  * built. Only the planner and the stored strategy state differ, and both are
  * plumbed through here, discriminated by `config.strategy`.
  */
-export type BotConfig = DcaConfig | GridConfig;
+export type BotConfig = DcaConfig | GridConfig | TrailingStopConfig;
 
 /**
  * The fields both strategy configs share, which every strategy-agnostic method
@@ -313,7 +323,7 @@ export type BotConfig = DcaConfig | GridConfig;
  * shared method can take `BotConfigBase` and be handed either.
  */
 export interface BotConfigBase {
-  readonly strategy: "dca" | "grid";
+  readonly strategy: StrategyType;
   readonly schemaVersion: number;
   readonly botInstanceId: string;
   readonly accountLabel: string;
@@ -323,8 +333,30 @@ export interface BotConfigBase {
   readonly allocatedCapital: Money;
 }
 
-/** A halt reason from either strategy. `#halt` is shared, so it accepts both. */
-export type HaltReason = DcaHaltReason | GridHaltReason;
+/**
+ * Does this price set a new high-water mark for this bot? Spec 22.2 decision 3.
+ *
+ * PURE, EXPORTED AND SEPARATE FROM THE MUTATION so the ratchet can be tested as
+ * arithmetic rather than through a Durable Object.
+ *
+ * Returns a BOOLEAN rather than the next value, deliberately: the caller uses it
+ * to decide whether to add the key at all, so a DCA or grid bot's stored state
+ * stays byte-identical to what it was before this field existed.
+ *
+ * STRICTLY GREATER, never `>=`: an equal price is not a new high, and re-writing
+ * on equality would be a storage write per candle on a flat market.
+ */
+export function raisesHighWaterMark(
+  strategy: StrategyType,
+  currentHighWaterMark: Money | undefined,
+  price: Money,
+): boolean {
+  if (strategy !== "trailing_stop") return false;
+  return currentHighWaterMark === undefined || price > currentHighWaterMark;
+}
+
+/** A halt reason from any strategy. `#halt` is shared, so it accepts all of them. */
+export type HaltReason = DcaHaltReason | GridHaltReason | TrailingStopHaltReason;
 
 /**
  * This object's persisted runtime state, beside its configuration.
@@ -372,6 +404,29 @@ export interface BotRuntimeState {
   readonly haltedAt: Timestamp | null;
   readonly lastPrice: Money | null;
   readonly lastPriceAt: Timestamp | null;
+  /**
+   * Spec 22.2 decision 3 / 22.5 open question 3, RESOLVED as Option 1: the
+   * highest price seen since entry, PERSISTED rather than derived.
+   *
+   * Derivation is not available: decision log 81 established there is no
+   * per-tick record anywhere, D1 or DO storage -- a `BotInstance` sees one
+   * closed candle at a time and retains nothing of the previous one. The cost of
+   * persisting is one overwritten field per bot, not a growing log.
+   *
+   * ⚠ OPTIONAL (`?`), NOT `Money | null`, and the difference is load-bearing.
+   * `lastPrice` can be non-optional because it has existed since the state shape
+   * did; this field is ADDITIVE to a shape live bots already have on disk. An
+   * already-running bot's stored state has no such key, so a non-optional
+   * declaration would be a type lie the moment `#state()` casts a stored object
+   * -- and would need a `schemaVersion` bump and a migration to become true.
+   * Optional is the section-16-additive treatment this codebase already uses for
+   * exactly this: `exitKind`, `pendingReplacements`, and `unmodelledBase`
+   * (decision log 69, which took this same decision for the same reason).
+   *
+   * ABSENT means "no high recorded yet". Written ONLY for a trailing-stop bot,
+   * and only ever upward -- see `raisesHighWaterMark`.
+   */
+  readonly highWaterMark?: Money;
   /** Gross realized profit: DCA cycles or grid round trips, before fees. */
   readonly realizedGross: Money;
   /** Cached symbol filters (section 4.3), refreshed when stale. */
@@ -393,7 +448,7 @@ export interface BotRuntimeState {
    * (the only exit that existed then was take-profit); nothing has ever run, so
    * this is belt-and-braces.
    */
-  readonly exitKind?: "take_profit" | "liquidation";
+  readonly exitKind?: "take_profit" | "liquidation" | "trailing_stop";
   /**
    * DCA ONLY: base this bot bought, still owns on the exchange, and no longer
    * counts anywhere else. Cumulative across every cycle, and NEVER traded.
@@ -481,6 +536,19 @@ export interface CreateDcaBotRequest {
   readonly actor: string;
 }
 
+export interface CreateTrailingStopBotRequest {
+  readonly botInstanceId: string;
+  readonly accountLabel: string;
+  readonly exchange: string;
+  readonly pair: Pair;
+  /** The asset the allocation -- and therefore the single entry -- is denominated in. */
+  readonly capitalAsset: Asset;
+  readonly allocatedCapital: Money;
+  readonly params: TrailingStopParams;
+  /** `audit_log.actor`: an authenticated email, or 'system'. */
+  readonly actor: string;
+}
+
 export interface CreateGridBotRequest {
   readonly botInstanceId: string;
   readonly accountLabel: string;
@@ -564,7 +632,7 @@ export interface PositionRepairFields {
   readonly additionalBuysUsed: number;
   readonly realizedGross: string;
   readonly exitOrderId: string | null;
-  readonly exitKind: "take_profit" | "liquidation" | null;
+  readonly exitKind: "take_profit" | "liquidation" | "trailing_stop" | null;
 }
 
 /** One order's local-versus-exchange comparison, the evidence behind gates 3-5. */
@@ -1264,8 +1332,14 @@ export class BotInstance extends DurableObject<Env> {
     // Section 16: stored state carries a schemaVersion and the check runs the
     // first time an object wakes under new code, which is here. Each strategy
     // versions its own state, so the assertion is dispatched by strategy.
+    // SPEC 22.4 TOUCHPOINT 8. Binary until now, with "not grid" meaning DCA --
+    // which would have validated a trailing-stop config against DCA's schema
+    // version. No compile error was possible: `schemaVersion` is a `number` on
+    // every strategy's config, so both arms type-check for all three.
     if (config.strategy === "grid") {
       assertReadableGridSchema(config.schemaVersion);
+    } else if (config.strategy === "trailing_stop") {
+      assertReadableTrailingStopSchema(config.schemaVersion);
     } else {
       assertReadableSchema(config.schemaVersion);
     }
@@ -1641,6 +1715,112 @@ export class BotInstance extends DurableObject<Env> {
     return { botInstanceId: request.botInstanceId, status: "created" };
   }
 
+  /**
+   * Create a trailing-stop bot (spec section 22).
+   *
+   * Structurally `create()`, not `createGrid()`: 22.2 decision 4 gives this the
+   * same single-position shape as DCA, so there is NO ladder to seed. The two
+   * grid-specific steps are deliberately absent -- `emptyLadder(params)` in the
+   * state, and grid's `takeProfitPct: null` reasoning, which here has a different
+   * cause (see below).
+   */
+  async createTrailingStop(
+    request: CreateTrailingStopBotRequest,
+  ): Promise<{ botInstanceId: string; status: BotStatus }> {
+    if ((await this.ctx.storage.get(CONFIG_KEY)) !== undefined) {
+      throw new BotInstanceError(
+        "already_created",
+        `bot instance ${JSON.stringify(request.botInstanceId)} already has a configuration`,
+      );
+    }
+
+    const db = this.#db();
+    const now = this.#now();
+
+    // Both latches, global first, exactly as the other two creation paths do.
+    await assertGlobalArmed(db, `create bot ${request.botInstanceId}`);
+    await assertAccountArmed(db, request.accountLabel, `create bot ${request.botInstanceId}`);
+
+    // THE SAME VALIDATOR `POST /api/bots` RUNS, not a copy (21.5 requirement 3).
+    // Reached again here because this object is callable by RPC and must not
+    // depend on its caller having checked -- the same reason `create()` re-runs
+    // `validateDcaParams`.
+    validateTrailingStopParams(request.params, request.allocatedCapital);
+
+    await createBotInstanceWithCapital(
+      db,
+      {
+        id: request.botInstanceId,
+        accountLabel: request.accountLabel,
+        asset: request.capitalAsset,
+        exchange: request.exchange,
+        pair: request.pair,
+        strategyType: "trailing_stop",
+        strategyParams: encodeTrailingStopParams(request.params),
+        // ⚠ THE TRAIL IS THE STOP-LOSS (22.4 touchpoint 9), so the column and
+        // `params.trailPct` are ONE quantity with two homes. Written from
+        // `trailPct` here and nowhere else, so the authoritative copy is the
+        // params and the column is its mirror -- which is the decision migration
+        // 0010's header left to this touchpoint. `stop_loss_pct` is NOT NULL and
+        // CHECK > 0 for every strategy (section 6.1); the validator has already
+        // guaranteed `trailPct` is positive, so this cannot violate it.
+        stopLossPct: request.params.trailPct,
+        // NULL, and for a different reason than grid's. Grid's take-profit is
+        // optional; this strategy has none at all -- 22.1's whole point is that
+        // gains are locked in progressively "without a fixed profit target
+        // having to be guessed in advance". The `dca_requires_take_profit` CHECK
+        // constrains only DCA, so NULL is accepted here (migration 0010).
+        takeProfitPct: null,
+        requestedCapital: request.allocatedCapital,
+      },
+      { actor: request.actor, now },
+    );
+
+    const config: TrailingStopConfig = {
+      strategy: "trailing_stop",
+      schemaVersion: TRAILING_STOP_SCHEMA_VERSION,
+      botInstanceId: request.botInstanceId,
+      accountLabel: request.accountLabel,
+      exchange: request.exchange,
+      pair: request.pair,
+      capitalAsset: request.capitalAsset,
+      allocatedCapital: request.allocatedCapital,
+      params: request.params,
+    };
+
+    const state: BotRuntimeState = {
+      schemaVersion: TRAILING_STOP_SCHEMA_VERSION,
+      status: "created",
+      // ⚠ REQUIRED BY `BotRuntimeState` AND NEVER INCREMENTED. This strategy has
+      // exactly one cycle by construction, so the counter has no referent -- but
+      // the field is not optional, and making it optional would be a state-shape
+      // change affecting every existing DCA and grid bot for no gain. It is set
+      // to 0 and left there; `#completeTrailingStopExit` deliberately does not
+      // touch it (22.9).
+      cycleCount: 0,
+      position: EMPTY_POSITION,
+      // NO `ladder` -- that is the grid-specific step this path excludes.
+      nextSequence: 0,
+      openOrderIds: [],
+      haltReason: null,
+      haltedAt: null,
+      lastPrice: null,
+      lastPriceAt: null,
+      // `highWaterMark` is DELIBERATELY ABSENT rather than set to null. It is an
+      // optional field (22.2 decision 3), and absent is what "no high recorded
+      // yet" means everywhere else that reads it -- `raisesHighWaterMark` takes
+      // `undefined` as "take the first price", and `decide`'s `max(entry, mark)`
+      // needs no special case for it.
+      realizedGross: ZERO,
+      filters: null,
+      exitOrderId: null,
+    };
+
+    await this.ctx.storage.put({ [CONFIG_KEY]: config, [STATE_KEY]: state });
+
+    return { botInstanceId: request.botInstanceId, status: "created" };
+  }
+
   // -------------------------------------------------------------------------
   // Lifecycle (section 6.3)
   // -------------------------------------------------------------------------
@@ -1702,15 +1882,36 @@ export class BotInstance extends DurableObject<Env> {
       return { status: state.status, action: "ignored", detail: `status is ${state.status}` };
     }
 
-    state = await this.#mutateState((current) => ({
-      ...current,
-      lastPrice: price.price,
-      lastPriceAt: price.at,
-    }));
+    state = await this.#mutateState((current) => {
+      const next: BotRuntimeState = {
+        ...current,
+        lastPrice: price.price,
+        lastPriceAt: price.at,
+      };
+      // SPEC 22.2 DECISION 3. The trail's high-water mark ratchets UP and never
+      // down, and it is updated HERE -- on the same write that records the price
+      // -- because a mark updated anywhere else could miss a candle that the
+      // price record saw, which is exactly the silent-in-both-directions failure
+      // 22.3 is about.
+      //
+      // Strategy-gated the same way the dispatch below is (`config.strategy ===
+      // "grid"`), not by a new mechanism. DCA and grid never take this branch, so
+      // the key is never added to their state at all.
+      if (raisesHighWaterMark(config.strategy, current.highWaterMark, price.price)) {
+        return { ...next, highWaterMark: price.price };
+      }
+      return next;
+    });
 
     try {
       if (config.strategy === "grid") {
         return await this.#gridOnPrice(config, price);
+      }
+      // SPEC 22.4 TOUCHPOINT 10. Its own branch, NOT the DCA fallback: before
+      // this, "not grid" meant DCA, and a trailing-stop bot would have run DCA's
+      // decision function against DCA's parameters on every candle.
+      if (config.strategy === "trailing_stop") {
+        return await this.#trailingStopOnPrice(config, state, price);
       }
 
       const action = decide({
@@ -3985,8 +4186,14 @@ export class BotInstance extends DurableObject<Env> {
     const state = await this.ctx.storage.get<BotRuntimeState>(STATE_KEY);
     if (stored === undefined || state === undefined) return null;
     const config = normalizeConfig(stored);
+    // SPEC 22.4 TOUCHPOINT 8. Binary until now, with "not grid" meaning DCA --
+    // which would have validated a trailing-stop config against DCA's schema
+    // version. No compile error was possible: `schemaVersion` is a `number` on
+    // every strategy's config, so both arms type-check for all three.
     if (config.strategy === "grid") {
       assertReadableGridSchema(config.schemaVersion);
+    } else if (config.strategy === "trailing_stop") {
+      assertReadableTrailingStopSchema(config.schemaVersion);
     } else {
       assertReadableSchema(config.schemaVersion);
     }
@@ -4052,7 +4259,11 @@ export class BotInstance extends DurableObject<Env> {
   }
 
   async #placeBuy(
-    config: DcaConfig,
+    // WIDENED FOR THE THIRD STRATEGY. Every field this method reads --
+    // `allocatedCapital`, `pair`, `botInstanceId` -- is on `BotConfigBase`; it
+    // never touched `params`. Trailing stop's single entry is the same
+    // quote-denominated buy, so it reuses this rather than growing a copy.
+    config: BotConfigBase,
     quoteAmount: Money,
     price: Price,
     label: string,
@@ -4358,7 +4569,10 @@ export class BotInstance extends DurableObject<Env> {
   // -------------------------------------------------------------------------
 
   async #applyFillToOrder(
-    config: DcaConfig,
+    // SPEC 22.9. The fill APPLICATION is genuinely shared -- a trailing stop is a
+    // single-position strategy and folds a fill exactly as DCA does. What is not
+    // shared is the completion tail below.
+    config: DcaConfig | TrailingStopConfig,
     state: BotRuntimeState,
     order: TrackedOrder,
     fill: Fill,
@@ -4451,6 +4665,28 @@ export class BotInstance extends DurableObject<Env> {
       // be confused by a future change to how status is set.
       if (state.exitKind === "liquidation") {
         return await this.#completeLiquidation(config, effect.order, fill);
+      }
+      // SPEC 22.9. Terminal by construction: one entry, one exit, no cycle to
+      // complete and no `autoRestart` to consult.
+      if (state.exitKind === "trailing_stop") {
+        if (config.strategy !== "trailing_stop") {
+          throw new Error(
+            `bot ${config.botInstanceId} is a ${config.strategy} bot carrying exitKind ` +
+              `"trailing_stop"; only a trailing-stop bot exits that way (spec 22.9).`,
+          );
+        }
+        return await this.#completeTrailingStopExit(config, effect.order, fill);
+      }
+      // Everything else is DCA's cycle completion. The narrowing is asserted
+      // rather than assumed: a trailing-stop bot reaching here would mean its
+      // exit was recorded with the wrong `exitKind`, which is a bug to surface
+      // and not to absorb into a strategy's completion path.
+      if (config.strategy !== "dca") {
+        throw new Error(
+          `bot ${config.botInstanceId} is a ${config.strategy} bot whose exit reached DCA's ` +
+            `cycle completion with exitKind ${JSON.stringify(state.exitKind)}; only a dca bot ` +
+            `completes a cycle (spec 22.9).`,
+        );
       }
       return await this.#completeCycle(config, effect.order, fill.executedAt);
     }
@@ -4622,7 +4858,7 @@ export class BotInstance extends DurableObject<Env> {
    * is a `close`, a separate human decision, exactly as `#completeCycle` leaves
    * it).
    */
-  async #completeLiquidation(config: DcaConfig, exit: TrackedOrder, fill: Fill): Promise<PipelineResult> {
+  async #completeLiquidation(config: BotConfigBase, exit: TrackedOrder, fill: Fill): Promise<PipelineResult> {
     // As in `#completeCycle`: `applyExit` has already realized every fill of
     // this liquidation as it landed, so this reports the total rather than
     // booking it a second time.
@@ -4698,6 +4934,226 @@ export class BotInstance extends DurableObject<Env> {
    * happen, and section 7.5's halt-on-exception would turn a redelivered queue
    * message into an emergency.
    */
+  /**
+   * The trailing stop's price pass (spec 22.4 touchpoint 10).
+   *
+   * Its OWN branch rather than DCA's. The shape is deliberately the same as the
+   * DCA arm above -- pure `decide`, then an exhaustive switch -- so the two read
+   * alike and neither grows behaviour the other lacks by accident.
+   */
+  async #trailingStopOnPrice(
+    config: TrailingStopConfig,
+    state: BotRuntimeState,
+    price: Price,
+  ): Promise<PipelineResult> {
+    const action = trailingStopDecide({
+      config,
+      position: state.position,
+      // READ, NOT RECOMPUTED. `#onPriceUpdatePass` has already ratcheted this on
+      // the same write that recorded `lastPrice`, so `decide` sees the mark that
+      // INCLUDES the current candle. Recomputing it here would be a second
+      // implementation of the rule, free to disagree with the stored one.
+      highWaterMark: state.highWaterMark,
+      price: price.price,
+      hasOpenOrder: state.openOrderIds.length > 0,
+    });
+
+    switch (action.kind) {
+      case "hold":
+        return { status: "running", action: "hold" };
+
+      case "open_entry":
+        return await this.#placeBuy(config, action.quoteAmount, price, "entry");
+
+      case "trailing_exit":
+        return await this.#placeTrailingStopSell(config, action.quantity, action.trailLevel, price);
+
+      case "halt":
+        return await this.#halt(config, action.reason, action.detail, "system");
+    }
+  }
+
+  /**
+   * Sell the whole position because the trail was crossed (spec 22.9).
+   *
+   * Marked `exitKind: "trailing_stop"` so the fill routes to
+   * `#completeTrailingStopExit` and not to DCA's cycle completion. The order is
+   * placed at the CURRENT price rather than at the trail level: the trail has
+   * already been crossed, so the level is behind the market and quoting it would
+   * be asking for a fill above where the book is.
+   */
+  async #placeTrailingStopSell(
+    config: TrailingStopConfig,
+    quantity: Money,
+    trailLevel: Money,
+    price: Price,
+  ): Promise<PipelineResult> {
+    let state = await this.#state();
+    const now = this.#now();
+    const filters = await this.#ensureFilters(config, state, now, "risk-exit");
+    state = await this.#state();
+
+    const adjusted = validateOrder(
+      { pair: config.pair, side: "sell", price: price.price, quantity },
+      filters,
+      { rounding: "adjust" },
+    );
+    if (!adjusted.valid) {
+      // The position cannot be sold as a limit order at this size. That is a
+      // risk exit that did not happen, so it halts rather than returning quietly.
+      return await this.#halt(
+        config,
+        "order_rejected",
+        `the trailing-stop exit of ${toDecimalString(quantity)} could not be constructed: ` +
+          `${adjusted.reason}. The trail at ${toDecimalString(trailLevel)} was crossed and the ` +
+          `position is still held.`,
+        "system",
+      );
+    }
+
+    const sequence = await this.#allocateSequence();
+    const guard = this.#guard(config.botInstanceId);
+    const decision = await guard.beginAttempt(sequence, now);
+    if (decision.action === "recover") {
+      return { status: "running", action: "recovering", detail: decision.clientOrderId };
+    }
+
+    const abandoned = await this.#statusChangedFrom("running");
+    if (abandoned !== null) {
+      await guard.markFailed(
+        decision.clientOrderId,
+        `the bot became ${abandoned} before the trailing-stop sell was sent`,
+        now,
+      );
+      return { status: abandoned, action: "abandoned", detail: "status changed" };
+    }
+
+    const outcome = await this.#exchange(config, "risk-exit").placeOrder({
+      pair: config.pair,
+      clientOrderId: decision.clientOrderId,
+      side: "sell",
+      type: "limit",
+      price: adjusted.price,
+      quantity: adjusted.quantity,
+    });
+    if (!outcome.ok) {
+      await guard.markFailed(decision.clientOrderId, outcome.message, now);
+      return await this.#halt(
+        config,
+        "order_rejected",
+        `the trailing-stop exit was refused by the exchange: ${outcome.message}`,
+        "system",
+      );
+    }
+
+    await guard.markPlaced(decision.clientOrderId, outcome.value.exchangeOrderId, now);
+    const order = createOrder({
+      clientOrderId: decision.clientOrderId,
+      pair: config.pair,
+      side: "sell",
+      price: adjusted.price,
+      quantity: adjusted.quantity,
+      at: outcome.value.acceptedAt,
+    });
+    await this.#putOrder(order);
+    await this.#mutateState((current) => ({
+      ...current,
+      exitOrderId: decision.clientOrderId,
+      exitKind: "trailing_stop",
+      openOrderIds: [...current.openOrderIds, decision.clientOrderId],
+    }));
+    await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
+
+    for (const fill of outcome.value.fills) {
+      await this.onFill(decision.clientOrderId, fill);
+    }
+
+    return { status: "running", action: "placed-trailing-exit", detail: decision.clientOrderId };
+  }
+
+  /**
+   * The trailing-stop exit has fully filled (spec 22.9).
+   *
+   * Modelled on `#completeLiquidation`, NOT on `#completeCycle`, and that is the
+   * whole of 22.9: there is no cycle to count and no `autoRestart` to consult,
+   * so this cleans up and halts. `cycleCount` is deliberately NOT incremented --
+   * a strategy with exactly one cycle by construction has no use for the counter,
+   * and a `bot.cycle_completed` row would report a number with no referent.
+   *
+   * `unmodelledBase` IS accumulated, and that is not optional: exit sells are
+   * sized by rounding the held quantity DOWN onto the symbol's step, so this
+   * strands base exactly as decision log 69 found DCA's completion did. Skipping
+   * it would reopen a closed leak in the one strategy with no later cycle
+   * boundary at which anyone would notice.
+   */
+  async #completeTrailingStopExit(
+    config: TrailingStopConfig,
+    exit: TrackedOrder,
+    fill: Fill,
+  ): Promise<PipelineResult> {
+    const proceeds = exit.fills.reduce(
+      (total, each) => total + mul(each.price, each.quantity, "half-even"),
+      ZERO,
+    );
+
+    let stranded = ZERO;
+    let spent = ZERO;
+    const completed = await this.#mutateState((current) => {
+      stranded = current.position.quantity;
+      spent = current.position.entries.reduce((total, each) => total + each.cost, ZERO) -
+        current.position.cost;
+      return {
+        ...current,
+        unmodelledBase: (current.unmodelledBase ?? ZERO) + stranded,
+        position: EMPTY_POSITION,
+        openOrderIds: current.openOrderIds.filter((id) => id !== exit.clientOrderId),
+        exitOrderId: null,
+        exitKind: undefined,
+        // The mark belongs to the position that just closed. Left set, it would
+        // be the starting high-water mark of a position this bot will never open
+        // -- and would make 22.8's detector read a frozen trail on a flat bot.
+        highWaterMark: undefined,
+      };
+    });
+    const gross = proceeds - spent;
+
+    await this.#audit(
+      config,
+      "bot.trailing_stop_exit",
+      "system",
+      {
+        gross_profit: toDecimalString(gross),
+        quantity: toDecimalString(exit.filledQuantity),
+        unmodelled_base: toDecimalString(stranded),
+        unmodelled_base_total: toDecimalString(completed.unmodelledBase ?? ZERO),
+      },
+      fill.executedAt,
+    );
+
+    if (stranded > ZERO) {
+      await this.#alert(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "cycle_unmodelled_base",
+        message:
+          `the trailing-stop exit sold ${toDecimalString(exit.filledQuantity)} but held ` +
+          `${toDecimalString(stranded)} more, which the exit could not be sized to include. ` +
+          `That base is still in the account and this bot no longer counts it.`,
+      });
+    }
+
+    // The halt carries the receipt. `trailing_stop_reached` is in `#halt`'s
+    // `positiveExit` list, so this alerts as `info` -- this is the strategy
+    // working, not failing.
+    return await this.#halt(
+      config,
+      "trailing_stop_reached",
+      `the trail was crossed and the position exited at ${toDecimalString(exit.price)} for a ` +
+        `gross ${toDecimalString(gross)} ${config.capitalAsset}`,
+      "system",
+    );
+  }
+
   async #onOrderStateError(
     config: BotConfigBase,
     state: BotRuntimeState,
@@ -5892,7 +6348,15 @@ export class BotInstance extends DurableObject<Env> {
     // resolves it, through `haltAlertType`'s counterpart predicate, once the bot
     // is running again. The two must stay together the way `standing.ts`'s two
     // halves do; see `/src/alerts/halt.ts`.
-    const positiveExit = reason === "take_profit_reached" || reason === "take_profit" || reason === "breakout_take_profit";
+    // `trailing_stop_reached` is here per spec 22.9: a trailing-stop exit is the
+    // strategy's intended, successful outcome, so it earns the same `info` receipt
+    // the other positive exits get. Omitting it would make every healthy exit of
+    // that strategy raise a `critical` alert.
+    const positiveExit =
+      reason === "take_profit_reached" ||
+      reason === "take_profit" ||
+      reason === "breakout_take_profit" ||
+      reason === "trailing_stop_reached";
     const alertFailed = await this.#cleanupStep(config, "halt_alert", () =>
       this.#alert(config, {
         severity: positiveExit ? "info" : "critical",

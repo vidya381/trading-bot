@@ -310,7 +310,7 @@ describe("a clean grid proposal", () => {
   it("computes the peak commitment with the strategy's own arithmetic", () => {
     const validated = validate(parseGrid(gridResponse()));
     // orderSize x (gridLines - 1) = 50 x 6
-    expect(plannedSpendOf(validated.params)).toBe(300n * ONE);
+    expect(plannedSpendOf(validated.params, validated.allocatedCapital)).toBe(300n * ONE);
   });
 });
 
@@ -333,7 +333,7 @@ describe("a clean DCA proposal", () => {
 
     // DCA's reference price is the newest real close, not a ladder bound.
     expect(validated.referencePrice).toBe(LAST_CLOSE);
-    expect(plannedSpendOf(validated.params)).toBe(300n * ONE);
+    expect(plannedSpendOf(validated.params, validated.allocatedCapital)).toBe(300n * ONE);
   });
 });
 

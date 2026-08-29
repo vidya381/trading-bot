@@ -114,8 +114,14 @@ import {
   type GridParams,
 } from "../strategies/grid";
 import type { StrategyType } from "../db/schema";
+import {
+  TRAILING_STOP_SCHEMA_VERSION,
+  decodeTrailingStopParams,
+  validateTrailingStopParams,
+  type TrailingStopParams,
+} from "../strategies/trailing-stop";
 import type { SymbolFilters } from "../shared/exchange-client";
-import { ZERO, fromDecimalString, toDecimalString, type Money } from "../shared/money";
+import { ONE, ZERO, fromDecimalString, toDecimalString, type Money } from "../shared/money";
 import type { EvidenceItem } from "./assess-prompt";
 import {
   readModelAnswer,
@@ -292,7 +298,8 @@ export interface ValidatedProposal {
    */
   readonly params:
     | { readonly strategy: "grid"; readonly value: GridParams }
-    | { readonly strategy: "dca"; readonly value: DcaParams };
+    | { readonly strategy: "dca"; readonly value: DcaParams }
+    | { readonly strategy: "trailing_stop"; readonly value: TrailingStopParams };
   readonly allocatedCapital: Money;
   readonly capitalAsset: string;
   /** The account's real headroom for that asset, as read. See `capital.ts`. */
@@ -538,6 +545,22 @@ function rawParameterObject(proposal: ParsedProposal): Record<string, unknown> {
  * this yourself"). Silently defaulting them here would be this stage inventing
  * two parameters and presenting them as derived.
  */
+/**
+ * The decoder's name for a refusal message, as an exhaustive switch rather than a
+ * ternary -- a fourth strategy must fail to compile here rather than silently be
+ * reported as DCA's decoder, which is what the ternary this replaced did.
+ */
+function decoderNameFor(strategy: StrategyType): string {
+  switch (strategy) {
+    case "grid":
+      return "decodeGridParams";
+    case "dca":
+      return "decodeDcaParams";
+    case "trailing_stop":
+      return "decodeTrailingStopParams";
+  }
+}
+
 function decodeWithRealDecoder(
   proposal: ParsedProposal,
 ): ValidatedProposal["params"] {
@@ -549,6 +572,20 @@ function decodeWithRealDecoder(
         value: decodeGridParams({ ...raw, strategy: "grid", schemaVersion: GRID_SCHEMA_VERSION }),
       };
     }
+    // SPEC 22.4 TOUCHPOINT 8. This used to be `if grid ... else DCA`, which
+    // handed a trailing-stop proposal to `decodeDcaParams` -- a real third branch,
+    // not a fallback, because "not grid" has meant "DCA" only by accident of there
+    // having been two strategies.
+    if (proposal.strategy === "trailing_stop") {
+      return {
+        strategy: "trailing_stop",
+        value: decodeTrailingStopParams({
+          ...raw,
+          strategy: "trailing_stop",
+          schemaVersion: TRAILING_STOP_SCHEMA_VERSION,
+        }),
+      };
+    }
     return {
       strategy: "dca",
       value: decodeDcaParams({ ...raw, strategy: "dca", schemaVersion: DCA_SCHEMA_VERSION }),
@@ -557,7 +594,7 @@ function decodeWithRealDecoder(
     throw new DeriveValidationError(
       "decoder",
       "decoder_rejected",
-      `the proposed parameters were rejected by ${proposal.strategy === "grid" ? "decodeGridParams" : "decodeDcaParams"}, the same decoder POST /api/bots runs on a human's own submission: ${cause instanceof Error ? cause.message : String(cause)}. The whole proposal is refused; no field is corrected or defaulted.`,
+      `the proposed parameters were rejected by ${decoderNameFor(proposal.strategy)}, the same decoder POST /api/bots runs on a human's own submission: ${cause instanceof Error ? cause.message : String(cause)}. The whole proposal is refused; no field is corrected or defaulted.`,
       { cause },
     );
   }
@@ -571,19 +608,37 @@ function decodeWithRealDecoder(
  * fit inside its own allocation are all refused -- by `grid.ts` and `dca.ts`
  * themselves, not by a copy. See the module header for why no copy exists here.
  */
+/**
+ * The validator and creation-method names for a refusal message, exhaustive so a
+ * fourth strategy fails to compile rather than being misreported as DCA's.
+ */
+function validatorNamesFor(strategy: StrategyType): { validator: string; creator: string } {
+  switch (strategy) {
+    case "grid":
+      return { validator: "validateGridParams", creator: "createGrid" };
+    case "dca":
+      return { validator: "validateDcaParams", creator: "create" };
+    case "trailing_stop":
+      return { validator: "validateTrailingStopParams", creator: "createTrailingStop (NOT BUILT)" };
+  }
+}
+
 function validateWithRealValidator(
   params: ValidatedProposal["params"],
   allocatedCapital: Money,
 ): void {
   try {
     if (params.strategy === "grid") validateGridParams(params.value, allocatedCapital);
-    else validateDcaParams(params.value, allocatedCapital);
+    else if (params.strategy === "trailing_stop") {
+      validateTrailingStopParams(params.value, allocatedCapital);
+    } else validateDcaParams(params.value, allocatedCapital);
   } catch (cause) {
     const code = cause instanceof GridError || cause instanceof DcaError ? cause.code : "unknown";
+    const { validator, creator } = validatorNamesFor(params.strategy);
     throw new DeriveValidationError(
       "strategy_validator",
       "validator_rejected",
-      `the proposed parameters were rejected by ${params.strategy === "grid" ? "validateGridParams" : "validateDcaParams"} (${code}), the same validator BotInstance.${params.strategy === "grid" ? "createGrid" : "create"} runs before any capital is reserved: ${cause instanceof Error ? cause.message : String(cause)}. The whole proposal is refused.`,
+      `the proposed parameters were rejected by ${validator} (${code}), the same validator BotInstance.${creator} runs before any capital is reserved: ${cause instanceof Error ? cause.message : String(cause)}. The whole proposal is refused.`,
       { cause },
     );
   }
@@ -623,9 +678,20 @@ function referencePriceFor(
 }
 
 /** Every quote-denominated order size this configuration would ever place. */
-function orderSizesOf(params: ValidatedProposal["params"]): readonly (readonly [string, Money])[] {
+function orderSizesOf(
+  params: ValidatedProposal["params"],
+  allocatedCapital: Money,
+): readonly (readonly [string, Money])[] {
   if (params.strategy === "grid") {
     return [["orderSize", params.value.orderSize]];
+  }
+  // ONE ENTRY, SIZED BY THE ALLOCATION (22.2 decisions 1 and 4 -- see the
+  // inference note on `validateTrailingStopParams`). Returning an empty
+  // list here would be the dangerous shape: the venue-minimum check below would
+  // silently pass a bot whose only order is too small for the venue to accept,
+  // which is exactly the class of configuration this function exists to catch.
+  if (params.strategy === "trailing_stop") {
+    return [["allocatedCapital", allocatedCapital]];
   }
   const sizes: (readonly [string, Money])[] = [["baseOrderSize", params.value.baseOrderSize]];
   // Only when additional buys can actually happen. With `maxAdditionalBuys: 0`
@@ -681,7 +747,7 @@ export function checkDeriveSanityBounds(
 
   // --- the venue's real minimum order floor ---------------------------------
   const referencePrice = referencePriceFor(params, latestClose);
-  const sizes = orderSizesOf(params);
+  const sizes = orderSizesOf(params, allocatedCapital);
 
   const hasNotionalFloor = filters.minNotional > ZERO;
   const hasQuantityFloor = filters.minQuantity > ZERO;
@@ -798,8 +864,24 @@ export function validateProposal(
   };
 }
 
-/** The planned worst-case spend, for the audit record. The strategy's own arithmetic. */
-export function plannedSpendOf(params: ValidatedProposal["params"]): Money {
+/**
+ * The planned worst-case spend, for the audit record. The strategy's own arithmetic.
+ *
+ * ⚠ TAKES `allocatedCapital` AS OF THE THIRD STRATEGY. A trailing stop has no
+ * size parameter to compute a spend from -- its one entry is its allocation
+ * (22.2 decisions 1 and 4) -- so the figure is not derivable from `params` alone.
+ * Required rather than optional: a defaulted allocation would silently report a
+ * worst-case spend of zero into an audit record.
+ *
+ * Note this branches on `dca` FIRST and grid last, which is not cosmetic: the old
+ * two-arm form ended `return params.value.orderSize * ...`, so a trailing-stop
+ * proposal would have fallen into GRID's arithmetic and read `gridLines`.
+ */
+export function plannedSpendOf(
+  params: ValidatedProposal["params"],
+  allocatedCapital: Money,
+): Money {
   if (params.strategy === "dca") return plannedTotalSpend(params.value);
+  if (params.strategy === "trailing_stop") return allocatedCapital;
   return params.value.orderSize * BigInt(params.value.gridLines - 1);
 }

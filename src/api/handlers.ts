@@ -122,6 +122,11 @@ import {
   GRID_SCHEMA_VERSION,
   decodeGridParams,
 } from "../strategies/grid";
+import {
+  TRAILING_STOP_SCHEMA_VERSION,
+  decodeTrailingStopParams,
+  validateTrailingStopParams,
+} from "../strategies/trailing-stop";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -657,8 +662,24 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
       schemaVersion: GRID_SCHEMA_VERSION,
     });
     create = (stub) => stub.createGrid({ ...base, params });
+  } else if (strategy === "trailing_stop") {
+    // SPEC 22.4 TOUCHPOINT 7. The same decoder and validator Stage 3 reuses --
+    // one implementation, two callers (21.5 requirement 3). An invalid trailPct
+    // is refused HERE, by `validateTrailingStopParams`, with that validator's own
+    // message; `createTrailingStop` re-runs it rather than trusting this caller,
+    // exactly as `create()` re-runs `validateDcaParams`.
+    const params = decodeTrailingStopParams({
+      ...rawParams,
+      strategy: "trailing_stop",
+      schemaVersion: TRAILING_STOP_SCHEMA_VERSION,
+    });
+    validateTrailingStopParams(params, base.allocatedCapital);
+    create = (stub) => stub.createTrailingStop({ ...base, params });
   } else {
-    throw badRequest("invalid_strategy", `strategy must be "dca" or "grid", got ${JSON.stringify(strategy)}`);
+    throw badRequest(
+      "invalid_strategy",
+      `strategy must be "dca", "grid" or "trailing_stop", got ${JSON.stringify(strategy)}`,
+    );
   }
 
   // 21.5 requirement 5's outcome link, checked HERE -- with the free checks,

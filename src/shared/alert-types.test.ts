@@ -94,6 +94,7 @@ const EVERY_HALT_REASON: Record<HaltReason, true> = {
   take_profit_reached: true,
   take_profit: true,
   breakout_take_profit: true,
+  trailing_stop_reached: true,
   manual: true,
 };
 

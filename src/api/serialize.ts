@@ -67,6 +67,7 @@ import type {
 } from "../research";
 import type { Candle } from "../shared/exchange-client";
 import { toDecimalString, type Money } from "../shared/money";
+import { trailLevelOf } from "../strategies/trailing-stop";
 
 /** A money value as the exact decimal string the API speaks. */
 export function money(value: Money): string {
@@ -603,6 +604,44 @@ function positionOf(snapshot: BotSnapshot | null) {
       heldQuantity: ladder === undefined ? "0" : money(ladder.heldQuantity),
       cost: ladder === undefined ? "0" : money(ladder.heldCost),
       realizedGross: money(state.realizedGross),
+    };
+  }
+  // SPEC 22.4 TOUCHPOINT 8. This used to fall through to the DCA shape for
+  // anything not grid, which would have published a trailing-stop bot to the
+  // dashboard labelled `strategy: "dca"` -- rendered as a DCA bot, with no
+  // compile error anywhere, because the fields it reads (`position.quantity`,
+  // `position.cost`) exist on every single-position strategy's state.
+  //
+  // ⚠ SCAFFOLD, AND DELIBERATELY INCOMPLETE. 22.4 touchpoint 5 requires this
+  // view to show ENTRY PRICE, CURRENT HIGH-WATER MARK and CURRENT TRAIL LEVEL.
+  // Only the first is derivable from state today: `averageEntryPrice` is a real
+  // entry price for a single-entry strategy. The other two depend on where the
+  // high-water mark LIVES, which is 22.2 decision 3 / 22.5 OPEN QUESTION 3 and
+  // is NOT settled -- the codebase has no per-candle history to derive it from
+  // (decision log 81), so it is likely a new persisted field, but that is a
+  // decision to take against the code, not here. Emitting a guessed field, or a
+  // zero standing in for one, would put an authoritative-looking number on the
+  // approval page with nothing behind it. So this emits ONLY what exists.
+  if (snapshot.config.strategy === "trailing_stop") {
+    // 22.4 touchpoint 5's three required figures. `averageEntryPrice` is a real
+    // entry price for a single-entry strategy (22.2 decision 4); the other two
+    // are now derivable because 22.2 decision 3 resolved to a persisted mark.
+    //
+    // BOTH NULL UNTIL THE FIRST PRICE ARRIVES, and null rather than "0": a bot
+    // that has seen no price has no high-water mark and therefore no trail level,
+    // and "0" would render as a real stop level sitting at zero.
+    const highWaterMark = state.highWaterMark;
+    return {
+      strategy: "trailing_stop" as const,
+      heldQuantity: money(state.position.quantity),
+      averageEntryPrice: money(state.position.averageEntryPrice),
+      cost: money(state.position.cost),
+      realizedGross: money(state.realizedGross),
+      highWaterMark: highWaterMark === undefined ? null : money(highWaterMark),
+      trailLevel:
+        highWaterMark === undefined
+          ? null
+          : money(trailLevelOf(highWaterMark, snapshot.config.params.trailPct)),
     };
   }
   return {

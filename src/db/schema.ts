@@ -18,7 +18,7 @@ import type { OrderState } from "../shared/order-state";
 export type BotStatus = "created" | "running" | "halted" | "stopped";
 
 /** Section 6: the two strategies in v1. */
-export type StrategyType = "grid" | "dca";
+export type StrategyType = "grid" | "dca" | "trailing_stop";
 
 /**
  * The exchanges an account can trade on (sections 4.4, 16).

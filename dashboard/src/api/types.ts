@@ -127,6 +127,27 @@ export type Position =
       readonly averageEntryPrice: string;
       readonly cost: string;
       readonly realizedGross: string;
+    }
+  | {
+      /**
+       * Spec 22. Mirrors `positionOf`'s trailing-stop branch EXACTLY -- pinned by
+       * a two-way type assertion in `src/strategies/trailing-stop-dashboard-parity.test.ts`,
+       * not by this comment, for the reason the other two parity tests give: this
+       * file is a hand-written mirror across a `tsc` seam the root project does
+       * not compile, so a drift here fails nothing anywhere without a pin.
+       *
+       * `averageEntryPrice` is a real entry price here, not an average of many:
+       * 22.2 decision 4 makes this a single-entry strategy.
+       */
+      readonly strategy: "trailing_stop";
+      readonly heldQuantity: string;
+      readonly averageEntryPrice: string;
+      readonly cost: string;
+      readonly realizedGross: string;
+      /** Highest price seen since entry (22.2 decision 3). Null before the first price. */
+      readonly highWaterMark: string | null;
+      /** `highWaterMark x (100 - trailPct) / 100`. Null before the first price. */
+      readonly trailLevel: string | null;
     };
 
 /**
@@ -338,7 +359,7 @@ export interface BotRuntimeState {
   readonly realizedGross: string;
   readonly filters: unknown;
   readonly exitOrderId: string | null;
-  readonly exitKind?: "take_profit" | "liquidation";
+  readonly exitKind?: "take_profit" | "liquidation" | "trailing_stop";
 }
 
 /** One order from D1 (`orderView` in serialize.ts). */
