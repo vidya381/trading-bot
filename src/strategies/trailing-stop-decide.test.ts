@@ -19,7 +19,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ENTRY_CROSS_PCT,
+  MAX_ENTRY_ATTEMPTS,
   decide,
+  entryLimitPrice,
   trailLevelOf,
   type TrailingStopAction,
   type TrailingStopConfig,
@@ -68,6 +71,7 @@ function run(
       highWaterMark: mark,
       price: p,
       hasOpenOrder: false,
+      entryAttempts: 0,
     });
     if (action.kind === "trailing_exit" && exitedAt === null) exitedAt = price;
   }
@@ -82,6 +86,7 @@ describe("the entry", () => {
       highWaterMark: undefined,
       price: m("100"),
       hasOpenOrder: false,
+      entryAttempts: 0,
     });
     expect(action).toEqual({ kind: "open_entry", quoteAmount: m("1000") });
   });
@@ -93,6 +98,7 @@ describe("the entry", () => {
       highWaterMark: undefined,
       price: m("100"),
       hasOpenOrder: true,
+      entryAttempts: 0,
     });
     expect(action.kind).toBe("hold");
   });
@@ -105,6 +111,7 @@ describe("the entry", () => {
         highWaterMark: m("100"),
         price: ZERO,
         hasOpenOrder: false,
+        entryAttempts: 0,
       }),
     ).toThrow(/price must be positive/);
   });
@@ -120,6 +127,7 @@ describe("the trail before any new high (22.2 decision 2)", () => {
       highWaterMark: undefined,
       price: m("89"),
       hasOpenOrder: false,
+      entryAttempts: 0,
     });
     expect(action.kind).toBe("trailing_exit");
     if (action.kind !== "trailing_exit") throw new Error("unreachable");
@@ -133,6 +141,7 @@ describe("the trail before any new high (22.2 decision 2)", () => {
       highWaterMark: undefined,
       price: m("91"),
       hasOpenOrder: false,
+      entryAttempts: 0,
     });
     expect(action.kind).toBe("hold");
   });
@@ -200,6 +209,7 @@ describe("22.3: a dropped candle does not silently suppress the exit", () => {
       highWaterMark: m("120"),
       price: m("90"),
       hasOpenOrder: false,
+      entryAttempts: 0,
     });
     expect(action.kind).toBe("trailing_exit");
   });
@@ -226,5 +236,129 @@ describe("22.3: a dropped candle does not silently suppress the exit", () => {
     for (const [mark, pct] of [["120", "10"], ["0.00000001", "1"], ["99829.5418", "20"]] as const) {
       expect(trailLevelOf(m(mark), m(pct))).toBeLessThanOrEqual(m(mark));
     }
+  });
+});
+
+/**
+ * SPEC 22.10, THE ARITHMETIC HALF. The end-to-end half -- that a real bot really
+ * sends this price, and really stops after the cap -- is
+ * `durable-objects/trailing-stop-entry.test.ts`. Both exist for the reason the
+ * dropped-candle pair does: this file proves the RULE, that one proves the
+ * WIRING, and neither substitutes for the other.
+ */
+describe("the entry price crosses the spread (22.10)", () => {
+  const TICK = m("0.01");
+
+  it("prices ABOVE the market, which is the whole of the fix", () => {
+    // The defect in one assertion. The old path placed the entry AT the last
+    // price, where a buy rests behind the ask; this places it above, where the
+    // venue matches it against resting asks immediately.
+    const last = m("100");
+    const entry = entryLimitPrice(last, ENTRY_CROSS_PCT, TICK);
+    expect(entry).toBeGreaterThan(last);
+    expect(entry).toBe(m("100.25"));
+  });
+
+  it("caps the slippage it is willing to pay at the offset, and no more", () => {
+    // The tradeoff, bounded and asserted. A crossing limit may fill worse than
+    // the last trade -- but the limit IS the ceiling, so "worse" has a number.
+    const last = m("100");
+    const entry = entryLimitPrice(last, ENTRY_CROSS_PCT, TICK);
+    const worstOverpay = entry - last;
+    expect(worstOverpay).toBe(m("0.25"));
+    // And it is small against the thing it is traded off against: `x 100 <
+    // last` is exactly "less than one percent of the price", and one percent is
+    // `TRAIL_PCT_MIN` -- the NARROWEST trail this strategy will accept. The
+    // entry can never cost a quarter of the tightest permitted trail.
+    expect(worstOverpay * 100n).toBeLessThan(last);
+  });
+
+  it("aligns UP onto the tick, so a coarse grid cannot undo the crossing", () => {
+    // 63718 x 1.0025 = 63877.295, which is not a multiple of a 0.01 tick.
+    // Rounding it DOWN -- which is what `validateOrder` does to a buy -- would
+    // move it back toward the market. `entryLimitPrice` moves it away.
+    const last = m("63718");
+    expect(entryLimitPrice(last, ENTRY_CROSS_PCT, TICK)).toBe(m("63877.30"));
+
+    // The case that actually breaks a floor-rounded crossing: a tick COARSER
+    // than the offset itself. 100.25 floored onto a 1.00 grid is 100 -- the
+    // resting order all over again. Ceiled, it is 101, which still crosses.
+    expect(entryLimitPrice(m("100"), ENTRY_CROSS_PCT, m("1"))).toBe(m("101"));
+  });
+
+  it("returns the raw crossed price when the symbol has no price grid", () => {
+    // `tickSize` of ZERO is `filters.ts`'s DISABLED, not "align to nothing".
+    expect(entryLimitPrice(m("100"), ENTRY_CROSS_PCT, ZERO)).toBe(m("100.25"));
+  });
+
+  it("is a price the exchange can accept: still positive, still finite arithmetic", () => {
+    // A guard against a percentage bug that inverts the sign or collapses the
+    // price -- the two ways this helper could produce an unplaceable order.
+    for (const last of ["0.00000001", "1", "100", "63718", "999999"]) {
+      const entry = entryLimitPrice(m(last), ENTRY_CROSS_PCT, TICK);
+      expect(entry).toBeGreaterThan(ZERO);
+      expect(entry).toBeGreaterThanOrEqual(m(last));
+    }
+  });
+});
+
+describe("the entry retry cap (22.10)", () => {
+  const flat = (entryAttempts: number) => ({
+    config: configWith("10"),
+    position: FLAT,
+    highWaterMark: undefined,
+    price: m("100"),
+    hasOpenOrder: false,
+    entryAttempts,
+  });
+
+  it("keeps asking for the entry below the cap", () => {
+    for (let attempts = 0; attempts < MAX_ENTRY_ATTEMPTS; attempts += 1) {
+      expect(decide(flat(attempts)).kind).toBe("open_entry");
+    }
+  });
+
+  it("halts AT the cap rather than placing one more and then halting", () => {
+    const action = decide(flat(MAX_ENTRY_ATTEMPTS));
+    expect(action.kind).toBe("halt");
+    if (action.kind !== "halt") throw new Error("unreachable");
+    expect(action.reason).toBe("entry_unfilled");
+  });
+
+  it("stays halted above the cap -- there is no state a later candle can restore", () => {
+    // The infinite loop, asserted absent. `decide` is pure, so the ONLY thing
+    // that could make it ask for another entry is the counter going backwards.
+    expect(decide(flat(MAX_ENTRY_ATTEMPTS + 7)).kind).toBe("halt");
+  });
+
+  it("reads as an explanation a human can act on, not a code", () => {
+    const action = decide(flat(MAX_ENTRY_ATTEMPTS));
+    if (action.kind !== "halt") throw new Error("unreachable");
+    // Names what happened, how many times, and where to look -- the standard
+    // the stop-loss detail already sets.
+    expect(action.detail).toContain(`placed ${MAX_ENTRY_ATTEMPTS} times`);
+    expect(action.detail).toContain("never filled");
+    expect(action.detail).toMatch(/cancell?ed on the exchange/);
+  });
+
+  it("does not bound anything except the entry", () => {
+    // A held position ignores the counter entirely: the cap must never be able
+    // to stop a bot exiting, which is the one thing worse than not entering.
+    const action = decide({
+      config: configWith("10"),
+      position: HELD("100"),
+      highWaterMark: m("120"),
+      price: m("90"),
+      hasOpenOrder: false,
+      entryAttempts: MAX_ENTRY_ATTEMPTS + 1,
+    });
+    expect(action.kind).toBe("trailing_exit");
+  });
+
+  it("holds, rather than halting, while an entry order is still live at the cap", () => {
+    // `hasOpenOrder` is checked FIRST. An order that is resting has not failed
+    // yet, and halting on it would cancel an entry that might be about to fill.
+    const action = decide({ ...flat(MAX_ENTRY_ATTEMPTS), hasOpenOrder: true });
+    expect(action.kind).toBe("hold");
   });
 });

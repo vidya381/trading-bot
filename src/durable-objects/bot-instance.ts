@@ -156,10 +156,13 @@ import {
   type GridSlot,
 } from "../strategies/grid";
 import {
+  ENTRY_CROSS_PCT,
+  MAX_ENTRY_ATTEMPTS,
   TRAILING_STOP_SCHEMA_VERSION,
   assertReadableSchema as assertReadableTrailingStopSchema,
   decide as trailingStopDecide,
   encodeTrailingStopParams,
+  entryLimitPrice,
   validateTrailingStopParams,
   type TrailingStopConfig,
   type TrailingStopHaltReason,
@@ -427,6 +430,25 @@ export interface BotRuntimeState {
    * and only ever upward -- see `raisesHighWaterMark`.
    */
   readonly highWaterMark?: Money;
+  /**
+   * TRAILING STOP ONLY (spec 22.10): how many times the single entry order has
+   * been placed on the exchange.
+   *
+   * The bound on `decide`'s `open_entry`, which is otherwise unbounded -- see
+   * `MAX_ENTRY_ATTEMPTS`. Counted here rather than derived from the order
+   * records, for the same reason `nextSequence` is: the derivation would be a
+   * scan of every order this bot has ever written, on the order-placing path.
+   *
+   * ⚠ OPTIONAL (`?`) for exactly the reason `highWaterMark` above is: this is
+   * ADDITIVE to a state shape live bots already have on disk, so a non-optional
+   * declaration would be a type lie the moment `#state()` casts a stored object.
+   * ABSENT means zero, and `#trailingStopOnPrice` is the one place that `?? 0`.
+   *
+   * Written ONLY for a trailing-stop bot. DCA's and grid's entry retries are
+   * bounded by their own cycle and ladder logic and neither branch touches this,
+   * so the key is never added to their state at all.
+   */
+  readonly entryAttempts?: number;
   /** Gross realized profit: DCA cycles or grid round trips, before fees. */
   readonly realizedGross: Money;
   /** Cached symbol filters (section 4.3), refreshed when stale. */
@@ -4417,6 +4439,16 @@ export class BotInstance extends DurableObject<Env> {
     // `allocatedCapital`, `pair`, `botInstanceId` -- is on `BotConfigBase`; it
     // never touched `params`. Trailing stop's single entry is the same
     // quote-denominated buy, so it reuses this rather than growing a copy.
+    //
+    // ⚠ WHAT THE WIDENING DID NOT CARRY, AND WHAT THAT COST (spec 22.10). This
+    // method prices a buy AT `price`, where a maker order rests until the market
+    // comes to it. DCA and grid pass the last trade price and want exactly that.
+    // A trailing stop passed the same price and did NOT want it: its one entry
+    // must fill before the strategy can begin, and a resting buy filled none of
+    // ten attempts on the first live bot. Trailing stop now reaches this through
+    // `#placeTrailingStopEntry`, which crosses the price first and counts the
+    // attempt. NOTHING here changed -- the maker behaviour below is DCA's and
+    // grid's, is still correct for them, and must stay the default.
     config: BotConfigBase,
     quoteAmount: Money,
     price: Price,
@@ -5110,6 +5142,9 @@ export class BotInstance extends DurableObject<Env> {
       highWaterMark: state.highWaterMark,
       price: price.price,
       hasOpenOrder: state.openOrderIds.length > 0,
+      // Spec 22.10. The ONE place the optional stored field is defaulted; the
+      // rule itself takes a required number, so nothing else can forget it.
+      entryAttempts: state.entryAttempts ?? 0,
     });
 
     switch (action.kind) {
@@ -5117,7 +5152,7 @@ export class BotInstance extends DurableObject<Env> {
         return { status: "running", action: "hold" };
 
       case "open_entry":
-        return await this.#placeBuy(config, action.quoteAmount, price, "entry");
+        return await this.#placeTrailingStopEntry(config, action.quoteAmount, price);
 
       case "trailing_exit":
         return await this.#placeTrailingStopSell(config, action.quantity, action.trailLevel, price);
@@ -5125,6 +5160,81 @@ export class BotInstance extends DurableObject<Env> {
       case "halt":
         return await this.#halt(config, action.reason, action.detail, "system");
     }
+  }
+
+  /**
+   * The trailing stop's SINGLE ENTRY, priced to fill instead of to rest
+   * (spec 22.10).
+   *
+   * ⚠ WHY THIS IS NOT JUST `#placeBuy`, WHICH ITS OWN HEADER SAYS IT WIDENED
+   * FOR. That widening was correct about the SHAPE of the order and wrong about
+   * its PURPOSE, and the difference cost a live bot ten failed entries. Every
+   * field `#placeBuy` reads really is on `BotConfigBase`, and a trailing-stop
+   * entry really is the same quote-denominated buy -- so the reuse below is
+   * kept, and this method is a thin shell around it. What `#placeBuy` also
+   * carries, invisibly, is DCA's INTENT: it prices a buy at the last trade
+   * price, where it rests as a maker order and waits for the market. A DCA
+   * ladder wants that. A trailing stop cannot start until its one entry fills,
+   * so it wants the opposite, and the two intents cannot both live in one
+   * default. This method supplies the trailing stop's.
+   *
+   * ⚠ AND WHY IT IS A SHELL RATHER THAN A COPY. Everything below `#placeBuy`'s
+   * price line -- the allocation guard, the sequence allocation, the idempotency
+   * guard's `beginAttempt`/`markPlaced`, section 4.3's two independent
+   * validations, the `#statusChangedFrom` point of no return, the four distinct
+   * failure outcomes, the order record, the D1 mirror and the attached-fill
+   * fold -- is transport and safety machinery that has nothing to do with which
+   * strategy wanted the buy. A second copy of it would be a second place for
+   * every one of those to drift, and the drifting copy would be the one on the
+   * strategy nobody has run yet.
+   *
+   * So exactly two things change: the price is crossed rather than resting, and
+   * the placement is counted.
+   */
+  async #placeTrailingStopEntry(
+    config: TrailingStopConfig,
+    quoteAmount: Money,
+    price: Price,
+  ): Promise<PipelineResult> {
+    const state = await this.#state();
+    // Read at ROUTINE priority, matching `#placeBuy`'s own read a moment later
+    // (section 5.4: an entry must not spend the reserve an exit will need). The
+    // tick size is needed HERE, before `#placeBuy` is called, because the
+    // crossing price has to be aligned onto the grid in the crossing direction
+    // -- see `entryLimitPrice` on why leaving that to `validateOrder` would
+    // round the crossing back out again.
+    const filters = await this.#ensureFilters(config, state, this.#now(), "routine");
+    const limit = entryLimitPrice(price.price, ENTRY_CROSS_PCT, filters.tickSize);
+
+    // The Price object is passed through with only its price replaced: `at` and
+    // `pair` still describe the observation this entry is a response to, and
+    // nothing downstream should think a different candle arrived.
+    const result = await this.#placeBuy(config, quoteAmount, { ...price, price: limit }, "entry");
+
+    // COUNTED ON WHAT REACHED THE EXCHANGE, not on every pass through here, and
+    // the two members of this list are deliberate:
+    //
+    //  - `placed-entry` is an order now resting (or already filling) on the
+    //    book. That is an attempt by any reading.
+    //  - `unresolved` is a transport failure, where the order's fate is unknown
+    //    and `#placeBuy` leaves the attempt open for recovery. It is counted
+    //    because `openOrderIds` is NOT written on that path, so `hasOpenOrder`
+    //    stays false and the next candle asks for the entry again -- an
+    //    unbounded loop of its own, and the one an exchange that is failing
+    //    consistently would produce.
+    //
+    // Everything else is excluded because nothing was sent and the condition
+    // clears itself: `throttled` and `skipped` are backpressure and arithmetic,
+    // `recover` means an earlier attempt is still being resolved (counting it
+    // would count that attempt twice), and `aborted` means the bot left
+    // `running` before the send.
+    if (result.action === "placed-entry" || result.action === "unresolved") {
+      await this.#mutateState((current) => ({
+        ...current,
+        entryAttempts: (current.entryAttempts ?? 0) + 1,
+      }));
+    }
+    return result;
   }
 
   /**

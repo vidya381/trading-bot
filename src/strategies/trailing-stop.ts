@@ -22,6 +22,7 @@ import {
   divideRounded,
   fromDecimalString,
   max,
+  roundToStep,
   toDecimalString,
   type Money,
 } from "../shared/money";
@@ -224,6 +225,12 @@ export type TrailingStopHaltReason =
    * `#halt`'s `positiveExit` so it alerts as `info` rather than `critical`.
    */
   | "trailing_stop_reached"
+  /**
+   * Spec 22.10. The single entry was placed `MAX_ENTRY_ATTEMPTS` times and never
+   * held long enough to fill. NOT a positive exit: the strategy never started,
+   * so this alerts `critical` like any other failure to trade.
+   */
+  | "entry_unfilled"
   /** Section 7.5: an unexpected exception in strategy or order-placing code. */
   | "unhandled_error"
   /** An order the exchange refused for a reason that will not fix itself. */
@@ -245,6 +252,101 @@ export type TrailingStopHaltReason =
  */
 export function trailLevelOf(highWaterMark: Money, trailPct: Money): Money {
   return divideRounded(highWaterMark * (HUNDRED_PERCENT - trailPct), HUNDRED_PERCENT, "ceil");
+}
+
+// ---------------------------------------------------------------------------
+// The entry price, and the bound on how many times it may be attempted
+// ---------------------------------------------------------------------------
+
+/**
+ * How far ABOVE the last trade price the single entry is priced, as a percent.
+ *
+ * ⚠ WHY THIS EXISTS AT ALL, from the incident that produced it (spec 22.10).
+ * The first live trailing-stop bot placed its entry through `#placeBuy`, which
+ * prices a buy AT the last trade price. That is right for DCA and grid, whose
+ * buys are MAKER orders meant to rest on the book until the market comes to
+ * them -- a DCA cycle that waits an hour for its base order is a DCA cycle
+ * working as designed. It is wrong here. A trailing stop has ONE entry, and it
+ * cannot begin doing the thing it exists to do -- ratchet a high-water mark
+ * above a position -- until that entry fills. A buy at the last price sits
+ * behind the ask and fills only if the market ticks down into it. The live bot
+ * placed exactly that order ten times and filled none of them.
+ *
+ * So the entry is priced to CROSS the spread: a limit ABOVE the current price,
+ * which the venue matches against resting asks immediately and which therefore
+ * behaves like a market order in every respect except the one that matters --
+ * the limit is still a hard ceiling on what may be paid. Section 4.5 rules out
+ * true market orders ("for price certainty") and `OrderType` is `"limit"` alone,
+ * so this is not a workaround for a missing order type; it is the same
+ * marketable-limit construction `#placeLiquidationSell` already uses on the sell
+ * side, applied to the one buy in this system that must not rest.
+ *
+ * ⚠ THE TRADEOFF, STATED PLAINLY. A crossing limit gives up price for
+ * certainty. The fill may be worse than the last trade -- up to this offset
+ * worse, and no worse than that -- and it pays taker rather than maker fees.
+ * The resting limit it replaces gave up certainty for price, and the certainty
+ * it gave up was total: it may never fill at all, which is the defect being
+ * fixed. For a strategy whose entire risk model is "hold, ratchet, and exit at
+ * `trailPct` below the peak", 0.25% of entry slippage is small against a trail
+ * that is 1-20% wide, and it is paid once. Never filling is not small.
+ *
+ * ⚠ 0.25 IS A JUDGEMENT, LIKE `TRAIL_PCT_MIN`/`MAX`, AND IS MARKED AS ONE. It
+ * is roughly two orders of magnitude wider than the top-of-book spread on the
+ * liquid pairs this system trades, so it clears several levels of depth, while
+ * capping the worst case at a quarter of one percent of the allocation. No
+ * backtest or depth study produced it. If a thin symbol turns out to need more,
+ * this constant is the only thing that changes.
+ */
+export const ENTRY_CROSS_PCT: Money = fromDecimalString("0.25");
+
+/**
+ * How many times the single entry may be placed before the bot gives up.
+ *
+ * ⚠ THE UNBOUNDED LOOP THIS CLOSES. `decide` is a pure function of the position
+ * and the price, so it re-answers `open_entry` on EVERY candle for as long as
+ * the position is flat and no order is live. That is correct for DCA and grid,
+ * whose retries are bounded by their own cycle and ladder logic -- a DCA bot
+ * with a resting base order has `hasOpenOrder` true and stops asking. It is
+ * unbounded here, because nothing in this strategy ever concludes that the entry
+ * is not going to happen. The live bot placed and lost the same order ten times
+ * at the identical price and would have continued indefinitely.
+ *
+ * THREE, and the reasoning is the shape of the failure rather than a round
+ * number. With a crossing entry a healthy placement fills on attempt one; there
+ * is no market condition in which the second attempt is the lucky one. So every
+ * attempt after the first is evidence of something structural -- a venue
+ * cancelling on an account setting, a book too thin to cross, a symbol that is
+ * quoted but not tradable. Three allows two transient cancellations to be
+ * absorbed silently and surfaces a structural fault within about three candles
+ * instead of ten-plus. Set higher, the bot spends longer failing quietly; set to
+ * one, an ordinary venue hiccup halts a bot that a human then has to restart.
+ */
+export const MAX_ENTRY_ATTEMPTS = 3;
+
+/**
+ * The limit price for the single entry: `lastPrice x (100 + crossPct) / 100`,
+ * aligned UP onto the symbol's tick grid.
+ *
+ * TWO roundings, both `ceil`, and both in the same direction for the same
+ * reason -- this price exists to be crossable, so every rounding step must move
+ * it further above the market, never back toward it. The tick alignment is done
+ * HERE rather than left to `validateOrder`, which rounds a buy's price DOWN (its
+ * "never pay more than asked" rule, correct for a maker ladder). On a symbol
+ * whose tick is coarse relative to the offset, that floor would quietly undo the
+ * crossing and hand back the resting order this function exists to replace. An
+ * already-aligned price makes `validateOrder`'s floor a no-op, so the two rules
+ * agree instead of fighting.
+ *
+ * `tickSize` of ZERO means the symbol has no price grid (`DISABLED` in
+ * `filters.ts`), and the raw price is returned unaligned.
+ */
+export function entryLimitPrice(lastPrice: Money, crossPct: Money, tickSize: Money): Money {
+  const crossed = divideRounded(
+    lastPrice * (HUNDRED_PERCENT + crossPct),
+    HUNDRED_PERCENT,
+    "ceil",
+  );
+  return tickSize > ZERO ? roundToStep(crossed, tickSize, "ceil") : crossed;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +407,20 @@ export interface TrailingStopDecisionInput {
    * orders anyway.
    */
   readonly hasOpenOrder: boolean;
+  /**
+   * How many times the single entry has already been PLACED on the exchange
+   * (spec 22.10). Bounds the entry, and nothing else.
+   *
+   * ⚠ REQUIRED, NOT OPTIONAL WITH A ZERO DEFAULT, even though the stored state
+   * field behind it IS optional. A default here would mean a caller that forgot
+   * to pass it got an unbounded bot and no compile error -- which is precisely
+   * the failure this field exists to prevent, reintroduced one level up. The
+   * `?? 0` belongs at the one place that reads storage, not in the rule.
+   *
+   * Never reset. There is one entry in this strategy's whole life (22.2 decision
+   * 4), so a counter that could be reset would be counting something else.
+   */
+  readonly entryAttempts: number;
 }
 
 /**
@@ -322,9 +438,26 @@ export function decide(input: TrailingStopDecisionInput): TrailingStopAction {
 
   // No position yet: waiting on the single entry.
   if (position.quantity <= ZERO) {
-    return input.hasOpenOrder
-      ? { kind: "hold" }
-      : { kind: "open_entry", quoteAmount: config.allocatedCapital };
+    if (input.hasOpenOrder) return { kind: "hold" };
+
+    // SPEC 22.10. Checked BEFORE `open_entry` is returned, so the cap bounds
+    // placements rather than trailing them by one: at the cap, the next answer
+    // is the halt, not one more order followed by a halt.
+    if (input.entryAttempts >= MAX_ENTRY_ATTEMPTS) {
+      return {
+        kind: "halt",
+        reason: "entry_unfilled",
+        detail:
+          `the entry order was placed ${input.entryAttempts} times and never filled, so this ` +
+          `bot has no position to trail and has stopped trying. Each attempt was a limit ` +
+          `${toDecimalString(ENTRY_CROSS_PCT)} percent above the market, priced to fill ` +
+          `immediately, so an order that did not fill was almost certainly cancelled on the ` +
+          `exchange rather than left behind by the price. Check the account's own ` +
+          `order-cancellation settings before restarting this bot.`,
+      };
+    }
+
+    return { kind: "open_entry", quoteAmount: config.allocatedCapital };
   }
 
   // 22.2 DECISION 3'S FORMULA, VERBATIM:
