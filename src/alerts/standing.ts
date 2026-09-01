@@ -129,6 +129,49 @@ export async function raiseStandingAlert(
   return true;
 }
 
+/**
+ * WHICH ROWS A PASS COVERED -- declared, rather than decided by a predicate.
+ *
+ * This was an `inScope: (botInstanceId) => boolean` callback until the READ
+ * underneath it became the problem. The resolve half queried on `source` alone
+ * and filtered in JS, and `source` is not per-bot: `BOT_ALERT_SOURCE` is the
+ * literal string `"bot-instance"`, shared by every bot in the fleet. So every
+ * `BotInstance` poll read every OTHER bot's open rows in order to act on its
+ * own, on a 30-second timer.
+ *
+ * A predicate cannot be pushed into a WHERE clause. A DESCRIPTOR can, and that
+ * is the whole reason for this shape. `scopeFilter` turns it into SQL and
+ * `scopeCovers` turns it into the row test, both derived from this one value,
+ * so the query and the check cannot disagree about what a pass owns. Handing
+ * call sites a filter AND a predicate to keep in step would have been the same
+ * duplicated-definition bug `shared/alert-types.ts` closed for the alert-type
+ * FORMAT and this module's own header closes for the LIFECYCLE.
+ *
+ * `halt.ts` already narrowed this way -- `HaltAlertScope` carries a
+ * non-nullable `botInstanceId` straight into its WHERE. The difference is that
+ * a resume is always about one bot, so a plain interface said everything;
+ * standing alerts have three real scopes and needed the union to say it.
+ */
+export type StandingAlertScope =
+  /**
+   * One bot's rows and nothing else. Never matches an account-scoped row: a
+   * row belonging to no bot was not re-derived by one bot's pass.
+   */
+  | { readonly kind: "bot"; readonly botInstanceId: string }
+  /**
+   * One account -- the bots named, PLUS the account-scoped rows that belong to
+   * no single bot. That second half is load-bearing, not incidental:
+   * `auditBlindness` and its siblings write rows with a null `bot_instance_id`,
+   * and a pass that did not cover them could never close them.
+   */
+  | { readonly kind: "account"; readonly botInstanceIds: readonly string[] }
+  /**
+   * Every row under this `source`, because the `source` IS the scope. For a
+   * writer whose source string is already account-qualified, so there is
+   * nothing left for a bot filter to add.
+   */
+  | { readonly kind: "source" };
+
 /** What one pass of a writer's own detection observed, for the resolve half. */
 export interface StandingAlertPass {
   /** The `source` whose rows this pass may close. See the header on ownership. */
@@ -159,17 +202,56 @@ export interface StandingAlertPass {
    */
   readonly observed: boolean;
   /**
-   * Whether a row belongs to what this pass covered -- one account's bots, or
-   * one bot. A row outside the pass's scope was not re-derived by it and its
-   * absence from `stillOpen` means nothing.
+   * Which rows this pass covered. A row outside it was not re-derived by this
+   * pass, so its absence from `stillOpen` means nothing.
    */
-  readonly inScope: (botInstanceId: string | null) => boolean;
+  readonly scope: StandingAlertScope;
+}
+
+/**
+ * The scope as a WHERE fragment. AN OPTIMISATION, AND ONLY AN OPTIMISATION.
+ *
+ * Every row this excludes is one `scopeCovers` would have rejected anyway, so
+ * adding it can never change which rows get closed -- only how many are read to
+ * find them. `standing.test.ts` pins exactly that: the narrowed read must
+ * resolve the identical id set the fleet-wide read did. A filter that removed a
+ * row the predicate would have kept would be a behaviour change wearing a
+ * performance fix's clothes, and this is the property that catches it.
+ *
+ * Only `bot` narrows, because only `bot` CAN. `db/table.ts`'s `Where` builder
+ * has no `OR`, and `account` means "these bots OR the account-scoped rows that
+ * belong to none of them" -- irreducibly a disjunction. Widening the query layer
+ * for it would buy nothing worth having: reconciliation is a 5-minute cron, and
+ * the read this exists to cut is the 30-second one.
+ */
+function scopeFilter(scope: StandingAlertScope): { readonly bot_instance_id?: string } {
+  return scope.kind === "bot" ? { bot_instance_id: scope.botInstanceId } : {};
+}
+
+/** The scope as a row test. The AUTHORITY on what a pass may close. */
+function scopeCovers(scope: StandingAlertScope, botInstanceId: string | null): boolean {
+  switch (scope.kind) {
+    case "bot":
+      return botInstanceId === scope.botInstanceId;
+    case "account":
+      return botInstanceId === null || scope.botInstanceIds.includes(botInstanceId);
+    case "source":
+      return true;
+  }
 }
 
 /**
  * Close the standing alerts whose condition did not recur on this pass.
  *
  * Returns the ids closed, so a caller can report or assert on them.
+ *
+ * THE SCOPE IS APPLIED TWICE, DELIBERATELY. `scopeFilter` narrows the read and
+ * `scopeCovers` still tests every row that comes back. The second is not
+ * redundant defence -- it is what keeps the first honest. `scopeCovers` is the
+ * definition of what this pass may close, the filter is a way of reading fewer
+ * rows to reach the same answer, and writing it in that order means a future
+ * scope whose SQL narrowing is imprecise (or absent, as `account`'s is) is
+ * still correct rather than quietly over-closing.
  */
 export async function resolveClearedStandingAlerts(
   db: Database,
@@ -178,13 +260,13 @@ export async function resolveClearedStandingAlerts(
   if (!pass.observed) return [];
 
   const open = await db.alerts.findMany({
-    where: { source: pass.source, resolved: false },
+    where: { source: pass.source, resolved: false, ...scopeFilter(pass.scope) },
   });
 
   const resolved: string[] = [];
   for (const row of open) {
     if (!pass.owns(row.alert_type)) continue;
-    if (!pass.inScope(row.bot_instance_id)) continue;
+    if (!scopeCovers(pass.scope, row.bot_instance_id)) continue;
     if (pass.stillOpen.has(standingAlertKey(row.alert_type, row.bot_instance_id))) continue;
 
     await db.alerts.update({ id: row.id }, { resolved: true });

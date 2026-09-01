@@ -85,6 +85,92 @@ export async function freshDatabase(): Promise<Database> {
   return new Database(d1);
 }
 
+/**
+ * What one query actually cost, as D1 itself reports it.
+ *
+ * `rows_read` is D1's billing unit, so a change that claims to read fewer rows
+ * should be provable in the number D1 charges on rather than in a proxy for it.
+ * Local D1 (miniflare) populates `meta.rows_read` the same way the real service
+ * does, which makes the claim testable without a deploy.
+ */
+export interface ReadMeter {
+  /** Every counted SELECT, in order, for asserting HOW MANY reads happened. */
+  readonly statements: string[];
+  /** D1's own `rows_read`, summed across those statements. */
+  rowsRead: number;
+  /** Forget everything so far -- call after seeding, before the measured act. */
+  reset(): void;
+}
+
+/**
+ * A `Database` that counts what its reads of ONE table cost.
+ *
+ * WHY IT LIVES HERE and not next to the test that uses it: `no-raw-d1.test.ts`
+ * fails the build if any file outside /src/db names `D1Database` or calls
+ * `.prepare(`, and wrapping the binding requires both. This file is already the
+ * sanctioned exception, for the same reason -- it is the one place allowed to
+ * reach past the layer.
+ *
+ * Only SELECTs against `table` are counted. Writes are excluded deliberately: a
+ * resolve pass UPDATEs the rows it closes, and folding those into the number
+ * would measure the outcome rather than the lookup that found them.
+ */
+export async function meteredDatabase(
+  table: string,
+): Promise<{ readonly db: Database; readonly meter: ReadMeter }> {
+  const d1 = rawD1();
+  await applyD1Migrations(d1, env.TEST_MIGRATIONS);
+  await d1.batch(TABLES_CHILDREN_FIRST.map((name) => d1.prepare(`DELETE FROM ${name}`)));
+
+  const statements: string[] = [];
+  const meter: ReadMeter = {
+    statements,
+    rowsRead: 0,
+    reset() {
+      statements.length = 0;
+      meter.rowsRead = 0;
+    },
+  };
+
+  const counted = (sql: string): boolean =>
+    /^\s*SELECT/i.test(sql) && sql.includes(`FROM "${table}"`);
+
+  const wrapStatement = (statement: D1PreparedStatement, sql: string): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, property, receiver) {
+        // `bind` returns a NEW statement, so the wrapper has to survive it or
+        // every parameterised query would go uncounted -- which is all of them.
+        if (property === "bind") {
+          return (...values: unknown[]) => wrapStatement(target.bind(...values), sql);
+        }
+        if (property === "all") {
+          return async () => {
+            const result = await target.all<Record<string, unknown>>();
+            if (counted(sql)) {
+              statements.push(sql);
+              meter.rowsRead += Number(result.meta.rows_read ?? 0);
+            }
+            return result;
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+  const metered = new Proxy(d1, {
+    get(target, property, receiver) {
+      if (property === "prepare") {
+        return (sql: string) => wrapStatement(target.prepare(sql), sql);
+      }
+      const value: unknown = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  return { db: new Database(metered), meter };
+}
+
 const T0 = 1_760_000_000_000;
 
 export function botInstanceRow(overrides: Partial<BotInstanceRow> = {}): BotInstanceRow {

@@ -1,0 +1,60 @@
+-- Migration 0011: an index for the standing-alert resolve read.
+--
+-- WHAT WAS WRONG. `resolveClearedStandingAlerts` (/src/alerts/standing.ts) read
+-- `WHERE source = ? AND resolved = 0` and then filtered to the calling bot in
+-- JS. `source` is not per-bot -- every `BotInstance` writes under the single
+-- literal `'bot-instance'` -- so each bot's 30-second poll read every OTHER
+-- bot's open rows in order to act on its own. The pass now declares its scope
+-- (`StandingAlertScope`) and the single-bot case narrows in SQL instead.
+--
+-- ---------------------------------------------------------------------------
+-- WHY THE EXISTING INDEXES DO NOT SERVE IT
+-- ---------------------------------------------------------------------------
+-- 0001 created three, and none of them helps this query:
+--
+--   idx_alerts_created      (created_at)                     -- wrong column
+--   idx_alerts_bot_created  (bot_instance_id, created_at)    -- leads on the bot,
+--       so it cannot seek when `source` is the selective term, and it indexes
+--       the whole table rather than the open rows
+--   idx_alerts_unresolved   (severity, created_at) WHERE resolved = 0
+--       -- partial on the right predicate, but it LEADS ON `severity`. A lookup
+--       by `source` cannot seek it. SQLite can still scan it (it is far smaller
+--       than the table), which is why the old query was slow rather than
+--       catastrophic, but a scan is what this replaces.
+--
+-- ---------------------------------------------------------------------------
+-- WHY PARTIAL, AND WHY THIS COLUMN ORDER
+-- ---------------------------------------------------------------------------
+-- Partial for the reason 0004's `idx_alerts_pending_notification` is partial:
+-- the interesting set is the OPEN incidents, which is almost always empty or
+-- tiny, while the table grows without bound (section 8.7 retains everything).
+-- `resolved = 0` is in every query that reaches here, from both halves of the
+-- lifecycle, so it costs nothing to require it.
+--
+-- `source` leads because it is in EVERY caller's WHERE -- the account-scoped and
+-- source-scoped passes narrow on nothing else, and they get a seek out of this
+-- index too. `bot_instance_id` second so the single-bot case seeks the pair.
+--
+-- ---------------------------------------------------------------------------
+-- IT ALSO SERVES `resolveHaltAlerts`
+-- ---------------------------------------------------------------------------
+-- /src/alerts/halt.ts already queried `(source, bot_instance_id, resolved = 0)`
+-- -- it narrowed in SQL from the start, and was reading it off no index at all.
+-- The same index covers it exactly, which is a second caller for free and is
+-- part of why this shape rather than one built only for the poll.
+--
+-- ---------------------------------------------------------------------------
+-- MECHANICS
+-- ---------------------------------------------------------------------------
+-- A separate numbered file rather than an edit to 0001, for the reason 0002,
+-- 0004 and 0007 all record: 0001 is already applied to the real testnet database
+-- and `applyD1Migrations` records applied migrations by filename, so an edited
+-- 0001 would never re-run there.
+--
+-- CREATE INDEX only. No ALTER, no table rebuild, so no column-order change for
+-- schema.ts and schema.test.ts to match, and none of migration 0010's
+-- deferred-foreign-key hazard (decision log 83): that counter is incremented by
+-- DROP TABLE orphaning children, and nothing here drops anything.
+
+CREATE INDEX idx_alerts_standing_lookup ON alerts (source, bot_instance_id)
+  WHERE resolved = 0;

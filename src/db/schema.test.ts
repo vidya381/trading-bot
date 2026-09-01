@@ -208,6 +208,38 @@ describe("the schema as a whole", () => {
     }
   });
 
+  it("keeps migration 0011's partial index for the standing-alert lookup", async () => {
+    // Both halves of the alert lifecycle look rows up by
+    // (source, bot_instance_id) among the UNRESOLVED rows --
+    // `resolveClearedStandingAlerts` for the bot-scoped case and
+    // `resolveHaltAlerts` for every case. 0001's indexes cannot serve that:
+    // `idx_alerts_unresolved` is partial on the right predicate but leads on
+    // `severity`, and `idx_alerts_bot_created` leads on the bot, so neither
+    // seeks on `source`.
+    //
+    // Pinned here rather than in `standing.test.ts` because a rows-read bound
+    // does NOT catch this index going missing -- SQLite falls back to
+    // `idx_alerts_bot_created` and still reads only one bot's rows. The cost
+    // lands on the account- and source-scoped callers instead, which have no
+    // bot column to fall back on.
+    const indexes = await rawD1()
+      .prepare(`PRAGMA index_list("alerts")`)
+      .all<{ name: string; partial: number }>();
+
+    const standing = indexes.results.find((index) => index.name === "idx_alerts_standing_lookup");
+    expect(standing, "migration 0011's index is missing from alerts").toBeDefined();
+    // Partial, for the reason 0004's index is: the open set stays tiny while
+    // the table grows without bound (section 8.7 retains everything).
+    expect(standing?.partial).toBe(1);
+
+    const info = await rawD1()
+      .prepare(`PRAGMA index_info("idx_alerts_standing_lookup")`)
+      .all<{ seqno: number; name: string | null }>();
+    expect(
+      [...info.results].sort((a, b) => a.seqno - b.seqno).map((column) => column.name),
+    ).toEqual(["source", "bot_instance_id"]);
+  });
+
   it("indexes the child side of every foreign key", async () => {
     // SQLite indexes the parent's key automatically but not the child's, so an
     // unindexed FK column means a full scan of a table that section 8.7 never

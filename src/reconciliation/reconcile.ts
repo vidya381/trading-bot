@@ -410,7 +410,7 @@ async function resolveClearedAlerts(
     owns: isReconciliationAlertType,
     stillOpen,
     observed,
-    inScope: (botInstanceId) => botInstanceId === null || botIds.includes(botInstanceId),
+    scope: { kind: "account", botInstanceIds: botIds },
   });
 }
 
@@ -1531,7 +1531,7 @@ async function auditEmptyBalanceSet(
       // This branch only runs when the exchange returned holdings, which is
       // the observation that clears the incident.
       observed: true,
-      inScope: () => true,
+      scope: { kind: "source" },
     });
     return;
   }

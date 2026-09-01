@@ -52,7 +52,15 @@ each one separately:
 | --- | --- | --- |
 | `source` | `reconciliation` | `bot-instance` |
 | `owns` | `isReconciliationAlertType` | `unattributable_fill`, `poll_blind`, `poll_blind_escalated` |
-| `inScope` | the account's bots | this bot |
+| `scope` | `{ kind: "account" }` — the account's bots, plus the rows belonging to no bot | `{ kind: "bot" }` — this bot |
+
+`scope` is a descriptor rather than the `inScope` predicate it replaced, because
+a predicate cannot be pushed into a `WHERE` clause and this one had to be. Every
+`BotInstance` writes under the single `source` `bot-instance`, so a poll that
+filtered in JS read the whole fleet's open rows to act on its own — on a
+30-second timer. `standing.ts` derives both the SQL filter and the row test from
+the one descriptor, so the read and the check cannot disagree about what a pass
+owns. Migration 0011 adds the index the narrowed read seeks on.
 
 `owns` matters most for the poll: `order_state_drift` and `cancel_failed` are
 written by the same object under the same source, and are reconciliation's to

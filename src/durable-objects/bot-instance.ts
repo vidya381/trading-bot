@@ -2949,7 +2949,7 @@ export class BotInstance extends DurableObject<Env> {
         owns: (alertType) => POLL_STANDING_ALERT_TYPES.has(alertType),
         stillOpen: pass.standing,
         observed: true,
-        inScope: (botInstanceId) => botInstanceId === config.botInstanceId,
+        scope: { kind: "bot", botInstanceId: config.botInstanceId },
       });
     }
 
@@ -5534,7 +5534,7 @@ export class BotInstance extends DurableObject<Env> {
           owns: (alertType) => alertType === LADDER_VACANT_ALERT_TYPE,
           stillOpen: new Set<string>(),
           observed: true,
-          inScope: (botInstanceId) => botInstanceId === config.botInstanceId,
+          scope: { kind: "bot", botInstanceId: config.botInstanceId },
         });
         return;
       }

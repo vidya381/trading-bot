@@ -27,6 +27,7 @@ export {
   standingAlertKey,
   type StandingAlert,
   type StandingAlertPass,
+  type StandingAlertScope,
 } from "./standing";
 
 export { resolveHaltAlerts, type HaltAlertScope } from "./halt";

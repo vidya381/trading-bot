@@ -22,7 +22,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { raiseStandingAlert, resolveClearedStandingAlerts, standingAlertKey } from "./standing";
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
-import { botInstanceRow, freshDatabase } from "../db/test-helpers";
+import { botInstanceRow, freshDatabase, meteredDatabase } from "../db/test-helpers";
 import type { BotInstance, CreateDcaBotRequest } from "../durable-objects/bot-instance";
 import { POLL_STANDING_ALERT_TYPES } from "../durable-objects/bot-instance";
 import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
@@ -125,7 +125,7 @@ describe("resolveClearedStandingAlerts", () => {
       owns: () => true,
       stillOpen: new Set<string>(),
       observed: true,
-      inScope: () => true,
+      scope: { kind: "source" } as const,
       ...overrides,
     };
   }
@@ -181,7 +181,7 @@ describe("resolveClearedStandingAlerts", () => {
 
     await resolveClearedStandingAlerts(
       db,
-      pass({ inScope: (botInstanceId) => botInstanceId === "bot-1" }),
+      pass({ scope: { kind: "bot", botInstanceId: "bot-1" } }),
     );
 
     expect((await db.alerts.findMany({ where: {} }))[0]!.resolved).toBe(false);
@@ -195,6 +195,279 @@ describe("resolveClearedStandingAlerts", () => {
     expect((await db.alerts.findMany({ where: {} }))[0]!.resolved).toBe(false);
   });
 });
+// ---------------------------------------------------------------------------
+// 1b. The scope descriptor, against the fleet-wide read it replaced
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THIS SECTION EXISTS. `resolveClearedStandingAlerts` used to read
+ * `WHERE source = ? AND resolved = 0` and then filter to the calling bot in JS.
+ * `source` is not per-bot -- every `BotInstance` writes under the one literal
+ * `'bot-instance'` -- so each bot's 30-second poll read the whole fleet's open
+ * rows to act on its own.
+ *
+ * The fix pushes the single-bot case into the WHERE clause, and the ONLY thing
+ * that makes it a performance fix rather than a behaviour change is that it
+ * closes exactly the same rows. So that is what these tests assert, against a
+ * transcription of the code that was replaced rather than against a
+ * hand-reasoned expectation -- a re-derived expectation would encode the same
+ * mistake twice if the reasoning were wrong.
+ */
+
+/** The pre-descriptor implementation, transcribed verbatim from git history. */
+async function resolveTheOldWay(
+  database: Database,
+  pass: {
+    readonly source: string;
+    readonly owns: (alertType: string) => boolean;
+    readonly stillOpen: ReadonlySet<string>;
+    readonly observed: boolean;
+    readonly inScope: (botInstanceId: string | null) => boolean;
+  },
+): Promise<string[]> {
+  if (!pass.observed) return [];
+
+  const open = await database.alerts.findMany({
+    where: { source: pass.source, resolved: false },
+  });
+
+  const resolved: string[] = [];
+  for (const row of open) {
+    if (!pass.owns(row.alert_type)) continue;
+    if (!pass.inScope(row.bot_instance_id)) continue;
+    if (pass.stillOpen.has(standingAlertKey(row.alert_type, row.bot_instance_id))) continue;
+
+    await database.alerts.update({ id: row.id }, { resolved: true });
+    resolved.push(row.id);
+  }
+  return resolved;
+}
+
+const FLEET = Array.from({ length: 12 }, (_, index) => `fleet-bot-${index + 1}`);
+const TARGET = FLEET[3]!;
+const OWNED = new Set(["unattributable_fill", "grid_replacement_queued"]);
+const owns = (alertType: string) => OWNED.has(alertType);
+
+/**
+ * One open incident of several kinds on every bot in the fleet, plus the two
+ * things the pass must step over: a type it does not own, and another writer's
+ * row. Ids are deterministic so two runs against two fresh databases produce
+ * byte-identical tables and can be compared directly.
+ */
+async function seedFleet(database: Database): Promise<void> {
+  for (const bot of FLEET) {
+    await database.botInstances.insert(botInstanceRow({ id: bot, account_label: "fixture" }));
+  }
+
+  let n = 0;
+  const seededId = () => `seeded-${String((n += 1)).padStart(3, "0")}`;
+
+  for (const bot of FLEET) {
+    for (const alertType of ["unattributable_fill", "grid_replacement_queued", "cancel_failed"]) {
+      await raiseStandingAlert(database, seededId, alertFor({ botInstanceId: bot, alertType }));
+    }
+    await raiseStandingAlert(
+      database,
+      seededId,
+      alertFor({ botInstanceId: bot, source: "reconciliation" }),
+    );
+  }
+
+  // Account-scoped, under the SAME shared source. This is the row that makes
+  // `bot` and `account` genuinely different scopes rather than a wide one and a
+  // narrow one, and the row a bot filter must never close.
+  await raiseStandingAlert(database, seededId, alertFor({ botInstanceId: null }));
+}
+
+/** The whole table, in a stable order, for comparing two runs. */
+async function snapshot(database: Database) {
+  const rows = await database.alerts.findMany({ orderBy: [{ column: "id", direction: "asc" }] });
+  return rows.map((row) => ({
+    id: row.id,
+    alert_type: row.alert_type,
+    bot_instance_id: row.bot_instance_id,
+    source: row.source,
+    resolved: row.resolved,
+  }));
+}
+
+describe("the scope descriptor resolves exactly what the fleet-wide read did", () => {
+  const cases = [
+    {
+      name: "bot -- the scope that now narrows in SQL",
+      scope: { kind: "bot", botInstanceId: TARGET },
+      inScope: (botInstanceId: string | null) => botInstanceId === TARGET,
+    },
+    {
+      name: "account -- bots plus the rows belonging to no bot",
+      scope: { kind: "account", botInstanceIds: FLEET.slice(0, 4) },
+      inScope: (botInstanceId: string | null) =>
+        botInstanceId === null || FLEET.slice(0, 4).includes(botInstanceId),
+    },
+    {
+      name: "source -- the source is already the scope",
+      scope: { kind: "source" },
+      inScope: () => true,
+    },
+  ] as const;
+
+  it.each(cases)("$name", async ({ scope, inScope }) => {
+    // Two fresh databases seeded identically, one run through each
+    // implementation. `freshDatabase` empties every table, so the second run
+    // starts from exactly the state the first did.
+    const before = await freshDatabase();
+    await seedFleet(before);
+    const oldIds = await resolveTheOldWay(before, {
+      source: SOURCE,
+      owns,
+      stillOpen: new Set(),
+      observed: true,
+      inScope,
+    });
+    const oldTable = await snapshot(before);
+
+    const after = await freshDatabase();
+    await seedFleet(after);
+    const newIds = await resolveClearedStandingAlerts(after, {
+      source: SOURCE,
+      owns,
+      stillOpen: new Set(),
+      observed: true,
+      scope,
+    });
+    const newTable = await snapshot(after);
+
+    // Identical ids, in identical order, and an identical table afterwards.
+    expect(newIds).toEqual(oldIds);
+    expect(newTable).toEqual(oldTable);
+    // Guard against the whole comparison passing vacuously: if the fixture ever
+    // stops producing closable rows, both sides would be empty and agree.
+    expect(newIds.length).toBeGreaterThan(0);
+  });
+
+  it("still agrees when some incidents are re-found and some are not", async () => {
+    // The narrowing must not interact with `stillOpen`. One type stays open on
+    // every bot, the other closes, so the two filters have to disagree per row
+    // rather than per bot.
+    const stillOpen = new Set(FLEET.map((bot) => standingAlertKey("unattributable_fill", bot)));
+
+    const before = await freshDatabase();
+    await seedFleet(before);
+    const oldIds = await resolveTheOldWay(before, {
+      source: SOURCE,
+      owns,
+      stillOpen,
+      observed: true,
+      inScope: (botInstanceId) => botInstanceId === TARGET,
+    });
+    const oldTable = await snapshot(before);
+
+    const after = await freshDatabase();
+    await seedFleet(after);
+    const newIds = await resolveClearedStandingAlerts(after, {
+      source: SOURCE,
+      owns,
+      stillOpen,
+      observed: true,
+      scope: { kind: "bot", botInstanceId: TARGET },
+    });
+
+    expect(newIds).toEqual(oldIds);
+    expect(await snapshot(after)).toEqual(oldTable);
+    expect(newIds).toEqual([expect.any(String)]);
+  });
+
+  it("a bot scope never closes the account-scoped row, however the read is filtered", async () => {
+    // The specific row a `bot_instance_id = ?` clause silently drops. It SHOULD
+    // be dropped -- but because no bot's pass covers it, not as an accident of
+    // how the query is written. `account` below proves the row is closable at
+    // all, so the first assertion cannot pass for the wrong reason.
+    const database = await freshDatabase();
+    await seedFleet(database);
+
+    await resolveClearedStandingAlerts(database, {
+      source: SOURCE,
+      owns,
+      stillOpen: new Set(),
+      observed: true,
+      scope: { kind: "bot", botInstanceId: TARGET },
+    });
+
+    const accountScoped = await database.alerts.findMany({
+      where: { bot_instance_id: null, source: SOURCE },
+    });
+    expect(accountScoped.map((row) => row.resolved)).toEqual([false]);
+
+    await resolveClearedStandingAlerts(database, {
+      source: SOURCE,
+      owns,
+      stillOpen: new Set(),
+      observed: true,
+      scope: { kind: "account", botInstanceIds: FLEET },
+    });
+    const nowClosed = await database.alerts.findMany({
+      where: { bot_instance_id: null, source: SOURCE },
+    });
+    expect(nowClosed.map((row) => row.resolved)).toEqual([true]);
+  });
+});
+
+describe("what the narrowed read costs", () => {
+  /**
+   * The measurement the change was made for, in D1's own billing unit.
+   *
+   * Not a benchmark -- a bound. The old read's cost grows with the FLEET; the
+   * new one does not. Asserting that relationship rather than a fixed number is
+   * what keeps this meaningful when the fixture size changes.
+   *
+   * WHAT IT DOES NOT CATCH, checked rather than assumed: dropping migration
+   * 0011 does NOT fail this. `EXPLAIN QUERY PLAN` confirms SQLite then falls
+   * back to 0001's `idx_alerts_bot_created (bot_instance_id, created_at)`,
+   * which still SEEKS by bot and still reads only this bot's rows -- it just
+   * reads them across every source and both resolved states, and gives the
+   * account- and source-scoped callers nothing. So this test pins the SHAPE of
+   * the read (one bot, not the fleet); `schema.test.ts` pins the index.
+   */
+  it("reads only the target bot's rows, not the fleet's", async () => {
+    const wide = await meteredDatabase("alerts");
+    await seedFleet(wide.db);
+    wide.meter.reset();
+    await resolveTheOldWay(wide.db, {
+      source: SOURCE,
+      owns,
+      stillOpen: new Set(),
+      observed: true,
+      inScope: (botInstanceId) => botInstanceId === TARGET,
+    });
+
+    const narrow = await meteredDatabase("alerts");
+    await seedFleet(narrow.db);
+    narrow.meter.reset();
+    await resolveClearedStandingAlerts(narrow.db, {
+      source: SOURCE,
+      owns,
+      stillOpen: new Set(),
+      observed: true,
+      scope: { kind: "bot", botInstanceId: TARGET },
+    });
+
+    // Both did exactly one lookup; only the number of rows it touched changed.
+    expect(wide.meter.statements).toHaveLength(1);
+    expect(narrow.meter.statements).toHaveLength(1);
+
+    // The old read scanned every row this source has open across the fleet.
+    expect(wide.meter.rowsRead).toBeGreaterThanOrEqual(FLEET.length * 3);
+    // The new one touches only the target bot's, so it cannot grow with the
+    // fleet. Three owned-or-not rows under this source belong to TARGET.
+    expect(narrow.meter.rowsRead).toBeLessThanOrEqual(5);
+
+    console.log(
+      `rows_read for one resolve pass: fleet-wide ${wide.meter.rowsRead}, ` +
+        `narrowed ${narrow.meter.rowsRead} (fleet of ${FLEET.length} bots)`,
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 2. The two real callers, ONE database, ONE bot
 // ---------------------------------------------------------------------------
