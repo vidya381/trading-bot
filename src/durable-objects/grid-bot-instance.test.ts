@@ -22,6 +22,8 @@ import type { GridParams } from "../strategies/grid";
 import {
   gridOrderWasPlaced,
   gridOutstanding,
+  pollTierFor,
+  POLL_TIER_INTERVAL_MS,
   type BotInstance,
   type BotRuntimeState,
   type CreateGridBotRequest,
@@ -862,6 +864,54 @@ describe("checkOpenOrders on a grid ladder", () => {
     expect(details.refused[0]).toMatch(/no real fill id/);
     expect(details.refused.join(" ")).not.toMatch(/unreadable/);
   });
+
+  it("reads every open order CONCURRENTLY, and still applies them in ladder order", async () => {
+    // WHAT THIS PINS, and why a green suite without it proved nothing: the
+    // reads in `#pollOpenOrders` used to run strictly one after another, each
+    // paying a `RateLimiter` RPC and then a venue round trip before the next
+    // one started. A bot resting N orders paid N times a single-order bot's
+    // latency -- measured in production as 780ms per alarm on a four-rung
+    // ladder against 250-310ms for its single-order peers. Reverting to a
+    // sequential loop is invisible to every other test in this file, because
+    // the RESULTS are identical either way; only the timing differs. This
+    // measures the timing.
+    //
+    // Two open orders is enough to tell the shapes apart, and the ladder is the
+    // only strategy that produces them -- the same reason the mixed pass above
+    // lives here rather than with the DCA passes.
+    await startAt("100");
+
+    const outstanding = await inBot(
+      objectName,
+      async (bot) => (await bot.snapshot()).state.openOrderIds,
+    );
+    expect(outstanding.length).toBeGreaterThan(1);
+
+    // Held open until every caller has arrived, so overlap is observable rather
+    // than a matter of scheduling luck.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const entered: string[] = [];
+    const real = exchange.getOrderStatus.bind(exchange);
+    exchange.getOrderStatus = async (pair, clientOrderId) => {
+      entered.push(clientOrderId);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const outcome = await real(pair, clientOrderId);
+      inFlight -= 1;
+      return outcome;
+    };
+
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+
+    // Every read outstanding at once. A sequential loop scores 1 here.
+    expect(maxInFlight).toBe(outstanding.length);
+    // And the fan-out preserves `openOrderIds` order, which the sequential
+    // APPLICATION below it still depends on: a filled buy places its paired
+    // sell, mutating the ladder that the next order is applied against.
+    expect(entered).toEqual(outstanding);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1541,5 +1591,163 @@ describe("a gridExit that could not cancel everything does not rebuild on resume
       await run((bot) => bot.onPriceUpdate(priceAt("100")));
       expect(exchange.placed.length).toBeGreaterThan(beforeResume);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The poll interval's SAFETY FLOOR (step 84)
+// ---------------------------------------------------------------------------
+
+/**
+ * The two conditions that outrank every other tier, locked down before the
+ * tiering that could break them.
+ *
+ * WHY THESE TWO AND NOTHING ELSE. The conditional interval that follows slows
+ * the poll down for bots whose books can afford to be a little stale: the poll
+ * does not evaluate stop-loss or take-profit (those ride price ticks through
+ * `#onPriceUpdatePass`), so for most bots it only maintains records. These two
+ * states are the exceptions, where the poll IS the mechanism rather than the
+ * bookkeeping:
+ *
+ *  - `exitOrderId !== null` -- a liquidation or take-profit sell is resting on
+ *    the exchange RIGHT NOW and the poll is what notices it filled. This is the
+ *    risk-management path, not a record of one.
+ *  - a non-empty `pendingReplacements` -- a grid buy filled and its paired sell
+ *    could not be placed, so base is held with nothing against it. The poll is
+ *    what drains the queue (`#drainReplacements`), so a slower poll is a longer
+ *    uncovered window -- the exact condition behind `grid_replacement_queued`
+ *    and behind the reconciliation drift that halted bot-gnqel3 in production.
+ *
+ * REGARDLESS OF STRATEGY OR STATUS is the load-bearing half, and the halted
+ * case below is why it is not merely defensive. A grid stop-loss cancels every
+ * rung, places a liquidation sell, and HALTS -- so the bot sits in `halted`
+ * with an exit in flight. A tier that keyed on status alone would put exactly
+ * that bot on the dormant interval, slowing the poll for the one order in the
+ * whole system that most needs watching. Ordering the urgent checks ahead of
+ * the status check is what prevents it, and this test is what would notice if
+ * that ordering were ever reversed.
+ */
+describe("poll interval: the urgent floor outranks every other tier", () => {
+  /** The delay the single armed alarm currently represents, from now. */
+  async function armedDelay(): Promise<number | null> {
+    const at = await inBot(objectName, async (_bot, state) => await state.storage.getAlarm());
+    return at === null ? null : at - clock;
+  }
+
+  it("keeps the tightest interval for a resting liquidation sell, even though the bot is HALTED", async () => {
+    await startAt("100");
+    // A held position, so the stop has something to liquidate.
+    await run((bot) => bot.onFill(placedAtPrice("95"), exchange.fillFor(placedAtPrice("95"))));
+
+    // Below the lowest line (90) by more than the 10% stop.
+    const result = await run((bot) => bot.onPriceUpdate(priceAt("80")));
+    expect(result.status).toBe("halted");
+
+    const state = (await run((bot) => bot.snapshot())).state;
+    // The precondition this test is actually about: halted AND mid-exit.
+    expect(state.status).toBe("halted");
+    expect(state.exitOrderId).not.toBeNull();
+
+    expect(await armedDelay()).toBe(30_000);
+  });
+
+  it("keeps the tightest interval while a replacement sell is queued", async () => {
+    await startAt("100");
+    const buyAt95 = placedAtPrice("95");
+    // The replacement cannot be placed, so it is queued and base is uncovered.
+    exchange.nextPlaceFailure = { kind: "rate_limited", message: "budget spent" };
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    const state = (await run((bot) => bot.snapshot())).state;
+    expect(state.pendingReplacements).toHaveLength(1);
+
+    expect(await armedDelay()).toBe(30_000);
+  });
+
+  it("tightens an already-armed loose interval the moment a replacement queues", async () => {
+    // THE LAG THIS CLOSES. `#syncAlarm` only recomputes `nextPollAt` when it is
+    // null, so a bot that armed on a loose tier would hold that instant even
+    // after going urgent -- up to a full loose interval before the floor
+    // applied. A fill arrives on the PRICE-TICK path, not the poll, so there is
+    // no firing in between to re-arm it. The schedule must be pulled in.
+    await startAt("100");
+    const armedLoose = await armedDelay();
+    expect(armedLoose).toBeGreaterThan(30_000);
+
+    const buyAt95 = placedAtPrice("95");
+    exchange.nextPlaceFailure = { kind: "rate_limited", message: "budget spent" };
+    await run((bot) => bot.onFill(buyAt95, exchange.fillFor(buyAt95)));
+
+    expect((await run((bot) => bot.snapshot())).state.pendingReplacements).toHaveLength(1);
+    expect(await armedDelay()).toBe(30_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The tier table itself (step 84)
+// ---------------------------------------------------------------------------
+
+describe("pollTierFor: which cadence a state earns", () => {
+  /** A state vacant on every count except the one under test. */
+  function stateOf(overrides: Partial<BotRuntimeState> = {}): BotRuntimeState {
+    return {
+      schemaVersion: 1,
+      status: "running",
+      cycleCount: 0,
+      position: { quantity: ZERO, averageEntryPrice: ZERO, spent: ZERO, additionalBuys: 0 },
+      nextSequence: 0,
+      openOrderIds: ["v1-grid-btc-1-0"],
+      haltReason: null,
+      haltedAt: null,
+      lastPrice: null,
+      lastPriceAt: null,
+      realizedGross: ZERO,
+      filters: null,
+      exitOrderId: null,
+      ...overrides,
+    } as BotRuntimeState;
+  }
+
+  /** A minimal ladder, present only to mark this state as a grid's. */
+  const ladder = { slots: [null], heldQuantity: ZERO, heldCost: ZERO, realizedGross: ZERO } as never;
+  const queued = [{ levelIndex: 1, side: "sell", price: ZERO }] as never;
+
+  it("puts a running DCA or trailing-stop bot on the routine tier", () => {
+    expect(pollTierFor(stateOf())).toBe("routine");
+  });
+
+  it("puts a running grid on its own tier, between routine and urgent", () => {
+    expect(pollTierFor(stateOf({ ladder }))).toBe("grid");
+    expect(POLL_TIER_INTERVAL_MS.grid).toBeLessThan(POLL_TIER_INTERVAL_MS.routine);
+    expect(POLL_TIER_INTERVAL_MS.grid).toBeGreaterThan(POLL_TIER_INTERVAL_MS.urgent);
+  });
+
+  it("puts a halted bot on the dormant tier, whatever its strategy", () => {
+    expect(pollTierFor(stateOf({ status: "halted" }))).toBe("dormant");
+    expect(pollTierFor(stateOf({ status: "halted", ladder }))).toBe("dormant");
+  });
+
+  // --- the two that outrank everything ------------------------------------
+
+  it("is urgent while an exit is in flight, in EVERY status and strategy", () => {
+    for (const status of ["running", "halted"] as const) {
+      for (const extra of [{}, { ladder }]) {
+        expect(pollTierFor(stateOf({ status, exitOrderId: "v1-grid-btc-1-9", ...extra }))).toBe(
+          "urgent",
+        );
+      }
+    }
+  });
+
+  it("is urgent while a replacement is queued, in EVERY status and strategy", () => {
+    for (const status of ["running", "halted"] as const) {
+      expect(pollTierFor(stateOf({ status, ladder, pendingReplacements: queued }))).toBe("urgent");
+    }
+  });
+
+  it("ranks the urgent floor tightest of all four", () => {
+    const intervals = Object.values(POLL_TIER_INTERVAL_MS);
+    expect(Math.min(...intervals)).toBe(POLL_TIER_INTERVAL_MS.urgent);
+    expect(Math.max(...intervals)).toBe(POLL_TIER_INTERVAL_MS.dormant);
   });
 });

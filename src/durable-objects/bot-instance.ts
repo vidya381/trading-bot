@@ -773,8 +773,85 @@ const FILTER_MAX_AGE_MS = 3_600_000;
  * holds back for getting OUT of a position.
  */
 const POLL_INTERVAL_MS = 30_000;
+/**
+ * The three looser bases, and the one thing to understand before reading them:
+ * THE POLL DOES NOT EVALUATE STOP-LOSS OR TAKE-PROFIT. Those run in
+ * `#onPriceUpdatePass`, through `decide()`, on price ticks forwarded by the
+ * `PriceFeed`; the alarm never calls `decide()`. Step 21 settled this
+ * deliberately -- a poll-observed fill does not act, because the poll has no
+ * price and every action either strategy can take needs one.
+ *
+ * So a slower poll does not slow any risk control down directly. What it slows
+ * is FILL DETECTION, which reaches a decision only through the next tick, and
+ * the feed's own measured cadence is one closed candle every 35-70s (~130s
+ * worst case -- the figure that sized `PRICE_STALENESS_MS`). A 30-second poll
+ * is therefore sampling about twice as fast as the signal that can act on what
+ * it finds, for every bot that is not in one of the two urgent states below.
+ *
+ * 45s FOR A RUNNING GRID, because replace-on-fill runs from the poll path
+ * (`#applyGridFillToOrder` places the paired sell), so its latency is real
+ * inventory exposure rather than bookkeeping -- less urgent than a queued
+ * replacement, more urgent than a DCA bot's records.
+ *
+ * 60s FOR DCA AND TRAILING STOP, where the poll only maintains `position` and
+ * `hasOpenOrder` for the next tick to read. 60s keeps the worst case fill-to-
+ * decision path at ~130s, exactly the gap between two closed candles this
+ * system already tolerates -- so the poll stays at parity with the feed rather
+ * than becoming the slower half. That parity is the reason not to go further.
+ *
+ * 120s WHILE HALTED, the midpoint of the range this was proposed over. A halted
+ * bot places nothing, so the poll exists only to keep the books current for the
+ * operator who is about to make a decision about them (step 19). Five minutes
+ * was the other candidate and was rejected as too stale for someone actively
+ * reviewing; 120s still removes three quarters of the firings and leaves the
+ * backoff room to climb 120 -> 240 -> the cap.
+ */
+const POLL_INTERVAL_GRID_MS = 45_000;
+const POLL_INTERVAL_ROUTINE_MS = 60_000;
+const POLL_INTERVAL_DORMANT_MS = 120_000;
 /** Slow retry once the reads are failing, so a long outage self-heals. */
 const POLL_BACKOFF_CAP_MS = 300_000;
+
+/**
+ * Which cadence this bot's CURRENT state earns.
+ *
+ * Exported and pure for the same reason `gridOutstanding` is: the interesting
+ * cases are combinations of state fields, and contriving each one through a
+ * live bot would test the fixture more than the rule.
+ *
+ * THE TWO URGENT CHECKS COME FIRST, AHEAD OF STATUS, and that order is the
+ * whole safety of this function rather than a stylistic choice. A grid
+ * stop-loss cancels every rung, places a liquidation sell, and halts -- leaving
+ * a bot that is `halted` AND mid-exit. Testing status first would put exactly
+ * that bot on the dormant interval and slow the poll for the one resting order
+ * in the system that most needs watching. `grid-bot-instance.test.ts` locks
+ * this ordering down end to end.
+ *
+ * `ladder !== undefined` IS THE GRID TEST, and it is sound because this is only
+ * ever consulted for an ARMED bot: `#pollArmed` requires a resting order, a
+ * grid's resting orders are placed by its ladder, and no other strategy writes
+ * the key at all. It is also the one derivation here that could be wrong
+ * without being dangerous -- misreading a strategy moves 45s to 60s and nothing
+ * else. The two urgent conditions are read directly from the fields that define
+ * them, with no derivation in between, because those are the ones where being
+ * wrong would matter.
+ */
+export type PollTier = "urgent" | "grid" | "routine" | "dormant";
+
+export function pollTierFor(state: BotRuntimeState): PollTier {
+  if (state.exitOrderId !== null) return "urgent";
+  if ((state.pendingReplacements ?? []).length > 0) return "urgent";
+  if (state.status === "halted") return "dormant";
+  if (state.ladder !== undefined) return "grid";
+  return "routine";
+}
+
+export const POLL_TIER_INTERVAL_MS: Record<PollTier, number> = {
+  urgent: POLL_INTERVAL_MS,
+  grid: POLL_INTERVAL_GRID_MS,
+  routine: POLL_INTERVAL_ROUTINE_MS,
+  dormant: POLL_INTERVAL_DORMANT_MS,
+};
 /** Consecutive unreadable passes before the poll is declared blind. */
 const MAX_POLL_FAILURES = 5;
 /** A blind poll gets louder after this long, mirroring the price feed's policy. */
@@ -2948,36 +3025,52 @@ export class BotInstance extends DurableObject<Env> {
     }
 
     const exchange = this.#exchange(config, "routine");
+    const clientOrderIds = [...state.openOrderIds];
 
-    for (const clientOrderId of [...state.openOrderIds]) {
-      reads += 1;
-      const outcome = await exchange.getOrderStatus(config.pair, clientOrderId);
+    // READ EVERY ORDER AT ONCE, then apply them one at a time. The split is the
+    // whole of this change, and each half is load-bearing for its own reason.
+    //
+    // THE READS FAN OUT because they are independent, and each one is two
+    // network round trips taken strictly after the last: a `RateLimiter` RPC for
+    // budget, then the venue. A bot resting N orders therefore paid N times the
+    // latency of a bot resting one -- measured as 780ms per alarm on a four-rung
+    // ladder against 250-310ms for the single-order peers -- for reads that
+    // never depended on each other. Concurrently they cost one round trip
+    // regardless of N.
+    //
+    // CONCURRENT `acquire` IS SAFE, and that was checked rather than assumed.
+    // `RateLimiter.acquire` reads the ceiling, sums the claims ahead of it, and
+    // calls `WeightBudget.consume` in ONE synchronous run; its only await, the
+    // persist, comes after the weight is already spent in memory. A Durable
+    // Object yields only at an await, so no two acquires can pass the same
+    // check. That ordering is deliberate -- the method says so, and
+    // `rate-limiter.test.ts` forces the interleaving rather than reasoning about
+    // it. Each caller queues its own ticket, exactly as the other bots on this
+    // account already do, and step 21's probe already observed two
+    // `getOrderStatus` calls outstanding here at once. Nothing about the budget
+    // is changed by this.
+    //
+    // THE APPLICATION STAYS SEQUENTIAL, and must. `#applyGridFillToOrder` places
+    // the paired sell for a filled buy, mutating the ladder and `openOrderIds`;
+    // the inner fill loop below re-reads `#order` and `#state` on every
+    // iteration for precisely that reason. Fanning the writes out would race the
+    // ladder against itself. Only the reads are independent, so only the reads
+    // are parallel.
+    const outcomes = await Promise.all(
+      clientOrderIds.map((clientOrderId) => exchange.getOrderStatus(config.pair, clientOrderId)),
+    );
+    reads = clientOrderIds.length;
 
-      // AND YIELD AGAIN HERE, which is the check that actually matters. The
-      // read above suspends this object on the network, and step 21's section 0
-      // probe measured that a price tick or an alarm is delivered into exactly
-      // that window. So the pass may have been alone when it started and not be
-      // alone now -- and the fill just read would be folded into a position
-      // another pass is mid-way through acting on.
-      //
-      // Abandoning costs nothing: the fill is the exchange's own record, it is
-      // still there on the next pass, and `applyFill` dedupes on its id. Not
-      // applying something re-readable is always cheaper than applying it at
-      // the wrong moment.
-      //
-      // `reads` deliberately KEEPS this read. It happened and it succeeded --
-      // the venue answered. An earlier version decremented it here on the
-      // reasoning that the result was discarded, and that quietly disabled both
-      // of the guards `deferred` exists to feed: `observedEverything` starts
-      // with `reads > 0`, and `#runScheduledPoll` treats `reads === 0` as
-      // "nothing to read". Forcing the count to zero made a deferred pass
-      // indistinguishable from an empty one, so two mutants that should have
-      // failed a test survived instead. What a deferred pass did not do is
-      // FINISH, and `deferred` is what says so.
-      if (this.#passesInFlight > 0) {
-        return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: true };
-      }
-
+    // CLASSIFIED BEFORE THE YIELD, so an unreadable order is still reported by a
+    // pass that then stands aside. `#runScheduledPoll` documents the mixed case
+    // -- failed to read A, then deferred on B -- as one whose failure must
+    // survive, because it is real evidence the venue is unreachable and dropping
+    // it suppresses the backoff and `poll_blind` for exactly the bot that needs
+    // them. The sequential loop knew only about the unreadable orders it happened
+    // to reach before deferring; this knows about all of them.
+    const readable: { clientOrderId: string; remote: OrderStatus }[] = [];
+    for (const [index, clientOrderId] of clientOrderIds.entries()) {
+      const outcome = outcomes[index]!;
       if (!isUsable(outcome)) {
         // Section 5.6: an unreachable exchange is not data. The order keeps its
         // local state and stays open, to be read again on the next pass.
@@ -2985,7 +3078,38 @@ export class BotInstance extends DurableObject<Env> {
         skipped.push(`${clientOrderId}: ${outcome.kind} ${outcome.message}`);
         continue;
       }
-      const remote = outcome.value;
+      readable.push({ clientOrderId, remote: outcome.value });
+    }
+
+    // AND YIELD AGAIN HERE, which is the check that actually matters -- unchanged
+    // in purpose, moved only in position. The reads above suspend this object on
+    // the network, and step 21's section 0 probe measured that a price tick or an
+    // alarm is delivered into exactly that window. So the pass may have been
+    // alone when it started and not be alone now, and a fill just read would be
+    // folded into a position another pass is mid-way through acting on.
+    //
+    // It still guards every write, because nothing above this line mutates
+    // anything. What it no longer does is abandon the remaining READS -- they
+    // have already happened, together, and cost nothing more to keep.
+    //
+    // Abandoning costs nothing: the fill is the exchange's own record, it is
+    // still there on the next pass, and `applyFill` dedupes on its id. Not
+    // applying something re-readable is always cheaper than applying it at the
+    // wrong moment.
+    //
+    // `reads` deliberately KEEPS these reads. They happened and they succeeded --
+    // the venue answered. An earlier version decremented here on the reasoning
+    // that the result was discarded, and that quietly disabled both of the guards
+    // `deferred` exists to feed: `observedEverything` starts with `reads > 0`,
+    // and `#runScheduledPoll` treats `reads === 0` as "nothing to read". Forcing
+    // the count to zero made a deferred pass indistinguishable from an empty one,
+    // so two mutants that should have failed a test survived instead. What a
+    // deferred pass did not do is FINISH, and `deferred` is what says so.
+    if (this.#passesInFlight > 0) {
+      return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: true };
+    }
+
+    for (const { clientOrderId, remote } of readable) {
 
       if (remote.fills === undefined) {
         const local = await this.#order(clientOrderId);
@@ -3439,8 +3563,29 @@ export class BotInstance extends DurableObject<Env> {
     let nextPollAt = schedule.nextPollAt;
 
     if (armed && nextPollAt === null) {
-      nextPollAt = this.#now() + this.#pollDelay(schedule);
+      nextPollAt = this.#now() + this.#pollDelay(schedule, state);
       await this.#putPollSchedule({ ...schedule, nextPollAt });
+    } else if (armed && nextPollAt !== null) {
+      // TIGHTEN, NEVER LOOSEN, and this branch exists because without it the
+      // tier would apply a whole interval late. `nextPollAt` is recomputed only
+      // when it is null -- i.e. after a firing -- so a bot that armed on a loose
+      // tier holds that instant even once it goes urgent. The transition that
+      // matters arrives on the PRICE-TICK path (a fill whose replacement could
+      // not be placed, a stop-loss placing a liquidation sell), with no firing
+      // in between to re-arm it, so up to a full loose interval could pass with
+      // an uncovered position and no poll due. Pulling the instant in closes it.
+      //
+      // Only ever EARLIER. A tier that loosens leaves the tighter instant
+      // standing until the next firing re-derives it, which costs one extra poll
+      // and cannot cost anything else -- the safe direction to be wrong in. It
+      // is also what keeps this from oscillating: once pulled in, `now + delay`
+      // grows past the instant it just set, so it changes nothing on subsequent
+      // passes.
+      const tightened = this.#now() + this.#pollDelay(schedule, state);
+      if (tightened < nextPollAt) {
+        nextPollAt = tightened;
+        await this.#putPollSchedule({ ...schedule, nextPollAt });
+      }
     } else if (!armed && nextPollAt !== null) {
       // Disarmed: there are no open orders to read. The failure COUNT resets,
       // because a bot with nothing to poll is not failing to poll -- but a
@@ -3487,9 +3632,18 @@ export class BotInstance extends DurableObject<Env> {
     return state.openOrderIds.length > 0 && state.status !== "stopped";
   }
 
-  /** 30s healthy; doubling to a 5-minute floor while the reads keep failing. */
-  #pollDelay(schedule: PollSchedule): number {
-    return Math.min(POLL_INTERVAL_MS * 2 ** schedule.failures, POLL_BACKOFF_CAP_MS);
+  /**
+   * This bot's own healthy cadence, doubling to a 5-minute floor while the
+   * reads keep failing.
+   *
+   * The backoff multiplies the TIER's base rather than a global 30s, so a
+   * failing bot backs off from wherever it actually sits. A halted bot is
+   * already at 120s and reaches the cap in one doubling, which is the intended
+   * shape: nothing about it is urgent and the venue is not answering.
+   */
+  #pollDelay(schedule: PollSchedule, state: BotRuntimeState): number {
+    const base = POLL_TIER_INTERVAL_MS[pollTierFor(state)];
+    return Math.min(base * 2 ** schedule.failures, POLL_BACKOFF_CAP_MS);
   }
 
   async #armAlarm(at: Timestamp | null): Promise<void> {

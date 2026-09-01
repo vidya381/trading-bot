@@ -28,7 +28,7 @@ import type {
   CreateDcaBotRequest,
   PipelineResult,
 } from "./bot-instance";
-import { BotInstanceError } from "./bot-instance";
+import { BotInstanceError, POLL_TIER_INTERVAL_MS } from "./bot-instance";
 import { FakeExchange, TEST_PAIR, testFilters } from "./fake-exchange";
 import { inBot, inLimiter, noopFeed, rateLimiterStub, recordingFeed } from "./test-helpers";
 import type { PriceFeedPort } from "./price-feed";
@@ -2687,8 +2687,10 @@ describe("alarm (the scheduled open-order poll)", () => {
   });
 
   it("arms the alarm the moment an order starts resting", async () => {
+    // DCA, running, nothing urgent -- the ROUTINE tier. Named rather than
+    // written as a literal so a tier change reads as a tier change here.
     await runningWithRestingOrder();
-    expect(await alarmAt()).toBe(T0 + 30_000);
+    expect(await alarmAt()).toBe(T0 + POLL_TIER_INTERVAL_MS.routine);
   });
 
   it("disarms when the last open order leaves", async () => {
@@ -2723,7 +2725,7 @@ describe("alarm (the scheduled open-order poll)", () => {
 
     // Restored to the instant it was already due at, not pushed out by the
     // recovery: the schedule is what survives, and the alarm is derived from it.
-    expect(await alarmAt()).toBe(T0 + 30_000);
+    expect(await alarmAt()).toBe(T0 + POLL_TIER_INTERVAL_MS.routine);
   });
 
   it("keeps its whole schedule in storage, so an eviction loses nothing", async () => {
@@ -2734,7 +2736,10 @@ describe("alarm (the scheduled open-order poll)", () => {
     exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
     await fireAlarm();
 
-    expect(await pollSchedule()).toMatchObject({ failures: 1, nextPollAt: clock + 60_000 });
+    expect(await pollSchedule()).toMatchObject({
+      failures: 1,
+      nextPollAt: clock + POLL_TIER_INTERVAL_MS.routine * 2,
+    });
   });
 
   // --- what a firing actually does ----------------------------------------
@@ -2777,12 +2782,12 @@ describe("alarm (the scheduled open-order poll)", () => {
     expect(audit[0]!.actor).toBe("system");
   });
 
-  it("re-arms 30 seconds later after a clean pass that found nothing", async () => {
+  it("re-arms one routine interval later after a clean pass that found nothing", async () => {
     await runningWithRestingOrder();
 
     await fireAlarm();
 
-    expect(await alarmAt()).toBe(T0 + 30_000 + 30_000);
+    expect(await alarmAt()).toBe(T0 + POLL_TIER_INTERVAL_MS.routine * 2);
   });
 
   it("keeps polling a HALTED bot, and places nothing", async () => {
@@ -2872,10 +2877,11 @@ describe("alarm (the scheduled open-order poll)", () => {
     await run((bot) => bot.alarm());
 
     expect(await db.trades.count({ bot_instance_id: BOT_ID })).toBe(1);
-    expect(await alarmAt()).toBe(firedAt + 60_000);
+    // The mixed pass counts as a failure, so this is the routine base doubled.
+    expect(await alarmAt()).toBe(firedAt + POLL_TIER_INTERVAL_MS.routine * 2);
   });
 
-  it("backs off on repeated unreadable passes: 30s, 60, 120, 240, then a 5-minute floor", async () => {
+  it("backs off on repeated unreadable passes: doubling the tier base to a 5-minute floor", async () => {
     await runningWithRestingOrder();
     exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
 
@@ -2887,7 +2893,10 @@ describe("alarm (the scheduled open-order poll)", () => {
       delays.push((await alarmAt())! - firedAt);
     }
 
-    expect(delays).toEqual([60_000, 120_000, 240_000, 300_000, 300_000]);
+    // The ROUTINE base (60s) doubled per consecutive failure, capped at five
+    // minutes. The backoff multiplies THIS bot's tier rather than a global 30s,
+    // so a bot always backs off from wherever it actually sits.
+    expect(delays).toEqual([120_000, 240_000, 300_000, 300_000, 300_000]);
   });
 
   it("goes blind after five consecutive failures, with ONE alert row", async () => {
@@ -2918,7 +2927,7 @@ describe("alarm (the scheduled open-order poll)", () => {
     expect(escalated[0]!.severity).toBe("critical");
   });
 
-  it("recovers: a readable pass resolves both blind alerts and restores the 30s cadence", async () => {
+  it("recovers: a readable pass resolves both blind alerts and restores the healthy cadence", async () => {
     await runningWithRestingOrder();
     exchange.orderStatusFailure = { kind: "transport", message: "unreachable" };
     for (let i = 0; i < 5; i++) await fireAlarm();
@@ -2933,7 +2942,7 @@ describe("alarm (the scheduled open-order poll)", () => {
 
     expect(await db.alerts.count({ resolved: false, alert_type: "poll_blind" })).toBe(0);
     expect(await db.alerts.count({ resolved: false, alert_type: "poll_blind_escalated" })).toBe(0);
-    expect(await alarmAt()).toBe(firedAt + 30_000);
+    expect(await alarmAt()).toBe(firedAt + POLL_TIER_INTERVAL_MS.routine);
     expect(await pollSchedule()).toMatchObject({ failures: 0, blindSince: null, escalated: false });
   });
 

@@ -274,12 +274,15 @@ async function nextPollAt(): Promise<number | null> {
  * waiting and carried on would report whatever the half-finished state happened
  * to be.
  */
-async function waitForPollScheduledAt(at: number): Promise<void> {
+async function waitForPollRearmedAfter(firedAt: number): Promise<void> {
   for (let i = 0; i < 200; i++) {
-    if ((await nextPollAt()) === at) return;
+    const next = await nextPollAt();
+    if (next !== null && next > firedAt) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  throw new Error(`the poll was never re-armed for ${at}; the alarm's pass did not complete`);
+  throw new Error(
+    `the poll was never re-armed past ${firedAt}; the alarm's pass did not complete`,
+  );
 }
 
 /**
@@ -448,8 +451,15 @@ describe("probe 2: an alarm arriving while the object is suspended on an exchang
     await attachDependencies();
 
     // Make the poll DUE on the injected clock, so a delivered alarm actually
-    // runs a pass rather than returning early.
-    clock = T0 + 30_000;
+    // runs a pass rather than returning early. Read from the bot's OWN schedule
+    // rather than a hardcoded interval: the healthy cadence is per-tier now
+    // (see `pollTierFor`), and a literal here would quietly stop making the poll
+    // due -- and this probe would fail as a timeout rather than as a wrong
+    // number, which is a much harder thing to read.
+    clock = await inBot(objectName, async (_bot, state) => {
+      const schedule = await state.storage.get<{ nextPollAt: number | null }>("poll-schedule");
+      return schedule!.nextPollAt!;
+    });
     exchange.now = clock;
 
     const gate = openable();
@@ -493,7 +503,12 @@ describe("probe 2: an alarm arriving while the object is suspended on an exchang
     // Re-arming the schedule is the last thing `alarm()` does, so the schedule
     // showing the NEXT poll time is the pass having completed. Timers were
     // tried first and were flaky; this is exact.
-    await waitForPollScheduledAt(T0 + 60_000);
+    // Any instant strictly later than the one it fired at. Deliberately not the
+    // exact next poll time: the healthy cadence is per-tier now, and this probe
+    // is about whether the alarm was DELIVERED during the manual pass, not about
+    // what interval it re-armed at. Pinning the number here would make a tier
+    // change look like a concurrency regression.
+    await waitForPollRearmedAfter(clock);
 
     expect(exchange.outstanding()).toBe(0);
     expect(alarmArrivedDuringPass).toBe(true);
