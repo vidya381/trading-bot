@@ -85,9 +85,13 @@ export const ENDPOINT_WEIGHTS = {
   exchangeInfo: 20,
   tickerPrice: 2,
   // `/api/v3/klines` at the default limit (<=100). From the published docs, not
-  // measured -- like every weight here (section 17 amendment), and doubly so
-  // since Binance is geo-blocked from this infrastructure (step 3.3) and this
-  // number cannot be verified against the real venue until a relay exists.
+  // measured -- like every weight here (section 17 amendment). Measuring it is
+  // blocked for `api.binance.com` and `testnet.binance.vision`, which both
+  // answer 451 ("restricted location") from the Cloudflare edge -- but that is
+  // a block on those venues, NOT on this infrastructure: `api.binance.us`
+  // answers 200 from the same edge (probed 2026-09-02 from colo DFW). That
+  // still does not verify THIS number, since binance.us is a separate venue
+  // publishing its own weights and `BINANCE_BASE_URLS` has no entry for it.
   klines: 2,
   placeOrder: 1,
   cancelOrder: 1,
