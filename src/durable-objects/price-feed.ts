@@ -171,6 +171,45 @@ const BLIND_ESCALATION_MS = 30 * 60_000;
 const MAX_FANOUT_FAILURES = 5;
 
 /**
+ * WHICH ROWS A RESOLVE COVERS, beyond the alert types it names. Always stated,
+ * never defaulted.
+ *
+ * `/src/alerts`'s `StandingAlertScope` records why this is a declared descriptor
+ * rather than an optional argument: a writer may only close an incident it was in
+ * a position to observe, and a scope that can be FORGOTTEN is one that silently
+ * over-closes. That failure is invisible here in a way it is not there -- an
+ * over-broad resolve closes a row belonging to a bot that is still failing, and
+ * the only symptom is an alert surface that has gone quiet about a live problem.
+ * Requiring the argument makes the two-line version of that bug unwritable.
+ *
+ * The double application `standing.ts` needs (a SQL filter AND a row predicate)
+ * is deliberately absent, because here it would be redundant rather than
+ * load-bearing: `bot` narrows on a single `bot_instance_id` equality, which the
+ * `Where` builder expresses exactly, where that module's `account` scope is an
+ * irreducible disjunction its query layer has no `OR` for.
+ */
+type FeedAlertScope =
+  /**
+   * Every row this feed raised of the named types, whoever they name. For an
+   * incident that belongs to the MARKET -- the socket being down, the value
+   * being fiction -- where no single subscriber owns it.
+   */
+  | { readonly kind: "feed" }
+  /**
+   * Only the rows naming one bot. For an incident attributed to a single
+   * subscriber, where another subscriber's recovery is no evidence at all.
+   *
+   * ⚠ IT WILL NEVER MATCH A NULL-ATTRIBUTED ROW, and that is correct rather than
+   * a gap to close. `#alert` falls back to `bot_instance_id: null` when the FK
+   * rejects an id (a bot with no `bot_instances` row), and a row that names
+   * nobody cannot be shown to be THIS bot's incident -- closing it on this bot's
+   * recovery would be exactly the unobserved-resolve that scoping exists to
+   * prevent. Those rows are the historical residue of ids that never had a bot
+   * behind them, and they stay open by design.
+   */
+  | { readonly kind: "bot"; readonly botInstanceId: string };
+
+/**
  * Consecutive unchanged, zero-volume candles before a feed is called frozen
  * (spec 5.7 detector 1).
  *
@@ -465,6 +504,13 @@ export class PriceFeed extends DurableObject<Env> {
     } else {
       await this.configure(config);
     }
+    // LAST, once this bot is genuinely back in the registry and the feed is up.
+    // If `startFeed` threw, the bot is NOT receiving prices and its prune row is
+    // still true, so the throw propagating past this is the correct outcome
+    // rather than a case to catch. Reading D1 on every subscribe is affordable
+    // in a way it would not be in `#fanOut`: this runs on a bot's start or
+    // resume, not once a minute per subscriber.
+    await this.#resolvePruned(botInstanceId);
   }
 
   /**
@@ -731,31 +777,196 @@ export class PriceFeed extends DurableObject<Env> {
     }
   }
 
-  /**
-   * Close the standing frozen-value row once prices move again.
-   *
-   * Scoped by `source` as well as type, so a feed resolves ITS OWN incident and
-   * never another market's -- `#alert` writes `price-feed:<exchange>:<pair>` and
-   * this reads the same string back.
-   */
+  /** Close the standing frozen-value row once prices move again. */
   async #resolveFrozen(): Promise<void> {
     try {
-      const db = databaseFrom(this.env);
-      const open = await db.alerts.findMany({
-        where: {
-          alert_type: "price_feed_value_frozen",
-          source: this.#alertSource(),
-          resolved: false,
-        },
-      });
-      for (const row of open) {
-        await db.alerts.update({ id: row.id }, { resolved: true });
-      }
+      await this.#resolveOwnAlerts(["price_feed_value_frozen"], { kind: "feed" });
     } catch (error) {
       console.error(
         `price feed ${this.#configLabel()}: prices moved again but the frozen-value alert ` +
           `could not be resolved (${(error as Error).message}).`,
       );
+    }
+  }
+
+  /**
+   * Close the standing blind rows once the feed is connected again.
+   *
+   * ⚠ THE BUG THIS CLOSES. `price_feed_blind` and `price_feed_blind_escalated`
+   * were raised by `#scheduleReconnect` and marked resolved by NOTHING, anywhere
+   * in the system -- entry 81 PART 6 confirmed it by grep and left it deliberately
+   * out of that scope. The system's other resolving paths could not have covered
+   * it even in principle: `resolveHaltAlerts`, `resolveClearedStandingAlerts`,
+   * reconciliation's own pass and the two maintenance endpoints are each scoped
+   * by `source` or an explicit type list, and none of them names `price-feed:*`.
+   * The cost was measured rather than theorised -- two 20-day-old open rows for
+   * `gemini:BTCUSD` and `gemini:DOGEUSD` that turned out to be stale bookkeeping,
+   * after they had already consumed real time to rule out as a live outage.
+   *
+   * ── WHY A SUCCESSFUL OPEN IS THE RIGHT CONDITION ──
+   *
+   * `#recordPollFailure` in `bot-instance.ts` says it "MIRRORS THE PRICE FEED'S
+   * BLIND POLICY", and what it gets from the standing path is "a real resolution
+   * the moment a pass reads cleanly again". THE CONNECT ATTEMPT IS THIS OBJECT'S
+   * PASS: it is the operation that failed `MAX_RECONNECT_ATTEMPTS` times over to
+   * produce the alert in the first place, so its success is the same evidence in
+   * the same currency. `#syncAlarm`'s rule -- only something that actually
+   * observed may close the row, never a mere absence of work -- is satisfied,
+   * because this runs on a handshake that really completed and not on a feed that
+   * simply stopped being asked for anything.
+   *
+   * IT IS DELIBERATELY NOT "a fresh price arrived". That is a different alert's
+   * job: `price_feed_blind` is a CONNECTION check (5.7's header records it and
+   * `price_updates_stale` as the two liveness checks, and `#trackFrozenValue` as
+   * the correctness one that neither could ever be). Waiting for a candle would
+   * also hold the row open through a legitimately quiet market, and -- worse --
+   * would decouple the row from `blindSince`, which is cleared here. The raise is
+   * gated on that flag, so a resolve on any LATER event allows a second open row
+   * behind the first. Raising and resolving on the same transition is what makes
+   * a duplicate impossible.
+   *
+   * Both types go together because the escalation is the same incident grown
+   * louder, not a second one: it can only exist while `blindSince` is set, and it
+   * stops describing anything the moment this clears.
+   */
+  async #resolveBlind(): Promise<void> {
+    try {
+      await this.#resolveOwnAlerts(["price_feed_blind", "price_feed_blind_escalated"], {
+        kind: "feed",
+      });
+    } catch (error) {
+      console.error(
+        `price feed ${this.#configLabel()}: the feed reconnected but its blind alert could ` +
+          `not be resolved (${(error as Error).message}).`,
+      );
+    }
+  }
+
+  /**
+   * Close one bot's fan-out failure rows once a delivery to it succeeds again.
+   *
+   * ⚠ SAME DEFECT AS `#resolveBlind`, ONE LAYER IN. These rows were raised and
+   * closed by nothing, under the same `price-feed:*` source no other resolver
+   * reaches. The condition they describe -- "this bot cannot be reached" -- has a
+   * precise, already-observed end that this object was throwing away.
+   *
+   * ── THE EVENT IS THE SUCCESSFUL DELIVERY, AND IT IS ALREADY TRUSTED ──
+   *
+   * `#fanOut`'s fulfilled branch resets `consecutive_failures` on exactly this
+   * event, with the reasoning stated there: a subscriber that can be REACHED is
+   * healthy whatever it did with the price, a non-running bot's `"ignored"`
+   * included. `consecutive_failures` is to this alert what `blindSince` is to the
+   * blind one -- the state that says an incident is open -- so resolving where
+   * that state clears keeps the row and the counter from ever disagreeing.
+   *
+   * ── PER BOT, NOT PER FEED, AND THAT IS THE DIFFERENCE FROM `#resolveBlind` ──
+   *
+   * A blind feed is one incident belonging to the market: nothing is delivered to
+   * anyone, and one reconnect ends it for every subscriber at once. A fan-out
+   * failure is attributed to ONE bot by design (entry 81 made these rows joinable
+   * precisely so they would appear on that bot's page), and the other subscribers
+   * on the same market were being delivered to perfectly throughout. So bot A
+   * succeeding is no evidence whatsoever about bot B, and a feed-scoped resolve
+   * here would close a live incident on an unrelated bot's recovery -- quietly,
+   * and on a surface whose whole job is to still be shouting.
+   *
+   * Never throws: see the call site on why a resolve that can throw inside
+   * `#fanOut` is a candle that is retried forever.
+   */
+  async #resolveFanoutFailures(botInstanceId: string): Promise<void> {
+    try {
+      await this.#resolveOwnAlerts(["price_feed_fanout_failed"], {
+        kind: "bot",
+        botInstanceId,
+      });
+    } catch (error) {
+      console.error(
+        `price feed ${this.#configLabel()}: delivery to ${botInstanceId} recovered but its ` +
+          `fan-out alerts could not be resolved (${(error as Error).message}).`,
+      );
+    }
+  }
+
+  /**
+   * Close a bot's prune row once it subscribes to this feed again.
+   *
+   * ── WHY THIS IS A REAL RESOLVE AND NOT AN ARTIFICIAL ONE ──
+   *
+   * The tempting reading is that a pruned subscriber is GONE rather than fixed,
+   * so there is nothing to resolve and the row is correctly informational. That
+   * reading does not survive contact with `/src/alerts/index.ts`, which names two
+   * lifecycles and puts this squarely in the second: "a discrete EVENT that a
+   * later state transition makes historical. One row per halt, closed when the
+   * bot successfully resumes." A prune IS that shape. One row per prune is right,
+   * and `resolveHaltAlerts` already applies the identical treatment to the
+   * identical shape one object over.
+   *
+   * The alert's own text settles it. It says the bot "receives no further prices
+   * until it is resumed, which re-subscribes it" -- the row NAMES its exit
+   * condition, and `subscribe` is that condition arriving. Left unresolved it
+   * ends up asserting, permanently and on the bot's own detail page, that a
+   * running bot's stop-loss is not being evaluated. That sentence is either
+   * urgent or it is false; there is no version of it that is worth leaving open
+   * as history. History is what `audit_log` is for.
+   *
+   * ── WHAT THIS DELIBERATELY DOES NOT CLAIM ──
+   *
+   * Not that the bot is healthy -- only that it is subscribed. A bot that
+   * re-subscribes and immediately starts failing again accumulates a fresh
+   * streak and is pruned again, opening a NEW row, exactly as a feed that
+   * re-connects and goes blind again does. Re-arming is the property that makes
+   * closing safe.
+   *
+   * Never throws. `subscribe` is FAIL-CLOSED for its caller -- `BotInstance`
+   * treats a throw here as a reason not to start or resume the bot at all -- so a
+   * D1 hiccup while tidying a stale row must never be the thing that stops a bot
+   * from running.
+   */
+  async #resolvePruned(botInstanceId: string): Promise<void> {
+    try {
+      await this.#resolveOwnAlerts(["price_feed_subscriber_pruned"], {
+        kind: "bot",
+        botInstanceId,
+      });
+    } catch (error) {
+      console.error(
+        `price feed ${this.#configLabel()}: ${botInstanceId} re-subscribed but its prune ` +
+          `alert could not be resolved (${(error as Error).message}).`,
+      );
+    }
+  }
+
+  /**
+   * Mark every open row of the given types, within `scope`, that THIS feed
+   * raised as resolved.
+   *
+   * Scoped by `source` as well as type, so a feed resolves ITS OWN incident and
+   * never another market's -- `#alert` writes `price-feed:<exchange>:<pair>` and
+   * this reads the same string back. Spelled once, for all four lifecycles, for
+   * the reason `#alertSource` is spelled once: a second copy of that scope would
+   * fail silently, as rows that are raised and never closed.
+   *
+   * EVERY matching row, not the newest one. `price_feed_fanout_failed` is raised
+   * per failed ATTEMPT rather than latched per incident, so a bot that failed
+   * four times and then succeeded has four rows describing one run that is now
+   * over. Closing the run means closing all of them.
+   *
+   * THROWS. Each caller decides what a D1 failure means on its own path, and all
+   * of them treat it as best-effort -- see `#trackFrozenValue` on why a detector
+   * that can throw is a detector that can stop a feed delivering prices.
+   */
+  async #resolveOwnAlerts(alertTypes: readonly string[], scope: FeedAlertScope): Promise<void> {
+    const db = databaseFrom(this.env);
+    const open = await db.alerts.findMany({
+      where: {
+        alert_type: { in: alertTypes },
+        source: this.#alertSource(),
+        resolved: false,
+        ...(scope.kind === "bot" ? { bot_instance_id: scope.botInstanceId } : {}),
+      },
+    });
+    for (const row of open) {
+      await db.alerts.update({ id: row.id }, { resolved: true });
     }
   }
 
@@ -788,7 +999,11 @@ export class PriceFeed extends DurableObject<Env> {
     this.#socket = socket;
     this.beginConnection(); // fresh connection: the replay batch will re-prime
     this.#lastMessageAt = this.#deps.now();
-    // A successful open clears any backoff/blind state from a prior outage.
+    // A successful open clears any backoff/blind state from a prior outage. The
+    // ALERT ROW is part of that state and was the one piece nothing cleared;
+    // `wasBlind` is read BEFORE the clear because the clear is what erases the
+    // evidence that there is a row to close.
+    const wasBlind = this.#state.blindSince !== null || this.#state.escalated;
     if (
       this.#state.reconnectAttempts !== 0 ||
       this.#state.blindSince !== null ||
@@ -799,6 +1014,12 @@ export class PriceFeed extends DurableObject<Env> {
     }
     socket.send(this.#deps.codec.subscribeMessage(config.pair));
     await this.#armAlarm(this.#deps.now() + HEALTH_CHECK_MS);
+    // LAST, and only for a feed that actually went blind. Everything that makes
+    // the feed live again -- the subscribe frame, the health-check alarm -- runs
+    // first; closing a row is reporting, and reporting never goes in front of
+    // recovery. Same order, and the same reason, as `#trackFrozenValue` sitting
+    // after the forward rather than before it. It cannot throw.
+    if (wasBlind) await this.#resolveBlind();
   }
 
   /** A socket closed or errored (or was found stale): drop it and reconnect. */
@@ -946,6 +1167,10 @@ export class PriceFeed extends DurableObject<Env> {
     // `stopFeed`, and tearing the feed down while still deciding what to do
     // about the other subscribers would read their state mid-teardown.
     const doomed: string[] = [];
+    // The bots whose streak this candle ENDED, for the same reason `doomed` is
+    // collected rather than acted on inline: these are D1 writes, and the loop
+    // above is the one place this object handles delivery outcomes.
+    const recovered: string[] = [];
 
     for (let i = 0; i < results.length; i++) {
       const id = ids[i]!;
@@ -955,6 +1180,14 @@ export class PriceFeed extends DurableObject<Env> {
         // Includes a non-running bot's `"ignored"` -- a successful RPC. A
         // subscriber that can be reached is healthy whatever it did with the
         // price.
+        //
+        // READ BEFORE THE RESET, and gated on it, because the reset is what
+        // erases the evidence that this bot had open rows -- the same ordering
+        // `#ensureConnected` needs around `blindSince`. The gate is also what
+        // keeps this off the hot path: the overwhelming majority of deliveries
+        // succeed with a streak already at zero, and those must cost no D1 read
+        // at all. Only a bot that was actually failing pays for one.
+        if (this.#failuresFor(id) !== 0) recovered.push(id);
         this.#resetFailures(id);
         continue;
       }
@@ -972,6 +1205,20 @@ export class PriceFeed extends DurableObject<Env> {
       );
       if (failures >= MAX_FANOUT_FAILURES) doomed.push(id);
     }
+
+    // BEFORE the pruning loop. NOT because it would break otherwise -- it would
+    // not, and the weaker claim is the true one: a pass with a recovery has at
+    // least one live subscriber, so the pruning below cannot empty the registry,
+    // so `unsubscribe`'s zero-check cannot reach `stopFeed` and clear the config
+    // that `#alertSource()` is built from. That safety is a property of
+    // `unsubscribe`, though, not of anything here, and it is exactly the kind of
+    // argument a later change to the zero-check would invalidate silently -- the
+    // rows would simply stop matching, under the bare `price-feed` source, with
+    // nothing to notice. Ordering it here costs nothing and does not depend on
+    // that argument holding. It is also the file's existing rule: recovery
+    // first, reporting second, as `#resolveBlind` sits after the subscribe frame
+    // and the alarm.
+    for (const id of recovered) await this.#resolveFanoutFailures(id);
 
     for (const id of doomed) {
       // Alerted BEFORE the unsubscribe, while `#configLabel()` can still name

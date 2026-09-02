@@ -400,6 +400,172 @@ describe("socket lifecycle, alarm, and backoff", () => {
     expect(await db.alerts.count({ alert_type: "price_feed_blind" })).toBe(1); // not re-fired
   });
 
+  /**
+   * THE BLIND ALERT'S RESOLVE HALF.
+   *
+   * ⚠ WHAT THESE COVER. `price_feed_blind` was raised and closed by nothing --
+   * entry 81 PART 6 confirmed by grep that none of the system's four resolving
+   * paths reaches the `price-feed:*` source, and left it out of scope. The cost
+   * was two 20-day-old open rows that read as a live outage and were not one.
+   * The test above already proves the row is not RE-fired while blind; these
+   * prove it stops being open once the feed is not.
+   */
+  describe("blind alerts resolve when the feed reconnects", () => {
+    /** Every blind row in the table, warning and escalation alike. */
+    const blindRows = async () =>
+      await db.alerts.findMany({
+        where: { alert_type: { in: ["price_feed_blind", "price_feed_blind_escalated"] } },
+      });
+
+    const rowsOfType = async (alertType: string) =>
+      (await blindRows()).filter((row) => row.alert_type === alertType);
+
+    it("closes BOTH the warning and the escalation on a successful reconnect", async () => {
+      let clock = NOW;
+      const fake = fakeConnect();
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({ now: () => clock, forward: async () => {}, connect: fake.connect });
+        await feed.subscribe("bot-a", CONFIG);
+        await fake.sockets[0]!.drop();
+        fake.failNext(6); // five alarms to go blind, then one more to escalate
+        for (let i = 0; i < 5; i++) {
+          clock += 20_000;
+          await feed.alarm();
+        }
+        clock += 31 * 60_000; // stay blind past the escalation window
+        await feed.alarm(); // escalates
+        clock += 60_000;
+        await feed.alarm(); // this connect succeeds
+
+        // The recovery really happened: a live socket, re-subscribed.
+        const last = fake.sockets[fake.sockets.length - 1]!;
+        expect(last.sent).toEqual([SUBSCRIBE]);
+      });
+
+      const rows = await blindRows();
+      expect(rows).toHaveLength(2);
+      // The escalation is the same incident grown louder, not a second one, so
+      // it closes with the warning rather than outliving it.
+      expect(rows.every((row) => row.resolved)).toBe(true);
+      expect(await rowsOfType("price_feed_blind_escalated")).toHaveLength(1);
+    });
+
+    it("RE-ARMS: a second outage opens a new row rather than reusing the closed one", async () => {
+      let clock = NOW;
+      const fake = fakeConnect();
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({ now: () => clock, forward: async () => {}, connect: fake.connect });
+        await feed.subscribe("bot-a", CONFIG);
+
+        await fake.sockets[0]!.drop();
+        fake.failNext(5); // exactly enough to go blind
+        for (let i = 0; i < 5; i++) {
+          clock += 20_000;
+          await feed.alarm();
+        }
+        clock += 60_000;
+        await feed.alarm(); // recovers -> the first row closes
+
+        // Blind a second time. The raise is gated on `blindSince`, which the
+        // recovery cleared, so this must produce a row of its own.
+        await fake.sockets[fake.sockets.length - 1]!.drop();
+        fake.failNext(100);
+        for (let i = 0; i < 5; i++) {
+          clock += 20_000;
+          await feed.alarm();
+        }
+      });
+
+      const rows = await rowsOfType("price_feed_blind");
+      expect(rows).toHaveLength(2);
+      expect(rows.filter((row) => row.resolved)).toHaveLength(1);
+      // The second outage is still open, which is the point: closing the first
+      // row must not suppress the alert for the next one.
+      expect(rows.filter((row) => !row.resolved)).toHaveLength(1);
+    });
+
+    it("closes only ITS OWN market's row, never another feed's", async () => {
+      const DOGE = { exchange: "gemini", pair: "DOGEUSD" } as const;
+      let clock = NOW;
+
+      // BTCUSD goes blind and STAYS blind.
+      const btc = fakeConnect();
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({ now: () => clock, forward: async () => {}, connect: btc.connect });
+        await feed.subscribe("bot-a", CONFIG);
+        await btc.sockets[0]!.drop();
+        btc.failNext(100);
+        for (let i = 0; i < 5; i++) {
+          clock += 20_000;
+          await feed.alarm();
+        }
+      });
+
+      // DOGEUSD goes blind and recovers.
+      const doge = fakeConnect();
+      await inFeed("gemini:DOGEUSD#resolve", async (feed) => {
+        feed.attach({ now: () => clock, forward: async () => {}, connect: doge.connect });
+        await feed.subscribe("bot-b", DOGE);
+        await doge.sockets[0]!.drop();
+        doge.failNext(5);
+        for (let i = 0; i < 5; i++) {
+          clock += 20_000;
+          await feed.alarm();
+        }
+        clock += 60_000;
+        await feed.alarm(); // recovers
+      });
+
+      const bySource = async (source: string) =>
+        await db.alerts.findMany({ where: { alert_type: "price_feed_blind", source } });
+
+      const btcRows = await bySource("price-feed:gemini:BTCUSD");
+      const dogeRows = await bySource("price-feed:gemini:DOGEUSD");
+      expect(btcRows).toHaveLength(1);
+      expect(dogeRows).toHaveLength(1);
+      // The one market that is still blind still says so.
+      expect(btcRows[0]!.resolved).toBe(false);
+      expect(dogeRows[0]!.resolved).toBe(true);
+    });
+
+    it("closes only the BLIND types, leaving this feed's other incidents open", async () => {
+      // A frozen-value row on the same feed, under the same `source`. Prices
+      // being fiction is a correctness problem; reconnecting says nothing about
+      // it, and a resolve scoped by source alone would wrongly close it.
+      await db.alerts.insert({
+        id: "alert-frozen-open",
+        severity: "critical",
+        category: "system",
+        alert_type: "price_feed_value_frozen",
+        bot_instance_id: null,
+        source: "price-feed:gemini:BTCUSD",
+        message: "the value is frozen",
+        resolved: false,
+        created_at: NOW,
+        notified_at: null,
+      });
+
+      let clock = NOW;
+      const fake = fakeConnect();
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({ now: () => clock, forward: async () => {}, connect: fake.connect });
+        await feed.subscribe("bot-a", CONFIG);
+        await fake.sockets[0]!.drop();
+        fake.failNext(5);
+        for (let i = 0; i < 5; i++) {
+          clock += 20_000;
+          await feed.alarm();
+        }
+        clock += 60_000;
+        await feed.alarm(); // recovers
+      });
+
+      expect((await rowsOfType("price_feed_blind"))[0]!.resolved).toBe(true);
+      const frozen = await db.alerts.findOne({ id: "alert-frozen-open" });
+      expect(frozen!.resolved).toBe(false);
+    });
+  });
+
   it("stopFeed closes the socket", async () => {
     const fake = fakeConnect();
     await inFeed(freshKey(), async (feed) => {
@@ -898,5 +1064,265 @@ describe("openOutboundSocket transport (Cloudflare handshake)", () => {
     await expect(
       openOutboundSocket("wss://x/y", { onMessage: () => {}, onClose: () => {} }, fakeFetch),
     ).rejects.toThrow(/no WebSocket in the upgrade response/);
+  });
+});
+
+/**
+ * THE RESOLVE HALF FOR THE TWO PER-BOT FEED ALERTS.
+ *
+ * ⚠ THE SAME DEFECT `price_feed_blind` HAD, twice more. `price_feed_fanout_failed`
+ * and `price_feed_subscriber_pruned` were raised under the `price-feed:*` source
+ * that none of the system's other resolvers reach, and nothing closed either one.
+ * Entry 81 made both rows joinable to the failing bot, so an unresolved row does
+ * not merely inflate a count -- it sits on that bot's detail page asserting,
+ * permanently, that its stop-loss is not being evaluated.
+ *
+ * WHAT SEPARATES THESE FROM THE BLIND TESTS ABOVE is the scope. A blind feed is
+ * ONE incident belonging to the market, ended for everybody by one reconnect.
+ * These are attributed to a single subscriber while the feed delivers perfectly
+ * to every other one, so the tests below are mostly about what a recovery must
+ * NOT close.
+ */
+describe("per-bot feed alerts resolve when the subscriber recovers", () => {
+  const rowsFor = async (alertType: string, botInstanceId: string | null = null) =>
+    await db.alerts.findMany({
+      where: { alert_type: alertType, ...(botInstanceId === null ? {} : { bot_instance_id: botInstanceId }) },
+    });
+
+  describe("price_feed_fanout_failed", () => {
+    it("closes every row of a failed RUN when delivery to that bot succeeds again", async () => {
+      const fake = fakeConnect();
+      await seedBot("bot-flaky");
+      let attempts = 0;
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          // Three failures, then it comes back -- short of the prune threshold.
+          deliver: async () => {
+            attempts += 1;
+            if (attempts <= 3) throw new Error("bot unreachable");
+          },
+        });
+        await feed.subscribe("bot-flaky", CONFIG);
+        await fake.sockets[0]!.deliver(BATCH); // primes to 19:39, forwards nothing
+        for (const k of ["1940", "1941", "1942", "1943", "1944"] as const) {
+          await fake.sockets[0]!.deliver(ROLLOVER[k]);
+        }
+      });
+
+      const rows = await rowsFor("price_feed_fanout_failed", "bot-flaky");
+      // Raised per ATTEMPT, not latched per incident: three failures, three rows.
+      expect(rows).toHaveLength(3);
+      // All three describe one run, and the run is over. Closing the newest only
+      // would leave two rows open for a bot that is being delivered to fine.
+      expect(rows.every((row) => row.resolved)).toBe(true);
+      // It was never pruned -- this is recovery, not the teardown path.
+      expect(await db.alerts.count({ alert_type: "price_feed_subscriber_pruned" })).toBe(0);
+    });
+
+    it("closes ONLY the recovering bot's rows, never a still-failing sibling's", async () => {
+      // THE TEST THAT JUSTIFIES THE PER-BOT SCOPE. Both bots are on one market
+      // and one feed; a feed-scoped resolve would pass every other assertion in
+      // this file and silently close a live incident here.
+      const fake = fakeConnect();
+      await seedBot("bot-recovers");
+      await seedBot("bot-stays-broken");
+      let attempts = 0;
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          deliver: async (id) => {
+            if (id === "bot-stays-broken") throw new Error("gone for good");
+            attempts += 1;
+            if (attempts <= 2) throw new Error("transient");
+          },
+        });
+        await feed.subscribe("bot-recovers", CONFIG);
+        await feed.subscribe("bot-stays-broken", CONFIG);
+        await fake.sockets[0]!.deliver(BATCH);
+        // Four candles: under MAX_FANOUT_FAILURES, so nobody is pruned and the
+        // only thing under test is which rows got closed.
+        for (const k of ["1940", "1941", "1942", "1943"] as const) {
+          await fake.sockets[0]!.deliver(ROLLOVER[k]);
+        }
+      });
+
+      const recovered = await rowsFor("price_feed_fanout_failed", "bot-recovers");
+      const broken = await rowsFor("price_feed_fanout_failed", "bot-stays-broken");
+      expect(recovered).toHaveLength(2);
+      expect(broken).toHaveLength(4);
+      expect(recovered.every((row) => row.resolved)).toBe(true);
+      // The bot that is still failing is still open on every one of its rows.
+      expect(broken.every((row) => !row.resolved)).toBe(true);
+    });
+
+    it("re-arms: a later failure opens a new row rather than reusing the closed one", async () => {
+      const fake = fakeConnect();
+      await seedBot("bot-flaky");
+      let attempts = 0;
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          // fail, succeed (closing the first row), fail again.
+          deliver: async () => {
+            attempts += 1;
+            if (attempts === 1 || attempts === 3) throw new Error("transient");
+          },
+        });
+        await feed.subscribe("bot-flaky", CONFIG);
+        await fake.sockets[0]!.deliver(BATCH);
+        for (const k of ["1940", "1941", "1942"] as const) {
+          await fake.sockets[0]!.deliver(ROLLOVER[k]);
+        }
+      });
+
+      const rows = await rowsFor("price_feed_fanout_failed", "bot-flaky");
+      expect(rows).toHaveLength(2);
+      expect(rows.filter((row) => row.resolved)).toHaveLength(1);
+      // The second failure is still open: closing the first must not suppress it.
+      expect(rows.filter((row) => !row.resolved)).toHaveLength(1);
+    });
+
+    it("leaves a NULL-attributed row open, because no bot's recovery can own it", async () => {
+      // `bot-nobody` has no `bot_instances` row, so `#alert`'s FK fallback writes
+      // `bot_instance_id: null` -- the same shape as the historical `debug-check`
+      // rows. A row that names nobody cannot be shown to be THIS bot's incident,
+      // and closing it on this bot's recovery would be the unobserved-resolve
+      // that scoping exists to prevent. Deliberate, and pinned so a future
+      // "helpful" widening of the scope has to argue with this test.
+      const fake = fakeConnect();
+      let attempts = 0;
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          deliver: async () => {
+            attempts += 1;
+            if (attempts <= 2) throw new Error("unreachable");
+          },
+        });
+        await feed.subscribe("bot-nobody", CONFIG);
+        await fake.sockets[0]!.deliver(BATCH);
+        for (const k of ["1940", "1941", "1942", "1943"] as const) {
+          await fake.sockets[0]!.deliver(ROLLOVER[k]);
+        }
+      });
+
+      const rows = await rowsFor("price_feed_fanout_failed");
+      expect(rows).toHaveLength(2);
+      // The fallback really did fire; this is not a test of attribution working.
+      expect(rows.every((row) => row.bot_instance_id === null)).toBe(true);
+      expect(rows.every((row) => !row.resolved)).toBe(true);
+    });
+  });
+
+  describe("price_feed_subscriber_pruned", () => {
+    /** Fail five deliveries to `id`, which is exactly what gets it pruned. */
+    async function pruneBot(socket: FakeSocket): Promise<void> {
+      await socket.deliver(BATCH);
+      for (const k of ["1940", "1941", "1942", "1943", "1944"] as const) {
+        await socket.deliver(ROLLOVER[k]);
+      }
+    }
+
+    it("closes the prune row when the bot subscribes again", async () => {
+      // The row says the bot "receives no further prices until it is resumed,
+      // which re-subscribes it". This is that sentence coming true.
+      const fake = fakeConnect();
+      await seedBot("bot-dead");
+      let deliveries = 0;
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          deliver: async () => {
+            deliveries += 1;
+            throw new Error("bot gone");
+          },
+        });
+        await feed.subscribe("bot-dead", CONFIG);
+        await pruneBot(fake.sockets[0]!);
+
+        // Pruned, and it was the last subscriber, so the feed took itself down.
+        expect((await feed.status()).subscriberCount).toBe(0);
+        expect(deliveries).toBe(5);
+        const pruned = await db.alerts.findMany({
+          where: { alert_type: "price_feed_subscriber_pruned" },
+        });
+        expect(pruned).toHaveLength(1);
+        expect(pruned[0]!.resolved).toBe(false); // open, until the bot comes back
+
+        // The human resumes the bot, which re-subscribes it.
+        await feed.subscribe("bot-dead", CONFIG);
+      });
+
+      const rows = await rowsFor("price_feed_subscriber_pruned", "bot-dead");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.resolved).toBe(true);
+    });
+
+    it("re-arms: a bot pruned a second time gets a second row, the first still closed", async () => {
+      // Re-subscribing claims only that the bot is subscribed, never that it is
+      // healthy. A bot that comes back and fails again must alert again.
+      const fake = fakeConnect();
+      await seedBot("bot-dead");
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          deliver: async () => {
+            throw new Error("bot gone");
+          },
+        });
+        await feed.subscribe("bot-dead", CONFIG);
+        await pruneBot(fake.sockets[0]!);
+        await feed.subscribe("bot-dead", CONFIG); // resumed -> first row closes
+        await pruneBot(fake.sockets[fake.sockets.length - 1]!); // and dies again
+      });
+
+      const rows = await rowsFor("price_feed_subscriber_pruned", "bot-dead");
+      expect(rows).toHaveLength(2);
+      expect(rows.filter((row) => row.resolved)).toHaveLength(1);
+      expect(rows.filter((row) => !row.resolved)).toHaveLength(1);
+    });
+
+    it("closes only the returning bot's row, leaving the other pruned bot's open", async () => {
+      const fake = fakeConnect();
+      await seedBot("bot-returns");
+      await seedBot("bot-still-gone");
+
+      await inFeed(freshKey(), async (feed) => {
+        feed.attach({
+          now: () => NOW,
+          connect: fake.connect,
+          deliver: async () => {
+            throw new Error("bot gone");
+          },
+        });
+        await feed.subscribe("bot-returns", CONFIG);
+        await feed.subscribe("bot-still-gone", CONFIG);
+        await pruneBot(fake.sockets[0]!); // both hit five in a row
+        expect((await feed.status()).subscriberCount).toBe(0);
+
+        await feed.subscribe("bot-returns", CONFIG); // only one comes back
+      });
+
+      const returned = await rowsFor("price_feed_subscriber_pruned", "bot-returns");
+      const gone = await rowsFor("price_feed_subscriber_pruned", "bot-still-gone");
+      expect(returned).toHaveLength(1);
+      expect(gone).toHaveLength(1);
+      expect(returned[0]!.resolved).toBe(true);
+      // Nobody resumed this one, so its row still says so.
+      expect(gone[0]!.resolved).toBe(false);
+    });
   });
 });
