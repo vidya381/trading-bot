@@ -72,6 +72,12 @@
 
 import type { StrategyType } from "../db/schema";
 import { toDecimalString } from "../shared/money";
+// The PROVISIONAL trail bounds, imported from the strategy that enforces them
+// rather than restated. A second copy here would be a number in a prompt that
+// could disagree with the number the validator refuses on -- the model would be
+// told one range and rejected against another, which reads to a reader as the
+// model disobeying a rule it was actually given correctly.
+import { TRAIL_PCT_MAX, TRAIL_PCT_MIN } from "../strategies/trailing-stop";
 import {
   EvidenceCollector,
   RULE_NO_BOT_DECISION,
@@ -146,6 +152,23 @@ export const DCA_DERIVE_FIELDS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * Trailing stop's required field. ONE, and that is the whole set.
+ *
+ * 22.2 decision 1 gives this strategy a single parameter, and 22.4 touchpoint 4
+ * is explicit that this is not a discount: **"A one-field parameter set does not
+ * make a proposal easier to justify -- the one field carries all of the risk that
+ * grid spreads across seven."** The field contract below is written to that
+ * standard rather than to the field count.
+ *
+ * ⚠ NO ORDER SIZE, and its absence is a decision rather than an omission: the
+ * single entry is sized by `allocatedCapital` (22.2, the consequence of decisions
+ * 1 and 4), which every strategy already answers in `DERIVE_CAPITAL_FIELDS`.
+ * `requireExactFields` refuses an extra field, so a model that invents one is
+ * rejected rather than silently trimmed.
+ */
+export const TRAILING_STOP_DERIVE_FIELDS: readonly string[] = Object.freeze(["trailPct"]);
+
+/**
  * The two fields 21.4 Stage 3 requires ON TOP of the strategy's own
  * ("Plus `allocatedCapital` and `capitalAsset`").
  *
@@ -173,6 +196,8 @@ export function deriveFieldsFor(strategy: StrategyType): readonly string[] {
       return GRID_DERIVE_FIELDS;
     case "dca":
       return DCA_DERIVE_FIELDS;
+    case "trailing_stop":
+      return TRAILING_STOP_DERIVE_FIELDS;
   }
 }
 
@@ -454,12 +479,61 @@ function dcaFieldContract(): string {
   ].join("\n");
 }
 
+/**
+ * The same, for trailing stop. Every sentence from `TrailingStopParams`,
+ * `validateTrailingStopParams` and `trailLevelOf` -- the real rules, not the
+ * conventional ones.
+ *
+ * TWO THINGS A MODEL REASONING FROM A GENERIC DEFINITION WOULD GET WRONG, and
+ * both are stated outright because each produces a plausible-looking answer:
+ *
+ *   1. `trailPct` DOES DOUBLE DUTY (22.2 decision 1). It is the trail distance
+ *      below the high-water mark AND the initial stop distance from the entry
+ *      price before any new high is made. A model that treats it as a trail
+ *      distance alone will pick a number thinking the position is protected by
+ *      some separate stop-loss, and there is none.
+ *   2. THERE IS NO PROFIT-ACTIVATION THRESHOLD (22.2 decision 2, 22.6). The trail
+ *      is live from the first price, not from some profit level. A model
+ *      assuming "it starts trailing once I am up X%" is describing a different
+ *      strategy.
+ *
+ * The provisional bounds are given as bounds AND as the reason they exist, in
+ * the same words `validateTrailingStopParams` refuses with, so a rejection the
+ * model triggers reads as the same rule it was told.
+ */
+function trailingStopFieldContract(): string {
+  return [
+    "THE FIELDS, AND WHAT EACH ONE MEANS IN THIS SYSTEM:",
+    "",
+    '- "trailPct": JSON STRING, a decimal percentage written as the percentage itself (for example "5.00" means five percent, NOT "0.05"). THIS IS THE ONLY PARAMETER THIS STRATEGY HAS, and it does two jobs at once:',
+    "    (a) THE TRAIL. The bot records the highest price seen since it entered -- the high-water mark -- and sells when the price falls this far below that mark. The mark only ever moves up, so the exit price ratchets up with it and never back down.",
+    "    (b) THE INITIAL STOP. Before any new high is made, this same percentage below the ENTRY PRICE is where the bot exits. There is no separate stop-loss field, and the position is not unprotected while it waits for a high.",
+    "  Must be above 0 and below 100. It is additionally restricted to the range stated below.",
+    "",
+    "WHAT THIS STRATEGY DOES NOT HAVE, so that you do not reason as though it did:",
+    "  * NO order size. The single entry is sized by allocatedCapital -- the whole allocation, in one buy. There is no field that could size it otherwise, and adding one gets your answer rejected.",
+    "  * NO take-profit. There is no fixed profit target: the trail IS the exit, and it is what locks gains in progressively rather than at a level guessed in advance.",
+    "  * NO profit-activation threshold. The trail is live from the first price the bot sees, not from some level of profit. It does not wait to be in the money before it starts protecting.",
+    "  * NO averaging down and no second entry. One entry, one exit, one cycle.",
+    "",
+    "THE ARITHMETIC THIS SYSTEM ENFORCES, checked after you answer:",
+    "  * trailPct must be above 0: a trail at or below zero is not a trail, and would sit at or above the high-water mark it follows.",
+    "  * trailPct must be below 100: a trail of 100% or more puts the stop at or below zero, where no positive price can ever reach it.",
+    `  * trailPct must be between ${toDecimalString(TRAIL_PCT_MIN)} and ${toDecimalString(TRAIL_PCT_MAX)} percent inclusive. Below the floor, ordinary market noise exits the position almost immediately; above the ceiling, the trail gives back most of what it gained before it triggers. These bounds are PROVISIONAL -- a deliberate starting range, not a backtested result -- and they are enforced regardless.`,
+    "  * allocatedCapital must be above zero, and must not exceed the available headroom for the asset you choose. The whole of it is spent on the single entry.",
+    "",
+    "HOW TO CHOOSE THE NUMBER: the trail is the whole of the risk control here, so it is the trade-off between being shaken out by ordinary volatility and giving back too much of a move before exiting. Reason about it against the volatility the DATA section actually shows for THIS coin -- the range and the size of the moves between buckets -- and cite what you used. Do not carry over a number that is conventional for trailing stops in general.",
+  ].join("\n");
+}
+
 function fieldContractFor(strategy: StrategyType): string {
   switch (strategy) {
     case "grid":
       return gridFieldContract();
     case "dca":
       return dcaFieldContract();
+    case "trailing_stop":
+      return trailingStopFieldContract();
   }
 }
 

@@ -29,7 +29,11 @@ import { describe, expect, it } from "vitest";
 import type { StrategyType } from "../db/schema";
 import { validatedProposalView } from "../api/serialize";
 import { fromDecimalString as m } from "../shared/money";
-import { DCA_DERIVE_FIELDS, GRID_DERIVE_FIELDS } from "./derive-prompt";
+import {
+  DCA_DERIVE_FIELDS,
+  GRID_DERIVE_FIELDS,
+  TRAILING_STOP_DERIVE_FIELDS,
+} from "./derive-prompt";
 import { DERIVE_MODEL_SETTINGS } from "./derive";
 import type { DeriveResult } from "./derive";
 import {
@@ -446,28 +450,24 @@ describe("the field lists are the backend's own, not a re-typed copy", () => {
     expect([...DCA_PROPOSAL_FIELDS]).toEqual([...DCA_DERIVE_FIELDS]);
   });
 
-  it("⚠ PIN ONE COVERS TWO OF THREE STRATEGIES, and this is the tripwire for the third", () => {
+  it("⚠ PIN ONE NOW COVERS ALL THREE — the tripwire fired and was converted", () => {
     /*
-     * ⚠ THERE IS NO `TRAILING_STOP_DERIVE_FIELDS` TO PIN AGAINST, AND THAT IS A
-     * REAL GAP RATHER THAN AN OVERSIGHT IN THIS TEST.
+     * ⚠ THIS ASSERTION REPLACES A TRIPWIRE, AND THE REPLACEMENT IS THE POINT.
      *
-     * `TRAILING_STOP_PROPOSAL_FIELDS` describes what `validatedProposalView`
-     * EMITS, which is now a settled shape. Spec 21.4 Stage 3's other half -- what
-     * the MODEL IS ASKED FOR -- does not exist for this strategy: `deriveFieldsFor`
-     * and `fieldContractFor` have no trailing-stop arm and `DERIVE_MODEL_SETTINGS`
-     * has no entry, so no trailing-stop proposal can currently be produced at all.
-     * Writing that contract means writing model-facing prose that shapes a paid
-     * inference, against 22.5's open questions; it is not a rendering fix and is
-     * deliberately not invented here.
+     * Entry 87 left `TRAILING_STOP_PROPOSAL_FIELDS` pinned by PIN TWO alone and
+     * asserted the ABSENCE of a `trailing_stop` key in `DERIVE_MODEL_SETTINGS`,
+     * because the model-prompt contract did not exist yet: there was nothing for
+     * PIN ONE to compare against. That assertion existed to FAIL the moment
+     * somebody wrote the contract, and name this line as the one to write.
      *
-     * So this asserts the ABSENCE, which makes the gap a tracked fact instead of a
-     * silent one. THE MOMENT SOMEONE ADDS THE PROMPT CONTRACT, THIS TEST FAILS and
-     * points at PIN ONE above, which must then gain its third line. That is the
-     * whole reason it is written as an assertion rather than a comment.
+     * It fired. `TRAILING_STOP_DERIVE_FIELDS` now exists, so the third line is
+     * here and the absence-assertion is gone -- an absence that is no longer
+     * true is not a guard, it is a lie waiting to be deleted.
      */
-    expect(DERIVE_MODEL_SETTINGS).not.toHaveProperty("trailing_stop");
-    // And the emitted-shape list stands on its own meanwhile, pinned by PIN TWO.
-    expect([...TRAILING_STOP_PROPOSAL_FIELDS]).toEqual(["trailPct"]);
+    expect([...TRAILING_STOP_PROPOSAL_FIELDS]).toEqual([...TRAILING_STOP_DERIVE_FIELDS]);
+    // And the settings record really does carry the third strategy now, which is
+    // the fact the old tripwire measured from the other side.
+    expect(DERIVE_MODEL_SETTINGS).toHaveProperty("trailing_stop");
   });
 
   it("trailing stop shares no field with either of the other two", () => {

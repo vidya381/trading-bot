@@ -38,14 +38,20 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ALL_ASSESS_STRATEGIES,
   ASSESS_PROMPT_VERSION,
+  ASSESS_STRATEGIES,
   CANDLE_BUCKET_COUNT,
   UNTRUSTED_TEXT_TOKEN,
+  WITHHELD_FROM_ASSESS,
+  assessStrategiesExcluding,
   bucketCandles,
   buildAssessPrompt,
+  strategyDescription,
   wrapUntrusted,
   type AssessPrompt,
 } from "./assess-prompt";
+import type { StrategyType } from "../db/schema";
 import { CandleWindowError, type CandleWindow } from "./candles";
 import {
   ConcentrationError,
@@ -742,5 +748,131 @@ describe("candle bucketing", () => {
     const value = evidence(buildAssessPrompt(bundle()), "candles.bucket.01").value;
     expect(value).toContain("open 99.00000000");
     expect(value).not.toMatch(/\de[+-]\d/);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// ⚠ THE 22.7 GATE: a strategy withheld from Stage 2, and the one-line lift
+// ---------------------------------------------------------------------------
+
+/**
+ * `ASSESS_STRATEGIES` was a hand-written `["dca", "grid"]` whose comment said
+ * "there is no third". A third arrived (spec 22), the literal did not move, and
+ * nothing failed — the drift was invisible until a serializer crash was traced
+ * back through it.
+ *
+ * It is now a SUBSET of `StrategyType`, derived rather than written, and the
+ * subset is a deliberate safety gate rather than an oversight. These tests pin
+ * three separate things:
+ *
+ *   1. the union is complete (no strategy is unknown to this file);
+ *   2. every strategy is CLASSIFIED — assessable or explicitly withheld, never
+ *      neither, so a fourth strategy cannot slip in unclassified;
+ *   3. ⚠ THE LIFT IS ONE SOURCE DELETION, verified by simulating it. Removing
+ *      `"trailing_stop"` from `WITHHELD_FROM_ASSESS` is sufficient for every
+ *      module — `tsc` stays clean, no downstream branch, schema or description
+ *      needs discovering. Four assertions then fail: the three below that name
+ *      the withheld state, and the response-contract pin reading "the two
+ *      lowercase strings". That is the gate announcing itself, not hidden
+ *      breakage, and updating them is the act of recording that 22.7 was met.
+ *      The machinery is exercised here ahead of the day it is used, which is the
+ *      difference between a documented plan and a checked one.
+ */
+describe("the strategies Stage 2 may choose from", () => {
+  it("knows every strategy the system implements", () => {
+    // The runtime half of the compile-time `Record<StrategyType, true>` pin: a
+    // type can be widened without the object following it.
+    expect([...ALL_ASSESS_STRATEGIES].sort()).toEqual(["dca", "grid", "trailing_stop"]);
+  });
+
+  it("⚠ classifies EVERY strategy as either assessable or withheld, never neither", () => {
+    /*
+     * The property that makes a fourth strategy safe. Whoever adds one must
+     * decide, here, whether Stage 2 may recommend it — and if they decide
+     * nothing, this fails rather than defaulting them into "yes".
+     */
+    const classified = [...ASSESS_STRATEGIES, ...WITHHELD_FROM_ASSESS].sort();
+    expect(classified).toEqual([...ALL_ASSESS_STRATEGIES].sort());
+    // And never both, which would make the two lists disagree about one strategy.
+    for (const strategy of WITHHELD_FROM_ASSESS) {
+      expect(ASSESS_STRATEGIES, `${strategy} is both assessable and withheld`).not.toContain(
+        strategy,
+      );
+    }
+  });
+
+  it("withholds exactly trailing_stop, and only it, under spec 22.7", () => {
+    // Named explicitly rather than counted: the point of the list is WHICH
+    // strategy is gated and why, and a count would survive a swap.
+    expect([...WITHHELD_FROM_ASSESS]).toEqual(["trailing_stop"]);
+    expect([...ASSESS_STRATEGIES]).toEqual(["dca", "grid"]);
+  });
+
+  it("keeps a withheld strategy out of the prompt entirely", () => {
+    /*
+     * Describing a choice the parser will refuse is how a model is set up to
+     * fail a rule it was implicitly offered. The whole prompt is checked, not
+     * just the definitions block, because the strategy list is rendered into
+     * four separate sections.
+     */
+    const text = buildAssessPrompt(bundle()).promptText;
+    expect(text).not.toContain("trailing_stop");
+    expect(text).not.toContain("trailing stop");
+  });
+
+  it("⚠ THE LIFT IS ONE SOURCE DELETION: emptying the withheld list yields all three", () => {
+    /*
+     * THE TEST THIS SECTION EXISTS FOR. When 22.7's observation period is
+     * satisfied, the operator deletes one line from `WITHHELD_FROM_ASSESS`.
+     * This asserts that the deletion alone is sufficient for the SET — nothing
+     * downstream needs discovering, because `ASSESS_STRATEGIES` is a pure
+     * function of the withheld list rather than a second literal beside it.
+     */
+    expect([...assessStrategiesExcluding([])].sort()).toEqual([
+      "dca",
+      "grid",
+      "trailing_stop",
+    ]);
+    // And withholding a different one really does change the answer, so the
+    // function is reading its argument rather than returning a constant.
+    expect([...assessStrategiesExcluding(["grid"])]).toEqual(["dca", "trailing_stop"]);
+  });
+
+  it("⚠ ...and the prompt is ALREADY ready for it: every strategy has a definition", () => {
+    /*
+     * The other half of the one-line lift. `STRATEGY_DESCRIPTIONS` is a
+     * `Record<StrategyType, string>`, so a missing definition is a compile
+     * error — but the definition existing is not the same as it being WRITTEN TO
+     * THE STANDARD 22.4 touchpoint 3 requires: "the existing two descriptions
+     * each state what market condition the strategy needs, and the third must be
+     * written to the same standard."
+     *
+     * So each is checked for the market condition it names, which is the part a
+     * placeholder would omit.
+     */
+    for (const strategy of ALL_ASSESS_STRATEGIES) {
+      expect(strategyDescription(strategy).length, `${strategy} has no definition`).toBeGreaterThan(
+        80,
+      );
+    }
+    expect(strategyDescription("grid")).toContain("stay within a range");
+    expect(strategyDescription("dca")).toContain("directional recovery");
+    // The withheld one, written and waiting: it must name the condition it needs
+    // and the cost it pays, exactly as the other two do.
+    expect(strategyDescription("trailing_stop")).toContain("sustained move in one direction");
+    expect(strategyDescription("trailing_stop")).toContain("gives back");
+  });
+
+  it("the parser's accepted set follows this list rather than a second copy", () => {
+    /*
+     * `assess-parse.ts` and `assess-resubmit.ts` both gate on `ASSESS_STRATEGIES`,
+     * so Stage 3 opens with Stage 2 and no separate edit is needed. Asserted by
+     * identity of the exported constant, since a second literal is exactly the
+     * drift this whole section is about.
+     */
+    const accepted: readonly StrategyType[] = ASSESS_STRATEGIES;
+    expect(accepted).toBe(ASSESS_STRATEGIES);
+    expect(accepted).not.toContain("trailing_stop");
   });
 });

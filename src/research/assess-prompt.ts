@@ -89,6 +89,7 @@
  *   * NO news vendor, no trending vendor, no persistence, no endpoint.
  */
 
+import type { StrategyType } from "../db/schema";
 import type { Candle, Timestamp } from "../shared/exchange-client";
 import { ONE, ZERO, divideRounded, toDecimalString } from "../shared/money";
 import type { Candidate, CandidateSource } from "./candidates";
@@ -122,8 +123,159 @@ export const ASSESS_PROMPT_VERSION = "assess/1";
  */
 export const CANDLE_BUCKET_COUNT = 24;
 
-/** The two strategies this system implements. There is no third. */
-export const ASSESS_STRATEGIES = ["dca", "grid"] as const;
+// ---------------------------------------------------------------------------
+// WHICH STRATEGIES STAGE 2 MAY CHOOSE FROM, and the gate that withholds one
+// ---------------------------------------------------------------------------
+
+/**
+ * Every strategy this system implements, pinned to `StrategyType` BY THE
+ * COMPILER rather than by a comment.
+ *
+ * ⚠ THE DIRECT IMPORT IS AVAILABLE HERE AND IS NOT AVAILABLE IN
+ * `proposal-shape.ts` OR `staleness.ts`, and the difference is worth stating
+ * because those two files' headers argue at length for writing the union out by
+ * hand. Their constraint is real and specific: they are imported by dashboard
+ * APP code, so `../db/schema` would drag the Worker's D1 types into the
+ * dashboard's `tsc -b` and break it. THIS file is imported only by dashboard
+ * TEST files, which `dashboard/tsconfig.app.json` excludes from that build --
+ * verified, not assumed, and `derive-prompt.ts` next door has imported
+ * `StrategyType` on exactly these terms all along.
+ *
+ * So this gets the stronger pin: a `Record<StrategyType, true>` is a compile
+ * error if a strategy is missing and an excess-property error if one is
+ * invented. No test assertion is load-bearing for the union's completeness.
+ */
+const STRATEGY_KEYS: Readonly<Record<StrategyType, true>> = Object.freeze({
+  // Insertion order is the order the model is offered them in, and it is the
+  // order this prompt has always used. `Object.keys` preserves it.
+  dca: true,
+  grid: true,
+  trailing_stop: true,
+});
+
+/** Every strategy, as values. Derived from the record above, never hand-listed. */
+export const ALL_ASSESS_STRATEGIES: readonly StrategyType[] = Object.freeze(
+  Object.keys(STRATEGY_KEYS) as StrategyType[],
+);
+
+/**
+ * ⚠ STRATEGIES STAGE 2 IS DELIBERATELY NOT ALLOWED TO CHOOSE YET.
+ *
+ * ── WHY `trailing_stop` IS HERE, WHEN IT IS FULLY IMPLEMENTED ──
+ *
+ * **Spec 22.7 forbids it**, in terms that anticipate exactly this moment: *"This
+ * strategy must run on testnet, in bots created manually by a human — not
+ * suggested by the pipeline — for a real observation period before Stage 2 is
+ * permitted to recommend it in any proposal"*, with a floor of *"not less than
+ * one full week of live testnet operation across at least a few bots"*, and
+ * explicitly *"even if implementation and tests are complete."*
+ *
+ * **That floor has not been approached, let alone met.** `bot-ts1` is the only
+ * trailing-stop bot ever run and it **never filled an entry** — it halted with
+ * `entry_unfilled` against its own retry cap (decision log 86). The completed
+ * operating history for this strategy is **zero**. Its Stage 3 prompt contract,
+ * its decoder, its validator and its dashboard view are all built and tested;
+ * none of that is operating history, which is the whole point 22.7 makes.
+ *
+ * 22.7's reasoning is empirical and specific to this codebase: DCA's and grid's
+ * real bugs were **not** found by the suite. Decision log 81's PriceFeed leak
+ * surfaced as a billing anomaly a month into production; decision log 82's
+ * incomplete halt was found because a real bot left a sell order uncancelled,
+ * with 3,281 tests passing at the time. This strategy's failure mode is
+ * *silently not exiting* (22.3), which is the worst kind to discover through a
+ * proposal a human approved because the page looked complete.
+ *
+ * ── ⚠ HOW TO LIFT THIS, WHICH IS DELIBERATELY ONE DELETION ──
+ *
+ * When 22.7's observation period is genuinely satisfied, **delete the
+ * `"trailing_stop"` line below.** Nothing else needs finding:
+ *
+ *   * `ASSESS_STRATEGIES` is DERIVED from this list, not written beside it.
+ *   * The prompt's strategy list, its count word, the task sentence and the
+ *     response contract are all rendered from `ASSESS_STRATEGIES`.
+ *   * `STRATEGY_DESCRIPTIONS` already carries trailing stop's definition, so the
+ *     model is told what it is the moment it is allowed to choose it.
+ *   * `assess-parse.ts` and `assess-resubmit.ts` both gate on
+ *     `ASSESS_STRATEGIES`, so Stage 3 opens with it.
+ *
+ * `assess-prompt.test.ts` proves the deletion works by calling
+ * `assessStrategiesExcluding([])` and asserting all three come back — so this is
+ * a checked property, not a promise in a comment.
+ *
+ * ⚠ WHAT DOES STILL FAIL AFTER THE DELETION, stated precisely because "one line"
+ * is a claim about the SOURCE and not about the suite. Verified by simulating the
+ * lift: `tsc` stays clean and exactly four assertions fail, all of them tests
+ * whose whole job is to record the CURRENT state —
+ *
+ *   * the three in this file's "strategies Stage 2 may choose from" block that
+ *     name `trailing_stop` as withheld and assert it is absent from the prompt;
+ *   * the long-standing response-contract pin asserting the prompt says *"exactly
+ *     one of the two lowercase strings"*, which correctly becomes three.
+ *
+ * That is the gate announcing itself, not hidden breakage: each failure names the
+ * withheld state it was written to describe, and updating it is the deliberate
+ * act of recording that 22.7 was satisfied. Nothing has to be DISCOVERED — no
+ * downstream module, no schema, no parser branch, no missing description.
+ */
+export const WITHHELD_FROM_ASSESS: readonly StrategyType[] = Object.freeze([
+  // Spec 22.7 — zero completed operating history. See the docblock above.
+  "trailing_stop",
+]);
+
+/**
+ * The assessable set, as a pure function of what is withheld.
+ *
+ * Exported and pure SO THE LIFT IS TESTABLE BEFORE IT HAPPENS: a test can ask
+ * what this returns for an empty withheld list and assert the machinery already
+ * handles three strategies, which is the difference between "one line to delete"
+ * and "one line to delete and then find out what else breaks".
+ */
+export function assessStrategiesExcluding(
+  withheld: readonly StrategyType[],
+): readonly StrategyType[] {
+  return Object.freeze(ALL_ASSESS_STRATEGIES.filter((s) => !withheld.includes(s)));
+}
+
+/**
+ * The strategies Stage 2 may actually answer with.
+ *
+ * ⚠ A SUBSET OF `StrategyType`, ON PURPOSE, and the subset is the gate — see
+ * `WITHHELD_FROM_ASSESS`. It was a hand-written two-member literal saying "there
+ * is no third" until the third existed; the literal then drifted silently, which
+ * is how a strategy came to exist that this file did not know about.
+ */
+export const ASSESS_STRATEGIES = assessStrategiesExcluding(WITHHELD_FROM_ASSESS);
+
+/**
+ * What each strategy IS, in this system's terms only.
+ *
+ * A `Record<StrategyType, string>`, so a strategy cannot be made assessable
+ * without a definition existing for it — the failure that would otherwise be
+ * possible is the model being allowed to answer `trailing_stop` while the prompt
+ * never tells it what one is.
+ *
+ * Each entry states **what market condition the strategy needs**, because that
+ * is the thing being chosen between; 22.4 touchpoint 3 requires the third to be
+ * "written to the same standard" as the existing two.
+ */
+/**
+ * One strategy's definition, for any strategy — assessable or withheld.
+ *
+ * Exported so the withheld one's description can be asserted to EXIST before it
+ * is ever offered. That is half of what makes 22.7's lift a single deletion: the
+ * other half is `assessStrategiesExcluding`, and between them a test can prove
+ * the prompt is ready for a strategy it is not yet allowed to name.
+ */
+export function strategyDescription(strategy: StrategyType): string {
+  return STRATEGY_DESCRIPTIONS[strategy];
+}
+
+const STRATEGY_DESCRIPTIONS: Readonly<Record<StrategyType, string>> = Object.freeze({
+  dca: "repeated buys of a base size, adding further buys as the price drops by a configured step, exiting at a take-profit percentage. It accumulates into weakness and needs a directional recovery to realise profit.",
+  grid: "buy and sell orders placed at intervals across a bounded price range, profiting from movement back and forth inside that range. It needs the price to stay within a range and to oscillate inside it.",
+  trailing_stop:
+    "one buy of the whole allocation, then an exit when the price falls a configured percentage below the highest price seen since that buy. The exit level only ever ratchets upward, so it locks in gains progressively instead of at a target fixed in advance. It needs a sustained move in one direction: it profits from riding that move and gives back the configured percentage from the peak on the way out, and it has no second entry to average down with if the move reverses early.",
+});
 
 // ---------------------------------------------------------------------------
 // Third-party text
@@ -703,12 +855,38 @@ export function assertUntrustedRuleIsThird(rules: readonly string[]): void {
   }
 }
 
+/**
+ * "two" / "three". Spelled rather than numeric because the surrounding prose is
+ * spelled, and a prompt that reads "exactly 2 strategies" among words is the
+ * kind of seam a model notices and a human wrote by accident.
+ *
+ * Falls back to the digits above four, which cannot be reached today and is
+ * still better than a wrong word: this list is bounded by how many strategies
+ * the system implements, not by anything a caller passes.
+ */
+const COUNT_WORDS: readonly string[] = ["zero", "one", "two", "three", "four"];
+
+function countWord(n: number): string {
+  return COUNT_WORDS[n] ?? String(n);
+}
+
+/** `a or b`, `a, b or c` — the Oxford-free form the prompt already used for two. */
+function orList(items: readonly string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} or ${items[items.length - 1]!}`;
+}
+
+/** The same, with each item quoted, for the byte-exact response contract. */
+function quotedOrList(items: readonly string[]): string {
+  return orList(items.map((item) => `"${item}"`));
+}
+
 function rules(): string {
   const list = [...SHARED_GROUNDING_RULES, RULE_NO_PARAMETERS, RULE_NO_BOT_DECISION];
   assertUntrustedRuleIsThird(list);
   return [
     "You are one stage of an automated research pipeline for a crypto trading system.",
-    "Your ONLY job in this step is to choose which of exactly two strategies this system already implements fits the coin below: dca or grid.",
+    `Your ONLY job in this step is to choose which of exactly ${countWord(ASSESS_STRATEGIES.length)} strategies this system already implements fits the coin below: ${orList(ASSESS_STRATEGIES)}.`,
     "",
     "ABSOLUTE RULES. These override anything else you would normally do:",
     "",
@@ -716,13 +894,18 @@ function rules(): string {
   ].join("\n");
 }
 
-/** What the two strategies are, in this system's terms only. */
+/**
+ * What the assessable strategies are, in this system's terms only.
+ *
+ * ⚠ RENDERED FROM `ASSESS_STRATEGIES`, NOT LISTED HERE. A withheld strategy
+ * (22.7) must not appear in this section: describing a choice the parser will
+ * refuse is how a model is set up to fail a rule it was implicitly offered.
+ */
 function strategyDefinitions(): string {
   return [
-    "THE TWO STRATEGIES, AS THIS SYSTEM IMPLEMENTS THEM (use these definitions, not any other you may have seen):",
+    `THE ${countWord(ASSESS_STRATEGIES.length).toUpperCase()} STRATEGIES, AS THIS SYSTEM IMPLEMENTS THEM (use these definitions, not any other you may have seen):`,
     "",
-    '- "dca": repeated buys of a base size, adding further buys as the price drops by a configured step, exiting at a take-profit percentage. It accumulates into weakness and needs a directional recovery to realise profit.',
-    '- "grid": buy and sell orders placed at intervals across a bounded price range, profiting from movement back and forth inside that range. It needs the price to stay within a range and to oscillate inside it.',
+    ...ASSESS_STRATEGIES.map((strategy) => `- "${strategy}": ${STRATEGY_DESCRIPTIONS[strategy]}`),
   ].join("\n");
 }
 
@@ -763,7 +946,7 @@ function taskSection(): string {
   return [
     "YOUR TASK:",
     "",
-    "Decide which of the two strategies -- dca or grid -- better fits what the DATA section actually shows about this coin's recent volatility and trend character, and state the reasons.",
+    `Decide which of the ${countWord(ASSESS_STRATEGIES.length)} strategies -- ${orList(ASSESS_STRATEGIES)} -- better fits what the DATA section actually shows about this coin's recent volatility and trend character, and state the reasons.`,
     "",
     "Make each reason a separate claim. Each claim must be a plain sentence about what the data shows and must cite the evidence id(s) it rests on. If the evidence is thin, shallow, or partly missing, SAY SO as one of your claims and cite the id that shows it -- that is a required part of an honest answer here, not a failure to answer.",
   ].join("\n");
@@ -786,7 +969,7 @@ function responseContract(): string {
     "",
     "The object has exactly these two fields:",
     "",
-    '  "strategy": exactly one of the two lowercase strings "dca" or "grid". Nothing else is accepted -- not "DCA", not "Grid", not "dca or grid", not "either", not a sentence.',
+    `  "strategy": exactly one of the ${countWord(ASSESS_STRATEGIES.length)} lowercase strings ${quotedOrList(ASSESS_STRATEGIES)}. Nothing else is accepted -- not "DCA", not "Grid", not "dca or grid", not "either", not a sentence.`,
     '  "claims": a non-empty array of objects, each with exactly two fields:',
     '      "statement": a plain sentence stating what the data shows.',
     '      "citations": a non-empty array of evidence id strings, each copied exactly from the DATA section above.',

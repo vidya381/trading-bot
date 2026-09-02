@@ -103,18 +103,27 @@ describe("priceThresholdFor", () => {
   it("returns the strategy's OWN threshold, not a fixed arm", () => {
     expect(priceThresholdFor("grid")).toBe(15 * MINUTE);
     expect(priceThresholdFor("dca")).toBe(60 * MINUTE);
-    expect(priceThresholdFor("trailing_stop")).toBe(60 * MINUTE);
+    /*
+     * ⚠ 15 MINUTES, MATCHING GRID, AND THIS ASSERTION IS A CORRECTION. It read
+     * `60 * MINUTE` -- a copy of DCA's number reached by structural analogy,
+     * which spec 22.5 open question 2 forbids by name. The threshold measures how
+     * promptly a price drop is noticed, not how a parameter is denominated, and
+     * 22.5's own guidance is "at or tighter than grid's -- not looser".
+     * `DEFAULT_STALENESS_POLICY`'s note carries the full correction.
+     */
+    expect(priceThresholdFor("trailing_stop")).toBe(15 * MINUTE);
     // Asserted as different rather than only as two values: a mutant that returns
     // `priceHistory.grid` for every strategy passes any test that checks only one.
     expect(priceThresholdFor("grid")).not.toBe(priceThresholdFor("dca"));
-    expect(priceThresholdFor("grid")).not.toBe(priceThresholdFor("trailing_stop"));
+    expect(priceThresholdFor("trailing_stop")).not.toBe(priceThresholdFor("dca"));
     /*
-     * ⚠ DCA AND TRAILING STOP DELIBERATELY SHARE A VALUE, so no distinctness
+     * ⚠ GRID AND TRAILING STOP DELIBERATELY SHARE A VALUE, so no distinctness
      * assertion is available between those two -- and the reason is recorded
-     * rather than left as an apparent omission. Both have percentage-only
-     * parameters and one absolute quote size checked against the reference price
-     * (see `DEFAULT_STALENESS_POLICY`'s note). If they are ever separated, this
-     * is the line that should gain the assertion.
+     * rather than left as an apparent omission. Both are tight because a stale
+     * window undermines a price-sensitive control: grid's bounds are absolute
+     * prices, and a trailing stop's whole risk control is a downward move being
+     * noticed promptly. If they are ever separated, this is the line that should
+     * gain the assertion.
      */
   });
 

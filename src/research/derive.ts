@@ -104,6 +104,7 @@ import {
 import {
   DCA_DERIVE_FIELDS,
   GRID_DERIVE_FIELDS,
+  TRAILING_STOP_DERIVE_FIELDS,
   buildDerivePrompt,
   type DerivePrompt,
 } from "./derive-prompt";
@@ -201,6 +202,11 @@ export const DERIVE_MODEL_SETTINGS: Readonly<Record<StrategyType, DeriveModelSet
   Object.freeze({
     grid: settingsFor("grid", GRID_DERIVE_FIELDS),
     dca: settingsFor("dca", DCA_DERIVE_FIELDS),
+    // Spec 22. Built exactly like the other two -- same `settingsFor`, same
+    // temperature, same seed -- so the one-field schema is the strategy's own
+    // and not a special case. 22.4 touchpoint 4: one field does not make the
+    // proposal easier to justify.
+    trailing_stop: settingsFor("trailing_stop", TRAILING_STOP_DERIVE_FIELDS),
   });
 
 // ---------------------------------------------------------------------------

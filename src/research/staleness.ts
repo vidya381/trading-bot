@@ -239,36 +239,47 @@ export interface StalenessPolicy {
  * those are the parts the reasoning above actually supports. The absolute values
  * are the parts it does not.
  *
- * ── TRAILING STOP: 1 HOUR, PLACED WITH DCA AND NOT WITH GRID ──
+ * ── TRAILING STOP: 15 MINUTES, MATCHING GRID — AND THIS IS A CORRECTION ──
  *
- * ⚠ THIS IS A NEW JUDGEMENT CALL, ARRIVED AT BY APPLYING THE TEST ABOVE RATHER
- * THAN BY MEASURING ANYTHING, AND IT DESERVES AN OPERATOR'S REVIEW LIKE THE
- * OTHER TWO. The question this file asks is whether a strategy's parameters name
- * an ABSOLUTE PRICE, and trailing stop's answer is the same as DCA's:
+ * ⚠ THIS NUMBER WAS 60 MINUTES AND THAT WAS WRONG, in the specific way spec 22.5
+ * open question 2 names in advance. The correction is recorded here rather than
+ * silently overwritten, because the reasoning that produced the wrong number is
+ * more instructive than the right number is.
  *
- *   * `trailPct` is a PERCENTAGE, and the only parameter there is (22.2 decision
- *     1). It is applied to the high-water mark -- a price discovered AT RUNTIME,
- *     after the bot is created -- and, before any high is set, to the price the
- *     single entry actually FILLS AT. Nothing in `TrailingStopParams` is
- *     denominated against the proposal's price window, which is precisely what
- *     makes grid's threshold four times tighter.
- *   * ⚠ IT IS STILL NOT PRICE-INDEPENDENT, for DCA's exact reason. The single
- *     entry is sized by `allocatedCapital`, an absolute quote amount, and
- *     `derive-parse.ts`'s minimum-order check evaluates it at the newest real
- *     close. An hour-old window can put the implied quantity on the other side of
- *     the venue's floor -- with the same backstop DCA has, `validateOrder`'s
- *     filter check at order time.
+ * **What was written first, and why it was wrong.** The threshold was set to
+ * DCA's hour by applying THE TEST DIRECTLY ABOVE — does the strategy's parameter
+ * name an absolute price? `trailPct` is a percentage applied to a runtime
+ * high-water mark, so no; and the single entry is sized by `allocatedCapital`, an
+ * absolute quote amount checked against the reference price, exactly as DCA's
+ * `baseOrderSize` is. Same structure, same number.
  *
- * So it takes DCA's hour, and for DCA's stated reasons rather than by analogy.
- * What would move it is evidence about how a trail behaves across a stale window,
+ * That is a coherent argument and it answers the wrong question. 22.5 open
+ * question 2 had already anticipated it, verbatim: *"What it must not be is a
+ * default fallback or a copy of DCA's number chosen because DCA is the closest
+ * structural analogue — the structural analogy does not hold for the property the
+ * threshold measures."* The reasoning above is that copy, and it landed on that
+ * number.
+ *
+ * **What the threshold actually measures**, per 22.5's own guidance: *"because
+ * the exit condition depends on noticing a price drop promptly, this strategy
+ * plausibly needs a threshold at or tighter than grid's — not looser."* The
+ * question is not how a parameter is denominated. It is how quickly a stale view
+ * of the price stops being a safe basis for approving a bot whose entire risk
+ * control is a downward move being noticed. Grid's fifteen minutes is the tighter
+ * of the two existing numbers, and this sits with it.
+ *
+ * ⚠ STILL POLICY, AND STILL MEASURED AGAINST NOTHING — the same category as the
+ * two above, and it must not acquire authority by being the corrected one. What
+ * would move it is evidence about how a trail behaves across a stale window,
  * which this project does not have: `bot-ts1`, the only trailing-stop bot ever
- * run, never filled its entry (decision log 86).
+ * run, never filled its entry (decision log 86), so the strategy has zero
+ * completed operating history to reason from.
  */
 export const DEFAULT_STALENESS_POLICY: StalenessPolicy = Object.freeze({
   priceHistory: Object.freeze({
     grid: 15 * MINUTE_MS,
     dca: 60 * MINUTE_MS,
-    trailing_stop: 60 * MINUTE_MS,
+    trailing_stop: 15 * MINUTE_MS,
   }),
   capitalLedger: 1 * HOUR_MS,
   botList: 1 * DAY_MS,
