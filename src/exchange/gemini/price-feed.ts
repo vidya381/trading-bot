@@ -96,6 +96,40 @@ export class GeminiPriceFeedCodec implements PriceFeedCodec {
         return [{ kind: "heartbeat", at }];
 
       case "candles_1m_updates": {
+        // SPEC 5.7 DETECTOR 3. The venue DOES send `symbol` on every candle
+        // frame -- confirmed against live captures from both the sandbox and
+        // production sockets, whose top-level keys are `changes,symbol,type`.
+        // This parser used to ignore it and attribute every row to the `pair`
+        // its CALLER passed in.
+        //
+        // Benign today and checked anyway. Each `PriceFeed` Durable Object is
+        // named `exchange:pair`, opens its own socket and subscribes to one
+        // symbol, so there is nothing else on the wire to confuse it with. The
+        // day that stops being true -- one socket multiplexing several symbols,
+        // which is exactly what the v2 marketdata endpoint is built for -- an
+        // unchecked attribution is not a crash but SILENT PRICE CORRUPTION:
+        // every bot on this pair trading on another pair's candles, with a fresh
+        // timestamp and a well-formed shape, which is precisely the class of
+        // failure 5.7 exists because nothing could see.
+        //
+        // Compared case-insensitively: the REST path lower-cases symbols
+        // (`toGeminiSymbol`) while the socket takes them upper-cased, so the two
+        // conventions coexist in this codebase and a case difference is not a
+        // mismatch. An ABSENT symbol is not an error either -- it is not this
+        // check's job to invent a required field the venue might stop sending.
+        const symbol = (msg as { symbol?: unknown }).symbol;
+        if (typeof symbol === "string" && symbol.toUpperCase() !== pair.toUpperCase()) {
+          return [
+            {
+              kind: "malformed",
+              reason:
+                `candles_1m_updates carried symbol ${JSON.stringify(symbol)} on the feed ` +
+                `subscribed to ${JSON.stringify(pair)}. Refusing to attribute another ` +
+                `market's candles to this one (spec 5.7).`,
+            },
+          ];
+        }
+
         const changes = (msg as { changes?: unknown }).changes;
         try {
           // Reuse Session A's parser: `changes` is the same row shape as

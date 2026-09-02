@@ -140,3 +140,70 @@ describe("GeminiPriceFeedCodec.parseMessage — non-candle frames", () => {
     expect(codec.parseMessage(JSON.stringify(42), PAIR, AT_IN_MINUTE)[0]!.kind).toBe("malformed");
   });
 });
+
+/**
+ * SPEC 5.7 DETECTOR 3: the candle's own symbol must be the one we subscribed to.
+ *
+ * ⚠ THIS CLOSES A LATENT GAP, NOT A LIVE ONE, and the distinction matters for
+ * anyone reading the test later. `parseMessage` attributed every row to the
+ * `pair` its CALLER passed and never looked at the `symbol` the venue sends on
+ * every frame -- confirmed present in live captures from both the sandbox and
+ * production sockets, whose top-level keys are `changes,symbol,type`.
+ *
+ * Today each `PriceFeed` Durable Object is named `exchange:pair` and subscribes
+ * its own socket to one symbol, so nothing else is on the wire and the
+ * attribution is always right by construction. The v2 marketdata endpoint EXISTS
+ * to multiplex several symbols over one connection, though, and the day anyone
+ * uses it that way an unchecked attribution is not a crash: it is every bot on
+ * this pair trading another market's candles, well-formed and freshly stamped.
+ * That is the exact class of failure -- wrong, but healthy-looking -- that 5.7
+ * was written because nothing could see.
+ */
+describe("GeminiPriceFeedCodec.parseMessage — symbol attribution (5.7)", () => {
+  const otherSymbol = (changes: unknown[]) =>
+    JSON.stringify({ type: "candles_1m_updates", symbol: "ETHUSD", changes });
+
+  it("REFUSES candles carrying a different symbol instead of attributing them to this pair", () => {
+    const events = codec.parseMessage(otherSymbol(REAL_CHANGES), PAIR, AT_IN_MINUTE);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.kind).toBe("malformed");
+    // No candle escapes: the whole point is that nothing reaches a strategy.
+    expect(candles(events)).toHaveLength(0);
+  });
+
+  it("names both symbols, so the report says what was confused with what", () => {
+    const [event] = codec.parseMessage(otherSymbol(REAL_CHANGES), PAIR, AT_IN_MINUTE);
+    if (event?.kind !== "malformed") throw new Error("expected a malformed event");
+    expect(event.reason).toContain("ETHUSD");
+    expect(event.reason).toContain("BTCUSD");
+  });
+
+  it("accepts the matching symbol, which is every real frame today", () => {
+    const events = codec.parseMessage(candlesMessage(REAL_CHANGES), PAIR, AT_IN_MINUTE);
+    expect(candles(events)).toHaveLength(REAL_CHANGES.length);
+  });
+
+  it("compares case-insensitively: the REST path lower-cases, the socket upper-cases", () => {
+    // `toGeminiSymbol` lower-cases symbols into REST URLs while the subscribe
+    // frame takes them upper-cased, so both conventions live in this codebase.
+    // A case difference is not a mismatch and must not be reported as one.
+    const lower = JSON.stringify({
+      type: "candles_1m_updates",
+      symbol: "btcusd",
+      changes: REAL_CHANGES,
+    });
+    expect(candles(codec.parseMessage(lower, PAIR, AT_IN_MINUTE))).toHaveLength(
+      REAL_CHANGES.length,
+    );
+  });
+
+  it("accepts a frame with NO symbol rather than inventing a required field", () => {
+    // It is not this check's job to demand a field the venue might stop sending.
+    // An absent symbol is unattributable, not misattributed.
+    const noSymbol = JSON.stringify({ type: "candles_1m_updates", changes: REAL_CHANGES });
+    expect(candles(codec.parseMessage(noSymbol, PAIR, AT_IN_MINUTE))).toHaveLength(
+      REAL_CHANGES.length,
+    );
+  });
+});

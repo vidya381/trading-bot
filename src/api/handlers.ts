@@ -341,7 +341,18 @@ export async function getBot(ctx: ApiContext): Promise<Response> {
     // the list page; one query path is how that stays true.
     feesFor(ctx, id),
   ]);
-  return ok(botDetail(row, snapshot, orders, trades, alerts, fees, await marketPriceFor(ctx, row)));
+  return ok(
+    botDetail(
+      row,
+      snapshot,
+      orders,
+      trades,
+      alerts,
+      fees,
+      await marketPriceFor(ctx, row),
+      ctx.env.ENVIRONMENT,
+    ),
+  );
 }
 
 /**
@@ -730,7 +741,7 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
   // `NO_FEES` for the same reason the three histories are empty literals: a bot
   // that came into existence in this request has no orders, no trades and no
   // alerts, so there is nothing to query for.
-  const detail = botDetail(row!, snapshot, [], [], [], NO_FEES);
+  const detail = botDetail(row!, snapshot, [], [], [], NO_FEES, null, ctx.env.ENVIRONMENT);
   // ABSENT rather than null when no proposal was named, so an ordinary creation's
   // response shape is byte-identical to what it was before this field existed.
   return ok(proposalLink === null ? detail : { ...detail, proposalLink }, 201);

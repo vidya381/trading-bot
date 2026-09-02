@@ -41,6 +41,7 @@ import type { PriceFeedCodec } from "../exchange/price-feed-codec";
 import { databaseFrom } from "../db";
 import type { AlertRow, ExchangeId } from "../db/schema";
 import type { Candle, Pair, Price, Timestamp } from "../shared/exchange-client";
+import { toDecimalString, ZERO } from "../shared/money";
 
 /** The (exchange, pair) a feed instance serves. Set once, by the first caller. */
 export interface PriceFeedConfig {
@@ -107,6 +108,25 @@ interface PersistedFeedState {
   blindSince: number | null;
   /** Whether the 30-minute blind escalation alert has already fired. */
   escalated: boolean;
+  /**
+   * SPEC 5.7 DETECTOR 1. The close of the last candle forwarded, as a DECIMAL
+   * STRING rather than `Money`.
+   *
+   * A string because this object is the JSON-shaped half of the feed's state and
+   * every other field in it is a number or a boolean. Durable Object storage
+   * would carry a `bigint` through structured clone, but nothing else here needs
+   * that exception and an equality comparison on the decimal form is exactly the
+   * comparison this detector wants.
+   */
+  lastForwardedClose: string | null;
+  /**
+   * How many consecutive forwarded candles have carried `lastForwardedClose`
+   * with NO TRADES AT ALL. See `#trackFrozenValue` for why both halves are
+   * required. Counts the candles themselves, so `2` means two in a row.
+   */
+  frozenRun: number;
+  /** Whether `price_feed_value_frozen` has been raised for the current run. */
+  frozenAlerted: boolean;
 }
 
 const INITIAL_STATE: PersistedFeedState = {
@@ -115,6 +135,9 @@ const INITIAL_STATE: PersistedFeedState = {
   reconnectAttempts: 0,
   blindSince: null,
   escalated: false,
+  lastForwardedClose: null,
+  frozenRun: 0,
+  frozenAlerted: false,
 };
 
 const STATE_KEY = "feed-state";
@@ -146,6 +169,21 @@ const BLIND_ESCALATION_MS = 30 * 60_000;
  * is never pruned. See `#fanOut`.
  */
 const MAX_FANOUT_FAILURES = 5;
+
+/**
+ * Consecutive unchanged, zero-volume candles before a feed is called frozen
+ * (spec 5.7 detector 1).
+ *
+ * TEN, on a one-minute feed, so ten minutes of a market that neither moved nor
+ * traded. The number comes from what it has to separate, not from a round
+ * figure: a thin pair really does print isolated zero-volume minutes, and a busy
+ * one really does repeat a close to the cent occasionally, so either signal
+ * alone would cry wolf. A market doing BOTH for ten consecutive minutes is not a
+ * market -- and the incident that produced this ran 1439 such candles in a row,
+ * so the threshold has three orders of magnitude of headroom over the case it
+ * was written for while still firing within ten minutes of the onset.
+ */
+const FROZEN_VALUE_RUN = 10;
 
 /** The minimal socket surface this object drives; the transport is injected. */
 export interface FeedSocket {
@@ -311,7 +349,14 @@ export class PriceFeed extends DurableObject<Env> {
     // racing the first message.
     ctx.blockConcurrencyWhile(async () => {
       const stored = await ctx.storage.get<PersistedFeedState>(STATE_KEY);
-      if (stored !== undefined) this.#state = stored;
+      // SPREAD OVER THE DEFAULTS, not assigned over them. Every feed running
+      // right now has a stored blob written before 5.7's three fields existed,
+      // and a bare assignment would leave them `undefined` -- `frozenRun + 1`
+      // would be `NaN` and the detector would never fire on exactly the feeds
+      // that have been running longest. The same additive treatment
+      // `BotRuntimeState` gives `highWaterMark` and `entryAttempts`, applied to
+      // a blob that is replaced wholesale rather than field by field.
+      if (stored !== undefined) this.#state = { ...INITIAL_STATE, ...stored };
     });
   }
 
@@ -586,8 +631,132 @@ export class PriceFeed extends DurableObject<Env> {
     // nobody asked for.
     if (this.#stopped) return;
 
+    // AFTER the forward, never before. This is a detector, not a gate: a frozen
+    // feed still delivers, because withholding prices from a bot holding a
+    // position would replace a reporting problem with a risk one. It observes
+    // and says so; what to do about it is a human's call.
+    await this.#trackFrozenValue(candle, at);
+
     this.#state = { ...this.#state, watermark: candle.closeTime };
     await this.#persist();
+  }
+
+  /**
+   * SPEC 5.7 DETECTOR 1: the feed is delivering, and the value is fiction.
+   *
+   * ⚠ THE GAP THIS FILLS, AND WHY NOTHING ELSE COULD. `#forwardClosed` stamps
+   * every price's `at` with RECEIPT time, so `lastPriceAt` on every subscriber is
+   * fresh by construction no matter how old the number is. `price_feed_blind`
+   * watches heartbeats and `price_updates_stale` watches `lastPriceAt`; both are
+   * liveness checks, and a healthy socket delivering a frozen price satisfies
+   * both perfectly. On 2026-09-02 exactly that happened for eleven hours across
+   * fourteen bots, and the first thing to notice was a human.
+   *
+   * ⚠ BOTH CONDITIONS, AND THE CONJUNCTION IS THE WHOLE DESIGN. An unchanged
+   * close alone is ordinary -- a quiet minute on a liquid pair closes where it
+   * opened. Zero volume alone is ordinary too, on a pair that simply had no
+   * trades that minute. What is NOT ordinary is a candle that reports the
+   * identical price AND that nothing traded to produce it: that is a
+   * carry-forward, a venue quoting its own last memory rather than a market. Ten
+   * of those in a row is the signature, and it is what the sandbox printed 1439
+   * times consecutively.
+   *
+   * STANDING, NOT REPEATING. One row per incident (`frozenAlerted` latches it,
+   * exactly as `escalated` latches the blind escalation), resolved the moment a
+   * differing close arrives. A row per frozen candle would be 1439 rows a day
+   * on the incident that produced this, which is how an alert surface stops
+   * being read.
+   *
+   * BEST-EFFORT, AND THAT IS LOAD-BEARING. Every D1 write below is wrapped: this
+   * runs inside the forwarding path, and a detector that can throw is a detector
+   * that can stop a feed delivering prices. The counters live in this object's
+   * own state and are correct whether or not the alert row lands.
+   */
+  async #trackFrozenValue(candle: Candle, at: Timestamp): Promise<void> {
+    const close = toDecimalString(candle.close);
+    const repeated = this.#state.lastForwardedClose === close;
+    const noTrades = candle.volume === ZERO;
+
+    if (repeated && noTrades) {
+      // `frozenRun` counts CANDLES, not repeats, so the first match counts the
+      // pair of them: the one that matched and the one it matched against.
+      // `FROZEN_VALUE_RUN` then reads as "ten candles in a row", which is what
+      // the constant claims and what the alert says.
+      const run = this.#state.frozenRun === 0 ? 2 : this.#state.frozenRun + 1;
+      const firstBreach = run >= FROZEN_VALUE_RUN && !this.#state.frozenAlerted;
+      this.#state = {
+        ...this.#state,
+        frozenRun: run,
+        frozenAlerted: this.#state.frozenAlerted || firstBreach,
+      };
+      if (firstBreach) {
+        await this.#reportFrozen(
+          `price feed for ${this.#configLabel()} has forwarded ${run} consecutive candles ` +
+            `at exactly ${close} with zero volume on every one. A market that neither ` +
+            `moves nor trades for ${run} minutes is not reporting a price, it is repeating ` +
+            `its last memory of one. Every bot on this pair is evaluating its entries and ` +
+            `stop-losses against that number, and nothing else can tell: this feed is ` +
+            `connected, its heartbeats are current, and each price carries a fresh receipt ` +
+            `timestamp (spec 5.7).`,
+          at,
+        );
+      }
+      return;
+    }
+
+    // The value moved, or something traded. Either way the run is over.
+    const wasAlerted = this.#state.frozenAlerted;
+    this.#state = {
+      ...this.#state,
+      lastForwardedClose: close,
+      frozenRun: 0,
+      frozenAlerted: false,
+    };
+    if (wasAlerted) await this.#resolveFrozen();
+  }
+
+  /** Raise the standing frozen-value row. Never throws; see `#trackFrozenValue`. */
+  async #reportFrozen(message: string, at: Timestamp): Promise<void> {
+    try {
+      await this.#alert("critical", "system", "price_feed_value_frozen", message);
+    } catch (error) {
+      // The condition is still recorded in `frozenAlerted`, so this does not
+      // re-fire every candle once D1 comes back -- deliberately. A missed alert
+      // is a missed alert; re-raising it on recovery would put the row minutes
+      // or hours after the onset with no way to tell.
+      console.error(
+        `price feed ${this.#configLabel()}: frozen-value alert could not be written ` +
+          `(${(error as Error).message}). Value frozen since ${at}.`,
+      );
+    }
+  }
+
+  /**
+   * Close the standing frozen-value row once prices move again.
+   *
+   * Scoped by `source` as well as type, so a feed resolves ITS OWN incident and
+   * never another market's -- `#alert` writes `price-feed:<exchange>:<pair>` and
+   * this reads the same string back.
+   */
+  async #resolveFrozen(): Promise<void> {
+    try {
+      const db = databaseFrom(this.env);
+      const open = await db.alerts.findMany({
+        where: {
+          alert_type: "price_feed_value_frozen",
+          source: this.#alertSource(),
+          resolved: false,
+        },
+      });
+      for (const row of open) {
+        await db.alerts.update({ id: row.id }, { resolved: true });
+      }
+    } catch (error) {
+      console.error(
+        `price feed ${this.#configLabel()}: prices moved again but the frozen-value alert ` +
+          `could not be resolved (${(error as Error).message}).`,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -902,6 +1071,20 @@ export class PriceFeed extends DurableObject<Env> {
     await this.ctx.storage.put(STATE_KEY, this.#state);
   }
 
+  /**
+   * The `alerts.source` this feed writes, spelled ONCE.
+   *
+   * Both halves of the frozen-value lifecycle depend on agreeing about it:
+   * `#alert` writes it and `#resolveFrozen` reads it back in a WHERE clause. A
+   * second copy of the format is the exact duplicated-definition bug
+   * `shared/alert-types.ts` exists to prevent, and it would fail silently --
+   * rows that are raised and never closed.
+   */
+  #alertSource(): string {
+    const config = this.#state.config;
+    return config === null ? "price-feed" : `price-feed:${config.exchange}:${config.pair}`;
+  }
+
   #configLabel(): string {
     const config = this.#state.config;
     return config === null ? "an unconfigured feed" : `${config.exchange}:${config.pair}`;
@@ -935,14 +1118,13 @@ export class PriceFeed extends DurableObject<Env> {
     message: string,
     botInstanceId: string | null = null,
   ): Promise<void> {
-    const config = this.#state.config;
     const row: AlertRow = {
       id: crypto.randomUUID(),
       severity,
       category,
       alert_type: alertType,
       bot_instance_id: botInstanceId,
-      source: config === null ? "price-feed" : `price-feed:${config.exchange}:${config.pair}`,
+      source: this.#alertSource(),
       message,
       resolved: false,
       created_at: this.#deps.now(),

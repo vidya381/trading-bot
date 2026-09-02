@@ -778,6 +778,35 @@ export interface MarketPrice {
   readonly at: number;
 }
 
+/**
+ * SPEC 5.7: the sandbox's prices are not a market's prices.
+ *
+ * ⚠ WHY A STATIC STRING IS THE RIGHT SIZE HERE, and why this is deliberately
+ * NOT wired to the frozen-value detector. The detector answers "is this feed
+ * stuck RIGHT NOW", and it answers it about ten minutes after a freeze begins.
+ * This answers a different question -- "should I believe what I am about to
+ * read at all" -- and it has to answer BEFORE anyone starts a live test, which
+ * a detector by construction cannot. On 2026-09-02 a trailing-stop bot ran its
+ * first live test against a sandbox market that had been frozen for eleven
+ * hours with a crossed book, and four rounds of investigation blamed the order
+ * type, the venue and the subscription before anyone asked whether the price was
+ * real. One sentence on the response would have shortened that to minutes.
+ *
+ * Environment-gated, not condition-gated: it is a standing property of the
+ * testnet deployment that its venue is a simulator, true whether or not any
+ * particular feed is stuck.
+ */
+export const SANDBOX_PRICE_WARNING =
+  "TESTNET: this bot trades against the exchange's SANDBOX, whose prices are simulated and " +
+  "may not track the real market -- they can sit frozen for hours, carry zero volume, or " +
+  "quote a crossed book. Verify prices against the live venue before drawing any conclusion " +
+  "from a live test run here. See spec 5.7.";
+
+/** The warning for an environment, or null where prices are real. */
+export function sandboxPriceWarning(environment: string | undefined): string | null {
+  return environment === "testnet" ? SANDBOX_PRICE_WARNING : null;
+}
+
 export function botDetail(
   row: BotInstanceRow,
   snapshot: BotSnapshot | null,
@@ -792,9 +821,18 @@ export function botDetail(
    * the two it was is the handler's business, not the screen's.
    */
   marketPrice: MarketPrice | null = null,
+  /** `env.ENVIRONMENT`. Adds the 5.7 sandbox warning on testnet, nothing elsewhere. */
+  environment: string | undefined = undefined,
 ) {
+  const warning = sandboxPriceWarning(environment);
   return {
     ...botSummary(row, snapshot, fees),
+    // ABSENT rather than null off testnet, for the reason `proposalLink` is
+    // absent when no proposal was named: a production response stays
+    // byte-identical to what it was before this field existed, and a reader
+    // testing `if (body.warning)` needs no knowledge of which environment it is
+    // talking to.
+    ...(warning === null ? {} : { warning }),
     marketPrice,
     config: snapshot === null ? null : jsonSafe(snapshot.config),
     state: snapshot === null ? null : jsonSafe(snapshot.state),

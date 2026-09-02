@@ -123,6 +123,66 @@ describe("parsePrice", () => {
   it("rejects a numeric price rather than putting a float in the money path", () => {
     expect(() => parsePrice("BTCUSD", { last: 43000.5 }, AT)).toThrow(ParseError);
   });
+
+  // --- SPEC 5.7 DETECTOR 2: the crossed-book refusal --------------------------
+  //
+  // Reproduced from the real payload. On 2026-09-02 Gemini's sandbox served
+  // exactly this shape -- a bid well ABOVE its own ask, alongside a `last` that
+  // had not moved in eleven hours -- and this parser read the `last` and handed
+  // it on as an ordinary price for fourteen bots to trade against.
+
+  it("REFUSES a crossed book: bid above ask cannot happen on a venue that matches", () => {
+    expect(() =>
+      parsePrice("BTCUSD", { bid: "68169.88", ask: "64886.32", last: "78172.34" }, AT),
+    ).toThrow(ParseError);
+    expect(() =>
+      parsePrice("BTCUSD", { bid: "68169.88", ask: "64886.32", last: "78172.34" }, AT),
+    ).toThrow(/CROSSED book/);
+  });
+
+  it("refuses a LOCKED book too -- bid exactly equal to ask is the same impossibility", () => {
+    // `>=`, not `>`. A locked book is not a real quote either, and admitting it
+    // would leave the one-tick-wide case as the only thing between this check
+    // and the crossed one it exists to catch.
+    expect(() =>
+      parsePrice("BTCUSD", { bid: "43000.0", ask: "43000.0", last: "43000.0" }, AT),
+    ).toThrow(/CROSSED book/);
+  });
+
+  it("names both sides in the refusal, so the reason is readable without the payload", () => {
+    try {
+      parsePrice("BTCUSD", { bid: "68169.88", ask: "64886.32", last: "78172.34" }, AT);
+      throw new Error("unreachable: the crossed book should have been refused");
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain("68169.88");
+      expect(message).toContain("64886.32");
+      expect(message).toContain("BTCUSD");
+    }
+  });
+
+  it("accepts an ordinary book, which is the case that must not regress", () => {
+    // One tick wide, the normal shape. If this ever throws, the check has been
+    // widened past the impossibility it was written for.
+    const price = parsePrice("BTCUSD", { bid: "76865.53", ask: "76865.54", last: "76831.61" }, AT);
+    expect(price.price).toBe(m("76831.61"));
+  });
+
+  it("accepts a ticker with NO book at all rather than inventing a required field", () => {
+    // A venue that sends no bid/ask has not sent a broken one. Refusing here
+    // would reject prices this system can legitimately use.
+    expect(parsePrice("BTCUSD", { last: "43000.5" }, AT).price).toBe(m("43000.5"));
+    expect(parsePrice("BTCUSD", { bid: "42999.0", last: "43000.5" }, AT).price).toBe(m("43000.5"));
+    expect(parsePrice("BTCUSD", { ask: "43001.0", last: "43000.5" }, AT).price).toBe(m("43000.5"));
+  });
+
+  it("still rejects a book side that is present but not a decimal string", () => {
+    // Absent is fine; malformed is not. A float here is the same money-path
+    // hazard the `last` check above refuses.
+    expect(() => parsePrice("BTCUSD", { bid: 43000, ask: "43001.0", last: "43000.5" }, AT)).toThrow(
+      ParseError,
+    );
+  });
 });
 
 describe("parseOrderStatus", () => {

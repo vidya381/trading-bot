@@ -42,6 +42,7 @@ import {
   fromDecimalStringRounded,
   mul,
   SCALE,
+  toDecimalString,
   ZERO,
   type Money,
 } from "../../shared/money";
@@ -291,6 +292,24 @@ function requireEpochMs(
  * a number here means the wrong field or a changed API, and silently accepting it
  * would put a float into the money path.
  */
+/**
+ * `requireMoney` for a field that may legitimately be absent.
+ *
+ * `undefined` means "the venue did not send this", which callers must be able to
+ * tell apart from a value -- see the crossed-book check in `parsePrice`, where
+ * an absent side means there is no book to judge rather than a broken one. A
+ * field that IS present but is not a decimal string still throws, because that
+ * is a shape this code does not understand rather than a field it does not have.
+ */
+function optionalMoney(
+  source: Record<string, unknown>,
+  field: string,
+  context: string,
+): Money | undefined {
+  if (source[field] === undefined || source[field] === null) return undefined;
+  return requireMoney(source, field, context);
+}
+
 function requireMoney(
   source: Record<string, unknown>,
   field: string,
@@ -407,9 +426,54 @@ export function toOrderState(
  * Binance ticker's price. The ticker carries no timestamp this system trusts as
  * the price's own age, so `at` is receipt time, exactly as documented on `Price`
  * and handled identically on the Binance side.
+ *
+ * ── SPEC 5.7 DETECTOR 2: THE CROSSED-BOOK REFUSAL ──
+ *
+ * A book whose bid is at or above its ask is ARITHMETICALLY IMPOSSIBLE on a real
+ * venue: the two sides would have matched. So this needs no threshold, no
+ * tolerance and no tuning -- unlike every other plausibility check in this
+ * system, it has no false-positive case to trade against, which is why it is
+ * worth having even though it catches only one shape of wrong.
+ *
+ * ⚠ IT IS HERE BECAUSE THIS IS THE ONLY PLACE A BOOK IS READ. Binance's
+ * `/api/v3/ticker/price` returns a symbol and a price and no book at all, so
+ * there is no counterpart check to write on that side; `getCurrentPrice` on
+ * Gemini is the whole surface. Stated rather than left implicit, so nobody
+ * later reads the asymmetry as an omission.
+ *
+ * WHAT IT COST TO NOT HAVE THIS. On 2026-09-02 the sandbox published
+ * `bid 68169.88 / ask 64886.32` -- crossed by more than three thousand dollars
+ * -- alongside a `last` frozen for eleven hours, and this function read the
+ * `last` and handed it on as an ordinary price. One comparison here would have
+ * refused it outright.
+ *
+ * REFUSING IS A `ParseError`, deliberately, rather than a new failure kind. The
+ * client turns a throw from a parser into `#unreadable`: a definite,
+ * non-retryable failure that section 5.6 already forbids from feeding strategy
+ * logic, and that every existing caller already handles (a liquidation reports
+ * `liquidation_no_price` and leaves the position held; a routine read halts).
+ * A new outcome kind would have needed all of those call sites to learn about
+ * it, for no behaviour they do not already have.
+ *
+ * BOTH SIDES MUST BE PRESENT to be checked. An absent or non-string `bid`/`ask`
+ * means the venue sent no book on this symbol, which is not the same as sending
+ * a broken one -- inventing a required field here would refuse prices this
+ * system can legitimately use.
  */
 export function parsePrice(pair: string, body: unknown, at: Timestamp): Price {
   const record = asRecord(body, "pubticker");
+
+  const bid = optionalMoney(record, "bid", "pubticker");
+  const ask = optionalMoney(record, "ask", "pubticker");
+  if (bid !== undefined && ask !== undefined && bid >= ask) {
+    throw new ParseError(
+      `pubticker for ${pair} reports a CROSSED book: bid ${toDecimalString(bid)} is at or ` +
+        `above ask ${toDecimalString(ask)}, which cannot happen on a venue that matches ` +
+        `orders. Refusing this price rather than trading on a book that is not real ` +
+        `(spec 5.7).`,
+    );
+  }
+
   return {
     pair,
     price: requireMoney(record, "last", "pubticker"),
