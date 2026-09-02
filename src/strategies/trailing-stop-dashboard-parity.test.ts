@@ -19,9 +19,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { Position } from "../../dashboard/src/api/types";
+import type {
+  BotConfig as DashboardBotConfig,
+  Position,
+  TrailingStopParams as DashboardTrailingStopParams,
+} from "../../dashboard/src/api/types";
 import { botSummary } from "../api/serialize";
-import { trailLevelOf } from "./trailing-stop";
+import { encodeTrailingStopParams, trailLevelOf, type TrailingStopConfig } from "./trailing-stop";
 import { stopLossPrice, type DcaParams } from "./dca";
 import { fromDecimalString, toDecimalString } from "../shared/money";
 
@@ -73,6 +77,92 @@ describe("the dashboard's Position mirror", () => {
     };
     expect(sample.highWaterMark).toBeNull();
     expect(sample.trailLevel).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1b. THE CONFIG MIRROR -- the half that was missing, and the blank page it cost
+//
+// Section 1 above pinned `Position` and nothing else, and `Position` was the one
+// piece of the trailing-stop mirror that WAS correct. `Strategy` and `BotConfig`
+// in the same file had never gained the variant, so `StrategyState.tsx`'s
+// `if (grid) ... else <DcaPositionView>` type-checked for a trailing-stop bot.
+// The DCA view then read `params.baseOrderSize` off `{ trailPct }`,
+// `formatMoney(undefined)` threw during render, React unmounted the whole tree,
+// and `/bots/bot-ts1` rendered NOTHING AT ALL -- no header, no layout.
+//
+// A parity test that pins one of three shapes is not a mirror guard, so the
+// remaining two are pinned here on exactly the terms section 1 states: this file
+// is a hand-written mirror across a `tsc` seam the root project does not
+// compile, and a drift fails nothing anywhere without a pin.
+// ---------------------------------------------------------------------------
+
+describe("the dashboard's trailing-stop CONFIG mirror", () => {
+  it("mirrors the params the Worker actually stores, in both directions", () => {
+    /*
+     * ⚠ THE TWO-WAY PIN, on the shape whose absence caused the crash.
+     * `encodeTrailingStopParams` is what a stored config's params go through, and
+     * `jsonSafe` leaves its strings alone -- so its output IS what the dashboard
+     * receives. A field added to the params and not mirrored fails the first
+     * assignment; a field invented in the dashboard's copy fails the second.
+     */
+    type WorkerParamsJson = Omit<ReturnType<typeof encodeTrailingStopParams>, "strategy" | "schemaVersion">;
+    const _paramsAgree: DashboardTrailingStopParams = null as unknown as WorkerParamsJson;
+    const _paramsAgreeBack: WorkerParamsJson = null as unknown as DashboardTrailingStopParams;
+    void _paramsAgree;
+    void _paramsAgreeBack;
+
+    // The value-level half, so the shape is visible in test output rather than
+    // only in a compile step.
+    const encoded = encodeTrailingStopParams({ trailPct: fromDecimalString("10") });
+    expect(Object.keys(encoded).sort()).toEqual(["schemaVersion", "strategy", "trailPct"]);
+    expect(encoded.trailPct).toBe("10.00000000");
+  });
+
+  it("⚠ carries a trailing_stop arm on BotConfig at all -- the arm that was missing", () => {
+    /*
+     * The assignment below is the whole test. Before the fix `DashboardBotConfig`
+     * had two arms and this line would not compile, which is precisely the state
+     * the dashboard shipped in: the Worker could hand the detail page a config
+     * the page's own types said could not exist, and the `else` swallowed it.
+     */
+    const config: TrailingStopConfig = {
+      strategy: "trailing_stop",
+      schemaVersion: 1,
+      botInstanceId: "bot-ts1",
+      accountLabel: "gemini-main",
+      exchange: "gemini",
+      pair: "BTCUSD",
+      capitalAsset: "USD",
+      allocatedCapital: fromDecimalString("500"),
+      params: { trailPct: fromDecimalString("10") },
+    };
+
+    // What `jsonSafe` makes of it: every Money becomes its decimal string and
+    // nothing else moves. Hand-applied here rather than imported, because the
+    // point is the SHAPE the dashboard's type must accept.
+    const published: DashboardBotConfig = {
+      ...config,
+      allocatedCapital: toDecimalString(config.allocatedCapital),
+      params: { trailPct: toDecimalString(config.params.trailPct) },
+    };
+
+    expect(published.strategy).toBe("trailing_stop");
+    // And the discriminator really does narrow to the trailing-stop params on
+    // the dashboard side -- the narrowing `StrategyState` now depends on.
+    if (published.strategy === "trailing_stop") {
+      expect(published.params.trailPct).toBe("10.00000000");
+    } else {
+      expect.unreachable("the trailing_stop discriminator did not narrow");
+    }
+  });
+
+  it("the dashboard's Strategy union admits trailing_stop", () => {
+    // A list-view row, a detail page and the create form all key off this union.
+    // It is asserted separately from `BotConfig` because the two were BOTH
+    // missing the variant and either alone would have kept the page blank.
+    const strategy: import("../../dashboard/src/api/types").Strategy = "trailing_stop";
+    expect(strategy).toBe("trailing_stop");
   });
 });
 

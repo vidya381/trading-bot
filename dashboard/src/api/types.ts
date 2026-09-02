@@ -100,7 +100,23 @@ export interface AccountSymbols {
 /** A bot's lifecycle status (spec section 8.1). */
 export type BotStatus = "created" | "running" | "halted" | "stopped";
 
-export type Strategy = "dca" | "grid";
+/**
+ * Every strategy a bot row can carry (`StrategyType` in the Worker).
+ *
+ * ⚠ `"trailing_stop"` WAS MISSING HERE, AND THAT ABSENCE IS WHAT MADE THE DETAIL
+ * PAGE GO BLANK. `Position` below had already grown its third variant (spec 22),
+ * but this union and `BotConfig` had not -- so `StrategyState`'s
+ * `if (grid) ... else DCA` fall-through TYPE-CHECKED for a trailing-stop bot and
+ * handed `{ trailPct }` to a component that reads `params.baseOrderSize`.
+ * `formatMoney(undefined)` threw out of render, React unmounted the whole tree,
+ * and the page rendered nothing at all.
+ *
+ * Adding the variant here is therefore not bookkeeping: it is what makes the
+ * missing branch a COMPILE ERROR rather than a runtime blank. `strategyView.ts`
+ * keeps the runtime list in step with this union, pinned by a type-level check
+ * so a fourth strategy cannot be added to one and forgotten in the other.
+ */
+export type Strategy = "dca" | "grid" | "trailing_stop";
 
 /**
  * The held position + realized profit, read from the bot's own Durable Object
@@ -334,14 +350,37 @@ interface BotConfigBase {
   readonly allocatedCapital: string;
 }
 
+/**
+ * Section 22's trailing-stop parameters (`TrailingStopParams` in
+ * src/strategies/trailing-stop.ts).
+ *
+ * ONE FIELD, AND THAT IS THE WHOLE SHAPE (22.2 decision 1). `trailPct` does
+ * double duty: the trail distance below the high-water mark, and the initial
+ * stop distance from entry before any new high is made.
+ *
+ * ⚠ NO ORDER SIZE, AND THAT IS NOT AN OMISSION IN THIS MIRROR. Per 22.2's
+ * consequence of decisions 1 and 4 the single entry is sized by
+ * `allocatedCapital`, so there is no field that could size it otherwise --
+ * which is exactly why handing these params to `DcaPositionView` crashed:
+ * every money field that view reads is absent here.
+ *
+ * Pinned against the Worker's own type in
+ * `src/strategies/trailing-stop-dashboard-parity.test.ts`.
+ */
+export interface TrailingStopParams {
+  readonly trailPct: string;
+}
+
 export type BotConfig =
   | (BotConfigBase & { readonly strategy: "dca"; readonly params: DcaParams })
-  | (BotConfigBase & { readonly strategy: "grid"; readonly params: GridParams });
+  | (BotConfigBase & { readonly strategy: "grid"; readonly params: GridParams })
+  | (BotConfigBase & { readonly strategy: "trailing_stop"; readonly params: TrailingStopParams });
 
 /**
  * The bot's persisted runtime state (`BotRuntimeState`). `config.strategy` is
  * the authoritative discriminator for which strategy-specific state is live:
- * a DCA bot populates `position`, a grid bot populates `ladder`.
+ * a DCA bot populates `position`, a grid bot populates `ladder`, and a
+ * trailing-stop bot populates `position` plus `highWaterMark`.
  */
 export interface BotRuntimeState {
   readonly schemaVersion: number;
@@ -349,6 +388,41 @@ export interface BotRuntimeState {
   readonly cycleCount: number;
   readonly position: DcaPosition;
   readonly ladder?: GridLadder;
+  /**
+   * Highest price seen since entry (22.2 decision 3, trailing stop only).
+   *
+   * ⚠ THREE STATES, NOT TWO, and the optional-plus-null type is deliberate:
+   *   - ABSENT   -- never set. `createTrailingStop` omits the key entirely,
+   *                 because "no high recorded yet" is what absent means to
+   *                 `raisesHighWaterMark`.
+   *   - a string -- a real mark.
+   *   - `null`   -- explicitly cleared after an exit completes. The Worker
+   *                 writes `highWaterMark: undefined`, which is an OWN KEY, and
+   *                 `jsonSafe` narrows undefined to null on the way out.
+   *
+   * All three mean "there is no mark to show", and every reader here must treat
+   * them the same. The FIGURE an operator reads comes from `position` (the
+   * backend derives `trailLevel` from this mark with the strategy's own
+   * arithmetic); this field is the raw state behind it.
+   */
+  readonly highWaterMark?: string | null;
+  /**
+   * How many times the single entry order has been placed (spec 22.10, trailing
+   * stop only). The bound on an otherwise unbounded retry -- and the reason
+   * `bot-ts1` halted with `entry_unfilled` (decision log 86).
+   *
+   * ABSENT MEANS ZERO, and absent is the normal case: the Worker adds the key
+   * only for a trailing-stop bot, and only once it has placed an entry. Same
+   * three-state caveat as `highWaterMark` above -- `jsonSafe` turns an
+   * explicitly-undefined own key into `null` -- so every reader treats absent,
+   * null and 0 alike.
+   *
+   * ⚠ THE CAP ITSELF IS NOT MIRRORED HERE. `MAX_ENTRY_ATTEMPTS` lives in the
+   * Worker, and a copy of it in this file would be a number that can silently
+   * disagree with the one the bot actually stops at -- the failure this whole
+   * mirror is tested against. The count is shown; the limit is not invented.
+   */
+  readonly entryAttempts?: number | null;
   readonly nextSequence: number;
   readonly openOrderIds: readonly string[];
   readonly haltReason: string | null;

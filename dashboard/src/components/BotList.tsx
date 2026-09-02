@@ -27,6 +27,7 @@ import type { Bot } from "../api/types";
 import { StatusBadge } from "./StatusBadge";
 import { Unit } from "./Unit";
 import { baseAssetOf, formatMoney, formatQuantity, signOf } from "../format";
+import { entryPriceOf, strategyLabel } from "../strategyView";
 
 const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   positive: "text-emerald-300",
@@ -52,20 +53,30 @@ function Pnl({ bot }: { bot: Bot }) {
   );
 }
 
-/** Held quantity in the base asset, with DCA's average entry as secondary context. */
+/**
+ * Held quantity in the base asset, with the entry price as secondary context.
+ *
+ * ⚠ THE STRATEGY TEST WAS INLINE HERE (`position.strategy === "dca"`), duplicating
+ * `BotSummary`'s -- so this column silently showed no entry price for a
+ * trailing-stop bot, whose `averageEntryPrice` is a real single entry (22.2
+ * decision 4). `entryPriceOf` is now the one exhaustive answer for both call
+ * sites; a new `Position` variant fails to compile there rather than quietly
+ * blanking a column here.
+ */
 function PositionCell({ bot }: { bot: Bot }) {
   const position = bot.position;
   if (position === null) return <span className="text-zinc-600">—</span>;
   const held = formatQuantity(position.heldQuantity);
   const asset = baseAssetOf(bot.pair, bot.capitalAsset);
-  if (position.strategy === "dca" && position.averageEntryPrice !== "0.00000000") {
+  const entry = entryPriceOf(position);
+  if (entry !== null) {
     return (
       <span className="tabular">
         {held}
         <Unit>{asset}</Unit>
         {/* The "@" is a real separator between the two numbers, spaced on both
             sides -- a quantity and a price abutting would read as one figure. */}
-        <Unit>@ {formatMoney(position.averageEntryPrice)} {bot.capitalAsset}</Unit>
+        <Unit>@ {formatMoney(entry)} {bot.capitalAsset}</Unit>
       </span>
     );
   }
@@ -144,7 +155,9 @@ function BotTable({ bots }: { bots: Bot[] }) {
               <td className="px-4 py-3">
                 <StatusBadge status={bot.status} />
               </td>
-              <td className="px-4 py-3 uppercase text-zinc-300">{bot.strategy}</td>
+              {/* `strategyLabel`, not the raw wire value -- `uppercase` would
+                  otherwise render "trailing_stop" with its underscore. */}
+              <td className="px-4 py-3 uppercase text-zinc-300">{strategyLabel(bot.strategy)}</td>
               <td className="px-4 py-3 text-zinc-300">{bot.pair}</td>
               <td className="px-4 py-3 text-right">
                 <PositionCell bot={bot} />
@@ -188,7 +201,7 @@ function BotCard({ bot }: { bot: Bot }) {
       <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Strategy</dt>
-          <dd className="uppercase text-zinc-300">{bot.strategy}</dd>
+          <dd className="uppercase text-zinc-300">{strategyLabel(bot.strategy)}</dd>
         </div>
         <div>
           <dt className="text-xs uppercase tracking-wide text-zinc-500">Pair</dt>

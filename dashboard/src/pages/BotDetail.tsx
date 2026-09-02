@@ -18,6 +18,28 @@
  * not exist; a schema-less environment (`no_schema`, production pre-go-live)
  * shows the same honest message pattern as the list; an expired Access session
  * says to reload. None of these shows a blank or broken page.
+ *
+ * ── ⚠ AND ONE THAT WAS NOT HONEST AT ALL, UNTIL IT HAPPENED ──
+ *
+ * Those three cover failures the FETCH can report. They cover nothing about a
+ * failure during RENDER, and on 2026-09-01 `/bots/bot-ts1` -- the first live
+ * trailing-stop bot -- rendered a completely blank page: no header, no banner,
+ * no layout. `StrategyState` fell through to the DCA view, `formatMoney` was
+ * handed an undefined parameter, and React's response to an uncaught render
+ * error is to unmount the WHOLE tree. A page that has crashed was pixel-identical
+ * to one that had not loaded.
+ *
+ * The cause is fixed where it belongs (`strategyView.ts`, `StrategyState.tsx`).
+ * The `ErrorBoundary` below is the SECOND, independent layer, and it is
+ * deliberately ignorant of what went wrong -- it exists for the NEXT unexpected
+ * shape, which by definition nobody has anticipated. It wraps the bot BODY and
+ * not the whole route, so a crash inside it still leaves the back link and the
+ * freshness indicator standing: the operator keeps a way out of the page and a
+ * statement of what broke, instead of a black screen.
+ *
+ * This boundary existed and was wired only into the three `/proposal*` pages.
+ * The blank page is what it costs to have written the defence and not applied it
+ * here.
  */
 
 import { useCallback } from "react";
@@ -35,6 +57,7 @@ import { LiquidateAction } from "../components/LiquidateAction";
 import { ArchiveAction } from "../components/ArchiveAction";
 import { CloneBotLink } from "../components/CloneBotLink";
 import { StrategyState } from "../components/StrategyState";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { OrderHistory } from "../components/OrderHistory";
 import { TradeHistory } from "../components/TradeHistory";
 import { AlertList } from "../components/AlertList";
@@ -136,7 +159,7 @@ function BotDetailView({ id }: { id: string }) {
       ) : hardError ? (
         <LoadError id={id} error={poll.error} />
       ) : bot !== null ? (
-        <>
+        <ErrorBoundary where="This bot's detail view">
           <BotSummary bot={bot} />
           {/*
            * The start control renders only for a created bot (this session's
@@ -238,7 +261,7 @@ function BotDetailView({ id }: { id: string }) {
           <OrderHistory orders={bot.orders} />
           <TradeHistory trades={bot.trades} />
           <AlertList alerts={bot.alerts} />
-        </>
+        </ErrorBoundary>
       ) : null}
     </div>
   );

@@ -22,6 +22,7 @@ import type { BotDetail } from "../api/types";
 import { StatusBadge } from "./StatusBadge";
 import { Unit } from "./Unit";
 import { baseAssetOf, formatMoney, formatQuantity, formatTime, signOf } from "../format";
+import { entryPriceOf, strategyLabel } from "../strategyView";
 
 const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   positive: "text-emerald-300",
@@ -48,19 +49,29 @@ function Stat({
 }
 
 /**
- * Held position, with DCA's average entry as secondary context. The hint spells
- * out the average entry's currency too: it is a price, and a bare number next to
- * a quantity in the asset above it is exactly the ambiguity this view had.
+ * Held position, with the entry price as secondary context. The hint spells out
+ * the entry price's currency too: it is a price, and a bare number next to a
+ * quantity in the asset above it is exactly the ambiguity this view had.
+ *
+ * ⚠ THE STRATEGY TEST USED TO BE INLINE HERE (`position.strategy === "dca"`),
+ * and `BotList.tsx` carried a second copy of it. Both therefore dropped the
+ * entry price for trailing-stop bots -- whose `averageEntryPrice` is a REAL
+ * entry price, since 22.2 decision 4 makes it a single-entry strategy. One
+ * exhaustive helper now answers for both call sites, so the next strategy is a
+ * compile error in one place instead of a silent omission in two.
+ *
+ * The wording follows the helper: "entry" for a single-entry strategy, "avg
+ * entry" for DCA, because a DCA position really is an average of several fills
+ * and calling it a plain entry price would misdescribe it.
  */
 function positionValue(bot: BotDetail): { value: string | null; hint?: string } {
   const position = bot.position;
   if (position === null) return { value: null, hint: "no object state (orphaned)" };
   const held = formatQuantity(position.heldQuantity);
-  if (position.strategy === "dca" && position.averageEntryPrice !== "0.00000000") {
-    return {
-      value: held,
-      hint: `avg entry ${formatMoney(position.averageEntryPrice)} ${bot.capitalAsset}`,
-    };
+  const entry = entryPriceOf(position);
+  if (entry !== null) {
+    const label = position.strategy === "dca" ? "avg entry" : "entry";
+    return { value: held, hint: `${label} ${formatMoney(entry)} ${bot.capitalAsset}` };
   }
   return { value: held };
 }
@@ -96,7 +107,9 @@ export function BotSummary({ bot }: { bot: BotDetail }) {
             <span className="text-zinc-600">·</span>
             <span className="text-zinc-300">{bot.pair}</span>
             <span className="text-zinc-600">·</span>
-            <span className="uppercase">{bot.strategy}</span>
+            {/* `strategyLabel`, not the raw wire value: `uppercase` renders
+                "trailing_stop" as "TRAILING_STOP", underscore and all. */}
+            <span className="uppercase">{strategyLabel(bot.strategy)}</span>
             <span className="text-zinc-600">·</span>
             <span>{bot.exchange}</span>
           </div>

@@ -50,7 +50,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, startBot } from "../api/client";
 import type { BotDetail } from "../api/types";
-import { baseAssetOf, formatMoney } from "../format";
+import { baseAssetOf, formatMoney, formatPercent } from "../format";
 
 type OutcomeTone = "success" | "warning" | "info" | "error";
 
@@ -72,22 +72,65 @@ const OUTCOME_CLASS: Record<OutcomeTone, string> = {
  * the bot's own config values (brief item 4) -- never generic wording. Returns
  * null when the object holds no config (an orphaned created row), so the dialog
  * can fall back to honest generic copy rather than inventing numbers.
+ *
+ * ── ⚠ THIS FUNCTION WAS A SECOND BLANK PAGE WAITING TO HAPPEN ──
+ *
+ * It read `if (dca) { ... }` and then destructured `gridLines, lowerBound,
+ * upperBound` unconditionally -- the same unstated "everything else is grid"
+ * claim that took `/bots/bot-ts1` off the screen from `StrategyState`. A
+ * trailing-stop bot in `created` status renders this control, `formatMoney`
+ * would have been handed `undefined`, and the whole tree would have unmounted
+ * for the second time on the same page.
+ *
+ * It could not be caught before, because `BotConfig` had only two variants. Now
+ * that it has three, this is an exhaustive `switch` and the `never` below makes
+ * the next strategy a compile error at exactly this line.
  */
 function plannedOrderSummary(bot: BotDetail): string | null {
   const config = bot.config;
   if (config === null) return null;
-  if (config.strategy === "dca") {
-    const asset = baseAssetOf(bot.pair, bot.capitalAsset);
-    return (
-      `a real buy worth ${formatMoney(config.params.baseOrderSize)} ${bot.capitalAsset} ` +
-      `of ${asset} (the base order)`
-    );
+  switch (config.strategy) {
+    case "dca": {
+      const asset = baseAssetOf(bot.pair, bot.capitalAsset);
+      return (
+        `a real buy worth ${formatMoney(config.params.baseOrderSize)} ${bot.capitalAsset} ` +
+        `of ${asset} (the base order)`
+      );
+    }
+    case "grid": {
+      const { gridLines, lowerBound, upperBound } = config.params;
+      return (
+        `its full ladder of ${gridLines} orders across ` +
+        `${formatMoney(lowerBound)} – ${formatMoney(upperBound)} ${bot.capitalAsset}`
+      );
+    }
+    case "trailing_stop": {
+      /*
+       * ONE order, sized by the whole allocation -- there is no order-size
+       * parameter to quote because 22.2 (consequence of decisions 1 and 4)
+       * gives the strategy none. The trail percentage is named too: it is the
+       * initial stop distance from entry, so it is part of what pressing this
+       * button commits to.
+       */
+      const asset = baseAssetOf(bot.pair, bot.capitalAsset);
+      return (
+        `a real buy worth ${formatMoney(bot.allocatedCapital)} ${bot.capitalAsset} of ${asset} ` +
+        `(the single entry), trailed ${formatPercent(config.params.trailPct)} below its high`
+      );
+    }
+    default: {
+      /*
+       * A strategy this build has no wording for. `null` is already the
+       * "cannot describe the order" answer this function is built around, and
+       * the dialog falls back to honest generic copy -- which is right here
+       * too: better an unspecific sentence than an invented one, and far
+       * better than a throw.
+       */
+      const unreachable: never = config;
+      void unreachable;
+      return null;
+    }
   }
-  const { gridLines, lowerBound, upperBound } = config.params;
-  return (
-    `its full ladder of ${gridLines} orders across ` +
-    `${formatMoney(lowerBound)} – ${formatMoney(upperBound)} ${bot.capitalAsset}`
-  );
 }
 
 /** Map a thrown `ApiError` (or any error) to its distinct, honest message. */

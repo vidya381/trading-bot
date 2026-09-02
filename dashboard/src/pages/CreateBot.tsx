@@ -142,7 +142,13 @@ import {
   fetchAccountSymbols,
   fetchBots,
 } from "../api/client";
-import type { Account, Bot, CreateBotRequest, ProposalLink, Strategy } from "../api/types";
+import type { Account, Bot, CreateBotRequest, ProposalLink } from "../api/types";
+
+/**
+ * The strategies this form can actually create: the discriminants of
+ * `CreateBotRequest`, and nothing else. See the `useState` that uses it.
+ */
+type CreatableStrategy = CreateBotRequest["strategy"];
 import { compareDecimal } from "../format";
 import { ProposalPrefillBanner } from "../components/ProposalPrefillBanner";
 import { CloneSourceBanner } from "../components/CloneSourceBanner";
@@ -851,7 +857,21 @@ export function CreateBot() {
   const gridPrefill = seed?.fields.strategy === "grid" ? seed.fields : null;
   const dcaPrefill = seed?.fields.strategy === "dca" ? seed.fields : null;
 
-  const [strategy, setStrategy] = useState<Strategy>(() => seed?.strategy ?? "dca");
+  /*
+   * ⚠ `CreatableStrategy`, NOT `Strategy`. The two diverged when `Strategy` grew
+   * its `trailing_stop` member (spec 22): the bot LIST and DETAIL pages must
+   * render every strategy that exists, but this form can only build the ones
+   * `CreateBotRequest` has a params shape for, and the toggle below offers
+   * exactly those. Deriving the type from the request rather than restating it
+   * means a strategy becomes selectable here only when the request it produces
+   * is real -- and until then the omission is a compile error, not a form that
+   * submits a body the backend has no branch for.
+   *
+   * The seed cannot widen it either: both prefill decoders refuse an
+   * unrecognised strategy outright (`isCloneStrategy`), so a clone link from a
+   * trailing-stop bot yields no prefill rather than a half-filled DCA form.
+   */
+  const [strategy, setStrategy] = useState<CreatableStrategy>(() => seed?.strategy ?? "dca");
 
   // Shared fields.
   const [botInstanceId, setBotInstanceId] = useState(generatedId);
@@ -1037,7 +1057,7 @@ export function CreateBot() {
     return () => controller.abort();
   }, [accountLabel, pairsReload]);
 
-  function switchStrategy(next: Strategy) {
+  function switchStrategy(next: CreatableStrategy) {
     if (next === strategy) return;
     setStrategy(next);
     // Clear cross-strategy validation noise and any stale outcome.
