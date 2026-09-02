@@ -89,7 +89,11 @@ describe("the policy", () => {
   it("has a threshold for every strategy and no extras", () => {
     // The runtime half of the type pin above: the object's real keys, so widening
     // the type without adding a number is caught here rather than at a call site.
-    expect(Object.keys(DEFAULT_STALENESS_POLICY.priceHistory).sort()).toEqual(["dca", "grid"]);
+    expect(Object.keys(DEFAULT_STALENESS_POLICY.priceHistory).sort()).toEqual([
+      "dca",
+      "grid",
+      "trailing_stop",
+    ]);
   });
 });
 
@@ -99,18 +103,29 @@ describe("priceThresholdFor", () => {
   it("returns the strategy's OWN threshold, not a fixed arm", () => {
     expect(priceThresholdFor("grid")).toBe(15 * MINUTE);
     expect(priceThresholdFor("dca")).toBe(60 * MINUTE);
+    expect(priceThresholdFor("trailing_stop")).toBe(60 * MINUTE);
     // Asserted as different rather than only as two values: a mutant that returns
-    // `priceHistory.grid` for both passes any test that checks only one of them.
+    // `priceHistory.grid` for every strategy passes any test that checks only one.
     expect(priceThresholdFor("grid")).not.toBe(priceThresholdFor("dca"));
+    expect(priceThresholdFor("grid")).not.toBe(priceThresholdFor("trailing_stop"));
+    /*
+     * ⚠ DCA AND TRAILING STOP DELIBERATELY SHARE A VALUE, so no distinctness
+     * assertion is available between those two -- and the reason is recorded
+     * rather than left as an apparent omission. Both have percentage-only
+     * parameters and one absolute quote size checked against the reference price
+     * (see `DEFAULT_STALENESS_POLICY`'s note). If they are ever separated, this
+     * is the line that should gain the assertion.
+     */
   });
 
   it("reads from an injected policy rather than the module constant", () => {
     const policy = {
       ...DEFAULT_STALENESS_POLICY,
-      priceHistory: { grid: 1_000, dca: 2_000 },
+      priceHistory: { grid: 1_000, dca: 2_000, trailing_stop: 3_000 },
     };
     expect(priceThresholdFor("grid", policy)).toBe(1_000);
     expect(priceThresholdFor("dca", policy)).toBe(2_000);
+    expect(priceThresholdFor("trailing_stop", policy)).toBe(3_000);
   });
 });
 

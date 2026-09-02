@@ -121,6 +121,7 @@ import { checkParamsShape } from "../../../src/research/proposal-shape";
 import {
   CREATE_BOT_PATH,
   WIRE_FIELDS,
+  isPrefillStrategy,
   type DcaPrefillFields,
   type GridPrefillFields,
   type PrefillFields,
@@ -241,6 +242,19 @@ export function cloneSearchParams(bot: BotDetail): URLSearchParams | null {
    */
   const shape = checkParamsShape({ ...config.params, strategy: config.strategy });
   if (!shape.ok) return null;
+  /*
+   * ⚠ A THIRD REFUSAL, AND IT IS NOT A SHAPE FAULT. `checkParamsShape` answers
+   * "are these params coherent for their own label", and a trailing-stop bot's
+   * are: `{ trailPct }` is exactly right. What it cannot answer is whether
+   * `/bots/new` has anywhere to PUT them, and it does not -- the form builds the
+   * two strategies `CreateBotRequest` has a params shape for.
+   *
+   * Refused here rather than encoded, because the alternative is silent: the
+   * decoder at the other end would reject the URL (`isCloneStrategy`) and the
+   * operator would land on a blank create form with no statement of why. A
+   * refusal at the link says it on the page they pressed it from.
+   */
+  if (!isPrefillStrategy(shape.strategy)) return null;
 
   const params = new URLSearchParams();
   params.set(KEY.cloneFrom, bot.id);
@@ -293,6 +307,51 @@ export function cloneSearchParams(bot: BotDetail): URLSearchParams | null {
 export function cloneBotHref(bot: BotDetail): string | null {
   const params = cloneSearchParams(bot);
   return params === null ? null : `${CREATE_BOT_PATH}?${params.toString()}`;
+}
+
+/**
+ * WHY a bot cannot be cloned, or `null` when it can.
+ *
+ * ── ⚠ THE WRONG MESSAGE THIS EXISTS TO STOP, WHICH WAS LIVE ON A REAL PAGE ──
+ *
+ * `CloneBotLink` had two refusal messages and inferred which to show from
+ * `bot.config === null`: no config meant "orphaned", and anything else meant "its
+ * stored parameters do not match the strategy they are labelled with".
+ *
+ * `bot-ts1` is a real trailing-stop bot whose parameters match its label
+ * perfectly. It got the second message, because `checkParamsShape` did not
+ * RECOGNISE `trailing_stop` at all and answered `strategy_not_recognised` — so
+ * the page told an operator their bot's configuration was incoherent when the
+ * actual reason was that `/bots/new` has no trailing-stop form. A refusal that
+ * names the wrong cause is worse than a refusal, because it sends someone to
+ * look for a corruption that is not there.
+ *
+ * Three causes, told apart HERE rather than guessed at in the component, so each
+ * has a message that is true and so the decision is one a test can reach (this
+ * module is React-free for exactly that reason).
+ */
+export type CloneRefusal =
+  /** The bot row exists but its Durable Object holds no state. Nothing to copy. */
+  | "no_config"
+  /**
+   * The params genuinely disagree with their own label, or the config's strategy
+   * disagrees with the row's. The original fault, and still a real one.
+   */
+  | "incoherent_config"
+  /**
+   * The config is FINE and this form cannot build it. A real strategy with no
+   * controls on `/bots/new` — `CreateBotRequest` has no params shape for it.
+   */
+  | "strategy_not_creatable";
+
+export function cloneRefusal(bot: BotDetail): CloneRefusal | null {
+  const config = bot.config;
+  if (config === null) return "no_config";
+  if (config.strategy !== bot.strategy) return "incoherent_config";
+  const shape = checkParamsShape({ ...config.params, strategy: config.strategy });
+  if (!shape.ok) return "incoherent_config";
+  if (!isPrefillStrategy(shape.strategy)) return "strategy_not_creatable";
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +414,17 @@ function spacingOf(params: URLSearchParams, incomplete: string[]): "arithmetic" 
   return "arithmetic";
 }
 
-/** A recognised strategy label, or null. Local rather than imported so this
- *  decoder's refusal does not depend on the proposal vocabulary's guard. */
+/**
+ * A strategy label this form can be filled from, or null.
+ *
+ * ⚠ IT DELIBERATELY DOES NOT ACCEPT EVERY REAL STRATEGY. `trailing_stop` is a
+ * genuine one and is still refused, for the reason `cloneSearchParams` refuses to
+ * encode one: the create-bot form has no controls for it. Kept as its own literal
+ * pair rather than delegating to `isPrefillStrategy`, so this decoder's refusal
+ * does not depend on the proposal vocabulary's guard -- the same independence the
+ * original comment claimed and the reason it was written out by hand. The two are
+ * asserted equal by `botClonePrefill.test.ts`.
+ */
 function isCloneStrategy(value: unknown): value is PrefillStrategy {
   return value === "grid" || value === "dca";
 }

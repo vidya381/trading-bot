@@ -216,5 +216,25 @@ function specsFor(params: ParamsRecord, strategy: ProposalStrategy): readonly Fi
           hint: "a stop-loss halts and holds the position",
         },
       ];
+    case "trailing_stop":
+      /*
+       * ONE FIELD, and the hint carries the fact a reviewer cannot get from the
+       * number: `trailPct` is BOTH the trail distance below the high-water mark
+       * and the initial stop distance from entry (22.2 decision 1). A bare
+       * "Trail %" would let a reviewer assume the position is unprotected until
+       * some first high is set.
+       *
+       * The absent order size is not rendered as a missing field, because it is
+       * not one: the single entry is sized by `allocatedCapital`, which
+       * `ProposalParameters` already prints above this list in its own block.
+       */
+      return [
+        {
+          field: "trailPct",
+          label: "Trail %",
+          value: percent(str(params.trailPct)),
+          hint: "below the high-water mark, and the initial stop below entry",
+        },
+      ];
   }
 }

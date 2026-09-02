@@ -41,6 +41,8 @@ import { CitationList } from "./ProposalCitations";
 const STRATEGY_DESCRIPTION: Readonly<Record<Strategy, string>> = {
   dca: "Repeated buys of a base size, adding further buys as the price drops by a configured step, exiting at a take-profit percentage. It accumulates into weakness and needs a directional recovery to realise profit.",
   grid: "Buy and sell orders placed at intervals across a bounded price range, profiting from movement back and forth inside it. It needs the price to stay within a range and to oscillate inside it.",
+  trailing_stop:
+    "A single entry sized by the whole allocation, exited when the price falls a configured percentage below the highest price seen since entry. It needs a sustained directional move to profit, and gives back that percentage of the peak on the way out.",
 };
 
 export function ProposalStrategy({

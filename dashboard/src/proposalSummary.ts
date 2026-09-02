@@ -153,6 +153,15 @@ export const HEADLINE_FIELDS: Readonly<Record<ProposalStrategy, readonly string[
   {
     grid: Object.freeze(["lowerBound", "upperBound", "orderSize"]),
     dca: Object.freeze(["baseOrderSize", "additionalOrderSize", "dropPct"]),
+    /*
+     * ⚠ ONE FIELD WHERE THE OTHERS HAVE THREE, AND IT IS THE WHOLE PARAMETER SET
+     * RATHER THAN A SELECTION. Trailing stop has exactly one parameter (22.2
+     * decision 1), so "the three that answer what shape of bot this is" is
+     * simply all of it -- the size question the other two answer with an order
+     * size is answered by `allocatedCapital`, which this card already carries
+     * separately for every strategy.
+     */
+    trailing_stop: Object.freeze(["trailPct"]),
   },
 );
 

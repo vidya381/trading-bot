@@ -34,28 +34,60 @@
 
 import { Link } from "react-router-dom";
 import type { BotDetail } from "../api/types";
-import { cloneBotHref } from "../research/botClonePrefill";
+import { cloneBotHref, cloneRefusal, type CloneRefusal } from "../research/botClonePrefill";
+import { strategyLabel } from "../strategyView";
+
+/**
+ * ⚠ THE THIRD REASON IS THE POINT, AND ITS ABSENCE WAS LIVE ON `bot-ts1`.
+ * The component used to infer the reason from `bot.config === null`, so every
+ * non-orphan refusal claimed the bot's parameters were incoherent — including a
+ * trailing-stop bot whose parameters are exactly right and which simply has no
+ * form to be built in. `cloneRefusal` decides; this only words it.
+ */
+function refusalText(reason: CloneRefusal, bot: BotDetail) {
+  switch (reason) {
+    case "no_config":
+      return (
+        <>
+          This bot cannot be cloned, because there is no configuration to copy. Its row exists but
+          its object holds no state, so the parameters a new bot would start from are not recorded
+          anywhere.
+        </>
+      );
+    case "incoherent_config":
+      return (
+        <>
+          This bot cannot be cloned, because there is no configuration to copy. Its stored
+          parameters do not match the strategy they are labelled with, so there is nothing
+          coherent to put in a form.
+        </>
+      );
+    case "strategy_not_creatable":
+      return (
+        <>
+          This bot cannot be cloned yet, and{" "}
+          <strong className="text-zinc-300">its configuration is fine</strong> — the create-bot
+          form simply has no controls for the{" "}
+          <span className="font-medium">{strategyLabel(bot.strategy)}</span> strategy, so there is
+          nowhere to put the values. Nothing is wrong with this bot.
+        </>
+      );
+  }
+}
 
 export function CloneBotLink({ bot }: { bot: BotDetail }) {
   const href = cloneBotHref(bot);
+  const reason = cloneRefusal(bot);
 
-  if (href === null) {
+  if (href === null || reason !== null) {
     return (
       <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
         <h2 className="text-base font-semibold text-zinc-200">Clone</h2>
         <p className="mt-2 text-sm leading-relaxed text-zinc-400">
-          This bot cannot be cloned, because there is no configuration to copy.{" "}
-          {bot.config === null ? (
-            <>
-              Its row exists but its object holds no state, so the parameters a new bot would
-              start from are not recorded anywhere.
-            </>
-          ) : (
-            <>
-              Its stored parameters do not match the strategy they are labelled with, so there is
-              nothing coherent to put in a form.
-            </>
-          )}{" "}
+          {/* `?? "incoherent_config"` is unreachable: `cloneBotHref` is null for
+              exactly the cases `cloneRefusal` names. Written rather than
+              asserted so the narrowing is the compiler's. */}
+          {refusalText(reason ?? "incoherent_config", bot)}{" "}
           The create-bot form is still reachable on its own and can be filled in by hand.
         </p>
       </section>

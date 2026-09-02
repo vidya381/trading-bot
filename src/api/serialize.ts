@@ -63,6 +63,7 @@ import type {
   AccountCapital,
   ParsedAssessment,
   ProposalRecord,
+  ValidatedProposal,
   WatchlistEntry,
 } from "../research";
 import type { Candle } from "../shared/exchange-client";
@@ -1012,6 +1013,122 @@ export function resubmittedAssessmentView(assessment: ParsedAssessment) {
 }
 
 /**
+ * ONE STRATEGY'S RENDERED PARAMETERS, as they go on the wire.
+ *
+ * Named and annotated rather than inferred, for two reasons that both bit this
+ * function: it is the shape `proposal-shape.ts` checks a pasted document against
+ * and the shape the dashboard's `research-types.ts` hand-mirrors, so it deserves
+ * to exist as a type someone can point a parity pin at -- and an explicit return
+ * annotation is what makes a missing `case` below a COMPILE ERROR (TS2366)
+ * rather than an inferred `| undefined` nobody reads.
+ */
+export type ProposalParamsView =
+  | {
+      readonly strategy: "grid";
+      readonly upperBound: string;
+      readonly lowerBound: string;
+      readonly gridLines: number;
+      readonly spacing: "arithmetic" | "geometric";
+      readonly orderSize: string;
+      readonly stopLossPct: string;
+      readonly breakoutTakeProfit: boolean;
+      readonly breakoutThresholdPct: string | null;
+      readonly takeProfitAmount: string | null;
+    }
+  | {
+      readonly strategy: "dca";
+      readonly baseOrderSize: string;
+      readonly additionalOrderSize: string;
+      readonly stepMultiplier: string;
+      readonly dropPct: string;
+      readonly maxAdditionalBuys: number;
+      readonly takeProfitPct: string;
+      readonly stopLossPct: string;
+      readonly autoRestart: boolean;
+      readonly sellOnStopLoss: boolean;
+    }
+  | {
+      /**
+       * Spec 22. ONE FIELD, and that is the entire parameter set (22.2 decision
+       * 1): `trailPct` is both the trail distance below the high-water mark and
+       * the initial stop distance from entry. There is deliberately no order
+       * size -- the single entry is sized by `allocatedCapital` (22.2, the
+       * consequence of decisions 1 and 4), which this view already publishes
+       * beside `params`.
+       */
+      readonly strategy: "trailing_stop";
+      readonly trailPct: string;
+    };
+
+/**
+ * ⚠ THE STRATEGY-CONDITIONAL SEAM, AND IT USED TO BE A TERNARY THAT LIED.
+ *
+ * This read `params.strategy === "grid" ? {grid fields} : {dca fields}` -- the
+ * same unstated "everything that is not grid is DCA" claim that took the bot
+ * detail page to a blank screen for `bot-ts1`. It is the identical bug class in
+ * the identical shape: `ValidatedProposal["params"]` has had a `trailing_stop`
+ * arm since 22.4 touchpoint 8 (`decodeWithRealDecoder` decodes one, and
+ * `validatorNamesFor` is already exhaustive over all three), so a trailing-stop
+ * proposal reached the `else` and this function read `baseOrderSize` and eight
+ * other DCA fields off a `{ trailPct }` object.
+ *
+ * WHAT THAT DOES AT RUNTIME, precisely, because it is NOT the dashboard's
+ * failure: `money(undefined)` is `toDecimalString(undefined)`, which throws
+ * `TypeError: Cannot mix BigInt and other types, use explicit conversions` from
+ * inside the Worker. This function is called by `deriveResultView` ->
+ * `deriveProposalReasoningView` at handlers.ts, BEFORE `logDeriveProposal`
+ * writes the row -- so `POST /api/proposals/run` would 500 with two paid
+ * inferences already spent and NO permanent record written. There is no blank
+ * page because the response never gets built; the failure is a 500 and a
+ * silently lost proposal.
+ *
+ * An exhaustive `switch` with an annotated return type and NO `default`, which
+ * is the convention this codebase already uses at every other strategy seam
+ * (`proposalFieldsFor`, `deriveFieldsFor`, `fieldContractFor`,
+ * `validatorNamesFor`, `decoderNameFor`). A fourth strategy fails to compile
+ * HERE, at the line that would otherwise misroute it.
+ *
+ * No runtime `default` arm, and that is a deliberate difference from
+ * `dashboard/src/strategyView.ts`'s otherwise identical fix. The dashboard needs
+ * one because its input crosses a network seam from a Worker that may be a
+ * deploy ahead of it. This input does not cross anything: `params` was produced
+ * by `decodeWithRealDecoder` in this same request, from this same build, so a
+ * strategy the compiler has not heard of cannot arrive here.
+ */
+function proposalParamsView(params: ValidatedProposal["params"]): ProposalParamsView {
+  switch (params.strategy) {
+    case "grid":
+      return {
+        strategy: "grid",
+        upperBound: money(params.value.upperBound),
+        lowerBound: money(params.value.lowerBound),
+        gridLines: params.value.gridLines,
+        spacing: params.value.spacing,
+        orderSize: money(params.value.orderSize),
+        stopLossPct: money(params.value.stopLossPct),
+        breakoutTakeProfit: params.value.breakoutTakeProfit,
+        breakoutThresholdPct: moneyOrNull(params.value.breakoutThresholdPct),
+        takeProfitAmount: moneyOrNull(params.value.takeProfitAmount),
+      };
+    case "dca":
+      return {
+        strategy: "dca",
+        baseOrderSize: money(params.value.baseOrderSize),
+        additionalOrderSize: money(params.value.additionalOrderSize),
+        stepMultiplier: money(params.value.stepMultiplier),
+        dropPct: money(params.value.dropPct),
+        maxAdditionalBuys: params.value.maxAdditionalBuys,
+        takeProfitPct: money(params.value.takeProfitPct),
+        stopLossPct: money(params.value.stopLossPct),
+        autoRestart: params.value.autoRestart,
+        sellOnStopLoss: params.value.sellOnStopLoss,
+      };
+    case "trailing_stop":
+      return { strategy: "trailing_stop", trailPct: money(params.value.trailPct) };
+  }
+}
+
+/**
  * The validated parameter set, rendered so every number sits beside the ids it
  * was drawn from.
  *
@@ -1026,32 +1143,7 @@ export function resubmittedAssessmentView(assessment: ParsedAssessment) {
  * leave them to look each one up, which is the same as not shipping them.
  */
 export function validatedProposalView(result: DeriveResult) {
-  const params =
-    result.proposal.params.strategy === "grid"
-      ? {
-          strategy: "grid" as const,
-          upperBound: money(result.proposal.params.value.upperBound),
-          lowerBound: money(result.proposal.params.value.lowerBound),
-          gridLines: result.proposal.params.value.gridLines,
-          spacing: result.proposal.params.value.spacing,
-          orderSize: money(result.proposal.params.value.orderSize),
-          stopLossPct: money(result.proposal.params.value.stopLossPct),
-          breakoutTakeProfit: result.proposal.params.value.breakoutTakeProfit,
-          breakoutThresholdPct: moneyOrNull(result.proposal.params.value.breakoutThresholdPct),
-          takeProfitAmount: moneyOrNull(result.proposal.params.value.takeProfitAmount),
-        }
-      : {
-          strategy: "dca" as const,
-          baseOrderSize: money(result.proposal.params.value.baseOrderSize),
-          additionalOrderSize: money(result.proposal.params.value.additionalOrderSize),
-          stepMultiplier: money(result.proposal.params.value.stepMultiplier),
-          dropPct: money(result.proposal.params.value.dropPct),
-          maxAdditionalBuys: result.proposal.params.value.maxAdditionalBuys,
-          takeProfitPct: money(result.proposal.params.value.takeProfitPct),
-          stopLossPct: money(result.proposal.params.value.stopLossPct),
-          autoRestart: result.proposal.params.value.autoRestart,
-          sellOnStopLoss: result.proposal.params.value.sellOnStopLoss,
-        };
+  const params = proposalParamsView(result.proposal.params);
 
   return {
     params,

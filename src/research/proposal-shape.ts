@@ -72,16 +72,25 @@
  */
 
 /**
- * The two strategies (spec section 6), as this file's own literal rather than an
- * import -- see the module header on why nothing is imported here.
+ * Every strategy (spec sections 6 and 22), as this file's own literal rather than
+ * an import -- see the module header on why nothing is imported here.
  *
  * PINNED TO `StrategyType` (`/src/db/schema.ts`) BY A TWO-WAY TYPE ASSERTION IN
  * `proposal-shape.test.ts`, not by this comment. `staleness.ts` carries its own
  * copy of the same union for the same reason and is pinned the same way; both are
- * two-member literals whose whole cost is one assertion each, and a third shared
+ * short literals whose whole cost is one assertion each, and a third shared
  * dependency-free file to hold one union would be worse than either.
+ *
+ * ⚠ `trailing_stop` IS HERE BECAUSE `validatedProposalView` CAN NOW EMIT ONE.
+ * It had been left at two members while the view's own union grew a third arm,
+ * and the pin above was consequently a standing `tsc` error rather than a guard.
+ * Leaving it at two would have been worse than the crash it was written for:
+ * `checkParamsShape` would answer `strategy_not_recognised` for a PERFECTLY VALID
+ * trailing-stop proposal, and the page would raise a red "do not act on this"
+ * banner over a genuine response -- a false alarm on real data, which is the one
+ * failure a guard must never produce.
  */
-export const PROPOSAL_STRATEGIES = ["grid", "dca"] as const;
+export const PROPOSAL_STRATEGIES = ["grid", "dca", "trailing_stop"] as const;
 
 export type ProposalStrategy = (typeof PROPOSAL_STRATEGIES)[number];
 
@@ -122,12 +131,31 @@ export const DCA_PROPOSAL_FIELDS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * Trailing stop's rendered parameter field. ONE, and that is the whole set (22.2
+ * decision 1): `trailPct` is both the trail distance below the high-water mark
+ * and the initial stop distance from entry.
+ *
+ * ⚠ A ONE-FIELD LIST IS A WEAKER CHECK THAN THE OTHER TWO, AND SAYING SO IS THE
+ * POINT. `satisfies` asks whether every required field is present, so this list
+ * is satisfied by anything carrying a `trailPct`. What still does the work here
+ * is the EXACTNESS rule below -- `unexpected` is measured against this list, so a
+ * document carrying `trailPct` PLUS a strategy's worth of other fields is
+ * refused, which is the merged-response fault this module already refuses for
+ * grid and dca.
+ *
+ * There is deliberately no order size to render: the single entry is sized by
+ * `allocatedCapital`, which the view publishes beside `params` (22.2, the
+ * consequence of decisions 1 and 4).
+ */
+export const TRAILING_STOP_PROPOSAL_FIELDS: readonly string[] = Object.freeze(["trailPct"]);
+
+/**
  * THE STRATEGY-CONDITIONAL SEAM. One function, so there is one place a wrong
  * answer can come from and one place a test can pin.
  *
  * An exhaustive switch rather than a lookup with a default, for
- * `deriveFieldsFor`'s stated reason: a third strategy must fail to COMPILE here
- * rather than silently receive one of these two lists.
+ * `deriveFieldsFor`'s stated reason: a fourth strategy must fail to COMPILE here
+ * rather than silently receive one of these three lists.
  */
 export function proposalFieldsFor(strategy: ProposalStrategy): readonly string[] {
   switch (strategy) {
@@ -135,6 +163,8 @@ export function proposalFieldsFor(strategy: ProposalStrategy): readonly string[]
       return GRID_PROPOSAL_FIELDS;
     case "dca":
       return DCA_PROPOSAL_FIELDS;
+    case "trailing_stop":
+      return TRAILING_STOP_PROPOSAL_FIELDS;
   }
 }
 
@@ -201,6 +231,15 @@ function satisfies(params: Record<string, unknown>, fields: readonly string[]): 
   return fields.every((field) => hasField(params, field));
 }
 
+/** `strategy` when the object carries that strategy's whole field list, else null. */
+function shapeOf(
+  params: Record<string, unknown>,
+  fields: readonly string[],
+  strategy: ProposalStrategy,
+): ProposalStrategy | null {
+  return satisfies(params, fields) ? strategy : null;
+}
+
 /**
  * A field counts as present when the key EXISTS and its value is not `undefined`.
  *
@@ -245,25 +284,32 @@ export function checkParamsShape(params: unknown): ParamsShapeCheck {
     (key) => key !== "strategy" && record[key] !== undefined,
   );
 
-  // Computed for BOTH strategies before the label is consulted, so the answer to
+  // Computed for EVERY strategy before the label is consulted, so the answer to
   // "what is this object actually shaped like" is independent of what it claims.
-  const looksLike: ProposalStrategy | null = satisfies(record, GRID_PROPOSAL_FIELDS)
-    ? "grid"
-    : satisfies(record, DCA_PROPOSAL_FIELDS)
-      ? "dca"
-      : null;
+  //
+  // ⚠ ORDER MATTERS NOW THAT THERE ARE THREE, and `PROPOSAL_STRATEGIES`' order is
+  // load-bearing rather than incidental: `satisfies` accepts a SUPERSET, and
+  // trailing stop's single-field list is satisfied by a great many objects. Grid
+  // and dca are therefore asked first, so a grid document that happens to carry a
+  // `trailPct` is still reported as grid-shaped. `looksLike` is a DIAGNOSIS
+  // ("this object is grid-shaped and labelled dca"), never the verdict -- the
+  // verdict is the exact-field comparison below.
+  const looksLike: ProposalStrategy | null =
+    shapeOf(record, GRID_PROPOSAL_FIELDS, "grid") ??
+    shapeOf(record, DCA_PROPOSAL_FIELDS, "dca") ??
+    shapeOf(record, TRAILING_STOP_PROPOSAL_FIELDS, "trailing_stop");
 
   const claimed: unknown = record["strategy"];
   if (!isProposalStrategy(claimed)) {
     // No claimed strategy to compare against, so "extra" can only mean "outside
     // both lists" here. Said in the message rather than left to be inferred.
-    const union = new Set([...GRID_PROPOSAL_FIELDS, ...DCA_PROPOSAL_FIELDS]);
+    const union = new Set(PROPOSAL_STRATEGIES.flatMap((s) => [...proposalFieldsFor(s)]));
     return {
       ok: false,
       code: "strategy_not_recognised",
       message:
-        `This proposal's params claim a strategy of ${describe(claimed)}, which is not one of the ` +
-        `two this system has (${PROPOSAL_STRATEGIES.join(", ")}). ` +
+        `This proposal's params claim a strategy of ${describe(claimed)}, which is not one this ` +
+        `system has (${PROPOSAL_STRATEGIES.join(", ")}). ` +
         (looksLike === null
           ? `Its fields do not match either strategy's, so nothing here can be rendered safely.`
           : `Its fields ARE exactly ${looksLike}'s, so the label is the part that is wrong.`) +
@@ -288,10 +334,23 @@ export function checkParamsShape(params: unknown): ParamsShapeCheck {
     return { ok: true, strategy: claimed };
   }
 
-  const other: ProposalStrategy = claimed === "grid" ? "dca" : "grid";
-  const otherFields = new Set(proposalFieldsFor(other));
+  /*
+   * ⚠ THIS WAS `claimed === "grid" ? "dca" : "grid"` -- a third instance of the
+   * same two-strategy assumption this whole change is about, in the module
+   * written to catch that class of fault. It is now a search over every OTHER
+   * strategy, so the "this document describes two bots at once" diagnosis works
+   * for any pair rather than only for the original two.
+   *
+   * `null` when no other strategy's field set is fully present, which is the
+   * ordinary case and falls through to the generic extras wording below.
+   */
+  const other: ProposalStrategy | null =
+    PROPOSAL_STRATEGIES.find(
+      (candidate) => candidate !== claimed && satisfies(record, proposalFieldsFor(candidate)),
+    ) ?? null;
+  const otherFields = new Set(other === null ? [] : proposalFieldsFor(other));
   const extrasAreTheOthers =
-    unexpected.length > 0 && unexpected.every((field) => otherFields.has(field));
+    other !== null && unexpected.length > 0 && unexpected.every((field) => otherFields.has(field));
 
   // Three genuinely different faults, described differently, because "9 fields are
   // missing" is true and useless next to "this object is grid-shaped and labelled
@@ -304,9 +363,9 @@ export function checkParamsShape(params: unknown): ParamsShapeCheck {
       `print blanks or nonsense for every field.`;
   } else if (missing.length === 0) {
     diagnosis = extrasAreTheOthers
-      ? `Every field a ${claimed} proposal needs is present, but so is a complete set of ${other}'s ` +
+      ? `Every field a ${claimed} proposal needs is present, but so is a complete set of ${other!}'s ` +
         `-- this object describes two different bots at once, which is what merging two responses ` +
-        `produces. Rendering it as ${claimed} would silently drop the ${other} half.`
+        `produces. Rendering it as ${claimed} would silently drop the ${other!} half.`
       : `Every field a ${claimed} proposal needs is present, but it also carries ` +
         `${unexpected.length} field(s) that no ${claimed} proposal has, so this is not the object a ` +
         `real response produces.`;

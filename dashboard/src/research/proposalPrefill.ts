@@ -118,19 +118,47 @@ import {
 import {
   checkParamsShape,
   isProposalStrategy,
-  type ProposalStrategy,
 } from "../../../src/research/proposal-shape";
 
 /** The create-bot route, in one place so the link and the tests cannot disagree. */
 export const CREATE_BOT_PATH = "/bots/new";
 
 /**
- * The two strategies, reusing the backend's own guard rather than a third copy of
- * the union. `proposal-shape.ts` is dependency-free precisely so both toolchains
- * can compile it, and its `isProposalStrategy` is already the runtime test for a
- * label that arrived as untrusted text.
+ * THE STRATEGIES THE CREATE-BOT FORM CAN BE PREFILLED FOR.
+ *
+ * ⚠ THIS WAS `= ProposalStrategy`, AND THE TWO HAVE NOW GENUINELY DIVERGED.
+ * `ProposalStrategy` answers "what can a proposal be about", and it gained
+ * `trailing_stop` when `validatedProposalView` learned to emit one. This answers
+ * a different question -- "what can `/bots/new` actually build" -- and the answer
+ * is still the two strategies `CreateBotRequest` has a params shape for. The form
+ * has no trailing-stop controls and `POST /api/bots` has no branch for one.
+ *
+ * Aliasing them was correct while both unions were the same two members and
+ * silently wrong the moment one grew. Written out as its own literal, with its
+ * own guard below, so the divergence is stated rather than inherited -- and so a
+ * prefill URL naming a strategy the form cannot build is refused at the decoder
+ * instead of half-filling a form.
+ *
+ * It is deliberately NOT pinned to `CreateBotRequest["strategy"]` by an import:
+ * this module is one of the two the dashboard shares across the `tsc` seam. The
+ * agreement is pinned by a test instead, the same way every other mirror here is.
  */
-export type PrefillStrategy = ProposalStrategy;
+export const PREFILL_STRATEGIES = ["grid", "dca"] as const;
+
+export type PrefillStrategy = (typeof PREFILL_STRATEGIES)[number];
+
+/**
+ * A label the create-bot form can actually be filled from.
+ *
+ * Narrower than `isProposalStrategy` on purpose, and the narrowing is the guard:
+ * a `trailing_stop` label is a REAL strategy that this form cannot build, so it
+ * is refused here rather than passed through to a form with no controls for it.
+ */
+export function isPrefillStrategy(value: unknown): value is PrefillStrategy {
+  return (
+    isProposalStrategy(value) && (PREFILL_STRATEGIES as readonly string[]).includes(value)
+  );
+}
 
 // ---------------------------------------------------------------------------
 // The mapped form values
@@ -411,7 +439,16 @@ const DCA_WIRE_FIELDS: readonly string[] = [
 ];
 
 /** Exposed for the test that pins them against the backend's own lists. */
-export const WIRE_FIELDS = Object.freeze({ grid: GRID_WIRE_FIELDS, dca: DCA_WIRE_FIELDS });
+/**
+ * Keyed by `PrefillStrategy`, NOT by `ProposalStrategy`, and the annotation is
+ * what says so. There is no trailing-stop entry because there is no
+ * trailing-stop form to fill; a strategy is refused before this is indexed
+ * (`isPrefillStrategy`), rather than indexed and found undefined.
+ */
+export const WIRE_FIELDS: Readonly<Record<PrefillStrategy, readonly string[]>> = Object.freeze({
+  grid: GRID_WIRE_FIELDS,
+  dca: DCA_WIRE_FIELDS,
+});
 
 // ---------------------------------------------------------------------------
 // Decoding: what /bots/new reads
@@ -501,7 +538,9 @@ export function readProposalPrefill(params: URLSearchParams): ProposalPrefill | 
   if (proposalId === null || proposalId.trim() === "") return null;
 
   const rawStrategy = params.get(KEY.strategy);
-  if (!isProposalStrategy(rawStrategy)) return null;
+  // `isPrefillStrategy`, not `isProposalStrategy`: a trailing-stop proposal is a
+  // real proposal, and still not something this form can be filled from.
+  if (!isPrefillStrategy(rawStrategy)) return null;
 
   const incomplete: string[] = [];
   const unrepresentable: string[] = [];

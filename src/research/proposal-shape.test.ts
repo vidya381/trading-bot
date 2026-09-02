@@ -30,16 +30,19 @@ import type { StrategyType } from "../db/schema";
 import { validatedProposalView } from "../api/serialize";
 import { fromDecimalString as m } from "../shared/money";
 import { DCA_DERIVE_FIELDS, GRID_DERIVE_FIELDS } from "./derive-prompt";
+import { DERIVE_MODEL_SETTINGS } from "./derive";
 import type { DeriveResult } from "./derive";
 import {
   DCA_PROPOSAL_FIELDS,
   GRID_PROPOSAL_FIELDS,
   PROPOSAL_STRATEGIES,
+  TRAILING_STOP_PROPOSAL_FIELDS,
   checkParamsShape,
   isProposalStrategy,
   proposalFieldsFor,
   type ProposalStrategy,
 } from "./proposal-shape";
+import type { ValidatedProposal } from "./derive-parse";
 
 /**
  * ⚠ THE TWO-WAY TYPE PIN the module header promises.
@@ -102,36 +105,53 @@ const DCA_PARAMS = {
  * that answers dca -- not a fixture. Tracked separately.
  */
 function deriveResultFor(strategy: ProposalStrategy): DeriveResult {
-  const params =
-    strategy === "grid"
-      ? {
-          strategy: "grid" as const,
-          value: {
-            upperBound: m("108"),
-            lowerBound: m("96"),
-            gridLines: 5,
-            spacing: "arithmetic" as const,
-            orderSize: m("50"),
-            stopLossPct: m("5"),
-            breakoutTakeProfit: true,
-            breakoutThresholdPct: null,
-            takeProfitAmount: null,
-          },
-        }
-      : {
-          strategy: "dca" as const,
-          value: {
-            baseOrderSize: m("100"),
-            additionalOrderSize: m("100"),
-            stepMultiplier: m("1.5"),
-            dropPct: m("5"),
-            maxAdditionalBuys: 2,
-            takeProfitPct: m("2"),
-            stopLossPct: m("20"),
-            autoRestart: false,
-            sellOnStopLoss: false,
-          },
-        };
+  /*
+   * ⚠ A RECORD KEYED BY `ProposalStrategy`, NOT THE TERNARY THIS USED TO BE.
+   * The ternary was `strategy === "grid" ? {grid} : {dca}` -- the same "everything
+   * that is not grid is DCA" shape as the bug in `validatedProposalView` that PIN
+   * TWO below exists to catch. A fixture built that way cannot test the fix: it
+   * would have handed the view a DCA params object while asking for a
+   * trailing-stop one, and PIN TWO would have compared DCA's keys against
+   * trailing stop's list and failed for the wrong reason. Keyed by the union, a
+   * missing strategy is a compile error here too.
+   */
+  const params: Readonly<Record<ProposalStrategy, ValidatedProposal["params"]>> = {
+    grid: {
+      strategy: "grid",
+      value: {
+        upperBound: m("108"),
+        lowerBound: m("96"),
+        gridLines: 5,
+        spacing: "arithmetic",
+        orderSize: m("50"),
+        stopLossPct: m("5"),
+        breakoutTakeProfit: true,
+        breakoutThresholdPct: null,
+        takeProfitAmount: null,
+      },
+    },
+    dca: {
+      strategy: "dca",
+      value: {
+        baseOrderSize: m("100"),
+        additionalOrderSize: m("100"),
+        stepMultiplier: m("1.5"),
+        dropPct: m("5"),
+        maxAdditionalBuys: 2,
+        takeProfitPct: m("2"),
+        stopLossPct: m("20"),
+        autoRestart: false,
+        sellOnStopLoss: false,
+      },
+    },
+    /*
+     * ONE FIELD, which is the entire parameter set (22.2 decision 1). This is the
+     * exact object that reached `validatedProposalView`'s `else` branch and had
+     * nine DCA fields read off it, throwing `TypeError: Cannot mix BigInt and
+     * other types` out of `money(undefined)`.
+     */
+    trailing_stop: { strategy: "trailing_stop", value: { trailPct: m("10") } },
+  };
 
   const evidence = {
     id: "candles.last_close",
@@ -147,7 +167,7 @@ function deriveResultFor(strategy: ProposalStrategy): DeriveResult {
       // off the proposal rather than off the result -- filled properly rather than
       // cast away, so this fixture is a real one.
       strategy,
-      params,
+      params: params[strategy],
       allocatedCapital: m("400"),
       capitalAsset: "USD",
       availableAtProposal: m("10000"),
@@ -426,6 +446,40 @@ describe("the field lists are the backend's own, not a re-typed copy", () => {
     expect([...DCA_PROPOSAL_FIELDS]).toEqual([...DCA_DERIVE_FIELDS]);
   });
 
+  it("⚠ PIN ONE COVERS TWO OF THREE STRATEGIES, and this is the tripwire for the third", () => {
+    /*
+     * ⚠ THERE IS NO `TRAILING_STOP_DERIVE_FIELDS` TO PIN AGAINST, AND THAT IS A
+     * REAL GAP RATHER THAN AN OVERSIGHT IN THIS TEST.
+     *
+     * `TRAILING_STOP_PROPOSAL_FIELDS` describes what `validatedProposalView`
+     * EMITS, which is now a settled shape. Spec 21.4 Stage 3's other half -- what
+     * the MODEL IS ASKED FOR -- does not exist for this strategy: `deriveFieldsFor`
+     * and `fieldContractFor` have no trailing-stop arm and `DERIVE_MODEL_SETTINGS`
+     * has no entry, so no trailing-stop proposal can currently be produced at all.
+     * Writing that contract means writing model-facing prose that shapes a paid
+     * inference, against 22.5's open questions; it is not a rendering fix and is
+     * deliberately not invented here.
+     *
+     * So this asserts the ABSENCE, which makes the gap a tracked fact instead of a
+     * silent one. THE MOMENT SOMEONE ADDS THE PROMPT CONTRACT, THIS TEST FAILS and
+     * points at PIN ONE above, which must then gain its third line. That is the
+     * whole reason it is written as an assertion rather than a comment.
+     */
+    expect(DERIVE_MODEL_SETTINGS).not.toHaveProperty("trailing_stop");
+    // And the emitted-shape list stands on its own meanwhile, pinned by PIN TWO.
+    expect([...TRAILING_STOP_PROPOSAL_FIELDS]).toEqual(["trailPct"]);
+  });
+
+  it("trailing stop shares no field with either of the other two", () => {
+    // The conditional design holding: `trailPct` is this strategy's alone, and a
+    // list that grew to overlap the others would be the signature of the design
+    // collapsing into a universal one -- the same property the next test checks
+    // for the original pair.
+    for (const other of [GRID_PROPOSAL_FIELDS, DCA_PROPOSAL_FIELDS]) {
+      expect(TRAILING_STOP_PROPOSAL_FIELDS.filter((f) => other.includes(f))).toEqual([]);
+    }
+  });
+
   it("intersects in exactly stopLossPct, the one field both strategies require", () => {
     // The same assertion `derive-prompt.test.ts` makes, for the same reason: a
     // growing intersection is the signature of the conditional design collapsing
@@ -435,12 +489,14 @@ describe("the field lists are the backend's own, not a re-typed copy", () => {
   });
 
   it("has a list for every strategy and no extras", () => {
-    expect([...PROPOSAL_STRATEGIES]).toEqual(["grid", "dca"]);
+    expect([...PROPOSAL_STRATEGIES]).toEqual(["grid", "dca", "trailing_stop"]);
     expect(proposalFieldsFor("grid")).toBe(GRID_PROPOSAL_FIELDS);
     expect(proposalFieldsFor("dca")).toBe(DCA_PROPOSAL_FIELDS);
+    expect(proposalFieldsFor("trailing_stop")).toBe(TRAILING_STOP_PROPOSAL_FIELDS);
     // Frozen, so nothing can extend a list at runtime.
     expect(Object.isFrozen(GRID_PROPOSAL_FIELDS)).toBe(true);
     expect(Object.isFrozen(DCA_PROPOSAL_FIELDS)).toBe(true);
+    expect(Object.isFrozen(TRAILING_STOP_PROPOSAL_FIELDS)).toBe(true);
   });
 
   it("⚠ PIN TWO, AND THE ONE THAT MATTERS: matches the key set `validatedProposalView` really emits", () => {

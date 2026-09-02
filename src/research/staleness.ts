@@ -115,14 +115,15 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 /**
- * The two strategies, as this file's own keys rather than an import.
+ * Every strategy, as this file's own keys rather than an import.
  *
  * PINNED TO `StrategyType` (`/src/db/schema.ts`) BY A TWO-WAY TYPE ASSERTION IN
  * `staleness.test.ts`, not by this comment -- see the module header on why the
- * import is deliberately absent. A third strategy added to `StrategyType` without
- * a threshold here is a compile error in that test, which is the point.
+ * import is deliberately absent. A strategy added to `StrategyType` without a
+ * threshold here is a compile error in that test, which is the point -- and it
+ * WAS one, standing unfixed, until `trailing_stop` was added below.
  */
-export type StalenessStrategy = "grid" | "dca";
+export type StalenessStrategy = "grid" | "dca" | "trailing_stop";
 
 /**
  * How old each of the four real inputs may be before a proposal resting on it is
@@ -237,11 +238,37 @@ export interface StalenessPolicy {
  * JUST AS WELL. What the pair encodes is the ORDERING and the rough RATIO, and
  * those are the parts the reasoning above actually supports. The absolute values
  * are the parts it does not.
+ *
+ * ── TRAILING STOP: 1 HOUR, PLACED WITH DCA AND NOT WITH GRID ──
+ *
+ * ⚠ THIS IS A NEW JUDGEMENT CALL, ARRIVED AT BY APPLYING THE TEST ABOVE RATHER
+ * THAN BY MEASURING ANYTHING, AND IT DESERVES AN OPERATOR'S REVIEW LIKE THE
+ * OTHER TWO. The question this file asks is whether a strategy's parameters name
+ * an ABSOLUTE PRICE, and trailing stop's answer is the same as DCA's:
+ *
+ *   * `trailPct` is a PERCENTAGE, and the only parameter there is (22.2 decision
+ *     1). It is applied to the high-water mark -- a price discovered AT RUNTIME,
+ *     after the bot is created -- and, before any high is set, to the price the
+ *     single entry actually FILLS AT. Nothing in `TrailingStopParams` is
+ *     denominated against the proposal's price window, which is precisely what
+ *     makes grid's threshold four times tighter.
+ *   * ⚠ IT IS STILL NOT PRICE-INDEPENDENT, for DCA's exact reason. The single
+ *     entry is sized by `allocatedCapital`, an absolute quote amount, and
+ *     `derive-parse.ts`'s minimum-order check evaluates it at the newest real
+ *     close. An hour-old window can put the implied quantity on the other side of
+ *     the venue's floor -- with the same backstop DCA has, `validateOrder`'s
+ *     filter check at order time.
+ *
+ * So it takes DCA's hour, and for DCA's stated reasons rather than by analogy.
+ * What would move it is evidence about how a trail behaves across a stale window,
+ * which this project does not have: `bot-ts1`, the only trailing-stop bot ever
+ * run, never filled its entry (decision log 86).
  */
 export const DEFAULT_STALENESS_POLICY: StalenessPolicy = Object.freeze({
   priceHistory: Object.freeze({
     grid: 15 * MINUTE_MS,
     dca: 60 * MINUTE_MS,
+    trailing_stop: 60 * MINUTE_MS,
   }),
   capitalLedger: 1 * HOUR_MS,
   botList: 1 * DAY_MS,

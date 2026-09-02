@@ -37,10 +37,15 @@ import {
   CLONE_KEYS,
   CREATE_BOT_PATH,
   cloneBotHref,
+  cloneRefusal,
   cloneSearchParams,
   readBotClonePrefill,
 } from "./botClonePrefill";
 import { readProposalPrefill, WIRE_FIELDS } from "./proposalPrefill";
+// Section 7 asserts that a trailing-stop config PASSES the backend's shape check,
+// which is the fact the old refusal message contradicted. Imported from the
+// backend directly, the same crossing `botClonePrefill.ts` itself makes.
+import { checkParamsShape } from "../../../src/research/proposal-shape";
 
 // ---------------------------------------------------------------------------
 // Fixtures -- the shape `GET /api/bots/:id` really returns
@@ -685,5 +690,81 @@ describe("a bot with no readable configuration offers no link", () => {
      */
     const bot = botFixture("grid");
     expect(cloneBotHref({ ...bot, strategy: "dca" } as BotDetail)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. ⚠ WHY a bot cannot be cloned, which the page used to get WRONG
+// ---------------------------------------------------------------------------
+
+/**
+ * A real trailing-stop bot, shaped as `GET /api/bots/:id` serves one. Its config
+ * is correct and complete -- `{ trailPct }` is the entire parameter set (22.2
+ * decision 1) -- which is the whole point of the fixture.
+ */
+function trailingStopBot(overrides: Partial<BotDetail> = {}): BotDetail {
+  const base = botFixture("dca");
+  return {
+    ...base,
+    id: "bot-ts1",
+    pair: "BTCUSD",
+    strategy: "trailing_stop",
+    cycleCount: 0,
+    takeProfitPct: null,
+    stopLossPct: "10.00000000",
+    config: {
+      strategy: "trailing_stop",
+      schemaVersion: 1,
+      botInstanceId: "bot-ts1",
+      accountLabel: "gemini-main",
+      exchange: "gemini",
+      pair: "BTCUSD",
+      capitalAsset: "USD",
+      allocatedCapital: "500.00000000",
+      params: { trailPct: "10.00000000" },
+    },
+    ...overrides,
+  };
+}
+
+describe("the refusal names the RIGHT cause", () => {
+  it("⚠ a trailing-stop bot is refused for the form's limits, NOT as a broken config", () => {
+    /*
+     * THE WRONG MESSAGE THIS TEST EXISTS FOR, WHICH WAS LIVE ON `bot-ts1`.
+     * `checkParamsShape` did not recognise `trailing_stop`, so it answered
+     * `strategy_not_recognised`, `cloneSearchParams` returned null, and
+     * `CloneBotLink` -- which inferred the reason from `config === null` alone --
+     * told the operator that their bot's stored parameters did not match their
+     * own label. They match perfectly. The real reason is that `/bots/new` has no
+     * trailing-stop controls.
+     */
+    expect(cloneRefusal(trailingStopBot())).toBe("strategy_not_creatable");
+    // And still no link, which was always right -- only the explanation was wrong.
+    expect(cloneBotHref(trailingStopBot())).toBeNull();
+  });
+
+  it("its params DO pass the shape check, which is what makes the old message a lie", () => {
+    // Stated separately from the refusal, because this is the fact the old
+    // message contradicted. A trailing-stop config is coherent.
+    const config = trailingStopBot().config!;
+    expect(checkParamsShape({ ...config.params, strategy: config.strategy }).ok).toBe(true);
+  });
+
+  it("an orphan and an incoherent config keep their own, different causes", () => {
+    expect(cloneRefusal(botFixture("grid", { config: null, orphaned: true }))).toBe("no_config");
+    const bot = botFixture("grid");
+    const mislabelled = {
+      ...bot,
+      config: { ...bot.config!, strategy: "grid" as const, params: DCA_PARAMS as never },
+    } as BotDetail;
+    expect(cloneRefusal(mislabelled)).toBe("incoherent_config");
+  });
+
+  it("a bot that CAN be cloned has no refusal at all", () => {
+    // The pairing that matters: a refusal reason and a link are mutually exclusive.
+    for (const strategy of ["grid", "dca"] as const) {
+      expect(cloneRefusal(botFixture(strategy))).toBeNull();
+      expect(cloneBotHref(botFixture(strategy))).not.toBeNull();
+    }
   });
 });

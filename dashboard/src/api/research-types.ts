@@ -224,7 +224,16 @@ export interface CandidateGatherBundle {
 // Stage 2 -- Assess (`assessResultView`)
 // ---------------------------------------------------------------------------
 
-export type Strategy = "dca" | "grid";
+/**
+ * The strategies a proposal can be ABOUT, mirroring the Worker's `StrategyType`.
+ *
+ * ⚠ NOT THE SAME QUESTION AS "what can the create-bot form build". That is
+ * `PrefillStrategy` (`../research/proposalPrefill.ts`), which is still the two
+ * strategies `CreateBotRequest` has a params shape for. The two were aliased
+ * while both had two members and diverged the moment `validatedProposalView`
+ * learned to emit a trailing-stop params object.
+ */
+export type Strategy = "dca" | "grid" | "trailing_stop";
 
 /** Whether the duplicate-key scan could run at all for a given answer. */
 export type DuplicateKeyCheck = "performed" | "unavailable_transport_parsed";
@@ -367,11 +376,29 @@ export interface DcaParams {
   readonly sellOnStopLoss: boolean;
 }
 
+/**
+ * Section 22's proposed trailing-stop parameters, mirroring
+ * `ProposalParamsView`'s third arm in `src/api/serialize.ts`.
+ *
+ * ONE FIELD, and that is the entire set (22.2 decision 1): `trailPct` is both the
+ * trail distance below the high-water mark and the initial stop distance from
+ * entry. There is no order size -- the single entry is sized by
+ * `allocatedCapital`, which `ValidatedProposal` already carries beside `params`.
+ *
+ * ⚠ THE ARM WHOSE ABSENCE WAS THE POINT. `validatedProposalView` read nine DCA
+ * fields off this shape for as long as its own `else` branch stood, and this
+ * mirror could not have caught that -- it did not know the shape existed.
+ */
+export interface TrailingStopParams {
+  readonly strategy: "trailing_stop";
+  readonly trailPct: string;
+}
+
 /** Which minimum-order floor the venue actually published for this pair. */
 export type MinimumOrderCheck = "notional" | "quantity" | "both" | "none_published";
 
 export interface ValidatedProposal {
-  readonly params: GridParams | DcaParams;
+  readonly params: GridParams | DcaParams | TrailingStopParams;
   readonly allocatedCapital: string;
   readonly capitalAsset: string;
   /** The headroom AS READ. A PREFILL a human confirms, never a reservation. */
