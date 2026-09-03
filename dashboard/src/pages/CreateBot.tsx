@@ -154,6 +154,7 @@ import { ProposalPrefillBanner } from "../components/ProposalPrefillBanner";
 import { CloneSourceBanner } from "../components/CloneSourceBanner";
 import { readProposalPrefill, withProposalId } from "../research/proposalPrefill";
 import { readBotClonePrefill, type FormPrefillSeed } from "../research/botClonePrefill";
+import { botInstanceIdError, maxBotInstanceIdLengthFor } from "../botId";
 
 // ---------------------------------------------------------------------------
 // Validation helpers -- pure string checks, no float ever constructed. The
@@ -463,9 +464,26 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values.filter((v) => v !== ""))].sort();
 }
 
-/** A short random slug so a fresh form has a unique, editable id prefilled. */
+/**
+ * A short random slug so a fresh form has a unique, editable id prefilled.
+ *
+ * `toString(36)` emits only digits and lowercase letters, so `bot-` plus six of
+ * them is 10 characters and always satisfies `BOT_INSTANCE_ID_PATTERN`. Ten is
+ * also exactly Kraken's budget (decision-log entry 90, DECISION 3), so the
+ * prefilled value needs no venue-specific variant -- it already fits the
+ * tightest venue this system knows. Anything typed over it is checked by
+ * `botInstanceIdError`.
+ */
 function generatedId(): string {
   return `bot-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Field help that names the venue's own limit once an account is selected. */
+function botIdHelp(exchange: string): string {
+  const base =
+    "Unique identifier, shown in the list and used in the bot’s URL. A suggestion is prefilled; edit it if you like.";
+  if (exchange === "") return base;
+  return `${base} Up to ${maxBotInstanceIdLengthFor(exchange)} characters on ${exchange}: lowercase letters, digits, dash or underscore.`;
 }
 
 /** True for the AbortError a cancelled in-flight fetch throws (component teardown
@@ -1086,9 +1104,12 @@ export function CreateBot() {
   function validate(): Errors {
     const errors: Errors = {};
 
-    if (botInstanceId.trim() === "") errors.botInstanceId = "Required.";
-    else if (!/^[A-Za-z0-9._:-]+$/.test(botInstanceId.trim()))
-      errors.botInstanceId = "Use letters, digits, dot, dash, underscore or colon only.";
+    // The server's own rule, imported rather than restated -- see botId.ts. It
+    // also applies the selected venue's client-order-id cap, which is why
+    // `exchange` is passed: the form knows the venue read-only, so the operator
+    // is told here rather than by a 400 after submitting.
+    const botIdError = botInstanceIdError(botInstanceId, exchange);
+    if (botIdError !== null) errors.botInstanceId = botIdError;
     if (accountLabel.trim() === "") errors.accountLabel = "Select an account.";
     // exchange is derived read-only from the account and never submitted, so it
     // is not validated here -- picking a valid account is what makes it valid.
@@ -1294,7 +1315,7 @@ export function CreateBot() {
             onChange={setBotInstanceId}
             required
             error={fieldErrors.botInstanceId}
-            help="Unique identifier, shown in the list and used in the bot’s URL. A suggestion is prefilled; edit it if you like."
+            help={botIdHelp(exchange)}
             disabled={submitting}
           />
           <AccountSelect

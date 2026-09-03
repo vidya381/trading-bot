@@ -614,6 +614,24 @@ export type CreateBotRequest =
   | (CreateBotBase & { readonly strategy: "grid"; readonly params: GridParamsInput });
 
 /**
+ * COMPILE-TIME GUARD on the note in `CreateBotBase`: `exchange` is not part of
+ * this request and must not become part of it.
+ *
+ * Written as a value rather than left as a comment because a comment cannot
+ * fail. If `exchange` is ever added above, `HasExchange` resolves to `true`, the
+ * initialiser below stops assigning, and the dashboard build breaks -- which is
+ * where a change with this consequence should be noticed. `createBotRequest.test.ts`
+ * asserts the same thing at runtime and explains why it matters.
+ *
+ * This declaration lives in app code, NOT in the test file, on purpose: this
+ * project typechecks `dashboard/src` through `tsconfig.app.json`, which excludes
+ * `*.test.ts` (see the note there), so a type-level assertion written in a test
+ * would be compiled by nothing and would guard nothing.
+ */
+type HasExchange = "exchange" extends keyof CreateBotRequest ? true : false;
+export const CREATE_BOT_REQUEST_HAS_NO_EXCHANGE: HasExchange = false;
+
+/**
  * The 201 body of `POST /api/bots`: the created bot's full detail, plus
  * `proposalLink` when — and only when — the request named a proposal. Absent on
  * an ordinary creation, which is why it is optional here rather than on

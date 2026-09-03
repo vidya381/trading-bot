@@ -98,6 +98,11 @@ import type {
 } from "../db/schema";
 import { EXCHANGE_IDS, isExchangeId } from "../db/schema";
 import {
+  checkBotInstanceIdFitsVenue,
+  describeVenueIdLengthViolation,
+  type VenueId,
+} from "../shared/idempotency";
+import {
   KvSymbolCacheStore,
   listAccountSymbols,
   type SymbolCacheStore,
@@ -485,6 +490,48 @@ async function resolveBotExchange(
 }
 
 /**
+ * COMPILE-TIME LINK between the venue budget table and the venues a bot can
+ * actually be created on.
+ *
+ * `VenueId` (idempotency) is deliberately wider than `ExchangeId` (db/schema):
+ * it knows Kraken's ceiling before Kraken is a venue. This assignment is the
+ * thing that stops the two drifting the other way. If a fourth exchange is ever
+ * added to `ExchangeId` without a row in `VENUE_ORDER_ID_BUDGETS`, this line
+ * stops compiling, and the gate below cannot silently become a no-op for a
+ * venue that a bot can really be created on.
+ */
+const _everyExchangeHasABudget: VenueId = null as unknown as ExchangeId;
+void _everyExchangeHasABudget;
+
+/**
+ * THE KRAKEN CLIENT-ORDER-ID GATE (decision-log entry 90, DECISION 3).
+ *
+ * Entry 90 decided this cap should be enforced "at generation time". Verifying
+ * it against the real `bot_instances` rows moved it here instead, and the
+ * reason is the whole point of the decision: `makeClientOrderId` runs when an
+ * order is being placed, by which time the bot exists, its capital is reserved,
+ * and the operator's only signal is orders that will not place. A length rule
+ * that is knowable from the request body belongs in the request that creates
+ * the bot, where it is still a form error.
+ *
+ * TODAY THIS CANNOT FIRE, AND THAT IS NOT AN ACCIDENT. `resolveBotExchange`
+ * above returns an `ExchangeId`, which is `"binance" | "gemini"`, and
+ * `checkBotInstanceIdFitsVenue` is inert for both by construction (see its
+ * docblock). The call is here so that the day `"kraken"` joins `ExchangeId`,
+ * bot creation is already gated -- rather than that change needing to remember
+ * a rule written months earlier. `create-bot-venue-gate.test.ts` proves the call
+ * really is on this path by driving `createBot` with an account whose stored
+ * exchange is "kraken" -- which `resolveBotExchange` returns unvalidated for a
+ * registered account, and is therefore the one venue string that reaches here.
+ */
+function assertBotInstanceIdFitsVenue(venue: string, botInstanceId: string): void {
+  const violation = checkBotInstanceIdFitsVenue(venue, botInstanceId);
+  if (violation !== null) {
+    throw badRequest("bot_instance_id_too_long_for_venue", describeVenueIdLengthViolation(violation));
+  }
+}
+
+/**
  * THE GATE: a new bot's pair must be one this venue lists, AND must be spot.
  *
  * Until this existed, `POST /api/bots` -- the endpoint that reserves capital and
@@ -636,6 +683,10 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
   const botInstanceId = requireString(body, "botInstanceId");
   const accountLabel = requireString(body, "accountLabel");
   const exchange = await resolveBotExchange(ctx, accountLabel, optionalString(body, "exchange"));
+  // The cheapest check in this handler -- one string length, no I/O -- and it
+  // runs the moment the venue is known, before the pair, the params, the
+  // proposal or the tradability gate. See `assertBotInstanceIdFitsVenue`.
+  assertBotInstanceIdFitsVenue(exchange, botInstanceId);
   const pair = requireString(body, "pair") as Pair;
   const capitalAsset = requireString(body, "capitalAsset") as Asset;
   const allocatedCapital = requireMoney(body, "allocatedCapital");

@@ -57,6 +57,152 @@ export const BOT_INSTANCE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,19}$/;
  */
 export const MAX_SEQUENCE = 999_999_999_999;
 
+// ---------------------------------------------------------------------------
+// PER-VENUE CLIENT-ORDER-ID BUDGETS (decision-log entry 90, DECISION 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The longest bot instance id `BOT_INSTANCE_ID_PATTERN` accepts.
+ *
+ * Stated as a number because the budget arithmetic below needs it and a regex
+ * quantifier cannot be read at runtime. `idempotency.test.ts` asserts the two
+ * agree in both directions, so this cannot drift from the pattern silently.
+ */
+export const MAX_BOT_INSTANCE_ID_LENGTH = 20;
+
+/**
+ * What the scheme itself spends: `"v1"` + `"-"` before the slug, and the `"-"`
+ * between the slug and the sequence. `v1-<slug>-<sequence>`.
+ */
+export const CLIENT_ORDER_ID_OVERHEAD = CLIENT_ORDER_ID_SCHEME.length + 2;
+
+/**
+ * Venues whose client-order-id ceiling this module knows.
+ *
+ * DELIBERATELY WIDER THAN `ExchangeId`, which is `"binance" | "gemini"` and is
+ * not changed here. Kraken is not yet a venue a bot can be created on -- entry
+ * 90 step (c), the Kraken client, does not exist -- but its ceiling is known
+ * now, and the gate below is wired into bot creation now, so that enabling the
+ * venue later is a one-line change to `ExchangeId` rather than a change that
+ * also has to remember this. `db/schema.ts`'s `ExchangeId` is a subset of this
+ * type, and `handlers.ts` asserts that at compile time.
+ */
+export type VenueId = "binance" | "gemini" | "kraken";
+
+export interface VenueOrderIdBudget {
+  /** The venue's own `clientOrderId` ceiling, in characters. */
+  readonly maxClientOrderIdLength: number;
+  /** How much of that is left for the bot instance id. */
+  readonly maxBotInstanceIdLength: number;
+  /** The remainder, reserved for the sequence number's digits. */
+  readonly reservedSequenceDigits: number;
+}
+
+/**
+ * How the three numbers per venue were chosen.
+ *
+ * `maxClientOrderIdLength` is the venue's rule and nothing else. The split of
+ * the remainder into slug and sequence digits IS a choice, and it is a choice
+ * about a bot's whole life: sequence numbers are allocated monotonically and
+ * never reused (`IdempotencyGuard.decide` -- "a fresh order needs a fresh
+ * sequence"), so the digits reserved here are a hard ceiling on how many orders
+ * one bot instance may ever place on that venue.
+ *
+ * - **binance / gemini** keep the scheme's original split unchanged: a
+ *   20-character slug and 12 digits, which is `MAX_CLIENT_ORDER_ID_LENGTH`
+ *   exactly. Nothing about these two venues is altered by this table.
+ *
+ * - **kraken** caps `cl_ord_id` at 18 characters for free-format text, which
+ *   `v1-<slug>-<sequence>` is (it is neither a 36-character UUID nor 32 hex
+ *   characters, the two other forms Kraken accepts). That leaves 14 for slug
+ *   plus digits. Entry 90 measured the real `bot_instances` rows: the longest
+ *   id in use is 11 characters, and 30 of 31 are 10 or shorter. An 11-character
+ *   budget would leave 3 digits -- 1,000 orders in a bot's lifetime, which is
+ *   reachable. 10 leaves 4 digits and 10,000 orders, which is not, and it is
+ *   what the generated ids already are. Hence 10.
+ */
+export const VENUE_ORDER_ID_BUDGETS: Readonly<Record<VenueId, VenueOrderIdBudget>> = {
+  binance: { maxClientOrderIdLength: 36, maxBotInstanceIdLength: 20, reservedSequenceDigits: 12 },
+  gemini: { maxClientOrderIdLength: 36, maxBotInstanceIdLength: 20, reservedSequenceDigits: 12 },
+  kraken: { maxClientOrderIdLength: 18, maxBotInstanceIdLength: 10, reservedSequenceDigits: 4 },
+};
+
+/** The budget for a venue name, or null if this module does not know it. */
+export function venueOrderIdBudget(venue: string): VenueOrderIdBudget | null {
+  return Object.hasOwn(VENUE_ORDER_ID_BUDGETS, venue)
+    ? VENUE_ORDER_ID_BUDGETS[venue as VenueId]
+    : null;
+}
+
+/** Why one bot instance id does not fit one venue. Every number the message needs. */
+export interface VenueIdLengthViolation {
+  readonly venue: VenueId;
+  readonly botInstanceId: string;
+  readonly actualLength: number;
+  readonly maxBotInstanceIdLength: number;
+  readonly maxClientOrderIdLength: number;
+  /** What `makeClientOrderId` would emit for this id at sequence 0. */
+  readonly shortestClientOrderId: string;
+}
+
+/**
+ * Does this bot instance id fit this venue's client-order-id ceiling?
+ *
+ * Returns the violation rather than throwing, so the API layer can turn it into
+ * its own refusal and the dashboard can turn it into field text, from one rule.
+ *
+ * ── WHY THIS IS INERT FOR BINANCE AND GEMINI, BY CONSTRUCTION ──
+ *
+ * A venue whose slug budget is the scheme-wide maximum is not constrained by
+ * this gate at all, and the early return below says so explicitly rather than
+ * relying on the arithmetic to work out. That matters: an id longer than
+ * `MAX_BOT_INSTANCE_ID_LENGTH` is ALREADY refused, by `assertBotInstanceId` in
+ * `capital/ledger.ts`, with the `invalid_bot_instance_id` error and message
+ * that names the real rule. If this gate also rejected such an id it would get
+ * there first and change that refusal's code and wording on two venues that
+ * have no Kraken problem. It must not. So for binance and gemini this function
+ * returns null for every input, including inputs that are invalid for other
+ * reasons, and the existing refusal stands untouched.
+ *
+ * An unknown venue also returns null: this module refusing a venue it has no
+ * ceiling for would be inventing a limit, and `isExchangeId` is what guards
+ * unknown venue strings.
+ */
+export function checkBotInstanceIdFitsVenue(
+  venue: string,
+  botInstanceId: string,
+): VenueIdLengthViolation | null {
+  const budget = venueOrderIdBudget(venue);
+  if (budget === null) return null;
+  if (budget.maxBotInstanceIdLength >= MAX_BOT_INSTANCE_ID_LENGTH) return null;
+  if (botInstanceId.length <= budget.maxBotInstanceIdLength) return null;
+
+  return {
+    venue: venue as VenueId,
+    botInstanceId,
+    actualLength: botInstanceId.length,
+    maxBotInstanceIdLength: budget.maxBotInstanceIdLength,
+    maxClientOrderIdLength: budget.maxClientOrderIdLength,
+    shortestClientOrderId: `${CLIENT_ORDER_ID_SCHEME}-${botInstanceId}-0`,
+  };
+}
+
+/**
+ * The violation as one sentence, shared by the API refusal and the dashboard so
+ * an operator reads the same explanation in both places.
+ */
+export function describeVenueIdLengthViolation(violation: VenueIdLengthViolation): string {
+  return (
+    `bot instance id ${JSON.stringify(violation.botInstanceId)} is ` +
+    `${violation.actualLength} characters, over the ` +
+    `${violation.maxBotInstanceIdLength} that ${violation.venue} allows: it is embedded in ` +
+    `every clientOrderId, and ${violation.venue} caps those at ` +
+    `${violation.maxClientOrderIdLength} characters ` +
+    `(${JSON.stringify(violation.shortestClientOrderId)} is already ` +
+    `${violation.shortestClientOrderId.length}). Use a shorter id.`
+  );
+}
+
 export type IdempotencyErrorCode =
   | "invalid_bot_instance_id"
   | "invalid_sequence"
