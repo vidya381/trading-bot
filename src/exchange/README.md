@@ -17,7 +17,7 @@ depend only on the interface and cannot tell which exchange is underneath.
 | [`gemini/filters.ts`](./gemini/filters.ts) | 4.3 | `symbols/details` parsing (with the field-name inversion); re-exports the shared validator |
 | [`gemini/parse.ts`](./gemini/parse.ts) | 4.1 | Payload parsing (boolean order-state flags, `fee_currency`, derived balances), error classification |
 | [`gemini/client.ts`](./gemini/client.ts) | 4.1 | The same REST surface, POST-with-header-auth, and lookup-then-cancel |
-| [`rate-limited.ts`](./rate-limited.ts) | 5.4 | Gate: asks the account's `RateLimiter` for budget before every call (Binance weight table) |
+| [`rate-limited.ts`](./rate-limited.ts) | 5.4 | Gate: asks the account's `RateLimiter` for budget before every call, at the **venue's own** weight table |
 
 ## The second exchange (`gemini/`, step 3.4)
 
@@ -68,7 +68,28 @@ resolver; step 11 wired the Binance-vs-Gemini dispatch to it through
 wraps any `RestExchangeClient` and requests budget from the account's
 `RateLimiter` Durable Object before each call, so no path reaches the exchange
 without a grant. It lives here rather than in `/src/shared` because it carries
-Binance's per-endpoint weight table and because it performs I/O.
+the venues' per-endpoint cost tables and because it performs I/O.
+
+**The gate is told which venue it is in front of**, as an `ExchangeId`, and there
+is no default. `METHOD_WEIGHTS` is a `Record<ExchangeId, MethodWeights>`, so a
+third exchange fails to compile until its table exists rather than quietly
+inheriting another venue's numbers — the same forcing function
+`resolveExchangeForAccount`'s `default`-less switch gives the client dispatch,
+and both call sites read the venue from the same stored `exchange` that chose the
+client, so the table and the client cannot disagree.
+
+This replaced a `weights` option that defaulted to `BINANCE_METHOD_WEIGHTS`.
+Neither call site passed one, so **every Gemini account was gated against
+Binance's cost model in production and testnet**, silently — a wrong weight
+raises no error, it just spends a budget that does not describe the venue.
+Binance's table is a transcription of published per-endpoint weights; Gemini's is
+a *conversion*, because Gemini publishes no weights at all — it counts requests
+against two independent per-minute counters (120 public, 600 private), priced
+into the budget's units so each counter lands on its own published limit. The
+derivation, and what it deliberately does **not** fix (the budget's ceiling and
+its single-counter shape are still Binance's), are documented on
+`GEMINI_METHOD_WEIGHTS` and pinned by `rate-limited.test.ts`. Kraken's table is
+absent on purpose — see decision-log 90.
 
 **Priority is chosen by which view a call site holds**, not by which method it
 calls: `withPriority("risk-exit")` returns a second view over the same client

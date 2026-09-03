@@ -73,7 +73,9 @@ import type {
 } from "../shared/exchange-client";
 import type { RequestPriority } from "../shared/rate-limiter";
 import type { AcquireRequest, AcquireResult } from "../durable-objects/rate-limiter";
+import type { ExchangeId } from "../db/schema";
 import { ENDPOINT_WEIGHTS } from "./binance/client";
+import { GEMINI_REQUEST_COSTS, type GeminiRequestCost } from "./gemini/client";
 
 /**
  * The part of the `RateLimiter` Durable Object this needs.
@@ -95,9 +97,9 @@ export interface RateLimiterPort {
  * the only way a new call could otherwise slip past the budget unmeasured.
  *
  * The numbers come from `ENDPOINT_WEIGHTS`, which step 3 exported for exactly
- * this purpose. They are Binance's, which is why this file sits under
- * `/src/exchange` and takes them as an option -- a second exchange brings its
- * own table.
+ * this purpose. They are Binance's -- which is why there is one table PER VENUE
+ * below and why the gate is told which venue it is in front of rather than
+ * defaulting to either.
  */
 export type MethodWeights = Record<keyof RestExchangeClient, number>;
 
@@ -117,6 +119,91 @@ export const BINANCE_METHOD_WEIGHTS: MethodWeights = {
 };
 
 /**
+ * How many budget units one Gemini request costs, per counter.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY GEMINI'S TABLE IS A CONVERSION AND BINANCE'S IS A COPY
+ * ---------------------------------------------------------------------------
+ * Binance publishes a weight per endpoint and a weight ceiling per window, so
+ * `BINANCE_METHOD_WEIGHTS` is a transcription. Gemini publishes neither: it
+ * counts REQUESTS against two independent per-minute counters (120 public, 600
+ * private -- see `GEMINI_RATE_LIMITS`). The `RateLimiter` Durable Object spends
+ * ONE budget denominated in weight, so a Gemini request has to be priced in
+ * that budget's units before the gate can charge for it.
+ *
+ * The price is chosen so that each of Gemini's two counters is respected on its
+ * own, against the budget's own ceiling (`DEFAULT_WEIGHT_LIMIT`, 1200 per 60s):
+ *
+ *     private: 1200 / 600 = 2 units  -> at most 600 private requests a minute
+ *     public:  1200 / 120 = 10 units -> at most 120 public requests a minute
+ *
+ * So a run made entirely of private calls stops at Gemini's private limit, and
+ * a run made entirely of public calls stops at its public limit. A MIXED run
+ * spends one shared pot, which is stricter than Gemini's two separate ones --
+ * deliberately the conservative direction, since the failure this replaces was
+ * a budget that had no relationship to Gemini at all.
+ *
+ * ⚠ WHAT THIS DOES NOT DO, stated rather than implied: it does not give Gemini
+ * its own limit or its own second counter. `DEFAULT_WEIGHT_LIMIT` and the
+ * single-budget shape are still Binance's, and modelling a venue whose limits
+ * are structurally different is the dedicated rate-limiter work decision-log 90
+ * separates out (the same work Kraken's decaying, per-pair counters need). This
+ * is the seam correction: the gate now knows its venue and charges that venue's
+ * real costs. `rate-limited.test.ts` pins the arithmetic above against the DO's
+ * actual constant, so a change to either side fails rather than silently
+ * re-pricing every Gemini call.
+ */
+const GEMINI_UNITS_PER_REQUEST: Readonly<Record<GeminiRequestCost["group"], number>> = {
+  public: 10,
+  private: 2,
+  none: 0,
+};
+
+/**
+ * The smallest weight the budget will accept.
+ *
+ * `WeightBudget.check` throws on a non-positive weight, so a method that sends
+ * no request at all (Gemini's `getServerTime`) cannot be charged its true cost
+ * of zero. One unit is the honest minimum: it over-charges a call that reaches
+ * no network by half of one private request, which is cheaper than every
+ * alternative and does not require the budget to grow a zero case.
+ */
+const MINIMUM_WEIGHT = 1;
+
+export const GEMINI_METHOD_WEIGHTS: MethodWeights = Object.fromEntries(
+  Object.entries(GEMINI_REQUEST_COSTS).map(([method, cost]) => [
+    method,
+    Math.max(MINIMUM_WEIGHT, cost.requests * GEMINI_UNITS_PER_REQUEST[cost.group]),
+  ]),
+) as MethodWeights;
+
+/**
+ * The weight table for each venue -- the whole of "which cost model is this?".
+ *
+ * A `Record<ExchangeId, ...>` rather than a lookup with a default, for the
+ * reason `resolveExchangeForAccount`'s `default`-less switch and
+ * `VENUE_PUBLISHES_INSTRUMENT_TYPE` are written that way: adding a third
+ * exchange must FAIL TO COMPILE here until its table is declared, not fall back
+ * to another venue's numbers. A default is precisely what made every Gemini
+ * account spend Binance's weights.
+ *
+ * Kraken's entry is deliberately absent rather than stubbed. Widening
+ * `ExchangeId` breaks this line, which is the intended forcing function;
+ * decision-log 90 records why Kraken's cost model (a decaying counter, a second
+ * PER-PAIR budget, and a cancel price that depends on order age) does not fit
+ * `Record<keyof RestExchangeClient, number>` at all and needs its own session.
+ */
+export const METHOD_WEIGHTS: Readonly<Record<ExchangeId, MethodWeights>> = {
+  binance: BINANCE_METHOD_WEIGHTS,
+  gemini: GEMINI_METHOD_WEIGHTS,
+};
+
+/** The cost model for one venue. Total over `ExchangeId`; never guesses. */
+export function methodWeightsFor(exchange: ExchangeId): MethodWeights {
+  return METHOD_WEIGHTS[exchange];
+}
+
+/**
  * The longest a single call will wait for budget before giving up.
  *
  * One window: everything in a rolling window has aged out after one, so a
@@ -129,8 +216,26 @@ export const BINANCE_METHOD_WEIGHTS: MethodWeights = {
 export const DEFAULT_MAX_WAIT_MS = 60_000;
 
 export interface RateLimitedExchangeOptions {
+  /**
+   * WHICH VENUE this gate sits in front of. REQUIRED, and the whole options
+   * object is required with it, so a call site cannot construct a gate without
+   * saying what it is gating.
+   *
+   * There is no default, and that is the fix. This used to be a `weights`
+   * option defaulting to `BINANCE_METHOD_WEIGHTS`; neither of the two call
+   * sites passed one, so every Gemini account in production and testnet was
+   * gated against Binance's cost model -- silently, because a wrong weight
+   * produces no error, just a budget that does not describe the venue being
+   * spent. A default here can only ever be right for one venue, so there is
+   * none: an unnamed venue is a compile error rather than a wrong guess.
+   *
+   * It is an `ExchangeId` -- the same value `accounts.exchange` stores,
+   * `bot_instances.exchange` stores and `resolveExchangeForAccount` dispatches
+   * on -- so the table charged and the client underneath are selected from ONE
+   * fact, not from two that could disagree.
+   */
+  readonly exchange: ExchangeId;
   readonly priority?: RequestPriority;
-  readonly weights?: MethodWeights;
   readonly maxWaitMs?: number;
   /** Injected so tests need no real delay. */
   readonly sleep?: (ms: number) => Promise<void>;
@@ -140,6 +245,7 @@ export interface RateLimitedExchangeOptions {
 }
 
 interface ResolvedOptions {
+  readonly exchange: ExchangeId;
   readonly priority: RequestPriority;
   readonly weights: MethodWeights;
   readonly maxWaitMs: number;
@@ -159,18 +265,27 @@ export class RateLimitedExchange implements RestExchangeClient {
   constructor(
     inner: RestExchangeClient,
     limiter: RateLimiterPort,
-    options: RateLimitedExchangeOptions = {},
+    options: RateLimitedExchangeOptions,
   ) {
     this.#inner = inner;
     this.#limiter = limiter;
     this.#options = {
+      exchange: options.exchange,
+      // Derived from the venue, never passed in beside it: a gate whose table
+      // and whose client could name different exchanges is the bug this
+      // replaces, one argument further along.
+      weights: methodWeightsFor(options.exchange),
       priority: options.priority ?? "routine",
-      weights: options.weights ?? BINANCE_METHOD_WEIGHTS,
       maxWaitMs: options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS,
       sleep: options.sleep ?? defaultSleep,
       now: options.now ?? (() => Date.now()),
       label: options.label ?? "",
     };
+  }
+
+  /** The venue whose cost model this gate is charging. */
+  get exchange(): ExchangeId {
+    return this.#options.exchange;
   }
 
   /**
@@ -182,8 +297,13 @@ export class RateLimitedExchange implements RestExchangeClient {
    * easy to miss in review.
    */
   withPriority(priority: RequestPriority): RestExchangeClient {
+    const { exchange, maxWaitMs, sleep, now, label } = this.#options;
     return new RateLimitedExchange(this.#inner, this.#limiter, {
-      ...this.#options,
+      exchange,
+      maxWaitMs,
+      sleep,
+      now,
+      label,
       priority,
     });
   }
@@ -320,7 +440,7 @@ export class RateLimitedExchange implements RestExchangeClient {
 export function withRateLimit(
   inner: RestExchangeClient,
   limiter: RateLimiterPort,
-  options: RateLimitedExchangeOptions = {},
+  options: RateLimitedExchangeOptions,
 ): RateLimitedExchange {
   return new RateLimitedExchange(inner, limiter, options);
 }

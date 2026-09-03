@@ -362,6 +362,13 @@ export async function runScheduledReconciliation(
     // they go through `haltBot` into the bot's own object, which uses its own
     // risk-exit view for the cancellations.
     const gatedExchange = withRateLimit(exchange, limiterFor(accountLabel), {
+      // The venue, so the gate charges THIS account's exchange rather than
+      // defaulting to Binance's weights for a Gemini account -- the same
+      // wrong-venue mistake the resolution above fixed for the CLIENT, which
+      // was still live one layer down in the BUDGET until this argument
+      // existed. It is `account.exchange`, the same value that selected the
+      // client, so the two cannot disagree.
+      exchange: account.exchange,
       priority: "routine",
       now,
       label: `reconciliation ${accountLabel}`,

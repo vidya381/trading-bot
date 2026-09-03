@@ -95,6 +95,80 @@ export const GEMINI_BASE_URLS = {
 } as const;
 
 /**
+ * Gemini's published rate limits -- this venue's answer to Binance's
+ * `ENDPOINT_WEIGHTS`, and the reason that constant could never stand in for it.
+ *
+ * Quoted from Gemini's own reference (developer.gemini.com/rate-limit, read
+ * 2026-09-02): "For public API entry points, we limit requests to 120 requests
+ * per minute, and recommend that you do not exceed 1 request per second. For
+ * private API entry points, we limit requests to 600 requests per minute, and
+ * recommend that you not exceed 5 requests per second."
+ *
+ * DOCUMENTED, NOT MEASURED -- the same standing `ENDPOINT_WEIGHTS` has, and
+ * labelled the same way. Nothing here was probed against a live account.
+ *
+ * The shape of the difference from Binance, which is what actually matters to
+ * the gate: Gemini counts REQUESTS, not weight, and it keeps TWO independent
+ * counters (public and private), where Binance keeps one weight budget. So a
+ * Gemini method's cost is "how many requests, against which of the two", not a
+ * single published number per endpoint.
+ */
+export const GEMINI_RATE_LIMITS = {
+  publicRequestsPerMinute: 120,
+  privateRequestsPerMinute: 600,
+  windowMs: 60_000,
+} as const;
+
+/** Which of Gemini's two counters a request is charged against. */
+export type GeminiRateLimitGroup = "public" | "private" | "none";
+
+export interface GeminiRequestCost {
+  readonly group: GeminiRateLimitGroup;
+  /** HTTP requests this method sends -- Gemini's unit of cost, not a weight. */
+  readonly requests: number;
+}
+
+/**
+ * What each section 4.1 method actually costs on Gemini, counted from the
+ * requests the methods above genuinely send.
+ *
+ * Keyed by method name against `RestExchangeClient` for the same reason
+ * `MethodWeights` is: a method added to the interface will not compile until
+ * its cost on this venue is declared, so no new call can slip past the budget
+ * unmeasured. The gate turns this into the budget's units
+ * (`GEMINI_METHOD_WEIGHTS` in `../rate-limited.ts`); the counting stays here,
+ * beside the endpoints being counted, so it cannot drift from them.
+ *
+ * Two entries are not one-request-per-method, and both are read off the code
+ * above rather than assumed:
+ *
+ *  - `cancelOrder` is TWO private requests. Gemini's `/v1/order/cancel` takes
+ *    only the numeric `order_id`, so a cancel is a `/v1/order/status` lookup
+ *    followed by the cancel itself. This is exactly the method a halt issues in
+ *    bulk, so charging it one request would under-count the risk-exit path by
+ *    half.
+ *  - `getServerTime` is ZERO requests: Gemini exposes no server-time endpoint
+ *    and the method above returns a failure without reaching the network.
+ *
+ * `placeOrder` is counted as its ONE order request. It also consults the symbol
+ * filters, but through the client's own cache (`#filtersFor`), and a cache miss
+ * there is a `getSymbolFilters` call that the gate charges in its own right --
+ * so folding it in here would double-count it.
+ */
+export const GEMINI_REQUEST_COSTS: Readonly<Record<keyof RestExchangeClient, GeminiRequestCost>> = {
+  getServerTime: { group: "none", requests: 0 },
+  getSymbolFilters: { group: "public", requests: 1 },
+  listTradablePairs: { group: "public", requests: 1 },
+  getCurrentPrice: { group: "public", requests: 1 },
+  getCandles: { group: "public", requests: 1 },
+  placeOrder: { group: "private", requests: 1 },
+  cancelOrder: { group: "private", requests: 2 },
+  getOrderStatus: { group: "private", requests: 1 },
+  getOpenOrders: { group: "private", requests: 1 },
+  getAccountBalances: { group: "private", requests: 1 },
+};
+
+/**
  * Map the interface's canonical intervals to Gemini's own timeframe spelling and
  * the interval's length in milliseconds.
  *

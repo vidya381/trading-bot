@@ -33,7 +33,11 @@ import { FakeExchange, TEST_PAIR, testFilters } from "./fake-exchange";
 import { inBot, inLimiter, noopFeed, rateLimiterStub, recordingFeed } from "./test-helpers";
 import type { PriceFeedPort } from "./price-feed";
 import type { AcquireRequest, AcquireResult } from "./rate-limiter";
-import { BINANCE_METHOD_WEIGHTS, type RateLimiterPort } from "../exchange/rate-limited";
+import {
+  BINANCE_METHOD_WEIGHTS,
+  GEMINI_METHOD_WEIGHTS,
+  type RateLimiterPort,
+} from "../exchange/rate-limited";
 
 /**
  * The fake clock's origin, and it is deliberately in the FUTURE.
@@ -1688,6 +1692,61 @@ describe("wired to the account's limiter (section 5.4)", () => {
       ["routine", BINANCE_METHOD_WEIGHTS.getSymbolFilters],
       ["routine", BINANCE_METHOD_WEIGHTS.placeOrder],
     ]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Which venue's weights this call site passes
+  // -------------------------------------------------------------------------
+  //
+  // `#exchange` is the ONLY path a bot reaches any exchange by, and until the
+  // `exchange` option existed it passed no weight table at all -- so the gate
+  // fell back to `BINANCE_METHOD_WEIGHTS` for every bot, Gemini bots included.
+  // The tests above all use Binance bots and so could not see it. These two
+  // pin the call site itself: the table charged follows the bot's own stored
+  // `exchange`, and a Gemini bot spends Gemini's numbers.
+
+  it("charges the bot's OWN venue: a Gemini bot spends Gemini's weights", async () => {
+    await runSpied((bot) => bot.create(creation({ exchange: "gemini" })));
+    await runSpied((bot) => bot.start(ACTOR));
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    // The same two calls the Binance test above makes -- a filter read then the
+    // order -- priced by the venue this bot actually trades on.
+    expect(spy.requests.map((request) => [request.priority, request.weight])).toEqual([
+      ["routine", GEMINI_METHOD_WEIGHTS.getSymbolFilters],
+      ["routine", GEMINI_METHOD_WEIGHTS.placeOrder],
+    ]);
+
+    // Said the other way round, because this is the assertion that fails
+    // against the old code: those are NOT Binance's weights. `getSymbolFilters`
+    // is the one that moves furthest -- 20 on Binance's `exchangeInfo`, 10 for
+    // one public request on Gemini.
+    expect(spy.requests.map((request) => request.weight)).not.toEqual([
+      BINANCE_METHOD_WEIGHTS.getSymbolFilters,
+      BINANCE_METHOD_WEIGHTS.placeOrder,
+    ]);
+  });
+
+  it("keeps the venue on the risk-exit view a halt uses", async () => {
+    // The halt path builds its client with `withPriority`, which rebuilds the
+    // wrapper. A venue lost there would be worst exactly here: a Gemini cancel
+    // is TWO requests (lookup then cancel), so Binance's cancel weight of 1
+    // under-counts a ladder-wide cancellation storm by half, on the traffic the
+    // risk-exit reserve exists to protect.
+    await runSpied((bot) => bot.create(creation({ exchange: "gemini" })));
+    await runSpied((bot) => bot.start(ACTOR));
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(exchange.placed.length).toBeGreaterThan(0);
+
+    spy.requests.length = 0;
+    await runSpied((bot) => bot.halt("manual", "risk check", ACTOR));
+
+    expect(spy.requests).not.toHaveLength(0);
+    expect(spy.requests.every((request) => request.priority === "risk-exit")).toBe(true);
+    expect(
+      spy.requests.every((request) => request.weight === GEMINI_METHOD_WEIGHTS.cancelOrder),
+    ).toBe(true);
+    expect(GEMINI_METHOD_WEIGHTS.cancelOrder).not.toBe(BINANCE_METHOD_WEIGHTS.cancelOrder);
   });
 
   it("asks at risk-exit priority for the cancellations a halt issues", async () => {

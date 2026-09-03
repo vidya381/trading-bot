@@ -80,7 +80,15 @@ import {
 } from "../alerts";
 import { CapitalError, createBotInstanceWithCapital, releaseBotCapital } from "../capital";
 import { databaseFrom, type Database } from "../db";
-import type { AlertRow, AuditLogRow, BotStatus, OrderRow, StrategyType, TradeRow } from "../db/schema";
+import type {
+  AlertRow,
+  AuditLogRow,
+  BotStatus,
+  ExchangeId,
+  OrderRow,
+  StrategyType,
+  TradeRow,
+} from "../db/schema";
 import { isExchangeId } from "../db/schema";
 import { resolveExchangeForAccount } from "../workers/exchange-dispatch";
 import { validateOrder } from "../exchange/binance/filters";
@@ -1139,6 +1147,34 @@ export class BotInstance extends DurableObject<Env> {
   }
 
   /**
+   * This bot's venue, as an `ExchangeId`, or a refusal to trade.
+   *
+   * `BotConfigBase.exchange` is a free-typed `string` (it is read back from
+   * storage), and TWO things now need it narrowed: the client dispatch below,
+   * which has always validated it, and the gate in `#exchange`, which must
+   * charge this venue's weights and cannot pick a table for a venue it cannot
+   * name. Hoisted into one method so both get the same answer and the same
+   * message rather than one of them re-deriving it.
+   *
+   * Refusing is the only safe move, and it is the move `#rawExchange` already
+   * made: a bot whose stored exchange is not a known venue can neither have a
+   * client built for it nor be gated against a real cost model, so it must not
+   * trade. `#subscribeToFeed` deliberately does NOT use this -- it returns
+   * quietly instead, because a corrupt exchange must halt the bot at its first
+   * trade (here), not block a state transition.
+   */
+  #venue(config: BotConfigBase): ExchangeId {
+    if (!isExchangeId(config.exchange)) {
+      throw new BotInstanceError(
+        "not_attached",
+        `bot ${config.botInstanceId}'s stored exchange ${JSON.stringify(config.exchange)} ` +
+          `is not a known exchange ("binance" or "gemini"); refusing to build a client.`,
+      );
+    }
+    return config.exchange;
+  }
+
+  /**
    * The RAW exchange client for this bot: injected if a test attached one,
    * otherwise built from the environment for the account's registered exchange.
    *
@@ -1164,15 +1200,7 @@ export class BotInstance extends DurableObject<Env> {
     const injected = this.#dependencies?.exchange as RestExchangeClient | undefined;
     if (injected !== undefined) return injected;
 
-    if (!isExchangeId(config.exchange)) {
-      throw new BotInstanceError(
-        "not_attached",
-        `bot ${config.botInstanceId}'s stored exchange ${JSON.stringify(config.exchange)} ` +
-          `is not a known exchange ("binance" or "gemini"); refusing to build a client.`,
-      );
-    }
-
-    const resolution = resolveExchangeForAccount(config.exchange, this.env, now);
+    const resolution = resolveExchangeForAccount(this.#venue(config), this.env, now);
     if (!resolution.ok) {
       throw new BotInstanceError("not_attached", resolution.reason);
     }
@@ -1219,6 +1247,12 @@ export class BotInstance extends DurableObject<Env> {
         config.accountLabel,
       );
       const routine = withRateLimit(raw, limiter, {
+        // The venue, so the gate spends THIS exchange's cost model. Read from
+        // the same stored `config.exchange` that chose the client above, so the
+        // table charged and the client charged for cannot name different
+        // exchanges. Before this was passed, the gate defaulted to Binance's
+        // weights for every bot, including bots trading on Gemini.
+        exchange: this.#venue(config),
         priority: "routine",
         now: deps.now,
         label: config.botInstanceId,

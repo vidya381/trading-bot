@@ -20,7 +20,11 @@ import { freshDatabase } from "../db/test-helpers";
 import type { AcquireRequest, AcquireResult } from "../durable-objects/rate-limiter";
 import { FakeExchange } from "../durable-objects/fake-exchange";
 import { inLimiter } from "../durable-objects/test-helpers";
-import { BINANCE_METHOD_WEIGHTS, type RateLimiterPort } from "../exchange/rate-limited";
+import {
+  BINANCE_METHOD_WEIGHTS,
+  GEMINI_METHOD_WEIGHTS,
+  type RateLimiterPort,
+} from "../exchange/rate-limited";
 import { fromDecimalString as m } from "../shared/money";
 import { BLIND_AFTER_MS, runScheduledReconciliation } from "./reconciliation";
 
@@ -235,6 +239,46 @@ describe("each account is reconciled against the exchange it is registered on", 
     );
     // And specifically: the Gemini account was NOT handed a Binance client.
     expect(routed.find((r) => r.label === GEMINI_ACCOUNT)!.exchange).toBe("gemini");
+  });
+
+  it("gates each account with ITS OWN venue's weight table", async () => {
+    // The venue bug, one layer below the one above. Routing the CLIENT per
+    // account was fixed already; the BUDGET was still Binance's for everyone,
+    // because this call site passed no weight table and the gate defaulted to
+    // one. So a Gemini account's balance read was charged 20 (Binance's
+    // `/api/v3/account`) against a budget that has nothing to do with Gemini,
+    // instead of the 2 units one private Gemini request costs.
+    //
+    // A limiter PER ACCOUNT, because the shared spy the other tests use pools
+    // both accounts' requests into one list and could not tell them apart --
+    // which is exactly why nothing here noticed.
+    await seedGeminiAccount();
+
+    const limiters = new Map<string, SpyLimiter>();
+    const limiterFor = (accountLabel: string): SpyLimiter => {
+      const existing = limiters.get(accountLabel);
+      if (existing !== undefined) return existing;
+      const fresh = new SpyLimiter();
+      limiters.set(accountLabel, fresh);
+      return fresh;
+    };
+
+    const result = await runScheduledReconciliation(env, options({ limiterFor }));
+    expect(result.ran).toBe(true);
+
+    const weightsFor = (accountLabel: string): number[] =>
+      (limiters.get(accountLabel)?.requests ?? []).map((request) => request.weight);
+
+    // One balance read per account (pinned by the budget test above), each
+    // priced by the venue that account is registered on.
+    expect(weightsFor(ACCOUNT)).toEqual([BINANCE_METHOD_WEIGHTS.getAccountBalances]);
+    expect(weightsFor(GEMINI_ACCOUNT)).toEqual([GEMINI_METHOD_WEIGHTS.getAccountBalances]);
+
+    // The assertion that fails against the old code, stated on its own so the
+    // failure names the actual defect rather than an off-by-one in a list.
+    expect(weightsFor(GEMINI_ACCOUNT)).not.toEqual([
+      BINANCE_METHOD_WEIGHTS.getAccountBalances,
+    ]);
   });
 
   it("reaches the Gemini resolver for a Gemini account, on the real dispatch path", async () => {

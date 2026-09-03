@@ -18,7 +18,19 @@ import { FakeExchange, TEST_PAIR } from "../durable-objects/fake-exchange";
 import { inLimiter, rateLimiterStub } from "../durable-objects/test-helpers";
 import { isUsable } from "../shared/downtime";
 import { fromDecimalString } from "../shared/money";
-import { BINANCE_METHOD_WEIGHTS, withRateLimit, type RateLimiterPort } from "./rate-limited";
+import { EXCHANGE_IDS } from "../db/schema";
+import { DEFAULT_WEIGHT_LIMIT } from "../durable-objects/rate-limiter";
+import { GEMINI_RATE_LIMITS, GEMINI_REQUEST_COSTS } from "./gemini/client";
+import {
+  BINANCE_METHOD_WEIGHTS,
+  GEMINI_METHOD_WEIGHTS,
+  METHOD_WEIGHTS,
+  methodWeightsFor,
+  withRateLimit,
+  type MethodWeights,
+  type RateLimitedExchangeOptions,
+  type RateLimiterPort,
+} from "./rate-limited";
 
 const NOW = 1_760_000_000_000;
 
@@ -77,8 +89,11 @@ beforeEach(() => {
   slept = [];
 });
 
-function gated(options: Parameters<typeof withRateLimit>[2] = {}) {
+function gated(options: Partial<RateLimitedExchangeOptions> = {}) {
   return withRateLimit(exchange, limiter, {
+    // Named explicitly, like every other call site must now. There is no
+    // default venue to fall back on -- see the "which venue" block below.
+    exchange: "binance",
     now: () => NOW,
     sleep: async (ms) => {
       slept.push(ms);
@@ -222,6 +237,165 @@ describe("priority views", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Which venue's cost model gets charged
+// ---------------------------------------------------------------------------
+
+/**
+ * The regression suite for a bug that ran in production and testnet.
+ *
+ * `RateLimitedExchange` used to default its weight table to
+ * `BINANCE_METHOD_WEIGHTS`, and NEITHER call site passed one -- so every Gemini
+ * account was gated against Binance's cost model. Nothing failed: a wrong
+ * weight produces no error, only a budget that does not describe the venue it
+ * is spending. That is exactly the class of bug a test has to catch, because
+ * running the system will not.
+ *
+ * The first test below is the one that would have caught it. It fails against
+ * the old code, because the old code had no way to be told a venue at all.
+ */
+describe("charging the venue it is actually in front of", () => {
+  /** Every method except `placeOrder`, which needs a live order to send. */
+  async function callEachMethod(client: ReturnType<typeof withRateLimit>): Promise<void> {
+    await client.getServerTime();
+    await client.getSymbolFilters(TEST_PAIR);
+    await client.listTradablePairs();
+    await client.getCurrentPrice(TEST_PAIR);
+    await client.getCandles(TEST_PAIR, "1m");
+    await client.getOrderStatus(TEST_PAIR, "v1-bot-0");
+    await client.getOpenOrders(TEST_PAIR);
+    await client.getAccountBalances();
+    await client.cancelOrder(TEST_PAIR, "v1-bot-0");
+  }
+
+  const CALLED: readonly (keyof MethodWeights)[] = [
+    "getServerTime",
+    "getSymbolFilters",
+    "listTradablePairs",
+    "getCurrentPrice",
+    "getCandles",
+    "getOrderStatus",
+    "getOpenOrders",
+    "getAccountBalances",
+    "cancelOrder",
+  ];
+
+  it("charges GEMINI's weights for a Gemini-gated call, not Binance's", async () => {
+    await callEachMethod(gated({ exchange: "gemini" }));
+
+    expect(limiter.requests.map((request) => request.weight)).toEqual(
+      CALLED.map((method) => GEMINI_METHOD_WEIGHTS[method]),
+    );
+
+    // And say it the other way round too, so this cannot pass by the two tables
+    // happening to agree: the weights actually sent are NOT Binance's.
+    expect(limiter.requests.map((request) => request.weight)).not.toEqual(
+      CALLED.map((method) => BINANCE_METHOD_WEIGHTS[method]),
+    );
+  });
+
+  it("still charges Binance's weights for a Binance-gated call", async () => {
+    await callEachMethod(gated({ exchange: "binance" }));
+
+    expect(limiter.requests.map((request) => request.weight)).toEqual(
+      CALLED.map((method) => BINANCE_METHOD_WEIGHTS[method]),
+    );
+  });
+
+  it("has two tables that genuinely disagree, so the assertions above bite", () => {
+    // Without this, both tests above could pass against a single shared table.
+    // Named methods rather than a count, because WHICH ones differ is the part
+    // that matters: a Gemini `getAccountBalances` is one cheap private request,
+    // where Binance's `/api/v3/account` is the most expensive call it makes.
+    const disagreeing = CALLED.filter(
+      (method) => GEMINI_METHOD_WEIGHTS[method] !== BINANCE_METHOD_WEIGHTS[method],
+    );
+    expect(disagreeing).toContain("getAccountBalances");
+    expect(disagreeing).toContain("getSymbolFilters");
+    expect(disagreeing).toContain("cancelOrder");
+  });
+
+  it("keeps the venue when a call site takes the risk-exit view", async () => {
+    // `withPriority` rebuilds the wrapper. A venue dropped there would restore
+    // the original bug on exactly the path that matters most -- the halt.
+    const routine = gated({ exchange: "gemini" });
+    await routine.withPriority("risk-exit").cancelOrder(TEST_PAIR, "v1-bot-0");
+
+    expect(limiter.requests[0]).toMatchObject({
+      priority: "risk-exit",
+      weight: GEMINI_METHOD_WEIGHTS.cancelOrder,
+    });
+  });
+
+  it("declares a table for every known exchange", () => {
+    // A `Record<ExchangeId, ...>`, so widening `ExchangeId` for Kraken breaks
+    // the map rather than silently handing it another venue's numbers. This
+    // asserts the runtime half: no venue resolves to `undefined`.
+    for (const exchange of EXCHANGE_IDS) {
+      expect(methodWeightsFor(exchange)).toBe(METHOD_WEIGHTS[exchange]);
+      expect(methodWeightsFor(exchange)).toBeDefined();
+    }
+  });
+
+  it("gives every method in every table a weight the budget will accept", () => {
+    // `WeightBudget.check` throws on a non-positive weight. Gemini's
+    // `getServerTime` sends no request at all, so its true cost is zero and it
+    // has to be floored -- this is the assertion that keeps that floor honest
+    // for every table, not just the one that needed it.
+    for (const exchange of EXCHANGE_IDS) {
+      for (const weight of Object.values(methodWeightsFor(exchange))) {
+        expect(weight).toBeGreaterThan(0);
+        expect(Number.isFinite(weight)).toBe(true);
+      }
+    }
+  });
+});
+
+describe("how Gemini's request counts become budget units", () => {
+  it("prices a request so neither of Gemini's published limits can be exceeded", () => {
+    // Gemini publishes no weights: it counts REQUESTS against two independent
+    // per-minute counters. The gate spends one weight budget, so a request has
+    // to be priced in that budget's units -- and the price is only defensible
+    // if it lands each counter exactly on Gemini's own published figure.
+    //
+    // This pins the arithmetic against the REAL constants on both sides, so a
+    // change to the DO's ceiling or to Gemini's documented limits fails here
+    // rather than silently re-pricing every Gemini call in production.
+    const requestsPerWindow = (method: keyof MethodWeights): number =>
+      DEFAULT_WEIGHT_LIMIT / GEMINI_METHOD_WEIGHTS[method];
+
+    // `/v1/balances` is private: 1200 / 2 = 600 = Gemini's private limit.
+    expect(requestsPerWindow("getAccountBalances")).toBe(
+      GEMINI_RATE_LIMITS.privateRequestsPerMinute,
+    );
+    // `/v1/pubticker` is public: 1200 / 10 = 120 = Gemini's public limit.
+    expect(requestsPerWindow("getCurrentPrice")).toBe(
+      GEMINI_RATE_LIMITS.publicRequestsPerMinute,
+    );
+    // Both are stated per MINUTE, which is the window the budget runs on.
+    expect(GEMINI_RATE_LIMITS.windowMs).toBe(60_000);
+  });
+
+  it("charges a Gemini cancel for BOTH requests it sends", () => {
+    // Gemini's cancel takes only a numeric `order_id`, so `cancelOrder` is a
+    // status lookup plus the cancel. Charging it one request would under-count
+    // the halt path -- the ladder-wide cancellation storm -- by half, on the
+    // one path the risk-exit reserve exists to protect.
+    expect(GEMINI_REQUEST_COSTS.cancelOrder.requests).toBe(2);
+    expect(GEMINI_METHOD_WEIGHTS.cancelOrder).toBe(
+      2 * GEMINI_METHOD_WEIGHTS.getOrderStatus,
+    );
+  });
+
+  it("charges the smallest accepted weight for a call that sends nothing", () => {
+    // Gemini exposes no server-time endpoint; the method returns a failure
+    // without reaching the network. Its true cost is zero requests, and the
+    // budget refuses a non-positive weight, so one unit is the floor.
+    expect(GEMINI_REQUEST_COSTS.getServerTime.requests).toBe(0);
+    expect(GEMINI_METHOD_WEIGHTS.getServerTime).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Against the real Durable Object
 // ---------------------------------------------------------------------------
 
@@ -244,6 +418,7 @@ describe("against the real RateLimiter", () => {
     });
 
     const client = withRateLimit(exchange, rateLimiterStub(account), {
+      exchange: "binance",
       priority: "risk-exit",
       now: () => clock,
       // Sleeping advances the shared clock, which is what makes a wait
@@ -290,6 +465,7 @@ describe("against the real RateLimiter", () => {
     });
 
     const options = {
+      exchange: "binance" as const,
       now: () => NOW,
       sleep: async (ms: number) => {
         slept.push(ms);
