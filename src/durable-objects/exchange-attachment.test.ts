@@ -221,7 +221,13 @@ describe("exchange attachment (step 13)", () => {
 
     const row = await db.botInstances.findOne({ id: BOT_ID });
     expect(row!.halt_reason).toMatch(/"kraken"/);
-    expect(row!.halt_reason).toMatch(/no exchange client wired/);
+    // The message is BUILT from the same two checks `isWiredExchange` uses, so
+    // it names whichever blocker is actually open rather than asserting both.
+    // It used to read "no exchange client wired" and to claim Kraken had no
+    // resolver, which went stale the day `workers/exchange-kraken.ts` landed and
+    // closed that half; the open blocker now is the rate-limit cost model.
+    expect(row!.halt_reason).toMatch(/not fully wired into this build/);
+    expect(row!.halt_reason).toMatch(/rate-limit cost model/);
     // NAMED, not anonymous. The halt CATEGORY is `unhandled_error` either way --
     // that is how this path reports any throw, including the "coinbase" case
     // above -- so the assertion that matters is which error, carrying what. A
