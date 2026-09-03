@@ -12,36 +12,44 @@
  *
  * ── WHY NOT A REAL `POST /api/bots` ROUND TRIP AGAINST KRAKEN ──
  *
- * BECAUSE ONE IS NOT POSSIBLE YET, AND DELIBERATELY SO. Kraken is not a venue a
- * bot can be created on:
+ * BECAUSE ONE IS STILL NOT POSSIBLE, THOUGH THE REASON HAS CHANGED. `ExchangeId`
+ * HAS now been widened to `"binance" | "gemini" | "kraken"` (the wiring step).
+ * What keeps Kraken off the HTTP path is no longer the union but two other
+ * things:
  *
- *   - `ExchangeId` in `db/schema.ts` is `"binance" | "gemini"`, and this change
- *     does not widen it. Entry 90 step (c), the Kraken client, does not exist,
- *     so a bot created on Kraken today would reserve capital and then halt at
- *     its first trade with `not_attached` -- the exact failure this gate exists
- *     to prevent, arriving through a different door.
- *   - `POST /api/bots` with `exchange: "kraken"` is therefore refused with 400
- *     `invalid_exchange`, and `api.test.ts` already pins that behaviour.
- *   - `accounts.exchange` carries a D1 `CHECK (exchange IN ('binance','gemini'))`,
- *     so a Kraken account cannot be seeded into the test database either.
+ *   - `accounts.exchange` still carries its D1
+ *     `CHECK (exchange IN ('binance','gemini'))` -- the widening migration is a
+ *     deliberate later step -- so a Kraken account cannot be seeded into the
+ *     test database, and the registry branch cannot be reached over HTTP.
+ *   - `assertExchangeIsWired` (handlers.ts) now refuses any venue with no client
+ *     behind it, so even the unregistered-account fallback answers 400
+ *     `exchange_not_wired` rather than creating a bot. `api.test.ts` pins that
+ *     round trip; it is the hole this gate's own docblock predicted, and it was
+ *     briefly open the moment the union widened.
  *
- * So the gate is unreachable over HTTP, and will stay unreachable until Kraken
- * is enabled on purpose. What this file does instead is call the real exported
- * `createBot` with a real `Request`, through its real body parsing and its real
- * `resolveBotExchange`, over a database stub whose ACCOUNT ROW SAYS "kraken".
- * That is not a contrivance: `resolveBotExchange` returns a registered account's
- * stored `exchange` column WITHOUT running it through `isExchangeId`, so this is
- * genuinely the value the handler would hold the day the venue is enabled.
+ * So the gate is still unreachable over HTTP. What this file does instead is
+ * call the real exported `createBot` with a real `Request`, through its real
+ * body parsing and its real `resolveBotExchange`, over a database stub whose
+ * ACCOUNT ROW SAYS "kraken". That is not a contrivance: `resolveBotExchange`
+ * returns a registered account's stored `exchange` column WITHOUT running it
+ * through `isExchangeId`, so this is genuinely the value the handler would hold
+ * the day the CHECK is widened.
  *
  * ── WHAT MAKES THIS A WIRING PROOF AND NOT A FUNCTION-EXISTS PROOF ──
  *
- * The stub database implements `accounts.findOne` and NOTHING ELSE. Any request
- * that gets past the gate walks into an unimplemented property and dies with a
- * `TypeError`, not an `ApiError`. So "the gate fired" and "the gate did not
- * fire" are two different, distinguishable outcomes here, and every test below
- * asserts which one happened. A `createBot` that had the rule imported but never
- * called would fail the first test; a `createBot` that called it on binance too
- * would fail the inertness tests.
+ * The stub database implements `accounts.findOne` and NOTHING ELSE, so "the gate
+ * fired" and "the gate did not fire" stay two distinguishable outcomes, and
+ * every test below asserts which one happened. A `createBot` that had the rule
+ * imported but never called would fail the first test; a `createBot` that called
+ * it on binance too would fail the inertness tests.
+ *
+ * WHAT AN IN-BUDGET KRAKEN ID HITS NEXT CHANGED, and the tests moved with it.
+ * It used to fall through to `requireString(body, "pair")` and fail with
+ * `missing_field`. `assertExchangeIsWired` now sits immediately after this gate,
+ * so it stops there instead with `exchange_not_wired`. That is a STRONGER
+ * acceptance signal than the old one, not a weaker one: a specific `ApiError`
+ * from the very next line proves this gate declined to refuse, where a
+ * `missing_field` several checks later proved only that it got somewhere.
  */
 
 import { describe, expect, it } from "vitest";
@@ -51,6 +59,7 @@ import type { ApiContext } from "./router";
 import type { Database } from "../db/database";
 import { EXCHANGE_IDS, isExchangeId } from "../db/schema";
 import { checkBotInstanceIdFitsVenue } from "../shared/idempotency";
+import { isWiredExchange, wiredExchanges } from "../workers/venue-wiring";
 
 /**
  * An `ApiContext` carrying only what `createBot` touches before the gate: the
@@ -116,15 +125,15 @@ describe("createBot calls the per-venue client-order-id gate", () => {
 
   it("lets an in-budget kraken id through the gate and on to the next check", async () => {
     // The acceptance half. A 10-character id -- exactly what the dashboard
-    // generates -- must NOT be refused by the gate. It is proved to have passed
-    // by the request failing at the NEXT thing `createBot` does, which is
-    // `requireString(body, "pair")`, with a different code.
+    // generates -- must NOT be refused by THIS gate. It is proved to have passed
+    // by the request failing at the NEXT thing `createBot` does, which is now
+    // `assertExchangeIsWired`, with a different code.
     const outcome = await outcomeOf(contextFor("bot-1toiyz", "kraken"));
 
     expect(outcome.kind).toBe("api");
     const error = (outcome as { error: ApiError }).error;
-    expect(error.code).toBe("missing_field");
-    expect(error.message).toContain("pair");
+    expect(error.code).toBe("exchange_not_wired");
+    expect(error.code).not.toBe("bot_instance_id_too_long_for_venue");
   });
 
   it("passes the venue and the id it actually resolved, not a hardcoded pair", async () => {
@@ -133,14 +142,14 @@ describe("createBot calls the per-venue client-order-id gate", () => {
     // their own, since `acct-1` is short enough to pass.
     const longAccountShortBot = await outcomeOf(contextFor("bot-ts1", "kraken"));
     expect(longAccountShortBot.kind).toBe("api");
-    expect((longAccountShortBot as { error: ApiError }).error.code).toBe("missing_field");
+    expect((longAccountShortBot as { error: ApiError }).error.code).toBe("exchange_not_wired");
 
     // And one character over the budget is refused, so the boundary is the id's.
     const elevenChars = await outcomeOf(contextFor("bot-1toiyzz", "kraken"));
     expect((elevenChars as { error: ApiError }).error.code).toBe("bot_instance_id_too_long_for_venue");
 
     const tenChars = await outcomeOf(contextFor("bot-1toiyz", "kraken"));
-    expect((tenChars as { error: ApiError }).error.code).toBe("missing_field");
+    expect((tenChars as { error: ApiError }).error.code).toBe("exchange_not_wired");
   });
 });
 
@@ -150,7 +159,12 @@ describe("createBot calls the per-venue client-order-id gate", () => {
  * ids, and assert the gate never speaks.
  */
 describe("the gate does not touch binance or gemini bot creation", () => {
-  for (const exchange of EXCHANGE_IDS) {
+  // `wiredExchanges()`, NOT `EXCHANGE_IDS`. The union now contains kraken, and
+  // iterating it here would generate a kraken case inside a block asserting the
+  // gate stays silent -- which is the one venue the gate is FOR. This loop is
+  // about the venues bots are really created on, and that is exactly the set
+  // `wiredExchanges()` names, so it widens on its own the day Kraken is wired.
+  for (const exchange of wiredExchanges()) {
     it(`lets an id that kraken would refuse through on ${exchange}`, async () => {
       const outcome = await outcomeOf(contextFor("grid-btcusd-01", exchange));
 
@@ -184,15 +198,27 @@ describe("the gate does not touch binance or gemini bot creation", () => {
  * `POST /api/bots` round trips and should be rewritten as such.
  */
 describe("why a real POST /api/bots round trip against kraken is not possible yet", () => {
-  it("does not accept kraken as an exchange a bot can be created on", () => {
-    expect(isExchangeId("kraken")).toBe(false);
-    expect(EXCHANGE_IDS).not.toContain("kraken");
-    expect([...EXCHANGE_IDS].sort()).toEqual(["binance", "gemini"]);
+  it("names kraken now, which is exactly why the second gate had to exist", () => {
+    // This assertion is INVERTED from what it said before the widening, and the
+    // inversion is the record of what happened: `isExchangeId` used to be the
+    // only thing standing between a request and a Kraken bot, and the day it
+    // started returning true, `POST /api/bots` answered 201.
+    expect(isExchangeId("kraken")).toBe(true);
+    expect(EXCHANGE_IDS).toContain("kraken");
+    expect([...EXCHANGE_IDS].sort()).toEqual(["binance", "gemini", "kraken"]);
+  });
+
+  it("still refuses kraken, on venue wiring rather than on the union", () => {
+    // The replacement precondition. `isWiredExchange` is what keeps the venue
+    // off the HTTP path now; when this starts failing, Kraken is being enabled,
+    // and at that moment the tests above become expressible as real
+    // `POST /api/bots` round trips and should be rewritten as such.
+    expect(isWiredExchange("kraken")).toBe(false);
+    expect(wiredExchanges()).toEqual(["binance", "gemini"]);
   });
 
   it("already knows kraken's budget, so enabling the venue needs no second change", () => {
-    // The gate is live now and keyed on the venue string. Widening `ExchangeId`
-    // is the only thing standing between these two facts and a refused request.
+    // The gate is live now and keyed on the venue string.
     expect(checkBotInstanceIdFitsVenue("kraken", "grid-btcusd-01")).not.toBeNull();
     expect(checkBotInstanceIdFitsVenue("kraken", "bot-1toiyz")).toBeNull();
   });

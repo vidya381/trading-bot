@@ -184,8 +184,35 @@ describe("exchange attachment (step 13)", () => {
 
   it("refuses a stored exchange value that is not a known exchange", async () => {
     // A corrupted or legacy exchange string must not reach a resolver at all;
-    // isExchangeId guards it first. "kraken" is a valid TEXT value in D1 (the
-    // column has no CHECK) but not a known ExchangeId.
+    // isExchangeId guards it first. "coinbase" is a valid TEXT value in D1 (the
+    // column has no CHECK) but not a known ExchangeId. This used to be spelled
+    // "kraken", back when "not in ExchangeId" and "cannot be traded" were the
+    // same fact; widening the union split them and each half now has its own
+    // test. See the one below for the half kraken moved to.
+    await runResolving((bot) => bot.create(creation({ exchange: "coinbase" })));
+    await runResolving((bot) => bot.start(ACTOR));
+
+    const result = await runResolving((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(result.status).toBe("halted");
+
+    const row = await db.botInstances.findOne({ id: BOT_ID });
+    expect(row!.halt_reason).toMatch(/"coinbase"/);
+    expect(row!.halt_reason).toMatch(/not a known exchange/);
+    // The venue list in that message is built from EXCHANGE_IDS, so it cannot go
+    // stale the way the hardcoded `("binance" or "gemini")` literal did.
+    expect(row!.halt_reason).toContain('"kraken"');
+
+    const snapshot = await runResolving((bot) => bot.snapshot());
+    expect(snapshot.orders).toHaveLength(0);
+  });
+
+  it("refuses a KNOWN exchange with no client wired, by name rather than by crash", async () => {
+    // The regression this pins is a DIAGNOSIS, not an outcome. "kraken" is a
+    // known ExchangeId now, so it passes the isExchangeId guard above; before
+    // `isWiredExchange` was added it then reached `resolveExchangeForAccount`,
+    // whose switch has no kraken case and no default, returned `undefined`, and
+    // the bot halted on `unhandled_error: TypeError: Cannot read properties of
+    // undefined (reading 'ok')`. Same halt, no way for an operator to act on it.
     await runResolving((bot) => bot.create(creation({ exchange: "kraken" })));
     await runResolving((bot) => bot.start(ACTOR));
 
@@ -194,7 +221,21 @@ describe("exchange attachment (step 13)", () => {
 
     const row = await db.botInstances.findOne({ id: BOT_ID });
     expect(row!.halt_reason).toMatch(/"kraken"/);
-    expect(row!.halt_reason).toMatch(/not a known exchange/);
+    expect(row!.halt_reason).toMatch(/no exchange client wired/);
+    // NAMED, not anonymous. The halt CATEGORY is `unhandled_error` either way --
+    // that is how this path reports any throw, including the "coinbase" case
+    // above -- so the assertion that matters is which error, carrying what. A
+    // `BotInstanceError` whose text names the venue and the missing wiring is
+    // actionable; `TypeError: Cannot read properties of undefined (reading
+    // 'ok')` was the exact string an operator got before, and it is a dead end.
+    expect(row!.halt_reason).toMatch(/BotInstanceError/);
+    expect(row!.halt_reason).not.toMatch(/TypeError/);
+    expect(row!.halt_reason).not.toMatch(/undefined/);
+    // Actionable: it says what to do instead.
+    expect(row!.halt_reason).toMatch(/binance, gemini/);
+    // It is NOT reported as an unknown venue: kraken is known, and telling an
+    // operator otherwise would send them to the wrong fix.
+    expect(row!.halt_reason).not.toMatch(/not a known exchange/);
 
     const snapshot = await runResolving((bot) => bot.snapshot());
     expect(snapshot.orders).toHaveLength(0);

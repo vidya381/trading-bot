@@ -31,9 +31,9 @@ export type StrategyType = "grid" | "dca" | "trailing_stop";
  * guard for values arriving as free-typed strings (a stored `bot_instances.exchange`,
  * a request field).
  */
-export type ExchangeId = "binance" | "gemini";
+export type ExchangeId = "binance" | "gemini" | "kraken";
 
-export const EXCHANGE_IDS: readonly ExchangeId[] = ["binance", "gemini"];
+export const EXCHANGE_IDS: readonly ExchangeId[] = ["binance", "gemini", "kraken"];
 
 export function isExchangeId(value: unknown): value is ExchangeId {
   return typeof value === "string" && (EXCHANGE_IDS as readonly string[]).includes(value);

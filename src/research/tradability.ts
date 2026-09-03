@@ -165,6 +165,59 @@ export interface TradabilityRefusal {
  *    and cannot reach. If a client for it is ever added, this row becomes wrong
  *    and must change -- it says "nothing to match", not "nothing exists".
  *
+ *  - `kraken`  `[]`, for Binance's structural reason, and NOT by default. Kraken
+ *    Spot (`api.kraken.com/0/public/AssetPairs`) and Kraken Futures
+ *    (`futures.kraken.com`) are separate products on separate hosts; this system
+ *    has a client for the first and none for the second, so no perpetual can
+ *    appear in the catalogue this heuristic runs against. `kraken/filters.ts`
+ *    reached the identical conclusion from the other direction and records it
+ *    there: AssetPairs carries no field distinguishing spot from futures because
+ *    there is no futures instrument in it to distinguish.
+ *
+ *    ── THE STAKED/BONDED QUESTION, ASKED AND ANSWERED RATHER THAN SKIPPED ──
+ *
+ *    Kraken publishes 44 suffixed asset codes (entry 91 PART 4, live count over
+ *    all 839 assets): 27 `.S` (staked, `DOT.S`), 7 `.HOLD`, 5 `.M` (bonded/earn,
+ *    `XBT.M`), 2 `.P`, and one each of `.INK`, `.CORE`, `.TEMPO`. They are real,
+ *    they are genuinely not freely tradeable the way spot is, and this codebase
+ *    treats them as distinct assets on purpose. So: do they belong in this row?
+ *
+ *    NO, and for two independent reasons, either of which would be sufficient.
+ *
+ *    FIRST, THEY CANNOT REACH THIS FUNCTION. `derivativeNameSuffix` matches on a
+ *    PAIR name. Those 44 codes are ASSET names, and no pair name Kraken
+ *    publishes contains a `.` -- checked across all 1440 pairs, and load-bearing
+ *    enough that `normalisePairName` strips punctuation on the strength of it
+ *    while `normaliseAssetName` deliberately keeps it. A suffix that never
+ *    occurs in this function's input cannot be matched by adding it here; a row
+ *    saying `[".s", ".m"]` would be inert code that LOOKED like a guard, which
+ *    is worse than the empty array because a later reader would trust it.
+ *
+ *    SECOND, THEY ARE NOT WHAT THIS TABLE IS ABOUT. The refusal this row feeds
+ *    (`pair_not_spot_by_name`) says a pair is a perpetual, and the harm it names
+ *    is the one section 4.5 cannot model: margin, funding and liquidation. A
+ *    staked or bonded balance involves none of those. Its real hazard is a WRONG
+ *    NUMBER -- an earn balance read as spot BTC, so the system sizes an order
+ *    against locked funds -- which is a different failure, guarded in the right
+ *    place already: `kraken/catalogue.ts` refuses to alias a suffixed code onto
+ *    its base, so `XBT.M` resolves to itself and never reads as `BTC`. Routing
+ *    that concern through a derivative-naming heuristic would put the guard
+ *    somewhere it does not belong and weaken the one that does the work.
+ *
+ *    NOT CLAIMED, and explicitly still open -- the same shape as the Binance row
+ *    above, and for the same reason: that everything Kraken lists on AssetPairs
+ *    is something this system should trade. `kraken/filters.ts` maps `status`
+ *    failing closed, so a non-`online` market is refused; nothing yet asks
+ *    whether a LISTED market is liquid enough or ordinary enough to run a bot
+ *    on. Entry 90 PART 5 puts liquidity and pair selection in the research
+ *    pipeline rather than here, so that is where it belongs, and it is recorded
+ *    here because this table is where a future reader will come looking for
+ *    "what does this system believe about Kraken instruments".
+ *
+ *    THE TRIPWIRE, if the premise ever breaks: a Kraken pair name containing a
+ *    `.` would falsify the first reason above AND `normalisePairName` at the
+ *    same time. The catalogue is where that would surface, not here.
+ *
  * Suffixes only. A substring match would refuse `PERPUSD` -- Perpetual
  * Protocol's real spot ticker -- and the whole point of a cheap heuristic is
  * that it is cheap to be right about.
@@ -172,6 +225,7 @@ export interface TradabilityRefusal {
 const DERIVATIVE_NAME_SUFFIXES: Readonly<Record<ExchangeId, readonly string[]>> = {
   gemini: ["perp"],
   binance: [],
+  kraken: [],
 };
 
 /**
@@ -350,10 +404,22 @@ export interface InstrumentRefusal {
  *    deliberately and recorded here rather than in a comment nobody reads,
  *    because this table is exactly where a future reader will come looking for
  *    "what does this system believe about Binance instruments".
+ *
+ *  - `kraken`  FALSE, and structural in exactly Binance's way rather than a
+ *    concession. `kraken/filters.ts` states the finding at its source: Kraken's
+ *    spot and futures markets live behind separate hosts, and AssetPairs carries
+ *    no field distinguishing them because there is no futures instrument in it
+ *    to distinguish. `parsePairFilters` therefore OMITS `instrument` entirely
+ *    rather than setting it to `unknown` -- "this venue publishes no such field"
+ *    is a different fact from "the venue sent something unmappable", and this
+ *    row is the same fact stated on the consuming side. See
+ *    `DERIVATIVE_NAME_SUFFIXES` above for the staked/bonded assets, which are a
+ *    real distinction on this venue and deliberately not this table's business.
  */
 const VENUE_PUBLISHES_INSTRUMENT_TYPE: Readonly<Record<ExchangeId, boolean>> = {
   gemini: true,
   binance: false,
+  kraken: false,
 };
 
 /** How each mappable answer reads in a refusal message. */

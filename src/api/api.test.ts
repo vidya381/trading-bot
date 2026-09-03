@@ -3434,9 +3434,71 @@ describe("bot creation dispatches exchange from the account registry (step 11)",
     const account = `bad-${suffix}`;
     await seedBalance(account);
 
-    const res = await createBotBody(account, `xb-${suffix}`, "kraken");
+    // "coinbase" and NOT "kraken". This test used to pass `"kraken"`, back when
+    // the two facts "is not an `ExchangeId`" and "cannot be traded" were the
+    // same fact. Widening `ExchangeId` for Kraken split them, and the value that
+    // still exercises THIS refusal -- `isExchangeId` rejecting the string
+    // outright -- is one the union has never contained. The Kraken case is now
+    // its own test, immediately below, because it is now its own failure mode.
+    const res = await createBotBody(account, `xb-${suffix}`, "coinbase");
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("invalid_exchange");
+    // The message offers only venues that really work -- never a venue the very
+    // next gate would refuse.
+    expect(res.body.error.message).not.toContain("kraken");
+  });
+
+  /**
+   * THE REGRESSION TEST for the hole that widening `ExchangeId` opened.
+   *
+   * `resolveBotExchange`'s unregistered-account fallback validated the body's
+   * `exchange` with `isExchangeId` ALONE. The moment `"kraken"` joined the
+   * union, this exact request -- an unregistered account, `exchange: "kraken"`
+   * -- returned **201** and created a live bot on a venue with no client behind
+   * it: capital reserved, `bot_instances` row written, Durable Object alive, and
+   * a `TypeError` waiting at its first trade.
+   *
+   * `accounts.exchange`'s D1 `CHECK (exchange IN ('binance','gemini'))` is no
+   * defence here and never was. An UNREGISTERED account is by definition absent
+   * from the accounts table, so the constraint is never consulted on this path.
+   * That is the whole reason the hole existed while the SQL still looked closed,
+   * and it is why this test drives the HTTP endpoint rather than asserting on
+   * `isExchangeId`: only the round trip can tell 201 from 400.
+   *
+   * THE LOAD-BEARING ASSERTION IS NOT THE STATUS CODE. It is that NOTHING
+   * HAPPENED -- the same standard the tradability-gate tests below hold
+   * themselves to. A gate that returns 400 after reserving capital is worse than
+   * no gate, because it looks correct.
+   */
+  it("refuses an unregistered account on an unwired venue, reserving nothing (400)", async () => {
+    const account = `unwired-${suffix}`;
+    await seedBalance(account);
+    const id = `kb-${suffix}`;
+
+    const res = await createBotBody(account, id, "kraken");
+
+    expect(res.status).not.toBe(201);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("exchange_not_wired");
+    // The refusal names the venue and says the shortfall is this build's, so an
+    // operator does not retry the same request expecting a different answer.
+    expect(res.body.error.message).toContain("kraken");
+
+    // NOTHING WAS CREATED, on any of the four surfaces a real creation touches.
+    expect(await db.botInstances.findOne({ id })).toBeNull();
+
+    const ledger = await db.capitalLedger.findOne({ account_label: account, asset: "USDT" });
+    expect(ledger!.total_allocated).toBe(m("0"));
+
+    const audit = await db.auditLog.findMany({ where: { target_bot_instance_id: id } });
+    expect(audit).toEqual([]);
+
+    // And no Durable Object was brought into existence -- proved the way every
+    // other refusal test here proves it: the id is still free, so the same id
+    // creates cleanly on a wired venue rather than answering 409 already_created.
+    const retry = await createBotBody(account, id, "binance");
+    expect(retry.status).toBe(201);
+    expect((await db.botInstances.findOne({ id }))!.exchange).toBe("binance");
   });
 });
 

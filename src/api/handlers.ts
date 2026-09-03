@@ -96,7 +96,8 @@ import type {
   ExchangeId,
   ManualAdjustmentRow,
 } from "../db/schema";
-import { EXCHANGE_IDS, isExchangeId } from "../db/schema";
+import { isExchangeId } from "../db/schema";
+import { describeUnwiredExchange, isWiredExchange, wiredExchanges } from "../workers/venue-wiring";
 import {
   checkBotInstanceIdFitsVenue,
   describeVenueIdLengthViolation,
@@ -481,9 +482,15 @@ async function resolveBotExchange(
     );
   }
   if (!isExchangeId(bodyExchange)) {
+    // The venues OFFERED here are the wired ones, not every `ExchangeId`.
+    // `EXCHANGE_IDS` now includes a venue with no client behind it, and naming
+    // it in a "must be one of" list would invite the operator to retry with a
+    // value that `assertExchangeIsWired` refuses one line later. A venue that
+    // IS in `ExchangeId` but unwired falls through to that gate, which explains
+    // the real reason -- so the two refusals stay distinct and both stay true.
     throw badRequest(
       "invalid_exchange",
-      `exchange must be one of ${EXCHANGE_IDS.join(", ")}, got ${JSON.stringify(bodyExchange)}`,
+      `exchange must be one of ${wiredExchanges().join(", ")}, got ${JSON.stringify(bodyExchange)}`,
     );
   }
   return bodyExchange;
@@ -528,6 +535,48 @@ function assertBotInstanceIdFitsVenue(venue: string, botInstanceId: string): voi
   const violation = checkBotInstanceIdFitsVenue(venue, botInstanceId);
   if (violation !== null) {
     throw badRequest("bot_instance_id_too_long_for_venue", describeVenueIdLengthViolation(violation));
+  }
+}
+
+/**
+ * THE VENUE-IS-ACTUALLY-WIRED GATE.
+ *
+ * `resolveBotExchange` answers "which venue does this request mean". It does NOT
+ * answer "can this build trade there", and until Kraken those were the same
+ * question. They are not any more: `ExchangeId` now names a venue whose client
+ * is not wired into dispatch (see `workers/venue-wiring.ts` for exactly what is
+ * missing and why each piece is deferred).
+ *
+ * ── THE HOLE THIS CLOSES, PRECISELY ──
+ *
+ * `resolveBotExchange`'s unregistered-account fallback validates the request
+ * body with `isExchangeId` alone. The instant `"kraken"` joined `ExchangeId`,
+ * `POST /api/bots` with an unregistered account and `exchange: "kraken"`
+ * returned **201** and created a real bot -- capital reserved, `bot_instances`
+ * row written, Durable Object alive -- which would then halt at its first trade
+ * on a `TypeError`. `accounts.exchange`'s D1 CHECK is no defence on that path,
+ * because an unregistered account is by definition not in the accounts table.
+ *
+ * ── WHY IT GUARDS BOTH BRANCHES, NOT JUST THE FALLBACK ──
+ *
+ * The fallback is the only door open TODAY (the CHECK still refuses a stored
+ * `kraken`). But the follow-up migration widening that CHECK is the whole point
+ * of this build, and on the day it lands the registry branch becomes a second
+ * door to the same failure. Guarding the value `resolveBotExchange` RETURNS
+ * covers both by construction, so that migration cannot reopen this.
+ *
+ * ── WHY IT RUNS HERE AND NOT EARLIER ──
+ *
+ * After `assertBotInstanceIdFitsVenue`, deliberately. That gate is a rule about
+ * the operator's INPUT -- an id they can shorten and resend -- so it is the more
+ * actionable message and keeps its place at the front. This one is a fact about
+ * the build, which no edit to the request can satisfy. Both are free, both run
+ * before the pair, the params, the proposal and any network call, so a refusal
+ * from either leaves NOTHING done: no row, no capital, no Durable Object.
+ */
+function assertExchangeIsWired(exchange: ExchangeId): void {
+  if (!isWiredExchange(exchange)) {
+    throw badRequest("exchange_not_wired", describeUnwiredExchange(exchange));
   }
 }
 
@@ -687,6 +736,10 @@ export async function createBot(ctx: ApiContext): Promise<Response> {
   // runs the moment the venue is known, before the pair, the params, the
   // proposal or the tradability gate. See `assertBotInstanceIdFitsVenue`.
   assertBotInstanceIdFitsVenue(exchange, botInstanceId);
+  // ...and the venue must be one this build can actually trade on. See
+  // `assertExchangeIsWired`: free, before anything is created, and covering the
+  // registry branch as well as the fallback.
+  assertExchangeIsWired(exchange);
   const pair = requireString(body, "pair") as Pair;
   const capitalAsset = requireString(body, "capitalAsset") as Asset;
   const allocatedCapital = requireMoney(body, "allocatedCapital");

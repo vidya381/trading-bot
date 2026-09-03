@@ -249,7 +249,13 @@ describe("the venue table must be exhaustive", () => {
     const complete: Readonly<Record<ExchangeId, readonly string[]>> = {
       gemini: ["perp"],
       binance: [],
+      // `[]` is this venue's ANSWER, not a placeholder: Kraken's perpetuals are
+      // on a separate host with no client here, and its 44 staked/bonded codes
+      // (`DOT.S`, `XBT.M`) are ASSET names that cannot appear in a pair name --
+      // no Kraken pair name contains a `.`, checked across all 1440. The real
+      // table carries the full reasoning.
+      kraken: [],
     };
-    expect(Object.keys(complete).sort()).toEqual(["binance", "gemini"]);
+    expect(Object.keys(complete).sort()).toEqual(["binance", "gemini", "kraken"]);
   });
 });

@@ -89,7 +89,8 @@ import type {
   StrategyType,
   TradeRow,
 } from "../db/schema";
-import { isExchangeId } from "../db/schema";
+import { EXCHANGE_IDS, isExchangeId } from "../db/schema";
+import { describeUnwiredExchange, isWiredExchange } from "../workers/venue-wiring";
 import { resolveExchangeForAccount } from "../workers/exchange-dispatch";
 import { validateOrder } from "../exchange/binance/filters";
 import type {
@@ -1165,12 +1166,46 @@ export class BotInstance extends DurableObject<Env> {
    */
   #venue(config: BotConfigBase): ExchangeId {
     if (!isExchangeId(config.exchange)) {
+      // The venue list is BUILT FROM `EXCHANGE_IDS`, never spelled out. It used
+      // to read `("binance" or "gemini")` as a literal, which `tsc` cannot check
+      // and which went stale the moment `ExchangeId` was widened for Kraken --
+      // a message confidently naming the wrong set is worse than none, because
+      // an operator diagnosing a halt believes it.
       throw new BotInstanceError(
         "not_attached",
         `bot ${config.botInstanceId}'s stored exchange ${JSON.stringify(config.exchange)} ` +
-          `is not a known exchange ("binance" or "gemini"); refusing to build a client.`,
+          `is not a known exchange (${EXCHANGE_IDS.map((id) => JSON.stringify(id)).join(", ")}); ` +
+          `refusing to build a client.`,
       );
     }
+
+    // KNOWN IS NOT THE SAME AS TRADABLE, and this is the second guard that
+    // separation now needs. `isExchangeId` above answers "can this string be
+    // named"; it answered both questions until Kraken widened `ExchangeId`
+    // ahead of its dispatch. A stored `"kraken"` passes the check above and
+    // then reaches `resolveExchangeForAccount`, whose `switch` has no matching
+    // `case` and no `default`, so it returns `undefined` -- and `#rawExchange`
+    // reads `.ok` off it and halts the bot with
+    // `unhandled_error: TypeError: Cannot read properties of undefined`.
+    //
+    // The bot halts either way; what was lost is the DIAGNOSIS. A halt reason
+    // an operator cannot act on is the failure this guard exists to prevent, so
+    // the refusal is named here, before the resolver is ever called, in the same
+    // `not_attached` shape as every other fail-closed reason on this path.
+    //
+    // Rows like this exist despite `createBot`'s `assertExchangeIsWired`: a bot
+    // row predates any handler gate (it is read back from storage), and
+    // `bot_instances.exchange` carries NO D1 CHECK -- unlike `accounts.exchange`
+    // -- so the column can hold any string a past write or a manual edit put
+    // there. This is the last line, and it must not be an anonymous crash.
+    if (!isWiredExchange(config.exchange)) {
+      throw new BotInstanceError(
+        "not_attached",
+        `bot ${config.botInstanceId}'s stored exchange ${JSON.stringify(config.exchange)}: ` +
+          `${describeUnwiredExchange(config.exchange)}`,
+      );
+    }
+
     return config.exchange;
   }
 
