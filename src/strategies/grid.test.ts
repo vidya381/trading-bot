@@ -19,6 +19,7 @@ import {
   stopLossPrice,
   topRungGap,
   vacantLadder,
+  peakLiveOrders,
   validateGridParams,
   withSlot,
   type GridConfig,
@@ -194,6 +195,35 @@ describe("validation", () => {
 
   it("refuses a stop-loss of 100% or more, which no positive price can reach", () => {
     expect(() => validateGridParams(gridParams({ stopLossPct: m("100") }), m("400"))).toThrow(/below 100%/);
+  });
+});
+
+describe("peakLiveOrders", () => {
+  it("is the level count, because every level holds at most one live order", () => {
+    expect(peakLiveOrders(gridParams({ gridLines: 5 }))).toBe(5);
+    expect(peakLiveOrders(gridParams({ gridLines: 2 }))).toBe(2);
+  });
+
+  it("counts one MORE than the capital check's buy levels, and that is the point", () => {
+    // ⚠ THE OFF-BY-ONE THIS FUNCTION EXISTS TO GET RIGHT. `validateGridParams`
+    // reasons about `gridLines - 1` because "the topmost line only ever holds a
+    // sell" and a sell costs no quote capital. It still costs an ORDER. Reusing
+    // the capital figure for a venue's order-count ceiling would under-count the
+    // peak by exactly one, at exactly the boundary the ceiling is checked at.
+    const p = gridParams({ gridLines: 5 });
+    expect(peakLiveOrders(p)).toBe(p.gridLines);
+    expect(peakLiveOrders(p)).toBe(p.gridLines - 1 + 1);
+  });
+
+  it("equals the number of slots a fresh ladder allocates", () => {
+    // Derived from the same structure rather than restated: `slots` is one entry
+    // per level and `claimSlot` is what keeps it to one order each, so this is
+    // the invariant the function is a reading of.
+    for (const gridLines of [2, 3, 7, 61]) {
+      expect(peakLiveOrders(gridParams({ gridLines }))).toBe(
+        emptyLadder(gridParams({ gridLines })).slots.length,
+      );
+    }
   });
 });
 

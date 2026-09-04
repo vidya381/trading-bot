@@ -361,6 +361,15 @@ export interface KrakenErrorClass {
 export const INVALID_NONCE_ERROR = "EAPI:Invalid nonce";
 
 /**
+ * The pair already holds its maximum number of open orders.
+ *
+ * Exported because two places need to name the same string and neither should
+ * spell it: this module classifies it, and `open-orders.test.ts` asserts the
+ * prevention path is aimed at the refusal the classifier actually handles.
+ */
+export const ORDERS_LIMIT_EXCEEDED_ERROR = "EOrder:Orders limit exceeded";
+
+/**
  * Errors that are RETRYABLE but still mean the exchange answered.
  *
  * `EAPI:Invalid nonce` mirrors Gemini's `INVALID_NONCE_REASON` exactly: a 4xx-
@@ -392,6 +401,37 @@ const TRANSPORT_ERRORS: ReadonlySet<string> = new Set([
   "EService:Market in cancel_only mode",
   "EService:Market in post_only mode",
   "EService:Deadline elapsed",
+]);
+
+/**
+ * Errors this system has CONFIRMED are definite, non-retryable refusals.
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠ THIS SET CHANGES NO BEHAVIOUR, AND THAT IS THE POINT OF IT
+ * ---------------------------------------------------------------------------
+ * `classifyKrakenError`'s default arm ALREADY returns exactly this for any
+ * unrecognised string, so every member here would classify identically if the
+ * set were deleted. It exists so that the classification of these strings is a
+ * DECISION ON THE RECORD rather than a consequence of not having been thought
+ * about -- the two are indistinguishable from the outside, and they call for
+ * opposite responses the day somebody wants to change the default.
+ *
+ * `EOrder:Orders limit exceeded` is the reason it was written. It is Kraken's
+ * refusal when a pair already holds the maximum number of open orders
+ * (`KRAKEN_OPEN_ORDER_CEILINGS`), and it LOOKS like a sibling of
+ * `EOrder:Rate limit exceeded`, which is two rows up in `RETRYABLE_EXCHANGE_ERRORS`
+ * and differs by one word. It is not a sibling. A rate limit clears by waiting;
+ * an open-order CEILING is a level that only a fill or a cancel lowers, so a
+ * retry re-sends an order into an identical refusal for as long as the book
+ * stays full. Classifying it retryable by analogy with its near-namesake is a
+ * mistake this set exists to make visibly wrong.
+ *
+ * The prevention side of the same limit is a creation-time check
+ * (`checkOpenOrderCeiling` in `exchange/open-orders.ts`); this is the backstop
+ * for what that check cannot see -- another bot on the same account and pair.
+ */
+const DEFINITE_REFUSALS: ReadonlySet<string> = new Set([
+  ORDERS_LIMIT_EXCEEDED_ERROR,
 ]);
 
 /**
@@ -435,7 +475,12 @@ export function classifyKrakenError(error: string, at: Timestamp): KrakenErrorCl
   if (RETRYABLE_EXCHANGE_ERRORS.has(error)) {
     return { kind: "exchange_error", retryable: true };
   }
-  // FAIL CLOSED. See the docblock.
+  if (DEFINITE_REFUSALS.has(error)) {
+    return { kind: "exchange_error", retryable: false };
+  }
+  // FAIL CLOSED. See the docblock. `DEFINITE_REFUSALS` above lands here too, by
+  // design -- it names the strings whose refusal is confirmed rather than
+  // inferred, and asserts nothing different about them.
   return { kind: "exchange_error", retryable: false };
 }
 

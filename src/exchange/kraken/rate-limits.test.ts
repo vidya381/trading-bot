@@ -32,11 +32,13 @@ import {
   KRAKEN_CANCEL_AGE_COSTS,
   KRAKEN_CANCEL_COST_UNKNOWN_AGE,
   KRAKEN_DEFAULT_TIER,
+  KRAKEN_OPEN_ORDER_CEILINGS,
   KRAKEN_REST_COUNTER_COSTS,
   KRAKEN_REST_TIERS,
   KRAKEN_TRADING_TIERS,
   krakenBatchCancelCost,
   krakenCancelCost,
+  krakenOpenOrderCeiling,
 } from "./rate-limits";
 
 describe("the REST call counter, per tier", () => {
@@ -371,5 +373,89 @@ describe("krakenBatchCancelCost", () => {
       );
       expect(krakenBatchCancelCost(ages)).toBe(sequential);
     }
+  });
+});
+
+describe("the per-pair open-order ceiling -- a LEVEL, not a rate", () => {
+  it("matches docs.kraken.com/api/docs/guides/spot-ratelimits verbatim", () => {
+    // Re-read live 2026-09-04 from the raw markdown of the same page the two
+    // tier tables above come from:
+    //
+    //   | | Starter | Intermediate | Pro |
+    //   | Max open orders per pair | 60 | 80 | 225 |
+    //
+    // CONFIRMED unchanged from what entry 96 CORRECTION 3 recorded in passing,
+    // which is the figure this session was asked to verify rather than trust.
+    expect(KRAKEN_OPEN_ORDER_CEILINGS).toEqual({
+      starter: 60,
+      intermediate: 80,
+      pro: 225,
+    });
+  });
+
+  it("is PER PAIR, which support.kraken.com's own worked example is what settles", () => {
+    // ⚠ THE SCOPE IS THE PART THAT NEARLY WENT IN BACKWARDS. Support article
+    // 209090607 phrases the limit as applying "across each trading pair", which
+    // reads just as naturally as an account-wide total -- and if it were one, a
+    // per-pair ceiling would be the wrong shape and this whole check would be
+    // measuring something the venue does not enforce.
+    //
+    // The article's own example is the disambiguation, and it is reproduced here
+    // rather than paraphrased, because the arithmetic IS the evidence:
+    //
+    //   "You have 78 buy limit orders BTC/EUR and 60 sell limit orders on
+    //    ETH/EUR ... The maximum limit for open orders for your account is 80.
+    //    This means that you can place 2 more orders on BTC/EUR and 20 more
+    //    open orders on ETH/EUR ... On other pairs, you can place 80 orders
+    //    each."
+    //
+    // Under an ACCOUNT-WIDE reading, 78 + 60 = 138 is already over 80 and the
+    // answer to "how many more" would be zero on both pairs. Under a PER-PAIR
+    // reading it is 80 - 78 = 2 and 80 - 60 = 20, which is what Kraken says.
+    const intermediate = KRAKEN_OPEN_ORDER_CEILINGS.intermediate;
+    expect(intermediate - 78).toBe(2);
+    expect(intermediate - 60).toBe(20);
+  });
+
+  it("takes the tier SET from docs, because support's table is stale in entry 96's way", () => {
+    // Article 209090607 lists only "Verified" (80) and "Verified with high
+    // limits" (225) -- the same missing-Starter staleness entry 96 CORRECTION 4
+    // found in article 206548367. So support corroborates two of these three
+    // numbers and CANNOT corroborate the third. Asserted rather than glossed,
+    // so the weakest-evidence figure is the one named.
+    expect(KRAKEN_OPEN_ORDER_CEILINGS.intermediate).toBe(80);
+    expect(KRAKEN_OPEN_ORDER_CEILINGS.pro).toBe(225);
+    expect(Object.keys(KRAKEN_OPEN_ORDER_CEILINGS)).toEqual(["starter", "intermediate", "pro"]);
+  });
+
+  it("defaults to the SMALLEST ceiling, which is the conservative direction HERE", () => {
+    // The other two tables are conservative when the number is LOW because a low
+    // counter throttles early. This one is conservative when the number is low
+    // for a different reason worth stating: over-estimating the ceiling is what
+    // lets a bot be created that the venue later refuses mid-run. Same tier,
+    // same direction, different argument -- and the assertion is that the
+    // default really is the minimum, not that it happens to be "starter".
+    expect(krakenOpenOrderCeiling()).toBe(KRAKEN_OPEN_ORDER_CEILINGS[KRAKEN_DEFAULT_TIER]);
+    expect(krakenOpenOrderCeiling()).toBe(Math.min(...Object.values(KRAKEN_OPEN_ORDER_CEILINGS)));
+  });
+
+  it("reads a named tier when one is given, so confirming a real account is one line", () => {
+    expect(krakenOpenOrderCeiling("starter")).toBe(60);
+    expect(krakenOpenOrderCeiling("intermediate")).toBe(80);
+    expect(krakenOpenOrderCeiling("pro")).toBe(225);
+  });
+
+  it("is NOT the trading rate threshold, which on Starter is the same number", () => {
+    // ⚠ THE COINCIDENCE THAT MAKES THIS EASY TO CONFLATE, AND THE REASON THE
+    // CEILING IS NOT MODELLED AS A COUNTER. On Starter both are 60. They are
+    // different limits: one decays at 1/sec and is cleared by waiting, the other
+    // does not decay at all and is cleared only by a fill or a cancel. The two
+    // diverge at the next tier up, which is the cheapest available proof that
+    // they are not the same fact recorded twice.
+    expect(KRAKEN_OPEN_ORDER_CEILINGS.starter).toBe(KRAKEN_TRADING_TIERS.starter.threshold);
+    expect(KRAKEN_OPEN_ORDER_CEILINGS.intermediate).not.toBe(
+      KRAKEN_TRADING_TIERS.intermediate.threshold,
+    );
+    expect(KRAKEN_OPEN_ORDER_CEILINGS.pro).not.toBe(KRAKEN_TRADING_TIERS.pro.threshold);
   });
 });

@@ -83,6 +83,8 @@ export type GridErrorCode =
   | "invalid_parameter"
   /** The buy ladder cannot be funded from the allocated capital. */
   | "exceeds_allocated_capital"
+  /** The ladder has more rungs than the venue will let rest on one pair. */
+  | "exceeds_venue_open_order_ceiling"
   /** Bounds and line count that collapse two levels onto one price. */
   | "degenerate_ladder"
   /** Stored state carries a schemaVersion this code does not know how to read. */
@@ -589,6 +591,29 @@ export function validateGridParams(params: GridParams, allocatedCapital: Money):
         `position open.`,
     );
   }
+}
+
+/**
+ * The most orders this ladder can have RESTING on the exchange at once.
+ *
+ * Every level holds at most one live order -- that invariant is `slots` itself,
+ * one entry per level, enforced by `claimSlot` -- so the peak is the number of
+ * levels, which is `gridLines`.
+ *
+ * ⚠ IT IS `gridLines`, NOT `gridLines - 1`, AND THE DIFFERENCE FROM
+ * `validateGridParams`' CAPITAL ARITHMETIC IS DELIBERATE. That check uses
+ * `gridLines - 1` because "the topmost line only ever holds a sell", and a sell
+ * costs no QUOTE capital. It still costs an ORDER. The two ceilings are counting
+ * different things, and using the capital figure here would under-count the peak
+ * by one at exactly the boundary a venue ceiling is checked against.
+ *
+ * Separate from `validateGridParams` because the ceiling it feeds is a VENUE
+ * fact and this module must not import one: `/src/exchange` performs real I/O,
+ * and section 13's backtest requirement is why the strategies do not depend on
+ * it. Grid answers "how many orders can I hold"; the caller owns the limit.
+ */
+export function peakLiveOrders(params: GridParams): number {
+  return params.gridLines;
 }
 
 // ---------------------------------------------------------------------------

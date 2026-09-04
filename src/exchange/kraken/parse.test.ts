@@ -27,6 +27,7 @@ import {
   requireResult,
   requireSingleOrder,
   toOrderState,
+  ORDERS_LIMIT_EXCEEDED_ERROR,
 } from "./parse";
 
 /**
@@ -293,6 +294,48 @@ describe("classifyKrakenError", () => {
     expect(classifyKrakenError(error, at)).toEqual({
       kind: "exchange_error",
       retryable: true,
+    });
+  });
+
+  describe("EOrder:Orders limit exceeded -- the open-order CEILING, not a rate limit", () => {
+    it("is a DEFINITE, NON-RETRYABLE refusal, and that is a decision, not a default", () => {
+      // ⚠ WHY THIS TEST IS NAMED AND NOT FOLDED INTO THE it.each BELOW.
+      //
+      // The classifier's default arm already returns exactly this for any
+      // unrecognised string, so this assertion passed BEFORE `DEFINITE_REFUSALS`
+      // existed and passes now. That is precisely why it is worth writing: a
+      // string classified correctly by accident and a string classified
+      // correctly on purpose are indistinguishable from the outside, and they
+      // call for opposite responses the day somebody edits the default arm.
+      //
+      // The specific mistake being guarded against is one word away. Two
+      // assertions up, `EOrder:Rate limit exceeded` is RETRYABLE. This string
+      // differs from it by "Orders"/"Rate" and is not a sibling: a rate limit
+      // decays and clears by waiting, an open-order ceiling is a LEVEL that only
+      // a fill or a cancel lowers. Retrying it re-sends into an identical
+      // refusal for as long as the pair's book stays full.
+      expect(classifyKrakenError(ORDERS_LIMIT_EXCEEDED_ERROR, at)).toEqual({
+        kind: "exchange_error",
+        retryable: false,
+      });
+    });
+
+    it("is the exact string Kraken sends, re-read live from the docs on 2026-09-04", () => {
+      // *(docs)* spot-ratelimits, verbatim: "When the open order threshold is
+      // reached, the engine will generate `EOrder:Orders limit exceeded`
+      // rejection message." Pinned as a literal in ONE place because every other
+      // reference in the codebase imports this constant rather than spelling it.
+      expect(ORDERS_LIMIT_EXCEEDED_ERROR).toBe("EOrder:Orders limit exceeded");
+    });
+
+    it("is not in the retryable set, which is the classification that would break it", () => {
+      // Order matters in `classifyKrakenError`: the retryable table is consulted
+      // BEFORE the definite-refusal one, so a string added to both would be
+      // classified retryable and this file would still pass every other test.
+      // Asserted through the public function, which is the only thing that can
+      // observe the precedence.
+      expect(classifyKrakenError(ORDERS_LIMIT_EXCEEDED_ERROR, at).retryable).toBe(false);
+      expect(classifyKrakenError("EOrder:Rate limit exceeded", at).retryable).toBe(true);
     });
   });
 

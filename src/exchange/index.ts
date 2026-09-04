@@ -60,3 +60,7 @@ export { GeminiPriceFeedCodec, GEMINI_WS_URLS } from "./gemini/price-feed";
 // per-endpoint weight table, which is why it lives here and not in /src/shared
 // -- and it performs I/O, which rules /src/shared out anyway.
 export * from "./rate-limited";
+// The per-pair open-order CEILING. Venue-agnostic like `rate-limited`, and
+// deliberately NOT part of it: that file models budgets that deplete and
+// recover, and this is a level that does neither. See its header.
+export * from "./open-orders";

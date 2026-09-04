@@ -176,6 +176,72 @@ describe("creation (sections 6.1, 6.2, 8.5)", () => {
   });
 });
 
+describe("the venue's open-order ceiling, checked before any capital is reserved", () => {
+  /**
+   * A ladder of `gridLines` rungs that comfortably fits its allocation, so the
+   * ONLY thing that can refuse it is the venue ceiling.
+   *
+   * `orderSize` drops to 1 deliberately: at the suite's default of 100 a 60-line
+   * grid needs 5,900 of allocation, and a test that had to raise the allocation
+   * to reach the ceiling would be unable to show which of the two checks fired.
+   */
+  function wideGrid(gridLines: number, overrides: Partial<CreateGridBotRequest> = {}) {
+    return creation({
+      params: { ...params, gridLines, orderSize: m("1") },
+      allocatedCapital: m("500"),
+      ...overrides,
+    });
+  }
+
+  it("refuses a Kraken grid with more rungs than the pair will hold", async () => {
+    // Kraken Starter holds 60 open orders per pair; 5 are held back for other
+    // bots on the same pair, so 56 rungs is over and 55 is not.
+    await expect(
+      run((bot) => bot.createGrid(wideGrid(56, { exchange: "kraken" }))),
+    ).rejects.toThrow(/EOrder:Orders limit exceeded/);
+
+    // NOTHING WAS CREATED. The same assertion the allocation test above makes,
+    // and the reason this check is here rather than at placement: no row, no
+    // reserved capital, no Durable Object state, no order.
+    expect(await db.botInstances.findOne({ id: BOT_ID })).toBeNull();
+  });
+
+  it("admits the same grid one rung smaller", async () => {
+    const result = await run((bot) => bot.createGrid(wideGrid(55, { exchange: "kraken" })));
+    expect(result.status).toBe("created");
+  });
+
+  it("admits a 100-rung grid on binance, whose ceiling this system has not verified", async () => {
+    // ⚠ NOT AN ENDORSEMENT OF 100 RUNGS ON BINANCE. Binance publishes a
+    // MAX_NUM_ORDERS filter that `binance/filters.ts` does not parse, so there
+    // is no verified number and the check declines to invent one. This pins that
+    // the unverified venues keep EXACTLY today's behaviour rather than acquiring
+    // a guessed limit -- which is also why every other test in this file, all of
+    // which create on binance, is unaffected by this change.
+    const result = await run((bot) => bot.createGrid(wideGrid(100, { exchange: "binance" })));
+    expect(result.status).toBe("created");
+  });
+
+  it("refuses on the ceiling only AFTER the allocation check, so the cheaper error wins", async () => {
+    // A 56-rung Kraken grid that ALSO cannot fund itself reports the funding
+    // problem, not the ceiling. Ordering matters because the allocation message
+    // names a number the operator controls directly; leading with the venue
+    // ceiling would send them to shrink a ladder that was going to be refused
+    // for a second reason anyway.
+    await expect(
+      run((bot) =>
+        bot.createGrid(
+          creation({
+            exchange: "kraken",
+            params: { ...params, gridLines: 56, orderSize: m("100") },
+            allocatedCapital: m("300"),
+          }),
+        ),
+      ),
+    ).rejects.toThrow(/more than the/);
+  });
+});
+
 describe("initial ladder (section 6.2 step 2)", () => {
   it("places buy orders at every level below the current price, and none above", async () => {
     await startAt("100");

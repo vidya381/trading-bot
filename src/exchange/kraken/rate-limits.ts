@@ -33,10 +33,15 @@
  *    (`BatchCancellingClient` in `shared/exchange-client.ts`), because neither
  *    Binance nor Gemini has an endpoint that cancels a named SET of orders and
  *    forcing them to stub one would have been a lie with a signature.
- * 2. **The open-order ceiling.** *(docs)* Max open orders PER PAIR is 60 /
- *    80 / 225 by tier, rejecting with `EOrder:Orders limit exceeded`. That is a
- *    LEVEL, not a rate: it does not decay and does not belong in a decaying
- *    counter. Recorded here so it is not lost, modelled nowhere yet.
+ * 2. ~~**The open-order ceiling.**~~ **NOW MODELLED**, by the session below
+ *    this header's own date -- see `KRAKEN_OPEN_ORDER_CEILINGS` at the foot of
+ *    this file. It is still a LEVEL, not a rate, and the distinction survives
+ *    the modelling: the number lives here beside the tier tables it is keyed by,
+ *    and is read by a CREATION-TIME check, never by `DecayingCounter`, `Budget`
+ *    or anything else that depletes and recovers. Routing it through the rate
+ *    limiter would have been the one wrong answer -- a ceiling that does not
+ *    decay cannot be waited out, so a gate that queued against it would queue
+ *    forever.
  */
 
 /**
@@ -323,4 +328,100 @@ export function krakenBatchCancelCost(ageMs: readonly (number | null)[]): number
   let total = 0;
   for (const age of ageMs) total += krakenCancelCost(age);
   return total;
+}
+
+// ---------------------------------------------------------------------------
+// The open-order ceiling -- a LEVEL, not a rate
+// ---------------------------------------------------------------------------
+
+/**
+ * The most orders that may REST on the book at once, per pair, per tier *(docs)*.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS IN THIS FILE BUT NOT IN THIS FILE'S MODEL
+ * ---------------------------------------------------------------------------
+ * Entries 96 and 98 both deferred this with the same one-line reason, and the
+ * reason was right: it is a LEVEL, not a rate. It does not decay, so there is no
+ * wait that clears it, so a `DecayingCounter` cannot represent it and a gate
+ * that queued against it would queue forever. Nothing here is wired into
+ * `AcquireCost`, `Budget`, or the `RateLimiter` Durable Object, and that is the
+ * whole point of the separation.
+ *
+ * It lives in this file anyway because it is transcribed from the SAME
+ * `docs.kraken.com/api/docs/guides/spot-ratelimits` page as the two tier tables
+ * above, keyed by the SAME `KrakenTier`, on the SAME per-pair axis, and read
+ * through the SAME `KRAKEN_DEFAULT_TIER`. Splitting one docs page across two
+ * files to honour a distinction the code already honours would cost more than
+ * it bought: the next person to confirm a real account's tier must find all
+ * three tables, and they are all here.
+ *
+ * ---------------------------------------------------------------------------
+ * HOW THESE NUMBERS WERE VERIFIED (2026-09-04)
+ * ---------------------------------------------------------------------------
+ * Re-read live from the docs page rather than carried over from entry 90's
+ * research, per this file's standing rule:
+ *
+ *   *(docs)* "The open order limit is the maximum number of open orders **per
+ *   pair**. When the open order threshold is reached, the engine will generate
+ *   `EOrder:Orders limit exceeded` rejection message."
+ *
+ *   | | Starter | Intermediate | Pro |
+ *   | Max open orders per pair | 60 | 80 | 225 |
+ *
+ * ⚠ THE SCOPE NEARLY WENT IN BACKWARDS, AND THE SECOND SOURCE IS WHY.
+ * *(support)* article 209090607 (updated 2025-12-11) describes the same limit as
+ * applying "across each trading pair" -- a phrase that reads just as naturally
+ * as an ACCOUNT-WIDE total, and which a summarising read of that page returns as
+ * "across all trading pairs combined". If that reading were right, a per-pair
+ * ceiling would be the wrong shape entirely and every check built on it would be
+ * measuring the wrong thing. The article's own worked example settles it the
+ * other way, verbatim: "You have 78 buy limit orders BTC/EUR and 60 sell limit
+ * orders on ETH/EUR ... you can place 2 more orders on BTC/EUR and 20 more open
+ * orders on ETH/EUR ... On other pairs, you can place 80 orders each." 78+2=80,
+ * 60+20=80, and 80 more on every other pair. PER PAIR, corroborated twice.
+ *
+ * That same *(support)* table is STALE in exactly the way entry 96 CORRECTION 4
+ * found article 206548367 to be: it lists only "Verified" (80) and "Verified
+ * with high limits" (225) and has no Starter row at all. It therefore
+ * corroborates two of these three numbers and cannot corroborate the third,
+ * which is stated here rather than glossed. The tier set is taken from *(docs)*,
+ * for the same reason `KrakenTier` is.
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠ A SECOND DIMENSION, RECORDED BECAUSE IT IS CURRENTLY INERT AND WOULD NOT BE
+ * ---------------------------------------------------------------------------
+ * *(support)*, same article: **scheduled orders have their own separate ceiling
+ * -- 25 (Verified) / 40 (Verified with high limits) -- AND they also count
+ * toward the open-order limit above.** A scheduled order is defined there as one
+ * "placed with a start time five seconds or more in the future".
+ *
+ * NOTHING IS BUILT FOR THIS, DELIBERATELY, because this client cannot create
+ * one: `KrakenClient` never sends `starttm` on any path, so every order it
+ * places is immediate and the scheduled ceiling is unreachable. It is written
+ * down because that inertness is a property of the CLIENT, not of the venue --
+ * the day any path sets `starttm`, this ceiling becomes live, it is tighter than
+ * the one modelled below, and there is no error string in `parse.ts` and no
+ * check anywhere that would catch it. Neither entry 90, 96 nor 98 recorded that
+ * this second dimension exists; this comment is so the next person does not have
+ * to rediscover it from the same support page.
+ */
+export const KRAKEN_OPEN_ORDER_CEILINGS: Readonly<Record<KrakenTier, number>> = Object.freeze({
+  starter: 60,
+  intermediate: 80,
+  pro: 225,
+});
+
+/**
+ * The open-order ceiling for one pair, at the tier this system assumes.
+ *
+ * Defaulted to `KRAKEN_DEFAULT_TIER` for the same reason every other figure in
+ * this file is: no real Kraken account exists yet, Starter is the most
+ * conservative REAL tier, and confirming the true tier must stay a one-line
+ * change. Over-estimating the ceiling would be the unsafe direction here --
+ * it is what lets a bot be created that the venue will later refuse mid-run --
+ * so the default is the SMALLEST of the three, and `rate-limits.test.ts` asserts
+ * that it is.
+ */
+export function krakenOpenOrderCeiling(tier: KrakenTier = KRAKEN_DEFAULT_TIER): number {
+  return KRAKEN_OPEN_ORDER_CEILINGS[tier];
 }

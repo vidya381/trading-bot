@@ -113,6 +113,10 @@ import {
   POLL_HEALTH_ALERT_TYPES,
 } from "../shared/alert-types";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
+import {
+  checkOpenOrderCeiling,
+  describeOpenOrderCeilingViolation,
+} from "../exchange/open-orders";
 import type { PriceFeedConfig, PriceFeedPort } from "./price-feed";
 import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
@@ -155,10 +159,12 @@ import {
   assertReadableSchema as assertReadableGridSchema,
   levelOf,
   openOrderIds as ladderOpenOrderIds,
+  peakLiveOrders,
   planFill,
   vacantLadder,
   validateGridParams,
   withSlot,
+  GridError,
   type GridConfig,
   type GridHaltReason,
   type GridLadder,
@@ -1853,6 +1859,29 @@ export class BotInstance extends DurableObject<Env> {
     // and also rejects a degenerate or out-of-order ladder before any capital
     // is reserved.
     validateGridParams(request.params, request.allocatedCapital);
+
+    // And this checks the same ladder against the VENUE's ceiling on how many
+    // orders may rest on one pair at once -- the second limit a ladder can
+    // outgrow, and the one nothing checked until now.
+    //
+    // A SIBLING RATHER THAN A PARAMETER, DELIBERATELY. `validateGridParams` is
+    // venue-blind and is called venue-blind from `derive-parse.ts`'s
+    // `validateWithRealValidator(params, allocatedCapital)`, which has no
+    // exchange to pass. Adding a required venue there would either break that
+    // call site or force a venue to be invented for it. Kept separate, this site
+    // has `request.exchange` already and that one keeps compiling untouched.
+    //
+    // The consequence is stated rather than hidden: a proposal from the LLM
+    // pipeline is NOT refused at derive time for an over-long ladder. It is
+    // refused here, when the bot it proposed is actually created, which is still
+    // before any capital is reserved and before any order exists.
+    const ceilingViolation = checkOpenOrderCeiling(request.exchange, peakLiveOrders(request.params));
+    if (ceilingViolation !== null) {
+      throw new GridError(
+        "exceeds_venue_open_order_ceiling",
+        describeOpenOrderCeilingViolation(ceilingViolation),
+      );
+    }
 
     await createBotInstanceWithCapital(
       db,
