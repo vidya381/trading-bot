@@ -21,7 +21,10 @@ import { fromDecimalString } from "../shared/money";
 import { EXCHANGE_IDS } from "../db/schema";
 import { DEFAULT_WEIGHT_LIMIT } from "../durable-objects/rate-limiter";
 import { GEMINI_RATE_LIMITS, GEMINI_REQUEST_COSTS } from "./gemini/client";
+import { supportsBatchCancel } from "../shared/exchange-client";
 import {
+  BATCH_CANCEL_COSTS,
+  batchCancelCostFor,
   BINANCE_METHOD_WEIGHTS,
   GEMINI_METHOD_WEIGHTS,
   METHOD_COSTS,
@@ -758,5 +761,167 @@ describe("the cancel price depends on the order's age, which is the whole reason
     expect(clock - NOW).toBe(40_000);
     expect(limiter.requests).toHaveLength(3);
     expect(limiter.requests.map((request) => request.cost.trading!.count)).toEqual([8, 8, 8]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch cancel: an optional capability, and the one charge this gate may not
+// refuse
+// ---------------------------------------------------------------------------
+
+describe("the batch-cancel capability, which only one venue has", () => {
+  /** A client that CAN batch-cancel, as `KrakenClient` can. */
+  function capable() {
+    return new FakeExchange({ batchCancel: true });
+  }
+
+  it("is exposed on a Kraken gate over a capable client", () => {
+    const client = withRateLimit(capable(), limiter, { exchange: "kraken", now: () => NOW });
+    expect(supportsBatchCancel(client)).toBe(true);
+    expect((client as unknown as { batchCancelMaxOrders: number }).batchCancelMaxOrders).toBe(50);
+  });
+
+  it("is ABSENT on Binance and Gemini, even over a client that could", async () => {
+    // ⚠ The venue decides, not the client. Neither Binance spot nor Gemini has
+    // an endpoint that cancels a NAMED SET of orders -- both offer only
+    // single-order cancel plus a cancel-EVERYTHING form, and cancel-everything
+    // is not a weaker version of this capability but a dangerous different one
+    // (two bots may share a pair on one account). So the cost table says `null`,
+    // and a null cost means the gate keeps the sequential path.
+    for (const exchange of ["binance", "gemini"] as const) {
+      const client = withRateLimit(capable(), limiter, { exchange, now: () => NOW });
+      expect(supportsBatchCancel(client)).toBe(false);
+      expect(batchCancelCostFor(exchange)).toBeNull();
+    }
+  });
+
+  it("is ABSENT on a Kraken gate over a client that cannot do it", () => {
+    // The other half of the same rule: the capability is the intersection of
+    // "the venue prices it" and "the client implements it". A gate that
+    // advertised a method its inner client lacks would hand the caller a
+    // TypeError on the halt path.
+    const client = withRateLimit(new FakeExchange(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+    });
+    expect(supportsBatchCancel(client)).toBe(false);
+  });
+
+  it("survives withPriority, which is how the halt path reaches it", () => {
+    // `#cancelOpenOrders` uses the risk-exit view exclusively. A capability lost
+    // at that seam would be a capability that never runs.
+    const routine = withRateLimit(capable(), limiter, { exchange: "kraken", now: () => NOW });
+    const riskExit = routine.withPriority("risk-exit");
+    expect(supportsBatchCancel(riskExit)).toBe(true);
+  });
+
+  it("charges ONE account-counter read for the whole batch, not one per order", async () => {
+    // The economic argument, at the gate. Eight sequential cancels cost 8 x 4 =
+    // 32 account-counter units on a Starter counter of 15; this costs 4.
+    const client = withRateLimit(capable(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+      orderPlacedAt: () => NOW - 3_000,
+    });
+    const ids = Array.from({ length: 8 }, (_, index) => `bot-1toiyz-000${index}`);
+    await (client as unknown as {
+      cancelOrderBatch: (pair: string, ids: readonly string[]) => Promise<unknown>;
+    }).cancelOrderBatch(TEST_PAIR, ids);
+
+    expect(limiter.requests).toHaveLength(1);
+    expect(limiter.requests[0]!.cost.rest).toBe(4);
+    expect(4 * ids.length).toBe(32);
+  });
+
+  it("charges the engine EXACTLY what the same cancels cost singly -- no discount", async () => {
+    // Kraken gives batch cancels no per-order discount, which is why preferring
+    // the batch can never cost more on this counter. Eight orders three seconds
+    // old: 8 x 8 = 64.
+    const client = withRateLimit(capable(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+      orderPlacedAt: () => NOW - 3_000,
+    });
+    const ids = Array.from({ length: 8 }, (_, index) => `bot-1toiyz-000${index}`);
+    await (client as unknown as {
+      cancelOrderBatch: (pair: string, ids: readonly string[]) => Promise<unknown>;
+    }).cancelOrderBatch(TEST_PAIR, ids);
+
+    expect(limiter.requests[0]!.cost.trading).toEqual({
+      pair: TEST_PAIR,
+      count: 64,
+      unconditional: true,
+    });
+  });
+
+  it("prices each order by ITS OWN age, so a mixed-age ladder is not one rung x n", async () => {
+    const ages = new Map<string, number>([
+      ["a", NOW - 3_000],
+      ["b", NOW - 8_000],
+      ["c", NOW - 600_000],
+    ]);
+    const client = withRateLimit(capable(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+      orderPlacedAt: (_pair, clientOrderId) => ages.get(clientOrderId) ?? null,
+    });
+    await (client as unknown as {
+      cancelOrderBatch: (pair: string, ids: readonly string[]) => Promise<unknown>;
+    }).cancelOrderBatch(TEST_PAIR, ["a", "b", "c"]);
+
+    // 8 + 6 + 0. Not 3 x 8, and not 3 x 0.
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(14);
+  });
+
+  it("charges an id whose age it cannot resolve at the dearest rung", async () => {
+    // `#ageOf`'s fail-closed rule, per order rather than relaxed for the batch.
+    const client = withRateLimit(capable(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+      orderPlacedAt: () => null,
+    });
+    await (client as unknown as {
+      cancelOrderBatch: (pair: string, ids: readonly string[]) => Promise<unknown>;
+    }).cancelOrderBatch(TEST_PAIR, ["a", "b"]);
+
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(16);
+  });
+
+  it("⚠ marks the engine charge unconditional, which is the escape hatch itself", async () => {
+    // Kraken: "If the rate counter in the batch exceeds maximum for a batch
+    // cancel, the requests in batch are still accepted." The flag is how that
+    // sentence reaches the limiter. Without it the gate would refuse the one
+    // call the venue promised to accept -- entry 90's worst case arriving by the
+    // other door.
+    const client = withRateLimit(capable(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+      orderPlacedAt: () => NOW - 3_000,
+    });
+    await (client as unknown as {
+      cancelOrderBatch: (pair: string, ids: readonly string[]) => Promise<unknown>;
+    }).cancelOrderBatch(TEST_PAIR, ["a", "b"]);
+
+    expect(limiter.requests[0]!.cost.trading!.unconditional).toBe(true);
+    // The REST half is NOT excused: Kraken's sentence is about the trading
+    // counter and says nothing about the call counter.
+    expect(limiter.requests[0]!.cost.rest).toBe(4);
+    const single = withRateLimit(capable(), limiter, {
+      exchange: "kraken",
+      now: () => NOW,
+      orderPlacedAt: () => NOW - 3_000,
+    });
+    await single.cancelOrder(TEST_PAIR, "a");
+    // An ordinary cancel is gated normally, and says so by omission.
+    expect(limiter.requests[1]!.cost.trading!.unconditional).toBeUndefined();
+  });
+
+  it("names every venue in the batch-cost table, so a fourth cannot inherit Kraken's", () => {
+    // The same forcing function `METHOD_COSTS` is. A `Partial` here would let a
+    // new exchange silently arrive with no entry.
+    for (const exchange of EXCHANGE_IDS) {
+      expect(BATCH_CANCEL_COSTS).toHaveProperty(exchange);
+    }
+    expect(Object.keys(BATCH_CANCEL_COSTS).sort()).toEqual([...EXCHANGE_IDS].sort());
   });
 });

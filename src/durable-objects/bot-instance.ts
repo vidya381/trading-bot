@@ -104,6 +104,8 @@ import type {
   SymbolFilters,
   Timestamp,
 } from "../shared/exchange-client";
+import { supportsBatchCancel } from "../shared/exchange-client";
+import type { ExchangeOutcome } from "../shared/downtime";
 import { isUsable } from "../shared/downtime";
 import {
   haltAlertType,
@@ -6757,6 +6759,12 @@ export class BotInstance extends DurableObject<Env> {
    * less rate-limit budget, and is not racy, because the cancellation response
    * is the same operation that ended the order.
    *
+   * ONE REQUEST FOR THE WHOLE SET where the venue offers one, and sequential
+   * cancels everywhere else. `#batchCancelled` above owns that choice and the
+   * argument for making it the preferred path rather than an emergency fallback;
+   * everything below this line is identical whichever way each id was cancelled,
+   * which is the property that kept the change small.
+   *
    * RISK-EXIT priority, and this is the call site section 5.4's reserved slice
    * was built for. Every caller of this method is getting out: a section 7.2
    * halt, a close, or the cancellation of a resting buy ahead of a take-profit
@@ -6764,14 +6772,161 @@ export class BotInstance extends DurableObject<Env> {
    * for step 9's grid it is a full ladder cancelled in one pass, which is the
    * exposure step 7 measured and named as the real one.
    */
+  /**
+   * Cancel the whole set in ONE request, where the venue can, and report each.
+   *
+   * Returns an outcome per id it handled. An id ABSENT from the map was not
+   * attempted here and must be cancelled singly by the caller -- which is how a
+   * venue without the capability, a set too small to be worth batching, and a
+   * batch the venue refused all reach the same sequential path without a flag.
+   *
+   * ---------------------------------------------------------------------------
+   * PREFERRED AT TWO ORDERS, NOT KEPT AS AN EMERGENCY FALLBACK. THE REASONING.
+   * ---------------------------------------------------------------------------
+   * The alternative considered and rejected was to cancel sequentially as before
+   * and reach for the batch only when the sequential run was about to exceed the
+   * per-pair budget. Four reasons it lost:
+   *
+   * 1. **A batch is never more expensive, on either counter.** Kraken gives batch
+   *    cancels no per-order discount, so the engine charge is identical to the
+   *    same orders cancelled one at a time -- it is literally the sum of the same
+   *    rungs. The account counter is where it differs, and it differs a lot: this
+   *    is ONE follow-up `ClosedOrders` read for the whole set instead of one per
+   *    order, so eight cancels cost 4 units instead of 32, on a Starter counter
+   *    of 15. There is no dimension in which preferring it costs more.
+   *
+   * 2. **It is one round trip instead of N, and the window is the hazard.** This
+   *    method's own comment below records what went wrong in that window once
+   *    already: the poll added a grid replacement mid-sweep, and the sweep's
+   *    closing write dropped it. Every awaited cancel widens that window, and a
+   *    throttled one widens it by up to `DEFAULT_MAX_WAIT_MS`. Collapsing eight
+   *    round trips into one shortens the race rather than reasoning about it.
+   *
+   * 3. **A fallback fires too late to be the escape hatch.** Kraken accepts a
+   *    batch cancel whose charge overshoots the counter -- that is the whole
+   *    mechanism. But a fallback only triggers AFTER the sequential run has
+   *    already spent the counter down and cancelled some of the ladder, so it
+   *    arrives to a drained counter and a half-cancelled bot. The venue's
+   *    guarantee is worth most when the batch is the FIRST thing tried.
+   *
+   * 4. **A path that only runs in an emergency is a path that has never run.**
+   *    The fallback design puts the least-exercised code on the highest-stakes
+   *    event -- a halt of a freshly-laid grid. Preferring the batch means the
+   *    ordinary halt exercises it, and the rare case is the well-worn one.
+   *
+   * TWO, rather than some higher threshold: at one order a batch buys nothing at
+   * all (same engine charge, same single read, one request either way) while
+   * spending a less-verified code path, and at two it already halves both the
+   * account-counter cost and the round trips.
+   *
+   * ---------------------------------------------------------------------------
+   * ⚠ WHEN IT FALLS BACK, AND WHEN IT MUST NOT
+   * ---------------------------------------------------------------------------
+   * A NON-RETRYABLE failure falls back to sequential cancels. That is the venue
+   * saying it understood the request and refused it -- a rejected body shape, a
+   * pair it does not list, a batch this client refused to send -- so nothing was
+   * cancelled and re-issuing as singles is not a second cancellation of anything.
+   * This branch is not hypothetical: `KrakenClient.cancelOrderBatch` records that
+   * its body shape is DOCUMENTED, NOT LIVE, and that Kraken's own schema
+   * contradicts its own example on the sibling field. If that encoding is wrong,
+   * this is what keeps the halt cancelling orders instead of alerting about all
+   * of them.
+   *
+   * ANY OTHER failure does NOT fall back, and the distinction is section 5.6's.
+   * A `transport` failure means the request left this process and its effect is
+   * unknown; re-sending it as N single cancels would spend the engine counter a
+   * second time at the worst possible moment, on orders that may already be
+   * cancelled. A `rate_limited` failure means nothing was sent, and the
+   * sequential path costs strictly more, so retrying it that way cannot succeed
+   * where the batch did not. Both leave every id mapped to the failure, and the
+   * caller's existing `!isUsable` branch does what it has always done: keep the
+   * order open, alert, and let section 9 reconciliation settle it.
+   *
+   * A SUCCESSFUL batch may still carry unresolved entries -- Kraken's response
+   * carries no per-order result, so an id the one follow-up read did not see is
+   * reported honestly rather than assumed cancelled. Those become non-retryable
+   * failures here, so the caller treats them exactly as it treats a single cancel
+   * whose read found nothing: the order stays open and is alerted on. It does NOT
+   * re-cancel them, for reason 3 above -- the batch was accepted, so their fate
+   * is unknown rather than untried.
+   */
+  async #batchCancelled(
+    config: BotConfigBase,
+    exchange: RestExchangeClient,
+    clientOrderIds: readonly string[],
+  ): Promise<Map<string, ExchangeOutcome<OrderStatus>>> {
+    const results = new Map<string, ExchangeOutcome<OrderStatus>>();
+    if (clientOrderIds.length < 2 || !supportsBatchCancel(exchange)) return results;
+
+    // Kraken's cap is 50 and a ladder is a handful, so this is one chunk in
+    // practice. It is written as chunking anyway because the cap is the VENUE's
+    // and a caller that silently truncated at it would cancel part of a set and
+    // report success for all of it.
+    const size = exchange.batchCancelMaxOrders;
+    for (let start = 0; start < clientOrderIds.length; start += size) {
+      const chunk = clientOrderIds.slice(start, start + size);
+      const outcome = await exchange.cancelOrderBatch(config.pair, chunk);
+
+      if (!isUsable(outcome)) {
+        if (!outcome.retryable) {
+          // Understood and refused: nothing was cancelled. Leave the chunk out
+          // of the map so the caller cancels each one singly, and say so --
+          // silently degrading to the expensive path is how a broken batch
+          // endpoint would go unnoticed until the counter ran out again.
+          await this.#alert(config, {
+            severity: "warning",
+            category: "trading",
+            alertType: "batch_cancel_unavailable",
+            message:
+              `batch cancellation of ${chunk.length} orders on ${config.pair} was ` +
+              `refused (${outcome.kind}: ${outcome.message}); falling back to ` +
+              `cancelling them one at a time, which costs more rate-limit budget ` +
+              `during a halt`,
+          });
+          continue;
+        }
+        // Sent, or refused by our own gate: the fate of these orders is not
+        // known and must not be guessed at by cancelling them again.
+        for (const clientOrderId of chunk) results.set(clientOrderId, outcome);
+        continue;
+      }
+
+      for (const entry of outcome.value.entries) {
+        results.set(
+          entry.clientOrderId,
+          entry.resolved
+            ? { ok: true, value: entry.order, at: outcome.at }
+            : {
+                ok: false,
+                kind: "exchange_error",
+                message: entry.reason,
+                retryable: false,
+                at: outcome.at,
+              },
+        );
+      }
+    }
+
+    return results;
+  }
+
   async #cancelOpenOrders(config: BotConfigBase, state: BotRuntimeState): Promise<void> {
     if (state.openOrderIds.length === 0) return;
     const exchange = this.#exchange(config, "risk-exit");
     const now = this.#now();
     const stillOpen: string[] = [];
 
+    // ONE REQUEST FOR THE WHOLE LADDER WHERE THE VENUE HAS ONE. Empty on the
+    // venues that do not, and on a single-order cancellation, so the loop below
+    // is unchanged in every case that reaches it sequentially.
+    const batched = await this.#batchCancelled(config, exchange, state.openOrderIds);
+
     for (const clientOrderId of state.openOrderIds) {
-      const outcome = await exchange.cancelOrder(config.pair, clientOrderId);
+      // The batch already cancelled this one, or it did not run for it. Either
+      // way exactly one cancellation is attempted per id, and the result is
+      // judged by the same code below.
+      const outcome =
+        batched.get(clientOrderId) ?? (await exchange.cancelOrder(config.pair, clientOrderId));
       const order = await this.#order(clientOrderId);
       if (order === undefined || isTerminal(order.state)) continue;
 

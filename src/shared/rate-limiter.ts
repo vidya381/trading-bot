@@ -110,6 +110,28 @@ export interface Budget {
   remainingFor(priority: RequestPriority, now: Timestamp): number;
   check(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision;
   consume(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision;
+  /**
+   * Apply a charge THAT CANNOT BE REFUSED, even past the ceiling.
+   *
+   * ⚠ NOT A WAY AROUND `consume`, and the distinction is the venue's rather than
+   * this system's. It exists for a call the EXCHANGE accepts unconditionally:
+   * Kraken, beside its Batch Cancel cost row, "If the rate counter in the batch
+   * exceeds maximum for a batch cancel, the requests in batch are still
+   * accepted." For such a call, refusing locally would not protect the account
+   * from anything -- the venue was never going to refuse it -- it would only stop
+   * a halt from cancelling its orders, which is the risk control defeating
+   * itself.
+   *
+   * The charge is still RECORDED, and that is the point of the method. Everything
+   * issued after it must see the counter it left behind, including a counter it
+   * pushed OVER the threshold: the next ordinary call then correctly waits for
+   * the overshoot to decay rather than being granted budget the venue no longer
+   * has.
+   *
+   * `consume` remains the only way an ordinary call spends anything, and the only
+   * caller of this is the gate's batch-cancel path.
+   */
+  record(weight: number, now: Timestamp): void;
   syncFromExchange(value: number, at: Timestamp): void;
   reset(): void;
   waitFor(weight: number, priority: RequestPriority, now: Timestamp): number;
@@ -257,6 +279,25 @@ export class WeightBudget implements Budget {
       this.#entries.push({ at: now, weight });
     }
     return decision;
+  }
+
+  /**
+   * Charge unconditionally. See `Budget.record`.
+   *
+   * On a sliding window this is exactly `consume`'s effect without the check --
+   * the entry ages out on the same schedule as any other, and no other part of
+   * this class needs to know it arrived by a different door.
+   *
+   * Implemented here rather than left to throw because `Budget` is an obligation,
+   * not a menu: a venue that gained an unconditional call on an account-wide
+   * counter would otherwise fail at runtime instead of at the type. No venue does
+   * today -- Kraken's is the only one, and it is on a `DecayingCounter`.
+   */
+  record(weight: number, now: Timestamp): void {
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new RateLimiterError(`weight must be positive, got ${weight}`);
+    }
+    this.#entries.push({ at: now, weight });
   }
 
   /**
@@ -551,6 +592,28 @@ export class DecayingCounter implements Budget {
    * taken as the truth it becomes the local value, and cannot later be undone by
    * the report expiring.
    */
+  /**
+   * Charge unconditionally, past the threshold if need be. See `Budget.record`.
+   *
+   * ⚠ THIS IS THE ONE PLACE THE COUNTER MAY EXCEED ITS OWN LIMIT, and it must be
+   * able to: Kraken's engine counter really does go over when it accepts a batch
+   * cancel that overshoots, and a local counter clamped at the threshold would
+   * under-state the account's true position at the exact moment it matters --
+   * granting the next call budget the venue does not have.
+   *
+   * Everything downstream already copes. `usedWeight` decays whatever value it
+   * holds, `remainingFor` floors at zero, and `waitFor` walks the decay from the
+   * real value, so an overshoot simply takes proportionally longer to drain --
+   * which is what the venue's own counter does.
+   */
+  record(weight: number, now: Timestamp): void {
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new RateLimiterError(`weight must be positive, got ${weight}`);
+    }
+    this.#value = this.usedWeight(now) + weight;
+    this.#at = now;
+  }
+
   consume(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision {
     const decision = this.check(weight, priority, now);
     if (decision.allowed) {

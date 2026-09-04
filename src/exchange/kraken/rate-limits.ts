@@ -26,12 +26,13 @@
  * ---------------------------------------------------------------------------
  * ⚠ WHAT THIS FILE DELIBERATELY DOES NOT MODEL
  * ---------------------------------------------------------------------------
- * 1. **The batch-cancel escape hatch.** *(docs)* "If the rate counter in the
- *    batch exceeds maximum for a batch cancel, the requests in batch are still
- *    accepted." A `CancelOrderBatch` therefore gets through where the eighth
- *    sequential `CancelOrder` would be refused -- which is the real answer to
- *    entry 90's risk-exit warning. It needs a new `RestExchangeClient` method,
- *    so it is a separate decision and is NOT taken here.
+ * 1. ~~**The batch-cancel escape hatch.**~~ **NOW MODELLED**, by the session
+ *    below this header's own date -- see `krakenBatchCancelCost` and
+ *    `KRAKEN_BATCH_CANCEL_MAX_IDS` at the foot of this file. It did not need a
+ *    new `RestExchangeClient` method after all: it needed an OPTIONAL capability
+ *    (`BatchCancellingClient` in `shared/exchange-client.ts`), because neither
+ *    Binance nor Gemini has an endpoint that cancels a named SET of orders and
+ *    forcing them to stub one would have been a lie with a signature.
  * 2. **The open-order ceiling.** *(docs)* Max open orders PER PAIR is 60 /
  *    80 / 225 by tier, rejecting with `EOrder:Orders limit exceeded`. That is a
  *    LEVEL, not a rate: it does not decay and does not belong in a decaying
@@ -244,4 +245,82 @@ export function krakenCancelCost(ageMs: number | null): number {
   }
   // Older than the last rung: the engine charges nothing for the cancel itself.
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Batch cancel -- the escape hatch, and its real price
+// ---------------------------------------------------------------------------
+
+/**
+ * The most order ids one `CancelOrderBatch` request may name *(docs)*.
+ *
+ * "up to a maximum of 50 total unique IDs/references", and the cap is TOTAL
+ * across the `orders` and `cl_ord_ids` arrays rather than per array. Verified
+ * against Kraken's published OpenAPI document on 2026-09-04, where the sentence
+ * appears on both fields' descriptions.
+ *
+ * Note this is a DIFFERENT number from `AddOrderBatch`'s, which is 2 to 15. The
+ * two batch endpoints are not symmetric in any respect that matters here -- see
+ * the cost function below for the other one.
+ */
+export const KRAKEN_BATCH_CANCEL_MAX_IDS = 50;
+
+/**
+ * The engine cost of cancelling several orders in one `CancelOrderBatch`.
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠ IT IS NOT `Add Order Batch`'s SHAPE, AND ASSUMING IT WERE WOULD UNDERCHARGE
+ * ---------------------------------------------------------------------------
+ * Entry 96 CORRECTION 3 recorded Batch Add at `+(n/2)` -- a genuine bulk
+ * DISCOUNT, half price per order. The obvious guess is that Batch Cancel mirrors
+ * it. It does not. Re-read from *(docs)*' own cost table on 2026-09-04 rather
+ * than carried over:
+ *
+ * | Transaction  | Fixed  | <5s    | <10s   | <15s   | <45s   | <90s   | <300s  |
+ * | Add Order    | +1     | --     | --     | --     | --     | --     | --     |
+ * | Batch Add    | +(n/2) | --     | --     | --     | --     | --     | --     |
+ * | Cancel Order | --     | +8     | +6     | +5     | +4     | +2     | +1     |
+ * | Batch Cancel | --     | +(8xn) | +(6xn) | +(5xn) | +(4xn) | +(2xn) | +(1xn) |
+ *
+ * **Batch Cancel has NO per-order discount.** n orders cost exactly what n
+ * separate cancels cost. Had this been assumed to mirror Batch Add's `n/2`, the
+ * gate would have charged HALF what the venue charges, on the risk-exit path, on
+ * the one counter entry 90's worst case is about -- undercharging, which is the
+ * unsafe direction, by a factor of two.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE COST TAKES AGES AND NOT A COUNT
+ * ---------------------------------------------------------------------------
+ * The published rows are written `+(8xn)` because they price a batch whose
+ * orders are all in one age band. A real halt's batch is not: a grid ladder laid
+ * over several minutes holds rungs of different ages, and the venue's own table
+ * gives each band a different multiplier. So the honest total is the SUM of each
+ * order's own rung -- which reduces to exactly `8n` when every order is under
+ * five seconds, and is never higher than the sum of the same orders cancelled
+ * one at a time, because it IS that sum.
+ *
+ * `null` ages are charged `KRAKEN_CANCEL_COST_UNKNOWN_AGE` each, for the reason
+ * `krakenCancelCost` charges them: an unknown age must never be the cheap way
+ * through the gate. An EMPTY list costs 0 and is not an error here -- refusing an
+ * empty batch is the caller's job (`KrakenClient.cancelOrderBatch` does refuse
+ * it), and a cost function that threw would make the gate the place a caller
+ * discovered its own bug.
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠ AND THE COUNTER IT CHARGES DOES NOT GATE IT
+ * ---------------------------------------------------------------------------
+ * *(docs)*, beside the Batch Cancel row: **"If the rate counter in the batch
+ * exceeds maximum for a batch cancel, the requests in batch are still
+ * accepted."** Re-confirmed live from the same page on 2026-09-04.
+ *
+ * So this number is what the venue's counter will REGISTER, not a threshold the
+ * request must fit under. That distinction is the whole escape hatch, and it is
+ * why `AcquireCost.trading` grew an `unconditional` flag: the charge must still
+ * be recorded -- everything issued afterwards has to see the counter it left
+ * behind -- and must never refuse or queue the batch itself.
+ */
+export function krakenBatchCancelCost(ageMs: readonly (number | null)[]): number {
+  let total = 0;
+  for (const age of ageMs) total += krakenCancelCost(age);
+  return total;
 }

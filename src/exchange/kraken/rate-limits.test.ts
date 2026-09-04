@@ -28,12 +28,14 @@ import { describe, expect, it } from "vitest";
 import {
   KRAKEN_ADD_ORDER_COST,
   KRAKEN_AGE_SAFETY_MARGIN_MS,
+  KRAKEN_BATCH_CANCEL_MAX_IDS,
   KRAKEN_CANCEL_AGE_COSTS,
   KRAKEN_CANCEL_COST_UNKNOWN_AGE,
   KRAKEN_DEFAULT_TIER,
   KRAKEN_REST_COUNTER_COSTS,
   KRAKEN_REST_TIERS,
   KRAKEN_TRADING_TIERS,
+  krakenBatchCancelCost,
   krakenCancelCost,
 } from "./rate-limits";
 
@@ -250,5 +252,124 @@ describe("Kraken's own worked examples reproduce", () => {
     // And the same cancels on five-minute-old orders cost nothing at all, which
     // is the eight-fold spread the age dependency exists to express.
     expect(krakenCancelCost(301_000)).toBe(0);
+  });
+});
+
+// --------------------------------------------------------------------------
+// Batch cancel -- the escape hatch's price
+// --------------------------------------------------------------------------
+
+/**
+ * ⚠ RE-READ FROM *(docs)* ON 2026-09-04, NOT CARRIED OVER FROM ENTRY 96.
+ *
+ * `docs.kraken.com/api/docs/guides/spot-ratelimits`, the trading rate-limit cost
+ * table, verbatim in the rows that matter here:
+ *
+ *   | Transaction  | Fixed  | <5s    | <10s   | <15s   | <45s   | <90s   | <300s  |
+ *   | Add Order    | +1     |        |        |        |        |        |        |
+ *   | Batch Add    | +(n/2) |        |        |        |        |        |        |
+ *   | Cancel Order |        | +8     | +6     | +5     | +4     | +2     | +1     |
+ *   | Batch Cancel |        | +(8xn) | +(6xn) | +(5xn) | +(4xn) | +(2xn) | +(1xn) |
+ *
+ * and, beside the Batch Cancel row: "If the rate counter in the batch exceeds
+ * maximum for a batch cancel, the requests in batch are still accepted."
+ */
+describe("krakenBatchCancelCost", () => {
+  /** Ages comfortably inside each rung, past the one-second safety margin. */
+  const UNDER_5S = 3_000;
+  const UNDER_10S = 8_000;
+  const UNDER_300S = 200_000;
+  const OVER_300S = 400_000;
+
+  it("is +(8 x n) for a batch of orders all under five seconds old", async () => {
+    // The published row, read literally. This is entry 90's worst case: a grid
+    // that has just laid a ladder is holding exactly these orders.
+    for (const n of [1, 2, 7, 8, 50]) {
+      const ages = Array.from({ length: n }, () => UNDER_5S);
+      expect(krakenBatchCancelCost(ages)).toBe(8 * n);
+    }
+  });
+
+  it("matches every other rung of the published table too", () => {
+    const rungs: readonly (readonly [number, number])[] = [
+      [3_000, 8],
+      [8_000, 6],
+      [13_000, 5],
+      [40_000, 4],
+      [80_000, 2],
+      [200_000, 1],
+    ];
+    for (const [age, per] of rungs) {
+      expect(krakenBatchCancelCost([age, age, age])).toBe(3 * per);
+    }
+  });
+
+  it("⚠ does NOT copy Batch Add's +(n/2) discount, which would undercharge by half", () => {
+    // The single most consequential line in this file. Batch ADD is half price
+    // per order; batch CANCEL is not discounted at all. Assuming symmetry would
+    // have had the gate charge 32 where the venue charges 64, on the risk-exit
+    // path, on the counter entry 90's worst case is about.
+    const eightFresh = Array.from({ length: 8 }, () => UNDER_5S);
+    expect(krakenBatchCancelCost(eightFresh)).toBe(64);
+    expect(krakenBatchCancelCost(eightFresh)).not.toBe(
+      (8 * KRAKEN_ADD_ORDER_COST * eightFresh.length) / 2,
+    );
+    // And it is exactly what the same orders cost cancelled one at a time --
+    // no discount, no penalty. That equality is why preferring the batch can
+    // never cost more on this counter.
+    expect(krakenBatchCancelCost(eightFresh)).toBe(
+      eightFresh.reduce((total, age) => total + krakenCancelCost(age), 0),
+    );
+  });
+
+  it("sums each order's OWN rung, because a real ladder is not one age band", () => {
+    // The published `+(8xn)` form prices a uniform batch. A grid ladder laid over
+    // several minutes is not uniform, and multiplying any single rung by n would
+    // be wrong in one direction or the other.
+    expect(krakenBatchCancelCost([UNDER_5S, UNDER_10S, UNDER_300S])).toBe(8 + 6 + 1);
+    // Past five minutes the venue charges nothing for the cancel itself, so an
+    // old ladder is genuinely free on this counter.
+    expect(krakenBatchCancelCost([OVER_300S, OVER_300S, OVER_300S])).toBe(0);
+  });
+
+  it("charges an unknown age the dearest rung, per order", () => {
+    // `krakenCancelCost`'s fail-closed rule, applied per entry rather than
+    // relaxed for the batch: "we could not look it up" must never be the cheap
+    // way through the gate, and the path most likely to lack a local record is
+    // reconciliation.
+    expect(krakenBatchCancelCost([null, null])).toBe(2 * KRAKEN_CANCEL_COST_UNKNOWN_AGE);
+    expect(krakenBatchCancelCost([null, OVER_300S])).toBe(KRAKEN_CANCEL_COST_UNKNOWN_AGE);
+  });
+
+  it("costs nothing for an empty list, leaving the refusal to the caller", () => {
+    // Refusing an empty batch is `KrakenClient.cancelOrderBatch`'s job, and it
+    // does refuse it. A throwing cost function would make the rate-limit gate
+    // the place a caller discovered its own bug.
+    expect(krakenBatchCancelCost([])).toBe(0);
+  });
+
+  it("publishes Kraken's documented cap of fifty ids per request", () => {
+    // "up to a maximum of 50 total unique IDs/references" -- and note it is a
+    // different number from AddOrderBatch's 2-to-15. The two batch endpoints are
+    // not symmetric in any respect this file depends on.
+    expect(KRAKEN_BATCH_CANCEL_MAX_IDS).toBe(50);
+  });
+
+  it("is never cheaper than the sequential cancels it replaces, at any mix of ages", () => {
+    // The property that makes preferring the batch safe rather than merely
+    // convenient: it can never under-charge relative to what the same orders
+    // would have cost one at a time, because it IS that sum.
+    const mixes: readonly (readonly (number | null)[])[] = [
+      [1_000, 60_000, null, 400_000],
+      [null, null, 4_000],
+      [12_000, 12_000, 12_000, 12_000, 12_000],
+    ];
+    for (const ages of mixes) {
+      const sequential = ages.reduce<number>(
+        (total, age) => total + krakenCancelCost(age),
+        0,
+      );
+      expect(krakenBatchCancelCost(ages)).toBe(sequential);
+    }
   });
 });

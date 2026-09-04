@@ -14,6 +14,8 @@
 import type { ExchangeOutcome } from "../shared/downtime";
 import type {
   Balance,
+  BatchCancelEntry,
+  BatchCancelResult,
   Candle,
   CandleInterval,
   Fill,
@@ -162,6 +164,87 @@ export class FakeExchange implements RestExchangeClient {
   fillOnCancel: Money = ZERO;
 
   #nextExchangeOrderId = 1;
+
+  /**
+   * The batch-cancel capability, PRESENT ONLY WHEN A TEST ASKS FOR IT.
+   *
+   * ⚠ ABSENT BY DEFAULT, and conditionally defined rather than flag-guarded, for
+   * the same reason `RateLimitedExchange` defines it conditionally:
+   * `supportsBatchCancel` answers on METHOD PRESENCE, so a fake that always had
+   * the method would claim a capability on every venue -- including the two that
+   * demonstrably do not have one -- and every existing test would silently switch
+   * to a code path it was not written for.
+   *
+   * `new FakeExchange()` is therefore still exactly the venue it always was, and
+   * `new FakeExchange({ batchCancel: true })` is the one that can.
+   */
+  readonly batchCancelMaxOrders?: number;
+  readonly cancelOrderBatch?: (
+    pair: Pair,
+    clientOrderIds: readonly string[],
+  ) => Promise<ExchangeOutcome<BatchCancelResult>>;
+
+  /** Every batch this fake was asked to cancel, in order. Empty when incapable. */
+  readonly cancelBatches: string[][] = [];
+  /** Set to force EVERY `cancelOrderBatch` to fail. Stays set until cleared. */
+  batchCancelFailure: { kind: ForcedFailureKind; message: string } | null = null;
+  /**
+   * clientOrderIds the follow-up read does not see, so the batch reports them
+   * `resolved: false` -- the venue's real shape, where the batch response
+   * carries no per-order result and one read has to supply it.
+   */
+  readonly batchCancelUnresolved = new Set<string>();
+
+  constructor(options: { batchCancel?: boolean; batchCancelMaxOrders?: number } = {}) {
+    if (options.batchCancel === true) {
+      this.batchCancelMaxOrders = options.batchCancelMaxOrders ?? 50;
+      this.cancelOrderBatch = async (pair, clientOrderIds) =>
+        await this.#cancelBatch(pair, clientOrderIds);
+    }
+  }
+
+  /**
+   * Cancel a named set, then report each one -- Kraken's shape, in memory.
+   *
+   * Faithful in the two ways that matter to the caller under test: the batch
+   * itself reports only whether the REQUEST succeeded, and each order's final
+   * state comes from a per-order lookup that may not find it. Reuses
+   * `cancelOrder` for the cancellation itself so a batched cancel and a single
+   * one cannot diverge in what they do to this fake's own state.
+   */
+  async #cancelBatch(
+    pair: Pair,
+    clientOrderIds: readonly string[],
+  ): Promise<ExchangeOutcome<BatchCancelResult>> {
+    this.cancelBatches.push([...clientOrderIds]);
+    if (this.batchCancelFailure !== null) {
+      return failure(this.batchCancelFailure.message, this.batchCancelFailure.kind, this.now);
+    }
+
+    const entries: BatchCancelEntry[] = [];
+    let cancelledCount = 0;
+    for (const clientOrderId of clientOrderIds) {
+      const outcome = await this.cancelOrder(pair, clientOrderId);
+      if (outcome.ok) cancelledCount += 1;
+      if (!outcome.ok || this.batchCancelUnresolved.has(clientOrderId)) {
+        entries.push({
+          clientOrderId,
+          resolved: false,
+          reason: outcome.ok
+            ? `the follow-up read did not see ${clientOrderId}`
+            : outcome.message,
+        });
+        continue;
+      }
+      entries.push({ clientOrderId, resolved: true, order: outcome.value });
+    }
+
+    return {
+      ok: true,
+      value: { pair, requested: [...clientOrderIds], cancelledCount, entries },
+      at: this.now,
+    };
+  }
 
   async getServerTime(): Promise<ExchangeOutcome<number>> {
     return { ok: true, value: this.now, at: this.now };

@@ -69,6 +69,9 @@ import type { ExchangeOutcome } from "../../shared/downtime";
 import { classifyStatus, classifyThrown, ok } from "../../shared/downtime";
 import type {
   Balance,
+  BatchCancelEntry,
+  BatchCancellingClient,
+  BatchCancelResult,
   Candle,
   CandleInterval,
   OrderRequest,
@@ -100,6 +103,7 @@ import {
   FEE_IN_QUOTE_FLAG,
   krakenTimeframe,
   parseBalances,
+  parseBatchCancelResult,
   parseCancelResult,
   parseCandles,
   parseClosedOrders,
@@ -109,9 +113,18 @@ import {
   parseTickerResult,
   readEnvelope,
   requireResult,
+  type KrakenBatchCancelResult,
   type KrakenCancelResult,
 } from "./parse";
-import { KRAKEN_FORM_CONTENT_TYPE, KrakenSigner, NonceGenerator, type BodyValue } from "./signing";
+import { KRAKEN_BATCH_CANCEL_MAX_IDS } from "./rate-limits";
+import {
+  KRAKEN_FORM_CONTENT_TYPE,
+  KRAKEN_JSON_CONTENT_TYPE,
+  KrakenSigner,
+  NonceGenerator,
+  type BodyValue,
+  type JsonBodyValue,
+} from "./signing";
 
 /**
  * Base URLs, keyed by environment -- and there is exactly ONE key.
@@ -149,6 +162,7 @@ export const KRAKEN_ENDPOINTS = {
   ohlc: "/0/public/OHLC",
   addOrder: "/0/private/AddOrder",
   cancelOrder: "/0/private/CancelOrder",
+  cancelOrderBatch: "/0/private/CancelOrderBatch",
   openOrders: "/0/private/OpenOrders",
   closedOrders: "/0/private/ClosedOrders",
   balanceEx: "/0/private/BalanceEx",
@@ -234,6 +248,31 @@ export const KRAKEN_REQUEST_COSTS: Readonly<
 });
 
 /**
+ * `cancelOrderBatch`'s request count, WHICH THE TABLE ABOVE CANNOT HOLD.
+ *
+ * Not an oversight and not a second table: `KRAKEN_REQUEST_COSTS` is keyed by
+ * `keyof RestExchangeClient`, and batch cancel is deliberately NOT on that
+ * interface -- it is an optional capability (`BatchCancellingClient`), because
+ * neither Binance nor Gemini has an endpoint that cancels a named SET of orders.
+ * So the compiler cannot force a row here, and the fact is written down beside
+ * the table instead of being lost between the two.
+ *
+ * ONE `CancelOrderBatch` plus ONE `ClosedOrders` read, for the whole batch,
+ * however many ids it names. That invariance is the entire economic case: N
+ * sequential cancels are 2N private requests and N account-history reads; this
+ * is two requests and one read. The engine charge is NOT invariant -- it is the
+ * sum of each order's own age rung -- and lives in `krakenBatchCancelCost`,
+ * which is the cost model rather than a request count. The distinction between
+ * those two facts is what this whole table exists to keep straight.
+ */
+export const KRAKEN_BATCH_CANCEL_REQUEST_COST: KrakenRequestCost = Object.freeze({
+  restRequests: 1,
+  tradingRequests: 1,
+  ageDependent: true,
+  needsCatalogue: true,
+});
+
+/**
  * How long to wait for a reply.
  *
  * Equal to both existing clients', for the reason stated there: aborting a POST
@@ -280,6 +319,14 @@ interface RequestSpec<T> {
   query?: readonly (readonly [string, string])[];
   /** Body parameters for a signed POST, beyond the nonce `buildBody` adds. */
   params?: readonly (readonly [string, BodyValue])[];
+  /**
+   * JSON body parameters, for a signed POST whose arguments are NOT scalars.
+   *
+   * Mutually exclusive with `params`, and used by exactly one endpoint:
+   * `CancelOrderBatch` takes an array, `URLSearchParams` cannot express one, and
+   * Kraken documents no form encoding for it. See `KRAKEN_JSON_CONTENT_TYPE`.
+   */
+  json?: readonly (readonly [string, JsonBodyValue | undefined])[];
   /** Names the call in an error message, e.g. `"Ticker"`. */
   context: string;
   /**
@@ -297,7 +344,7 @@ type Transport =
   | { reached: true; response: Response; body: unknown; at: Timestamp }
   | { reached: false; error: unknown; at: Timestamp };
 
-export class KrakenClient implements RestExchangeClient {
+export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
   readonly #baseUrl: string;
   readonly #fetch: FetchLike;
   readonly #now: () => Timestamp;
@@ -607,6 +654,179 @@ export class KrakenClient implements RestExchangeClient {
         `accepted; where the order finished is NOT known, and no filled quantity is ` +
         `being invented for it. Section 9 reconciliation is the mechanism that ` +
         `settles this.`,
+      read.at,
+    );
+  }
+
+  /**
+   * The most ids one `CancelOrderBatch` may name. Kraken's own cap, not a policy.
+   */
+  readonly batchCancelMaxOrders = KRAKEN_BATCH_CANCEL_MAX_IDS;
+
+  /**
+   * Cancel a NAMED SET of orders in one request -- entry 90's escape hatch.
+   *
+   * ── WHY THIS EXISTS AT ALL ──
+   *
+   * Entry 90's worst case: section 7.2's halt cancels every open order for a bot
+   * instance, a grid that has just laid a ladder is holding exactly the young
+   * orders Kraken prices at +8, and roughly SEVEN of those exhaust a Starter
+   * trading threshold of 60 on that one pair. The eighth sequential
+   * `CancelOrder` is refused, mid-halt.
+   *
+   * Kraken publishes the answer, beside its own Batch Cancel cost row: **"If the
+   * rate counter in the batch exceeds maximum for a batch cancel, the requests in
+   * batch are still accepted."** One `CancelOrderBatch` naming all eight gets
+   * through where the eighth single cancel does not. This is the venue's
+   * documented mechanism, not a trick played on it.
+   *
+   * ── ⚠ WHAT KRAKEN RETURNS, WHICH IS ALMOST NOTHING ──
+   *
+   * `{"count": 2}`. No per-order results. No ids. No filled quantities. Kraken's
+   * OpenAPI document declares NO response schema for this endpoint at all, only
+   * that example -- while the neighbouring `AddOrderBatch` declares a full
+   * per-order `orders` array, so the asymmetry is Kraken's choice rather than a
+   * gap in the reading (see `parseBatchCancelResult`).
+   *
+   * `count` is an aggregate and cannot be attributed. A batch of eight answering
+   * `count: 6` says six were cancelled and NOT which six -- and, exactly as with
+   * a single cancel, a shortfall is an ordinary answer rather than an error,
+   * because an order that had already filled matches nothing.
+   *
+   * ── SO: ONE BATCH, THEN ONE READ. THE SAME SHAPE `cancelOrder` HAS ──
+   *
+   * `cancelOrder` is a cancel plus exactly one `ClosedOrders` read (entry 90
+   * DECISION 2), because the interface promises a filled quantity Kraken's cancel
+   * response does not carry. Every word of that applies here and none of it is
+   * weakened: one batch, one read, NEVER a loop, and what the one read saw is
+   * reported honestly -- including when it saw nothing.
+   *
+   * ⚠ THE READ IS DELIBERATELY UNFILTERED. `ClosedOrders` accepts ONE
+   * `cl_ord_id`, and this method has up to fifty of them; asking per id would be
+   * N reads and would give back the very cost the batch exists to avoid. So it
+   * asks for the recent closed orders and matches locally -- which is what
+   * `#singleOrder` was already doing anyway, for the reason its docblock gives.
+   *
+   * WHAT THAT COSTS, STATED RATHER THAN HIDDEN: `ClosedOrders` returns a bounded
+   * recent page, so an id pushed off it by other traffic on the same account
+   * comes back `resolved: false`. That is the SAFE direction and the same
+   * treatment `cancelOrder` gives a read that finds nothing -- the caller keeps
+   * the order open, alerts, and section 9 reconciliation settles it -- but it is
+   * a real limit of one read and is not presented as a certainty.
+   *
+   * ── THE THREE LOCAL REFUSALS, ALL BEFORE ANYTHING IS SENT ──
+   *
+   * An EMPTY list, because a batch that names nothing would spend a nonce and a
+   * request to cancel nothing, and a caller reaching here with none has a bug
+   * worth naming. MORE THAN FIFTY, Kraken's documented cap, because the venue
+   * counts the excess as an error and the caller must chunk rather than discover
+   * that mid-halt. And DUPLICATES -- the cap is on "unique IDs/references", so a
+   * repeated id makes the batch quietly smaller than the caller believes, and a
+   * caller believing it cancelled eight orders when it named seven is exactly
+   * the accounting error this whole path exists to prevent.
+   *
+   * ── ⚠ DOCUMENTED, NOT LIVE, AND ONE FIELD IS SELF-CONTRADICTORY ──
+   *
+   * No live probe can settle the body shape: Kraken checks the API key before it
+   * checks parameters (established in entry 92 and re-confirmed for
+   * `QueryOrders`), so an unauthenticated call answers `EAPI:Invalid key`
+   * whatever is sent, and this session has no Kraken credentials.
+   *
+   * Kraken's OpenAPI document CONTRADICTS ITSELF on the sibling field: `orders`
+   * is declared as an array of OBJECTS carrying `txid`, while the very same
+   * schema's `example` shows `orders` as an array of bare STRINGS. Both cannot be
+   * right. `cl_ord_ids` -- the field this method uses, because the interface
+   * hands it client order ids -- is declared as an array of objects
+   * `{cl_ord_id: string}` and carries NO example, so there is exactly one
+   * documented form for it and this sends that one. Recorded because if this
+   * endpoint ever fails on a real account, the encoding is the first thing to
+   * suspect, and `#cancelOpenOrders` falls back to sequential cancels on exactly
+   * that class of refusal for this reason.
+   */
+  async cancelOrderBatch(
+    pair: Pair,
+    clientOrderIds: readonly string[],
+  ): Promise<ExchangeOutcome<BatchCancelResult>> {
+    if (clientOrderIds.length === 0) {
+      return this.#refused<BatchCancelResult>(
+        `CancelOrderBatch was asked to cancel no orders at all. Refusing to spend a ` +
+          `nonce and a request on an empty batch; a caller with nothing to cancel ` +
+          `should not be calling this.`,
+      );
+    }
+    if (clientOrderIds.length > KRAKEN_BATCH_CANCEL_MAX_IDS) {
+      return this.#refused<BatchCancelResult>(
+        `CancelOrderBatch was given ${clientOrderIds.length} client order ids; Kraken ` +
+          `accepts at most ${KRAKEN_BATCH_CANCEL_MAX_IDS} unique ids per request. ` +
+          `Refusing to send a batch the venue will reject -- chunk it instead ` +
+          `(batchCancelMaxOrders publishes the cap for exactly this).`,
+      );
+    }
+    const unique = new Set(clientOrderIds);
+    if (unique.size !== clientOrderIds.length) {
+      return this.#refused<BatchCancelResult>(
+        `CancelOrderBatch was given ${clientOrderIds.length} client order ids but only ` +
+          `${unique.size} distinct ones. Kraken's cap counts UNIQUE ids, so a repeated ` +
+          `id makes the batch smaller than the caller believes it is; refusing rather ` +
+          `than reporting a cancellation count against a list that does not match it.`,
+      );
+    }
+
+    const resolved = await this.#resolvePair<BatchCancelResult>(pair);
+    if (!resolved.ok) return resolved.outcome;
+    const { catalogue, kraken } = resolved;
+
+    const cancelled = await this.#request<KrakenBatchCancelResult>({
+      path: KRAKEN_ENDPOINTS.cancelOrderBatch,
+      signed: true,
+      context: "CancelOrderBatch",
+      // JSON, not form. The only such call in this client; see `RequestSpec.json`
+      // and `KRAKEN_JSON_CONTENT_TYPE` for why a second encoding exists.
+      json: [["cl_ord_ids", clientOrderIds.map((id) => ({ cl_ord_id: id }))]],
+      parse: (result) => parseBatchCancelResult(result),
+    });
+    if (!cancelled.ok) return cancelled;
+
+    // THE ONE READ, for the WHOLE batch. Not a loop, not one per id.
+    const read = await this.#request<OrderStatus[]>({
+      path: KRAKEN_ENDPOINTS.closedOrders,
+      signed: true,
+      context: "ClosedOrders",
+      // No `cl_ord_id`: it filters one id and there are up to fifty. See above.
+      // `trades: false` for the reason `cancelOrder` gives.
+      params: [["trades", false]],
+      parse: (result) => parseClosedOrders(result, catalogue),
+    });
+    if (!read.ok) return read;
+
+    const { count } = cancelled.value;
+    const entries: BatchCancelEntry[] = clientOrderIds.map((clientOrderId) => {
+      // `#singleOrder` unchanged and reused whole, so the duplicate-id refusal
+      // and the wrong-market refusal are the SAME checks the single-cancel path
+      // makes rather than a second, subtly different copy of them.
+      const found = this.#singleOrder(read.value, clientOrderId, kraken, read.at);
+      if (found === undefined) {
+        return {
+          clientOrderId,
+          resolved: false,
+          reason:
+            `Kraken's batch cancel reported count=${count} for ${clientOrderIds.length} ` +
+            `ids, and the single follow-up read (one read, never a loop) found no ` +
+            `CLOSED order carrying this id. Where it finished is NOT known, and no ` +
+            `filled quantity is being invented for it.`,
+        };
+      }
+      if (!found.ok) return { clientOrderId, resolved: false, reason: found.message };
+      return { clientOrderId, resolved: true, order: found.value };
+    });
+
+    return ok(
+      {
+        pair: kraken.ticker,
+        requested: [...clientOrderIds],
+        cancelledCount: count,
+        entries,
+      },
       read.at,
     );
   }
@@ -1120,12 +1340,21 @@ export class KrakenClient implements RestExchangeClient {
     try {
       if (spec.signed) {
         const nonce = this.#nonce.next(this.#now());
-        const signed = await this.#signer.signedRequest(spec.path, nonce, spec.params ?? []);
+        // THE BODY'S ENCODING AND ITS CONTENT-TYPE ARE CHOSEN TOGETHER, in one
+        // expression, because Kraken signs the literal bytes: sending a JSON
+        // body under the form Content-Type (or the reverse) yields a signature
+        // that verifies against a body Kraken never reconstructs. `json` is set
+        // by one endpoint; every other call keeps the form path untouched.
+        const signed =
+          spec.json === undefined
+            ? await this.#signer.signedRequest(spec.path, nonce, spec.params ?? [])
+            : await this.#signer.signedJsonRequest(spec.path, nonce, spec.json);
         init = {
           method: "POST",
           headers: {
             ...signed.headers,
-            "Content-Type": KRAKEN_FORM_CONTENT_TYPE,
+            "Content-Type":
+              spec.json === undefined ? KRAKEN_FORM_CONTENT_TYPE : KRAKEN_JSON_CONTENT_TYPE,
           },
           // The bytes that were signed. Not rebuilt. See the docblock.
           body: signed.body,

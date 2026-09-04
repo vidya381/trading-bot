@@ -205,11 +205,41 @@ const VENUE_BUDGET_MODELS: Readonly<Record<ExchangeId, VenueBudgetModel>> = {
   },
 };
 
-/** Every counter a cost vector touches, as (key, amount) pairs. */
+/**
+ * One counter's share of a cost vector, resolved against this object's budgets.
+ *
+ * `unconditional` is carried alongside the amount rather than re-read from the
+ * request at each of the four places the grant logic consults a charge, so
+ * "recorded but never refused" is decided ONCE.
+ */
+interface Charge {
+  readonly key: string;
+  readonly budget: Budget;
+  readonly amount: number;
+  /** The venue accepts this component regardless. See `AcquireCost.trading`. */
+  readonly unconditional: boolean;
+}
+
+/**
+ * Every counter a cost vector touches AND CAN BE HELD BACK BY, as (key, amount).
+ *
+ * ⚠ An unconditional component is deliberately absent. This function's one caller
+ * is `#claimedAhead`, which computes what a QUEUED ticket has reserved against
+ * everything behind it -- and a component the venue never refuses reserves
+ * nothing: its own call was never held on that counter, so holding somebody
+ * else's would be this gate inventing a constraint the exchange does not have.
+ *
+ * A batch cancel can still be ticketed on its account-counter component, and
+ * that component still claims here. Only the trading half drops out.
+ */
 function costKeys(cost: AcquireCost): [string, number][] {
   const keys: [string, number][] = [];
   if (cost.rest > 0) keys.push(["rest", cost.rest]);
-  if (cost.trading !== undefined && cost.trading.count > 0) {
+  if (
+    cost.trading !== undefined &&
+    cost.trading.count > 0 &&
+    cost.trading.unconditional !== true
+  ) {
     keys.push([`trading:${cost.trading.pair}`, cost.trading.count]);
   }
   return keys;
@@ -352,7 +382,30 @@ export interface AcquireCost {
    * cancels on different markets do not compete, and a budget that pooled them
    * would refuse traffic the venue would have accepted.
    */
-  readonly trading?: { readonly pair: string; readonly count: number };
+  readonly trading?: {
+    readonly pair: string;
+    readonly count: number;
+    /**
+     * ⚠ THE VENUE ACCEPTS THIS CHARGE EVEN OVER THE THRESHOLD, so this gate must
+     * not be the thing that refuses it.
+     *
+     * Set by exactly one cost entry: Kraken's batch cancel. Kraken publishes it
+     * beside that row's own numbers -- "If the rate counter in the batch exceeds
+     * maximum for a batch cancel, the requests in batch are still accepted."
+     *
+     * The charge is still applied, through `Budget.record`, so everything after
+     * it sees the counter it left behind (possibly OVER the threshold, which is
+     * where the venue's counter will also be). What changes is only that this
+     * component neither refuses the call, nor queues it, nor holds a claim
+     * against anything behind it.
+     *
+     * IT DOES NOT EXCUSE THE REST OF THE VECTOR. A batch cancel's account-counter
+     * component -- the follow-up status read -- is metered normally and gates
+     * normally, because Kraken's sentence is about the trading counter and says
+     * nothing about the REST one.
+     */
+    readonly unconditional?: boolean;
+  };
 }
 
 export interface AcquireRequest {
@@ -623,11 +676,16 @@ export class RateLimiter extends DurableObject<Env> {
 
     const { priority } = request;
     const charges = this.#chargesFor(request);
+    // The components this gate may actually refuse the call over. An
+    // unconditional one is charged at the end and consulted nowhere before it --
+    // see `AcquireCost.trading.unconditional`. `#chargesFor` has already refused
+    // a vector with nothing left in this list.
+    const gating = charges.filter((charge) => !charge.unconditional);
 
     // A charge larger than its counter's entire share for this priority can
     // never succeed, so it gets no ticket: queueing it would leave the caller
     // retrying forever and would block everything behind it while doing so.
-    for (const charge of charges) {
+    for (const charge of gating) {
       if (charge.amount > charge.budget.ceilingFor(priority)) {
         this.#drop(request.ticketId);
         return {
@@ -637,7 +695,7 @@ export class RateLimiter extends DurableObject<Env> {
           retryAfterMs: 0,
           queuePosition: 0,
           usedWeight: this.#budget.usedWeight(now),
-          remainingForPriority: this.#remainingAcross(charges, priority, now),
+          remainingForPriority: this.#remainingAcross(gating, priority, now),
           at: now,
         };
       }
@@ -651,7 +709,7 @@ export class RateLimiter extends DurableObject<Env> {
     // and a stream of small requests overtake a large one -- the head-of-line
     // case. Two requests that share no counter do not block each other at all,
     // which is the whole point of keeping the pair counters apart.
-    const blocked = charges.filter((charge) => {
+    const blocked = gating.filter((charge) => {
       const ahead = claimed.get(charge.key) ?? 0;
       const remaining = Math.max(
         0,
@@ -693,7 +751,7 @@ export class RateLimiter extends DurableObject<Env> {
         retryAfterMs: Math.max(1, retryAfterMs),
         queuePosition: this.#positionOf(ticket),
         usedWeight: this.#budget.usedWeight(now),
-        remainingForPriority: this.#remainingAcross(charges, priority, now),
+        remainingForPriority: this.#remainingAcross(gating, priority, now),
         at: now,
       };
     }
@@ -701,7 +759,17 @@ export class RateLimiter extends DurableObject<Env> {
     // Synchronous, and ALL OF THEM, before any await. See the method comment.
     // Partially charging and then suspending would leave one counter spent for a
     // call that never went, which is the one outcome worse than refusing it.
+    //
+    // AN UNCONDITIONAL COMPONENT IS RECORDED, NOT CONSUMED, and the difference is
+    // that `record` cannot fail. Passing it through `consume` would trip the
+    // guard below the moment the counter is where this whole mechanism exists to
+    // work from -- already past the threshold -- turning the escape hatch into an
+    // exception thrown at the gate during a halt.
     for (const charge of charges) {
+      if (charge.unconditional) {
+        charge.budget.record(charge.amount, now);
+        continue;
+      }
       const decision = charge.budget.consume(charge.amount, priority, now);
       if (!decision.allowed) {
         // Unreachable: the arithmetic above already established every charge
@@ -727,7 +795,7 @@ export class RateLimiter extends DurableObject<Env> {
       cost: request.cost,
       usedWeight: this.#budget.usedWeight(now),
       usedTrading: tradingCounter === null ? null : tradingCounter.usedWeight(now),
-      remainingForPriority: this.#remainingAcross(charges, priority, now),
+      remainingForPriority: this.#remainingAcross(gating, priority, now),
       at: now,
     };
   }
@@ -1140,9 +1208,7 @@ export class RateLimiter extends DurableObject<Env> {
   }
 
   /** The counters this request actually spends, with the amount for each. */
-  #chargesFor(
-    request: AcquireRequest,
-  ): { key: string; budget: Budget; amount: number }[] {
+  #chargesFor(request: AcquireRequest): Charge[] {
     const { rest, trading } = request.cost;
 
     if (!Number.isFinite(rest) || rest < 0) {
@@ -1159,13 +1225,17 @@ export class RateLimiter extends DurableObject<Env> {
       }
     }
 
-    const charges: { key: string; budget: Budget; amount: number }[] = [];
-    if (rest > 0) charges.push({ key: "rest", budget: this.#budget, amount: rest });
+    const charges: Charge[] = [];
+    if (rest > 0) {
+      charges.push({ key: "rest", budget: this.#budget, amount: rest, unconditional: false });
+    }
     if (trading !== undefined && trading.count > 0) {
       charges.push({
         key: `trading:${trading.pair}`,
         budget: this.#tradingCounterFor(trading.pair),
         amount: trading.count,
+        // The venue's own promise, carried through to the grant logic below.
+        unconditional: trading.unconditional === true,
       });
     }
 
@@ -1179,6 +1249,21 @@ export class RateLimiter extends DurableObject<Env> {
           `gate would not be measuring it. Every method needs a positive cost.`,
       );
     }
+
+    if (charges.every((charge) => charge.unconditional)) {
+      // Every component of this call is one the venue would accept regardless,
+      // so nothing here could ever hold it back and the gate would be decorative.
+      // Reaching this means a cost table marked its ONLY component unconditional,
+      // which is an unmeasured path through the gate in the same sense the
+      // zero-cost case above is -- and Kraken's batch cancel is not it: its
+      // follow-up read is charged normally, on purpose.
+      throw new RateLimiterError(
+        `${request.label ?? "a request"} has no component this gate can refuse, so ` +
+          `every counter it names would be recorded and none enforced. A call needs ` +
+          `at least one gating charge.`,
+      );
+    }
+
     return charges;
   }
 

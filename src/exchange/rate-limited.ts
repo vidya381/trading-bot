@@ -60,6 +60,8 @@
 import { rateLimited, type ExchangeOutcome } from "../shared/downtime";
 import type {
   Balance,
+  BatchCancellingClient,
+  BatchCancelResult,
   Candle,
   CandleInterval,
   OrderRequest,
@@ -71,6 +73,7 @@ import type {
   SymbolFilters,
   Timestamp,
 } from "../shared/exchange-client";
+import { supportsBatchCancel } from "../shared/exchange-client";
 import { RateLimiterError, type RequestPriority } from "../shared/rate-limiter";
 import type { AcquireCost, AcquireRequest, AcquireResult } from "../durable-objects/rate-limiter";
 import type { ExchangeId } from "../db/schema";
@@ -79,6 +82,7 @@ import { GEMINI_REQUEST_COSTS, type GeminiRequestCost } from "./gemini/client";
 import {
   KRAKEN_ADD_ORDER_COST,
   KRAKEN_REST_COUNTER_COSTS,
+  krakenBatchCancelCost,
   krakenCancelCost,
 } from "./kraken/rate-limits";
 
@@ -359,6 +363,85 @@ export function methodCostsFor(exchange: ExchangeId): MethodCosts {
   return METHOD_COSTS[exchange];
 }
 
+// ---------------------------------------------------------------------------
+// Batch cancel: an OPTIONAL capability, so a table of its own
+// ---------------------------------------------------------------------------
+
+/** What is known about a batch cancellation, for pricing it. */
+export interface BatchCancelContext {
+  /** The one market every id in the batch rests on. */
+  readonly pair: Pair;
+  /**
+   * One age per order, in the order requested; `null` where unknown.
+   *
+   * A LIST, not a count, and that is the whole reason this cost is not a
+   * `MethodCost`. Kraken prices each cancelled order by its own age rung and
+   * gives batches no discount, so a real ladder -- rungs laid minutes apart --
+   * costs the SUM of its rungs, not `n` times any one of them. A count could
+   * only be multiplied by a single rung, which would be wrong in both directions
+   * depending on which one was picked.
+   */
+  readonly orderAgesMs: readonly (number | null)[];
+}
+
+/** What one batch cancellation costs, given what is known about it. */
+export type BatchCancelCost = (context: BatchCancelContext) => AcquireCost;
+
+/**
+ * Kraken's batch cancel: one unconditional engine charge, one metered read.
+ *
+ * ⚠ THE TWO HALVES ARE TREATED DIFFERENTLY ON PURPOSE.
+ *
+ * The ENGINE half is `unconditional`. Kraken publishes, beside the Batch Cancel
+ * row of its own cost table, "If the rate counter in the batch exceeds maximum
+ * for a batch cancel, the requests in batch are still accepted." So the gate
+ * records the charge and never refuses the call over it -- refusing would protect
+ * nothing (the venue was not going to refuse) and would stop a halt from
+ * cancelling its orders, which is entry 90's worst case arriving by the other
+ * door.
+ *
+ * The REST half is `accountHistory`, ORDINARY and gated, and it is ONE read for
+ * the whole batch rather than one per order -- `KrakenClient.cancelOrderBatch`
+ * issues a single `ClosedOrders`. That single number is most of the point: eight
+ * sequential `cancelOrder`s cost 8 x 4 = 32 on a counter of 15, and this costs 4.
+ * Kraken's sentence says nothing about the REST counter, so nothing here claims
+ * it does.
+ */
+export const KRAKEN_BATCH_CANCEL_COST: BatchCancelCost = (context) => ({
+  rest: KRAKEN_REST_COUNTER_COSTS.accountHistory,
+  trading: {
+    pair: context.pair,
+    count: krakenBatchCancelCost(context.orderAgesMs),
+    unconditional: true,
+  },
+});
+
+/**
+ * Which venues can cancel a named set of orders, and what it costs them.
+ *
+ * ⚠ `null` MEANS "THIS VENUE HAS NO SUCH ENDPOINT", and is written out per venue
+ * rather than left to a missing key, for the same reason `METHOD_COSTS` is a
+ * total `Record` and `resolveExchangeForAccount`'s switch has no `default`: a
+ * fourth exchange must FAIL TO COMPILE here until somebody has looked, instead of
+ * silently inheriting Kraken's numbers or silently losing the capability.
+ *
+ * Both nulls are findings, not placeholders. Binance spot cancels one order, all
+ * orders on a symbol, or one OCO list; Gemini cancels one order, all session
+ * orders, or all active orders. Neither has an endpoint that takes a LIST of
+ * ids, and their cancel-everything forms are not a substitute -- see
+ * `BatchCancellingClient` for why one of those would be actively dangerous here.
+ */
+export const BATCH_CANCEL_COSTS: Readonly<Record<ExchangeId, BatchCancelCost | null>> = {
+  binance: null,
+  gemini: null,
+  kraken: KRAKEN_BATCH_CANCEL_COST,
+};
+
+/** How this venue prices a batch cancel, or `null` if it cannot do one. */
+export function batchCancelCostFor(exchange: ExchangeId): BatchCancelCost | null {
+  return BATCH_CANCEL_COSTS[exchange];
+}
+
 /**
  * The longest a single call will wait for budget before giving up.
  *
@@ -448,6 +531,33 @@ export class RateLimitedExchange implements RestExchangeClient {
   readonly #limiter: RateLimiterPort;
   readonly #options: ResolvedOptions;
 
+  /**
+   * The batch-cancel capability, PRESENT ONLY WHEN THE WRAPPED CLIENT HAS IT.
+   *
+   * ⚠ These two are assigned in the constructor or not at all, and that
+   * conditional definition is the design rather than an accident of it.
+   * `supportsBatchCancel` is a runtime check on method presence, and every call
+   * site holds a `RestExchangeClient` -- `withPriority` returns one, `#exchange`
+   * on `BotInstance` returns one. If this class always defined the method, the
+   * guard would answer TRUE for a Binance bot, whose client cannot do this at
+   * all, and the caller would take the batch path into a `TypeError`.
+   *
+   * So the gate mirrors the venue: it can batch-cancel exactly when the thing it
+   * wraps can, and it says so the same way. `withPriority` rebuilds a gate over
+   * the same inner client, so the capability survives that seam by being
+   * re-derived rather than by being copied.
+   *
+   * A venue whose cost table says `null` does NOT get the method even if its
+   * client somehow offers one: an uncosted call through the gate is the failure
+   * this file exists to prevent, and the fail-closed answer is to keep the
+   * sequential path.
+   */
+  readonly batchCancelMaxOrders?: number;
+  readonly cancelOrderBatch?: (
+    pair: Pair,
+    clientOrderIds: readonly string[],
+  ) => Promise<ExchangeOutcome<BatchCancelResult>>;
+
   constructor(
     inner: RestExchangeClient,
     limiter: RateLimiterPort,
@@ -468,6 +578,14 @@ export class RateLimitedExchange implements RestExchangeClient {
       label: options.label ?? "",
       orderPlacedAt: options.orderPlacedAt,
     };
+
+    const batchCost = batchCancelCostFor(options.exchange);
+    if (batchCost !== null && supportsBatchCancel(inner)) {
+      const capable: BatchCancellingClient = inner;
+      this.batchCancelMaxOrders = capable.batchCancelMaxOrders;
+      this.cancelOrderBatch = async (pair, clientOrderIds) =>
+        await this.#gateBatchCancel(capable, batchCost, pair, clientOrderIds);
+    }
   }
 
   /** The venue whose cost model this gate is charging. */
@@ -614,11 +732,64 @@ export class RateLimitedExchange implements RestExchangeClient {
     call: () => Promise<ExchangeOutcome<T>>,
     resolveAge?: () => Promise<number | null>,
   ): Promise<ExchangeOutcome<T>> {
-    const { exchange, priority, costs, maxWaitMs, sleep, now, label } = this.#options;
+    const { costs, label } = this.#options;
     const describe = `${label === "" ? "" : `${label} `}${method}${detail === "" ? "" : ` ${detail}`}`;
 
     const orderAgeMs = resolveAge === undefined ? null : await resolveAge();
     const cost = costs[method]({ pair, orderAgeMs });
+    return await this.#spend(describe, cost, call);
+  }
+
+  /**
+   * Cancel several orders in one request, charged as one.
+   *
+   * Present on this class only when the wrapped client offers it -- see the
+   * fields at the top. The ages are resolved BEFORE the cost is computed and
+   * every one of them individually, because Kraken prices each order in the batch
+   * by its own rung; an id whose placement time this gate cannot read reports
+   * `null` and is charged the dearest rung, which is `#ageOf`'s existing rule
+   * applied per order rather than a second, laxer one.
+   *
+   * The ages are resolved SEQUENTIALLY rather than with `Promise.all`. The
+   * resolver is a read against one Durable Object's own storage -- there is no
+   * concurrency to win -- and doing them in order keeps the ages in the same
+   * order as the ids, which is what makes the cost auditable against the list.
+   */
+  async #gateBatchCancel(
+    inner: BatchCancellingClient,
+    cost: BatchCancelCost,
+    pair: Pair,
+    clientOrderIds: readonly string[],
+  ): Promise<ExchangeOutcome<BatchCancelResult>> {
+    const { label } = this.#options;
+    const describe =
+      `${label === "" ? "" : `${label} `}cancelOrderBatch ${pair} ` +
+      `(${clientOrderIds.length} orders)`;
+
+    const orderAgesMs: (number | null)[] = [];
+    for (const clientOrderId of clientOrderIds) {
+      orderAgesMs.push(await this.#ageOf(pair, clientOrderId));
+    }
+
+    return await this.#spend(describe, cost({ pair, orderAgesMs }), () =>
+      inner.cancelOrderBatch(pair, clientOrderIds),
+    );
+  }
+
+  /**
+   * Ask for budget, wait if refused, and only then make the call.
+   *
+   * Split out of `#gate` so the batch-cancel path -- whose cost is not a
+   * `MethodCost` and whose method name is not a `keyof RestExchangeClient` --
+   * shares the queueing, ticket and give-up behaviour exactly rather than
+   * growing a second copy of it that could drift.
+   */
+  async #spend<T>(
+    describe: string,
+    cost: AcquireCost,
+    call: () => Promise<ExchangeOutcome<T>>,
+  ): Promise<ExchangeOutcome<T>> {
+    const { exchange, priority, maxWaitMs, sleep, now } = this.#options;
     const priced = describeCost(cost);
 
     let ticketId: string | undefined;

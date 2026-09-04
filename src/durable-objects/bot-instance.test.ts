@@ -4448,3 +4448,34 @@ describe("halt and close cleanup survives a throw in one step", () => {
     expect(await db.alerts.count({ alert_type: "cleanup_step_failed" })).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The batch-cancel threshold, on the bot that can only ever hold one order
+// ---------------------------------------------------------------------------
+
+describe("a single open order is not worth a batch", () => {
+  it("cancels a lone DCA order singly, even on a venue that could batch it", async () => {
+    // `#batchCancelled` prefers the batch at TWO orders and not at one, and this
+    // is the boundary. At n=1 a batch buys nothing at all -- the engine charge is
+    // the same rung, the follow-up read is the same one read, and it is one
+    // request either way -- so taking it would spend a less-verified code path
+    // for no saving. The grid file covers the n>=2 side, where a ladder is.
+    exchange = new FakeExchange({ batchCancel: true });
+    exchange.now = T0;
+
+    await run((bot) => bot.create(creation({ exchange: "kraken" })));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    const before = await run((bot) => bot.snapshot());
+    expect(before.state.openOrderIds).toHaveLength(1);
+    const [only] = before.state.openOrderIds;
+
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    expect(exchange.cancelBatches).toEqual([]);
+    expect(exchange.cancelled).toEqual([only]);
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.openOrderIds).toEqual([]);
+  });
+});

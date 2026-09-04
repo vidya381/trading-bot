@@ -8,6 +8,7 @@ import { KrakenCatalogueCache } from "./catalogue";
 import {
   KrakenClient,
   KRAKEN_BASE_URLS,
+  KRAKEN_BATCH_CANCEL_REQUEST_COST,
   KRAKEN_ENDPOINTS,
   KRAKEN_REQUEST_COSTS,
   type FetchLike,
@@ -1399,5 +1400,310 @@ describe("KRAKEN_REQUEST_COSTS", () => {
     // cancel priced by the order's age.
     expect(METHOD_COSTS).toHaveProperty("kraken");
     expect(Object.keys(METHOD_COSTS).sort()).toEqual(["binance", "gemini", "kraken"]);
+  });
+});
+
+// --------------------------------------------------------------------------
+// cancelOrderBatch -- entry 90's escape hatch
+// --------------------------------------------------------------------------
+
+/**
+ * ── PROVENANCE FOR THIS BLOCK, WHICH IS NOT THE SAME AS THE ONE ABOVE ──
+ *
+ * FROM KRAKEN'S PUBLISHED OpenAPI DOCUMENT (`docs.kraken.com/openapi/spot-rest.yaml`,
+ * fetched raw and read on 2026-09-04), NOT LIVE:
+ *
+ *   - the endpoint path `/private/CancelOrderBatch`;
+ *   - the request schema `batchcancel`: `cl_ord_ids` is `type: array`, `items`
+ *     `type: object` with a single `cl_ord_id` `type: string` property, described
+ *     "An alphanumeric client order identifier which uniquely identifies an open
+ *     order for each client. Up to a maximum of 50 total unique IDs/references.";
+ *   - the ONLY documented response, which is an `example` and NOT a `schema`:
+ *     `{"error": [], "result": {"count": 2}}`.
+ *
+ * ⚠ AND THE CONTRADICTION, quoted because it is the reason this is treated as
+ * unverified rather than known. The SAME `batchcancel` schema declares `orders`
+ * as an array of objects carrying `txid`, and then gives an `example` in which
+ * `orders` is an array of bare strings:
+ *
+ *     example:
+ *       nonce: 1695828490
+ *       orders:
+ *         - OP5V2Y-RYKVL-ET3V3B
+ *         - OP5V2Y-7YKVL-ET3V3B
+ *
+ * Both cannot be right. `cl_ord_ids` -- the field this client uses -- has the
+ * object form and no example at all, so there is exactly one documented shape for
+ * it and that is what is sent and asserted here.
+ *
+ * NOT LIVE-VERIFIABLE, for the reason the private payloads above are not: Kraken
+ * checks the API key before the parameters (`QueryOrders` with `cl_ord_id` and no
+ * `txid` answers `EAPI:Invalid key`), so an unauthenticated probe cannot tell a
+ * good body from a bad one. `#batchCancelled` in `bot-instance.ts` falls back to
+ * sequential cancels on precisely this risk.
+ */
+describe("cancelOrderBatch", () => {
+  const IDS = ["v1-bot-1toiyz-7", "v1-bot-1toiyz-8", "v1-bot-1toiyz-9"];
+
+  function batchRoutes(
+    cancel: unknown,
+    closed: unknown,
+  ): { client: KrakenClient; requests: Recorded[] } {
+    return catalogued((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.cancelOrderBatch) return envelope(cancel);
+      if (recorded.path === KRAKEN_ENDPOINTS.closedOrders) return envelope(closed);
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+  }
+
+  /** One cancelled record per id, keyed by a distinct Kraken txid. */
+  function closedFor(ids: readonly string[]): Record<string, unknown> {
+    const closed: Record<string, unknown> = {};
+    ids.forEach((id, index) => {
+      closed[`OQCLML-BW3P3-BUCMW${index}`] = orderRecord({
+        cl_ord_id: id,
+        status: "canceled",
+        reason: "User requested",
+        closetm: 1688666600.1234,
+      });
+    });
+    return closed;
+  }
+
+  it("is EXACTLY two private requests for the WHOLE set: one batch, then ONE read", async () => {
+    // This single assertion is the escape hatch's whole economic argument.
+    // Three sequential cancelOrder calls would be SIX private requests -- three
+    // cancels and three ClosedOrders reads, at 4 account-counter units each on a
+    // Starter counter of 15. This is two, and only one of them is the read.
+    const { client, requests } = batchRoutes({ count: 3 }, { closed: closedFor(IDS), count: 3 });
+    const outcome = await client.cancelOrderBatch("BTCUSD", IDS);
+
+    expect(outcome.ok).toBe(true);
+    expect(paths(requests)).toEqual([
+      KRAKEN_ENDPOINTS.assetPairs,
+      KRAKEN_ENDPOINTS.assets,
+      KRAKEN_ENDPOINTS.cancelOrderBatch,
+      KRAKEN_ENDPOINTS.closedOrders,
+    ]);
+  });
+
+  it("sends cl_ord_ids as JSON objects under the JSON content type, with a STRING nonce", async () => {
+    // The documented shape, and the whole reason a second body encoding exists:
+    // URLSearchParams cannot express an array, and Kraken documents no form
+    // encoding for this field anywhere. The nonce is a JSON string because
+    // Kraken's own Go signing helper reads it back with `.(string)`.
+    const { client, requests } = batchRoutes({ count: 3 }, { closed: closedFor(IDS), count: 3 });
+    await client.cancelOrderBatch("BTCUSD", IDS);
+
+    const batch = requests[2]!;
+    expect(batch.method).toBe("POST");
+    expect(batch.headers["Content-Type"]).toBe("application/json");
+    const body = JSON.parse(batch.bodyText) as Record<string, unknown>;
+    expect(typeof body["nonce"]).toBe("string");
+    expect(body["cl_ord_ids"]).toEqual([
+      { cl_ord_id: "v1-bot-1toiyz-7" },
+      { cl_ord_id: "v1-bot-1toiyz-8" },
+      { cl_ord_id: "v1-bot-1toiyz-9" },
+    ]);
+    // No `pair`: CancelOrderBatch does not take one. The pair argument is used
+    // to resolve the catalogue and to check each returned order's market.
+    expect(body["pair"]).toBeUndefined();
+    expect(batch.headers["API-Sign"]).toBeTypeOf("string");
+  });
+
+  it("reads every order back with ONE unfiltered ClosedOrders call, not one per id", async () => {
+    // ClosedOrders accepts a single cl_ord_id and this call has three. Asking
+    // per id would restore exactly the per-order read cost the batch removes.
+    const { client, requests } = batchRoutes({ count: 3 }, { closed: closedFor(IDS), count: 3 });
+    await client.cancelOrderBatch("BTCUSD", IDS);
+
+    const read = bodyOf(requests[3]!);
+    expect(read["cl_ord_id"]).toBeUndefined();
+    expect(read["trades"]).toBe("false");
+  });
+
+  it("reports where each order finished, in the order requested", async () => {
+    const { client } = batchRoutes({ count: 3 }, { closed: closedFor(IDS), count: 3 });
+    const outcome = await client.cancelOrderBatch("BTCUSD", IDS);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+
+    expect(outcome.value.pair).toBe("BTCUSD");
+    expect(outcome.value.requested).toEqual(IDS);
+    expect(outcome.value.cancelledCount).toBe(3);
+    expect(outcome.value.entries.map((entry) => entry.clientOrderId)).toEqual(IDS);
+    for (const entry of outcome.value.entries) {
+      expect(entry.resolved).toBe(true);
+      if (!entry.resolved) continue;
+      // The filled quantity is what determines the position a halted bot is left
+      // holding, and it comes from the read rather than from the batch response,
+      // which carries no such thing.
+      expect(entry.order.filledQuantity).toBe(m("0.375"));
+      expect(entry.order.state).toBe("cancelled");
+    }
+  });
+
+  it("carries Kraken's aggregate count through WITHOUT attributing it to orders", async () => {
+    // `{"count": 2}` for three ids is an ORDINARY answer -- one had already
+    // filled -- and Kraken does not say which two it counted. The count is
+    // reported as the aggregate it is; the per-order truth comes from the read.
+    const alreadyFilled = orderRecord({
+      cl_ord_id: IDS[2]!,
+      status: "closed",
+      closetm: 1688666600.1234,
+      vol_exec: "1.25000000",
+    });
+    const closed = closedFor(IDS.slice(0, 2));
+    closed["OQCLML-BW3P3-BUCMWF"] = alreadyFilled;
+
+    const { client } = batchRoutes({ count: 2 }, { closed, count: 3 });
+    const outcome = await client.cancelOrderBatch("BTCUSD", IDS);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+
+    expect(outcome.value.cancelledCount).toBe(2);
+    const third = outcome.value.entries[2]!;
+    expect(third.resolved).toBe(true);
+    if (!third.resolved) return;
+    expect(third.order.state).toBe("filled");
+    expect(third.order.filledQuantity).toBe(m("1.25"));
+  });
+
+  it("reports an id the one read did not see as UNRESOLVED, inventing no fill for it", async () => {
+    // The same honesty `cancelOrder` has when its single read finds nothing: the
+    // cancel was accepted, where the order finished is not known, and a
+    // fabricated "cancelled, nothing filled" would be a quantity nobody observed
+    // in the field that decides the halted bot's position.
+    const { client } = batchRoutes({ count: 3 }, { closed: closedFor(IDS.slice(0, 2)), count: 2 });
+    const outcome = await client.cancelOrderBatch("BTCUSD", IDS);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+
+    const third = outcome.value.entries[2]!;
+    expect(third.resolved).toBe(false);
+    if (third.resolved) return;
+    expect(third.reason).toContain("found no CLOSED order carrying this id");
+    expect(third.reason).toContain("no filled quantity is being invented");
+    // The other two are unaffected: one unreadable id does not poison the batch.
+    expect(outcome.value.entries.slice(0, 2).every((entry) => entry.resolved)).toBe(true);
+  });
+
+  it("refuses an order returned on a DIFFERENT market than the caller named", async () => {
+    // `#singleOrder`'s pair check, reused whole rather than re-implemented, so
+    // the batch path cannot be laxer than the single-cancel path about acting on
+    // one market's order under another market's name.
+    const crossPair = orderRecord({ cl_ord_id: IDS[1]!, status: "canceled" }, { pair: "ETHXBT" });
+    const closed = { ...closedFor([IDS[0]!]), "OQCLML-BW3P3-CROSS": crossPair };
+
+    const { client } = batchRoutes({ count: 2 }, { closed, count: 2 });
+    const outcome = await client.cancelOrderBatch("BTCUSD", IDS.slice(0, 2));
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+
+    const second = outcome.value.entries[1]!;
+    expect(second.resolved).toBe(false);
+    if (second.resolved) return;
+    // `ETHBTC` is the catalogue's canonical ticker for the `ETHXBT` Kraken
+    // names in the payload -- resolved, never string-rewritten.
+    expect(second.reason).toContain("is on ETHBTC, not the BTCUSD the caller named");
+  });
+
+  it("refuses more than Kraken's documented fifty ids, before sending anything", async () => {
+    const { client, requests } = batchRoutes({ count: 0 }, { closed: {}, count: 0 });
+    const tooMany = Array.from({ length: 51 }, (_, index) => `v1-bot-1toiyz-${index}`);
+    const outcome = await client.cancelOrderBatch("BTCUSD", tooMany);
+
+    const failed = failureOf(outcome);
+    expect(failed.retryable).toBe(false);
+    expect(failed.message).toContain("at most 50 unique ids");
+    // Nothing was sent -- not even the catalogue fetch, since the refusal is
+    // local and comes first.
+    expect(requests).toHaveLength(0);
+  });
+
+  it("refuses an empty batch rather than spending a nonce on nothing", async () => {
+    const { client, requests } = batchRoutes({ count: 0 }, { closed: {}, count: 0 });
+    const failed = failureOf(await client.cancelOrderBatch("BTCUSD", []));
+    expect(failed.retryable).toBe(false);
+    expect(failed.message).toContain("no orders at all");
+    expect(requests).toHaveLength(0);
+  });
+
+  it("refuses a list with a repeated id, because Kraken's cap counts UNIQUE ids", async () => {
+    // A duplicate makes the batch quietly smaller than the caller believes, so a
+    // `count` compared against the caller's own list would be compared against
+    // the wrong number.
+    const { client, requests } = batchRoutes({ count: 0 }, { closed: {}, count: 0 });
+    const failed = failureOf(
+      await client.cancelOrderBatch("BTCUSD", [IDS[0]!, IDS[1]!, IDS[0]!]),
+    );
+    expect(failed.retryable).toBe(false);
+    expect(failed.message).toContain("only 2 distinct ones");
+    expect(requests).toHaveLength(0);
+  });
+
+  it("returns Kraken's own refusal, non-retryably, when the venue rejects the batch", async () => {
+    // The branch `#batchCancelled` falls back to sequential cancels on, and the
+    // reason it exists: this body shape is documented, not live-verified.
+    const { client } = catalogued((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.cancelOrderBatch) {
+        return failure("EGeneral:Invalid arguments");
+      }
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+    const failed = failureOf(await client.cancelOrderBatch("BTCUSD", IDS));
+    expect(failed.retryable).toBe(false);
+    expect(failed.message).toContain("EGeneral:Invalid arguments");
+  });
+
+  it("publishes Kraken's cap as data, so a caller chunks rather than guesses", async () => {
+    const { client } = batchRoutes({ count: 0 }, { closed: {}, count: 0 });
+    expect(client.batchCancelMaxOrders).toBe(50);
+  });
+});
+
+describe("the batch cancel's request count, which the method table cannot hold", () => {
+  it("is TWO private requests regardless of how many ids the batch names", async () => {
+    // The invariance is the economic case. Written as a table row it would be
+    // indistinguishable from a per-order count, so it is asserted against the
+    // real client at two very different batch sizes.
+    for (const size of [2, 40]) {
+      const ids = Array.from({ length: size }, (_, index) => `v1-bot-1toiyz-${index}`);
+      const closed: Record<string, unknown> = {};
+      ids.forEach((id, index) => {
+        closed[`OQCLML-BW3P3-BUCM${index}`] = orderRecord({
+          cl_ord_id: id,
+          status: "canceled",
+          closetm: 1688666600.1234,
+        });
+      });
+
+      const { client, requests } = catalogued((recorded) => {
+        if (recorded.path === KRAKEN_ENDPOINTS.cancelOrderBatch) return envelope({ count: size });
+        if (recorded.path === KRAKEN_ENDPOINTS.closedOrders) {
+          return envelope({ closed, count: size });
+        }
+        throw new Error(`unexpected path ${recorded.path}`);
+      });
+      const outcome = await client.cancelOrderBatch("BTCUSD", ids);
+      expect(outcome.ok).toBe(true);
+
+      const privateRequests = requests.filter((request) => request.path.startsWith("/0/private/"));
+      expect(privateRequests).toHaveLength(2);
+      expect(privateRequests.filter((r) => r.path === KRAKEN_ENDPOINTS.closedOrders)).toHaveLength(1);
+    }
+  });
+
+  it("records that count beside the table that is structurally unable to carry it", () => {
+    // `KRAKEN_REQUEST_COSTS` is keyed by `keyof RestExchangeClient`, and batch
+    // cancel is deliberately not on that interface -- so the compiler cannot
+    // force a row and the fact is pinned here instead.
+    expect(KRAKEN_BATCH_CANCEL_REQUEST_COST).toEqual({
+      restRequests: 1,
+      tradingRequests: 1,
+      ageDependent: true,
+      needsCatalogue: true,
+    });
+    expect(KRAKEN_REQUEST_COSTS).not.toHaveProperty("cancelOrderBatch");
   });
 });

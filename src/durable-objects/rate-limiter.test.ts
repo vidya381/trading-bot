@@ -1090,3 +1090,134 @@ describe("a call that costs nothing anywhere is a bug, not a free pass", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// The batch-cancel escape hatch: a charge this gate records but may not refuse
+// ---------------------------------------------------------------------------
+
+/**
+ * Kraken, beside its own Batch Cancel cost row: **"If the rate counter in the
+ * batch exceeds maximum for a batch cancel, the requests in batch are still
+ * accepted."** (`docs.kraken.com/api/docs/guides/spot-ratelimits`, re-read
+ * 2026-09-04.)
+ *
+ * That sentence is the whole answer to entry 90's worst case, and these tests
+ * are it reaching the object that would otherwise refuse it.
+ */
+describe("an unconditional trading charge, which the venue accepts regardless", () => {
+  /** One batch cancel of `n` orders three seconds old: no discount, so 8n. */
+  function batch(count: number, rest = 4) {
+    return {
+      exchange: "kraken" as const,
+      cost: { rest, trading: { pair: BTC, count, unconditional: true } },
+      priority: "risk-exit" as const,
+    };
+  }
+
+  it("is GRANTED where the same charge as an ordinary cancel would be refused", async () => {
+    // ⚠ THE TEST THIS WHOLE SESSION EXISTS FOR. Entry 90's worst case, driven
+    // through the real object: seven fresh cancels have exhausted BTC's engine
+    // counter, and the eighth is refused. The batch naming all eight is not.
+    await withKraken(async ({ trade, limiter }) => {
+      for (let i = 0; i < 7; i++) {
+        expect((await trade(BTC, 8, 0, "risk-exit")).granted).toBe(true);
+      }
+      // The eighth sequential cancel: refused, mid-halt. This is the failure.
+      expect((await trade(BTC, 8, 0, "risk-exit")).granted).toBe(false);
+
+      // The same engine charge, presented as a batch cancel: accepted.
+      expect((await limiter.acquire(batch(8))).granted).toBe(true);
+    });
+  });
+
+  it("goes through even when the counter is empty and the batch alone overshoots it", async () => {
+    // A ladder of ten fresh rungs is 80 engine units against a Starter threshold
+    // of 60. No sequencing, no waiting and no chunking makes that fit -- the
+    // venue's own promise is the only thing that does.
+    await withKraken(async ({ limiter }) => {
+      const overshoot = await limiter.acquire(batch(80));
+      expect(overshoot.granted).toBe(true);
+      if (!overshoot.granted) return;
+      expect(overshoot.usedTrading).toBe(80);
+    });
+  });
+
+  it("is RECORDED, so the next ordinary call sees the counter it left behind", async () => {
+    // Not refusing is not the same as not counting. Kraken's own counter really
+    // is at 80 afterwards, and a routine order that ignored that would be sent
+    // straight into an `EOrder:Rate limit exceeded`.
+    await withKraken(async ({ limiter, trade }) => {
+      expect((await limiter.acquire(batch(80))).granted).toBe(true);
+
+      const stats = await limiter.stats();
+      expect(stats.trading.find((counter) => counter.pair === BTC)!.usedWeight).toBe(80);
+      // Over the threshold, so even a risk-exit order is held.
+      expect((await trade(BTC, 1, 0, "risk-exit")).granted).toBe(false);
+    });
+  });
+
+  it("drains from the real overshoot, not from a value clamped at the threshold", async () => {
+    // A counter clamped at 60 would say it had recovered 20 seconds too early,
+    // which is under-counting on the counter the escape hatch just overshot.
+    await withKraken(async ({ limiter, trade, setNow }) => {
+      expect((await limiter.acquire(batch(80))).granted).toBe(true);
+
+      // 80 units shedding 1/second. At +21s the counter is 59 and one unit fits.
+      setNow(NOW + 21_000);
+      expect((await trade(BTC, 1, 0, "risk-exit")).granted).toBe(true);
+      // ...but a moment earlier it did not.
+      setNow(NOW + 19_000);
+      const stats = await limiter.stats();
+      expect(stats.trading.find((counter) => counter.pair === BTC)!.usedWeight).toBeGreaterThan(59);
+    });
+  });
+
+  it("does NOT excuse the account counter, which Kraken's sentence says nothing about", async () => {
+    // The REST half is the one follow-up `ClosedOrders` read, and it is metered
+    // and gated exactly like any other read. A Starter counter of 15 with 14
+    // spent has no room for a 4-unit read.
+    await withKraken(async ({ limiter, rest }) => {
+      for (let i = 0; i < 14; i++) expect((await rest(1, "risk-exit")).granted).toBe(true);
+
+      const refused = await limiter.acquire(batch(8));
+      expect(refused.granted).toBe(false);
+      if (refused.granted) return;
+      expect(refused.reason).toBe("budget_exhausted");
+    });
+  });
+
+  it("holds no queue claim on the counter it does not gate on", async () => {
+    // A component the venue never refuses reserves nothing: this gate must not
+    // invent a constraint the exchange does not have. The batch here is queued
+    // on its REST half; its engine half must not block an unrelated order.
+    await withKraken(async ({ limiter, rest }) => {
+      for (let i = 0; i < 15; i++) await rest(1, "risk-exit");
+      // Queued: the account counter is full, so it takes a ticket.
+      const queued = await limiter.acquire(batch(80));
+      expect(queued.granted).toBe(false);
+
+      // The engine counter is untouched by that queued claim, so an order on the
+      // same pair that needs no account budget still goes.
+      const order = await limiter.acquire({
+        exchange: "kraken",
+        cost: { rest: 0, trading: { pair: BTC, count: 1 } },
+        priority: "risk-exit",
+      });
+      expect(order.granted).toBe(true);
+    });
+  });
+
+  it("refuses a vector whose ONLY component is unconditional, as an unmeasured call", async () => {
+    // The gate would be decorative. Kraken's batch cancel is not this case: its
+    // follow-up read is charged normally, on purpose.
+    await withKraken(async ({ limiter }) => {
+      await expect(
+        limiter.acquire({
+          exchange: "kraken",
+          cost: { rest: 0, trading: { pair: BTC, count: 8, unconditional: true } },
+          priority: "risk-exit",
+        }),
+      ).rejects.toThrow(/no component this gate can refuse/);
+    });
+  });
+});

@@ -1123,6 +1123,52 @@ export function parseCancelResult(result: unknown): KrakenCancelResult {
   return { count, pending: record["pending"] === true };
 }
 
+/**
+ * Parse `POST /0/private/CancelOrderBatch` -> `{count: n}`.
+ *
+ * ⚠ AND THAT IS GENUINELY ALL IT RETURNS. Verified against Kraken's published
+ * OpenAPI document (`docs.kraken.com/openapi/spot-rest.yaml`, read 2026-09-04):
+ * the `200` response for this endpoint carries NO `schema` at all, only an
+ * example, and the example is `{"error": [], "result": {"count": 2}}`. There is
+ * no per-order array, no id list, no status.
+ *
+ * THE CONTRAST THAT MAKES THAT DELIBERATE RATHER THAN A GAP IN THE READING: the
+ * neighbouring `AddOrderBatch` in the same document DOES declare a response
+ * schema, DOES return a per-order `orders` array, and its response description
+ * states "The order of returned `orders` in the response array is the same as the
+ * order of the order list sent in request". Kraken knows how to write a per-order
+ * batch response. It did not write one here.
+ *
+ * SO THIS RESULT IS ALL-OR-NOTHING ONLY IN THE SENSE THAT NOTHING IS
+ * ATTRIBUTABLE. `count` less than the number of ids sent is an ORDINARY answer
+ * -- the same "already filled, already cancelled" case `parseCancelResult`
+ * records -- and it does not say which ids it counted. A caller that needs to
+ * know where each order finished has to read them back; see
+ * `KrakenClient.cancelOrderBatch`.
+ *
+ * SEPARATE FROM `parseCancelResult`, rather than reusing it with a different
+ * context string, because `pending` is a field this response does not have.
+ * Reusing that parser would silently report `pending: false` -- an assertion that
+ * Kraken said the cancels had taken effect, which Kraken did not say.
+ */
+export interface KrakenBatchCancelResult {
+  readonly count: number;
+}
+
+export function parseBatchCancelResult(result: unknown): KrakenBatchCancelResult {
+  const context = "CancelOrderBatch";
+  const record = asRecord(result, context);
+  const count = record["count"];
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0) {
+    throw new ParseError(
+      `${context}: expected count to be a non-negative integer, got ${JSON.stringify(
+        count,
+      )}`,
+    );
+  }
+  return { count };
+}
+
 // ---------------------------------------------------------------------------
 // Trades (fills)
 // ---------------------------------------------------------------------------

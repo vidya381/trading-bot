@@ -6,8 +6,10 @@ import {
 } from "../credentials";
 import {
   buildBody,
+  buildJsonBody,
   decodeApiSecret,
   KRAKEN_FORM_CONTENT_TYPE,
+  KRAKEN_JSON_CONTENT_TYPE,
   KrakenSigner,
   NonceGenerator,
   SigningError,
@@ -428,5 +430,206 @@ describe("NonceGenerator, reused from the Gemini signer", () => {
 
     expect(signed.nonce).toBe(nonce);
     expect(signed.body).toBe(`nonce=${nonce}`);
+  });
+});
+
+// --------------------------------------------------------------------------
+// The JSON body path -- for CancelOrderBatch, whose parameter is an array
+// --------------------------------------------------------------------------
+
+/**
+ * KRAKEN'S OWN SIGNING HELPER, TRANSCRIBED FROM ITS DOCS AND RE-RUN HERE.
+ *
+ * There is no published worked example for a JSON body -- Kraken's only one is
+ * the form-encoded `AddOrder` above -- so an expected signature cannot simply be
+ * quoted. What Kraken DOES publish is the algorithm, in code, on
+ * `docs.kraken.com/api/docs/guides/spot-rest-auth` (read 2026-09-04), and both
+ * its Node and Go samples branch on the payload type. Verbatim:
+ *
+ *   Node.js
+ *     function getKrakenSignature(urlPath, data, secret) {
+ *       let encoded;
+ *       if (typeof data === 'string') {
+ *         const jsonData = JSON.parse(data);
+ *         encoded = jsonData.nonce + data;
+ *       } else if (typeof data === 'object') {
+ *         const dataStr = querystring.stringify(data);
+ *         encoded = data.nonce + dataStr;
+ *       } else { throw new Error('Invalid data type'); }
+ *       const sha256Hash = crypto.createHash('sha256').update(encoded).digest();
+ *       const message = urlPath + sha256Hash.toString('binary');
+ *       ...
+ *     }
+ *
+ *   Go
+ *     case string:
+ *       var jsonData map[string]interface{}
+ *       if err := json.Unmarshal([]byte(v), &jsonData); err != nil { return "", err }
+ *       encodedData = jsonData["nonce"].(string) + v
+ *
+ * Two facts come out of that, and both are asserted below. The "POST data" in
+ * `SHA256(nonce + POST data)` is the RAW JSON TEXT for a JSON body, and the
+ * nonce inside it is read back as a STRING -- Go's `.(string)` assertion would
+ * panic on a JSON number, which is why `buildJsonBody` writes one.
+ *
+ * `krakenSignatureFromDocs` below is that snippet reimplemented from those
+ * quotes, NOT from `signing.ts`. Its own correctness is established first,
+ * against Kraken's published form-encoded output, before it is used to judge the
+ * JSON path -- so the chain ends at a number Kraken published rather than at
+ * this implementation agreeing with itself.
+ */
+async function krakenSignatureFromDocs(
+  urlPath: string,
+  nonce: string,
+  body: string,
+  apiSecret: string,
+): Promise<string> {
+  const encoder = new TextEncoder();
+  const inner = await crypto.subtle.digest("SHA-256", encoder.encode(`${nonce}${body}`));
+
+  const path = encoder.encode(urlPath);
+  const digest = new Uint8Array(inner);
+  const message = new Uint8Array(path.length + digest.length);
+  message.set(path, 0);
+  message.set(digest, path.length);
+
+  const secret = Uint8Array.from(atob(apiSecret), (character) => character.charCodeAt(0));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    secret,
+    { name: "HMAC", hash: "SHA-512" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, message);
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
+}
+
+describe("buildJsonBody", () => {
+  it("writes the nonce FIRST and as a JSON STRING, which is what Kraken reads back", async () => {
+    // Kraken's Go helper does `jsonData["nonce"].(string)`. A JSON number
+    // decodes as float64 there and that assertion panics -- so the string form
+    // is the venue's requirement, not a house style.
+    const body = buildJsonBody(1616492376594, [["cl_ord_ids", [{ cl_ord_id: "a" }]]]);
+    expect(body).toBe('{"nonce":"1616492376594","cl_ord_ids":[{"cl_ord_id":"a"}]}');
+    expect(JSON.parse(body)).toMatchObject({ nonce: "1616492376594" });
+    expect(typeof (JSON.parse(body) as { nonce: unknown }).nonce).toBe("string");
+  });
+
+  it("carries arrays and nested objects, which buildBody structurally cannot", async () => {
+    // The entire reason a second encoding exists: URLSearchParams stringifies an
+    // array to "[object Object]" and there is no documented form encoding for
+    // this parameter anywhere in Kraken's reference.
+    const ids = ["v1-bot-1", "v1-bot-2", "v1-bot-3"];
+    const body = buildJsonBody(1, [["cl_ord_ids", ids.map((id) => ({ cl_ord_id: id }))]]);
+    expect(JSON.parse(body)).toEqual({
+      nonce: "1",
+      cl_ord_ids: [{ cl_ord_id: "v1-bot-1" }, { cl_ord_id: "v1-bot-2" }, { cl_ord_id: "v1-bot-3" }],
+    });
+
+    const formed = buildBody(1, [["cl_ord_ids", undefined]]);
+    expect(formed).toBe("nonce=1");
+  });
+
+  it("drops undefined values, exactly as buildBody does", () => {
+    expect(buildJsonBody(7, [["a", "x"], ["b", undefined], ["c", 2]])).toBe(
+      '{"nonce":"7","a":"x","c":2}',
+    );
+  });
+});
+
+describe("KrakenSigner.signJson", () => {
+  it("reproduces Kraken's PUBLISHED signature through the independent helper first", async () => {
+    // Establishes that `krakenSignatureFromDocs` is itself right, against the
+    // one output Kraken publishes. Everything below leans on this line.
+    await expect(
+      krakenSignatureFromDocs(
+        DOC_PATH,
+        String(DOC_NONCE),
+        DOC_BODY,
+        KRAKEN_DOCUMENTED_EXAMPLE_CREDENTIALS.apiSecret,
+      ),
+    ).resolves.toBe(DOC_SIGNATURE);
+  });
+
+  it("signs a JSON body the way Kraken's own helper says to: SHA256(nonce + raw JSON)", async () => {
+    const path = "/0/private/CancelOrderBatch";
+    const body = buildJsonBody(DOC_NONCE, [
+      ["cl_ord_ids", [{ cl_ord_id: "v1-bot-1toiyz-7" }, { cl_ord_id: "v1-bot-1toiyz-8" }]],
+    ]);
+
+    const expected = await krakenSignatureFromDocs(
+      path,
+      String(DOC_NONCE),
+      body,
+      KRAKEN_DOCUMENTED_EXAMPLE_CREDENTIALS.apiSecret,
+    );
+    await expect(docSigner().signJson(path, DOC_NONCE, body)).resolves.toBe(expected);
+  });
+
+  it("signs the bytes it was GIVEN, never a re-serialised copy of them", async () => {
+    // The signature covers literal bytes. Two JSON documents that parse equal but
+    // differ by a space are different messages, and the one sent must be the one
+    // signed -- so a signer that normalised its input would produce a signature
+    // that verifies against a body nobody sent.
+    const path = "/0/private/CancelOrderBatch";
+    const spaced = `{"nonce": "${DOC_NONCE}", "cl_ord_ids": []}`;
+    const compact = `{"nonce":"${DOC_NONCE}","cl_ord_ids":[]}`;
+
+    const signedSpaced = await docSigner().signJson(path, DOC_NONCE, spaced);
+    const signedCompact = await docSigner().signJson(path, DOC_NONCE, compact);
+    expect(signedSpaced).not.toBe(signedCompact);
+    await expect(
+      krakenSignatureFromDocs(path, String(DOC_NONCE), spaced, KRAKEN_DOCUMENTED_EXAMPLE_CREDENTIALS.apiSecret),
+    ).resolves.toBe(signedSpaced);
+  });
+
+  it("refuses a body whose nonce is not the nonce being signed", async () => {
+    // The JSON counterpart of `sign`'s prefix check. A mismatch here produces a
+    // perfectly well-formed signature that Kraken answers EAPI:Invalid signature
+    // to, which is a much worse failure than this one.
+    const body = buildJsonBody(DOC_NONCE, [["cl_ord_ids", []]]);
+    await expect(
+      docSigner().signJson("/0/private/CancelOrderBatch", DOC_NONCE + 1, body),
+    ).rejects.toThrow(SigningError);
+  });
+
+  it("refuses a nonce written as a JSON NUMBER, which Kraken's Go helper cannot read", async () => {
+    const body = `{"nonce":${DOC_NONCE},"cl_ord_ids":[]}`;
+    await expect(
+      docSigner().signJson("/0/private/CancelOrderBatch", DOC_NONCE, body),
+    ).rejects.toThrow(/as a STRING/);
+  });
+
+  it("refuses a body that is not JSON at all", async () => {
+    await expect(
+      docSigner().signJson("/0/private/CancelOrderBatch", DOC_NONCE, DOC_BODY),
+    ).rejects.toThrow(SigningError);
+  });
+
+  it("signedJsonRequest builds, signs and returns the exact bytes to send", async () => {
+    const path = "/0/private/CancelOrderBatch";
+    const signed = await docSigner().signedJsonRequest(path, DOC_NONCE, [
+      ["cl_ord_ids", [{ cl_ord_id: "v1-bot-1toiyz-7" }]],
+    ]);
+
+    expect(signed.body).toBe(
+      `{"nonce":"${DOC_NONCE}","cl_ord_ids":[{"cl_ord_id":"v1-bot-1toiyz-7"}]}`,
+    );
+    expect(signed.headers["API-Sign"]).toBe(
+      await krakenSignatureFromDocs(
+        path,
+        String(DOC_NONCE),
+        signed.body,
+        KRAKEN_DOCUMENTED_EXAMPLE_CREDENTIALS.apiSecret,
+      ),
+    );
+    expect(signed.nonce).toBe(DOC_NONCE);
+  });
+
+  it("keeps the two content types distinct, since each is signed with its own body", async () => {
+    expect(KRAKEN_FORM_CONTENT_TYPE).toBe("application/x-www-form-urlencoded");
+    expect(KRAKEN_JSON_CONTENT_TYPE).toBe("application/json");
+    expect(KRAKEN_JSON_CONTENT_TYPE).not.toBe(KRAKEN_FORM_CONTENT_TYPE);
   });
 });

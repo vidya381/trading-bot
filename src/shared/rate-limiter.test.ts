@@ -633,3 +633,130 @@ describe("DecayingCounter survives eviction", () => {
     expect(c.usedWeight(AT)).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// record(): the charge that cannot be refused
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠ WHAT THIS METHOD IS FOR, SO IT IS NOT MISTAKEN FOR A BACK DOOR AROUND
+ * `consume`.
+ *
+ * It exists for a call the EXCHANGE accepts unconditionally, and exactly one
+ * does. Kraken, beside the Batch Cancel row of its own cost table
+ * (`docs.kraken.com/api/docs/guides/spot-ratelimits`, re-read 2026-09-04):
+ * **"If the rate counter in the batch exceeds maximum for a batch cancel, the
+ * requests in batch are still accepted."**
+ *
+ * Refusing such a call locally protects nothing -- the venue was never going to
+ * refuse it -- and would stop a halt from cancelling its ladder, which is the
+ * risk control defeating itself. So the charge is APPLIED and never checked.
+ *
+ * The counter still has to carry it. Not refusing is not the same as not
+ * counting: everything issued afterwards must see the counter this left behind,
+ * including one pushed OVER its threshold, which is where the venue's own
+ * counter will also be.
+ */
+describe("DecayingCounter.record", () => {
+  it("applies a charge that consume would have refused", () => {
+    const c = counter();
+    // 56 of 60 spent: an 8-unit cancel does not fit and is refused.
+    c.consume(56, "risk-exit", AT);
+    expect(c.consume(8, "risk-exit", AT).allowed).toBe(false);
+    expect(c.usedWeight(AT)).toBe(56);
+
+    // The same 8 units, recorded rather than consumed, go on.
+    c.record(8, AT);
+    expect(c.usedWeight(AT)).toBe(64);
+  });
+
+  it("⚠ carries the counter PAST its own limit, which nothing else here may do", () => {
+    // A ladder of ten fresh rungs is 80 engine units against a Starter threshold
+    // of 60. Clamping at 60 would under-state the account's true position at the
+    // exact moment it matters -- granting the next call budget the venue does not
+    // have. This is the one place the overshoot is allowed to be real.
+    const c = counter();
+    c.record(80, AT);
+    expect(c.usedWeight(AT)).toBe(80);
+    expect(c.usedWeight(AT)).toBeGreaterThan(c.limit);
+  });
+
+  it("leaves remainingFor and check coherent above the limit rather than negative", () => {
+    const c = counter();
+    c.record(80, AT);
+    expect(c.remainingFor("risk-exit", AT)).toBe(0);
+    expect(c.remainingFor("routine", AT)).toBe(0);
+    const decision = c.check(1, "risk-exit", AT);
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reason).toBe("budget_exhausted");
+  });
+
+  it("drains from the REAL overshoot, not from a value clipped at the threshold", () => {
+    // 80 shedding 1/second. A counter clipped at 60 would claim room 20 seconds
+    // early, which is under-counting on the very counter the escape hatch just
+    // overshot.
+    const c = counter();
+    c.record(80, AT);
+    expect(c.usedWeight(AT + 20_000)).toBe(60);
+    expect(c.usedWeight(AT + 79_000)).toBe(1);
+    expect(c.usedWeight(AT + 100_000)).toBe(0);
+    // Only once it has decayed below the ceiling does an ordinary charge fit.
+    expect(c.check(1, "risk-exit", AT + 19_000).allowed).toBe(false);
+    expect(c.check(1, "risk-exit", AT + 21_000).allowed).toBe(true);
+  });
+
+  it("stacks on top of what is already there, decayed to the moment it is applied", () => {
+    const c = counter();
+    c.consume(30, "risk-exit", AT);
+    // Ten seconds later the 30 has decayed to 20; recording 8 makes it 28.
+    c.record(8, AT + 10_000);
+    expect(c.usedWeight(AT + 10_000)).toBe(28);
+  });
+
+  it("refuses a non-positive or non-finite weight, like every other charge here", () => {
+    const c = counter();
+    for (const weight of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => c.record(weight, AT)).toThrow(RateLimiterError);
+    }
+  });
+});
+
+describe("WeightBudget.record", () => {
+  /**
+   * ⚠ NO VENUE REACHES THIS TODAY, AND THAT IS WHY IT IS TESTED HERE.
+   *
+   * `record` is only ever called for an unconditional charge, only the per-pair
+   * TRADING counter carries one, and every trading counter is a
+   * `DecayingCounter`. So this implementation exists because `Budget` is an
+   * obligation rather than a menu -- a venue that later gained an unconditional
+   * call on an account-wide counter must fail at the type, not at runtime.
+   *
+   * Untested, it would be a method nothing runs and nothing checks. These pin
+   * the behaviour it is obliged to have.
+   */
+  it("applies a charge that consume would have refused", () => {
+    const b = budget();
+    b.consume(95, "risk-exit", AT);
+    expect(b.consume(10, "risk-exit", AT).allowed).toBe(false);
+    b.record(10, AT);
+    expect(b.usedWeight(AT)).toBe(105);
+    expect(b.usedWeight(AT)).toBeGreaterThan(b.limit);
+  });
+
+  it("ages out of the rolling window on the same schedule as any other entry", () => {
+    // No second lifetime for a recorded charge: it arrived by a different door
+    // and is otherwise an ordinary entry.
+    const b = budget();
+    b.record(50, AT);
+    expect(b.usedWeight(AT + WINDOW - 1)).toBe(50);
+    expect(b.usedWeight(AT + WINDOW)).toBe(0);
+  });
+
+  it("refuses a non-positive or non-finite weight, like every other charge here", () => {
+    const b = budget();
+    for (const weight of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => b.record(weight, AT)).toThrow(RateLimiterError);
+    }
+  });
+});

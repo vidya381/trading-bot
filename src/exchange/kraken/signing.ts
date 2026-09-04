@@ -93,6 +93,75 @@ export { NonceGenerator } from "../gemini/signing";
 export const KRAKEN_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded";
 
 /**
+ * The Content-Type for a signed request whose body is JSON.
+ *
+ * ⚠ A SECOND ENCODING EXISTS BECAUSE ONE ENDPOINT NEEDS IT, not as a
+ * preference. `buildBody` above is `URLSearchParams`, which can express a flat
+ * map of scalars and nothing else. `CancelOrderBatch` takes an ARRAY --
+ * `cl_ord_ids: [{cl_ord_id: "..."}]` -- and Kraken documents no form encoding
+ * for it anywhere: not in the endpoint reference, not in the OpenAPI document,
+ * not in the auth guide. Inventing one (`cl_ord_ids[0][cl_ord_id]=...`, or
+ * repeated keys) would be a guess about a venue's parser on the halt path.
+ *
+ * KRAKEN DOCUMENTS THE JSON PATH ITSELF, which is why this is transcription
+ * rather than invention. Its own signing helpers on
+ * `docs.kraken.com/api/docs/guides/spot-rest-auth` branch on the payload type
+ * (read 2026-09-04, quoted in `signing.test.ts`):
+ *
+ *   Node:  `if (typeof data === 'string') { const jsonData = JSON.parse(data);
+ *           encoded = jsonData.nonce + data; }`
+ *   Go:    `case string: ... encodedData = jsonData["nonce"].(string) + v`
+ *
+ * So for a JSON body the "POST data" in `SHA256(nonce + POST data)` is the RAW
+ * JSON TEXT, and the rule is otherwise identical to the form case. And Kraken's
+ * OpenAPI document declares `application/json` as the ONLY request content type
+ * for every private endpoint, this one included.
+ */
+export const KRAKEN_JSON_CONTENT_TYPE = "application/json";
+
+/**
+ * A value that may appear in a JSON request body. Arrays and objects allowed.
+ *
+ * Deliberately wider than `BodyValue`, and deliberately a separate type: the
+ * form path must stay unable to express a structure it cannot encode.
+ */
+export type JsonBodyValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonBodyValue[]
+  | { readonly [key: string]: JsonBodyValue };
+
+/**
+ * Build the JSON POST body that will be both sent and signed.
+ *
+ * ⚠ THE NONCE IS WRITTEN AS A JSON *STRING*, NOT A NUMBER, and that is not a
+ * stylistic choice. Kraken's own Go helper reads it back with a type assertion:
+ * `jsonData["nonce"].(string)`. A JSON number would decode as `float64` and that
+ * assertion PANICS -- which tells us plainly which type Kraken's own tooling
+ * expects to find there. The Node helper's `jsonData.nonce + data` would
+ * silently coerce a number, so only the Go snippet reveals the requirement; both
+ * are quoted in the test.
+ *
+ * Nonce first, matching `buildBody`'s convention, so `signJson`'s check below is
+ * possible and so both encodings read the same way.
+ *
+ * `undefined` values are dropped, exactly as `buildBody` drops them.
+ */
+export function buildJsonBody(
+  nonce: number,
+  params: readonly (readonly [string, JsonBodyValue | undefined])[] = [],
+): string {
+  const payload: Record<string, JsonBodyValue> = { nonce: String(nonce) };
+  for (const [key, value] of params) {
+    if (value === undefined) continue;
+    payload[key] = value;
+  }
+  return JSON.stringify(payload);
+}
+
+/**
  * Build the POST body that will be both sent and signed.
  *
  * `nonce` is written FIRST, then the remaining parameters in the order given.
@@ -235,7 +304,11 @@ export interface KrakenAuthHeaders {
 export interface SignedKrakenRequest {
   /** The URI path signed, e.g. `/0/private/AddOrder`. Also the path to POST to. */
   readonly path: string;
-  /** The exact URL-encoded body that was signed. Send these bytes unmodified. */
+  /**
+   * The exact body that was signed -- URL-encoded or JSON, depending on which
+   * builder produced it. Send these bytes unmodified, under the matching
+   * Content-Type (`KRAKEN_FORM_CONTENT_TYPE` / `KRAKEN_JSON_CONTENT_TYPE`).
+   */
   readonly body: string;
   /** The nonce carried in `body` and folded into the signature. */
   readonly nonce: number;
@@ -297,6 +370,65 @@ export class KrakenSigner {
       );
     }
 
+    return await this.#signRaw(uriPath, nonce, body);
+  }
+
+  /**
+   * `sign`, for a body that is JSON rather than URL-encoded.
+   *
+   * THE CRYPTOGRAPHY IS IDENTICAL and is shared with `sign` rather than repeated
+   * -- Kraken's rule is `SHA256(nonce + POST data)` for both encodings, and the
+   * only thing that differs is what "POST data" looks like. What this method owns
+   * is the ONE invariant that differs with it: the same mismatch `sign` refuses
+   * (signing with a nonce the body does not carry) is invisible to a
+   * `startsWith("nonce=")` check when the body is `{"nonce":"...","cl_ord_ids":…}`.
+   *
+   * So the body is PARSED and its `nonce` compared. That is stricter than the
+   * form check, not looser: it catches a nonce in the wrong place, a nonce
+   * written as a JSON number (which Kraken's own Go helper would panic on -- see
+   * `buildJsonBody`), and a body that is not JSON at all.
+   *
+   * The parsed value is discarded. The BYTES given are what gets signed and what
+   * the caller must send; nothing here re-serialises them.
+   */
+  async signJson(uriPath: string, nonce: number, body: string): Promise<string> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch (error) {
+      throw new SigningError(
+        `the JSON body to sign is not valid JSON (${(error as Error).message}). ` +
+          `Build it with buildJsonBody(nonce, ...), or use signedJsonRequest().`,
+      );
+    }
+
+    const carried =
+      typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)["nonce"]
+        : undefined;
+
+    if (carried !== String(nonce)) {
+      throw new SigningError(
+        `the JSON body to sign must carry "nonce": ${JSON.stringify(String(nonce))} ` +
+          `as a STRING, and carries ${JSON.stringify(carried)}: Kraken folds the ` +
+          `nonce into the signature AND requires it as a body parameter, and its own ` +
+          `Go helper reads it back with a \`.(string)\` type assertion that a JSON ` +
+          `number would not satisfy. Build the body with buildJsonBody(nonce, ...), ` +
+          `or use signedJsonRequest(), which cannot get this wrong.`,
+      );
+    }
+
+    return await this.#signRaw(uriPath, nonce, body);
+  }
+
+  /**
+   * The two-stage digest itself, shared by both encodings.
+   *
+   * Deliberately private and deliberately unaware of how `body` was built: it is
+   * the one place the venue's algorithm is written down, and neither caller may
+   * reach it without having first proved the body carries the nonce being signed.
+   */
+  async #signRaw(uriPath: string, nonce: number, body: string): Promise<string> {
     const key = await this.#key();
     const encoder = new TextEncoder();
 
@@ -330,6 +462,34 @@ export class KrakenSigner {
   ): Promise<SignedKrakenRequest> {
     const body = buildBody(nonce, params);
     const signature = await this.sign(path, nonce, body);
+    return {
+      path,
+      body,
+      nonce,
+      headers: {
+        "API-Key": this.apiKey,
+        "API-Sign": signature,
+      },
+    };
+  }
+
+  /**
+   * `signedRequest`, for the one endpoint whose parameters are not scalars.
+   *
+   * Same contract, same return type, different encoding -- and the caller must
+   * send `KRAKEN_JSON_CONTENT_TYPE` with it rather than the form type, or Kraken
+   * reconstructs different bytes and the signature fails to verify. That coupling
+   * is why the two builders are separate functions instead of one with a flag:
+   * the body's encoding and its Content-Type must be chosen together, and here
+   * they are chosen by which method the caller invoked.
+   */
+  async signedJsonRequest(
+    path: string,
+    nonce: number,
+    params: readonly (readonly [string, JsonBodyValue | undefined])[] = [],
+  ): Promise<SignedKrakenRequest> {
+    const body = buildJsonBody(nonce, params);
+    const signature = await this.signJson(path, nonce, body);
     return {
       path,
       body,

@@ -455,3 +455,138 @@ export interface RestExchangeClient {
     since?: Timestamp,
   ): Promise<ExchangeOutcome<Candle[]>>;
 }
+
+// ---------------------------------------------------------------------------
+// An OPTIONAL venue capability: cancelling several orders in one request
+// ---------------------------------------------------------------------------
+
+/**
+ * WHERE ONE ORDER FINISHED, within a batch cancellation.
+ *
+ * A discriminated union rather than an optional `order`, for the reason section
+ * 5.6 makes `ExchangeOutcome` one: a caller must not be able to read a final
+ * state that nobody observed. `resolved: false` is an ORDINARY outcome here, not
+ * an error -- see `BatchCancelResult.cancelledCount`.
+ */
+export type BatchCancelEntry =
+  | {
+      readonly clientOrderId: string;
+      readonly resolved: true;
+      /** The order's own account of where it finished, from the follow-up read. */
+      readonly order: OrderStatus;
+    }
+  | {
+      readonly clientOrderId: string;
+      readonly resolved: false;
+      /** Why this id could not be resolved. Never a fabricated quantity. */
+      readonly reason: string;
+    };
+
+/**
+ * The result of cancelling several orders in one request.
+ *
+ * ⚠ `cancelledCount` IS AN AGGREGATE AND CANNOT BE ATTRIBUTED TO ORDERS. This is
+ * the venue's shape, not a simplification: Kraken's `CancelOrderBatch` answers
+ * `{"count": 2}` and nothing else -- no per-order status, no ids, no filled
+ * quantities. (Its sibling `AddOrderBatch` DOES return a per-order array, and the
+ * contrast is what makes the absence deliberate rather than an oversight in the
+ * reading.) So a caller learns "the venue cancelled two of the ids I named" and
+ * cannot learn WHICH two from this field.
+ *
+ * `entries` is therefore NOT the venue's per-order breakdown -- there is none. It
+ * is what a single follow-up read observed, one entry per requested id, in the
+ * order requested. An implementation that cannot see where an order finished
+ * says so in `resolved: false` rather than inventing a zero fill, exactly as
+ * `cancelOrder` refuses to.
+ */
+export interface BatchCancelResult {
+  readonly pair: Pair;
+  /** The ids the caller asked for, echoed so `entries` can be checked against it. */
+  readonly requested: readonly string[];
+  /** How many the venue said it cancelled. Aggregate; see above. */
+  readonly cancelledCount: number;
+  /** One per requested id, same order. */
+  readonly entries: readonly BatchCancelEntry[];
+}
+
+/**
+ * A venue that can cancel a NAMED SET of orders in one request.
+ *
+ * ── WHY THIS IS NOT A METHOD ON `RestExchangeClient` ──
+ *
+ * Because it is not a capability the other two venues have, and stubbing it on
+ * them would be a lie with a signature. Checked against each venue's own current
+ * reference rather than assumed:
+ *
+ *  - **Binance spot** has `DELETE /api/v3/order` (one order), `DELETE
+ *    /api/v3/openOrders` ("Cancels all active orders on a symbol") and `DELETE
+ *    /api/v3/orderList` (one OCO/OTO list, which this system never creates).
+ *    There is no endpoint taking a list of order ids.
+ *  - **Gemini** has `/v1/order/cancel` (one order), `cancel-all-session-orders`
+ *    and `cancel-all-active-orders`. Again no list form.
+ *
+ * Both bulk forms they DO have are cancel-EVERYTHING, and that is not a weaker
+ * version of this capability -- it is a different and dangerous one here.
+ * `bot_instances` has no uniqueness constraint on (account_label, pair), so two
+ * bots may run the same market on one account, and "cancel all open orders on
+ * BTCUSD" during one bot's halt would cancel the other bot's ladder. Offering
+ * that as this method's Binance implementation would put a foot-gun behind a
+ * name that reads as safe.
+ *
+ * The alternative -- a REQUIRED method that Binance and Gemini implement by
+ * looping `cancelOrder` -- is worse than either. It reads as one request and
+ * costs N, so the gate would charge one call's budget for N calls' traffic, on
+ * the risk-exit path, which is the exact class of failure decision log 90 PROBLEM
+ * 2 is about. A capability a venue does not have should be ABSENT, so a caller
+ * has to ask.
+ *
+ * So: an optional interface, a runtime guard, and a caller that keeps its
+ * sequential path for every venue that does not answer the guard.
+ */
+export interface BatchCancellingClient {
+  /**
+   * The most ids one request may name, as the VENUE documents it.
+   *
+   * Published as data rather than left to the caller to know, so chunking a
+   * longer list is the caller's arithmetic and not its guess. Kraken: 50.
+   */
+  readonly batchCancelMaxOrders: number;
+
+  /**
+   * Cancel the named orders on one pair, then report where each finished.
+   *
+   * All ids must be on `pair`: the implementation checks each returned order's
+   * market against it, for the reason `cancelOrder` does.
+   *
+   * A failed outcome means the REQUEST failed, and says nothing about any
+   * individual order -- which, on a venue with no per-order response, is the only
+   * honest reading. A successful outcome may still carry unresolved entries.
+   */
+  cancelOrderBatch(
+    pair: Pair,
+    clientOrderIds: readonly string[],
+  ): Promise<ExchangeOutcome<BatchCancelResult>>;
+}
+
+/**
+ * Whether this client can cancel a named set of orders in one request.
+ *
+ * A runtime guard, because the capability is a property of the VENUE and the
+ * call sites hold a `RestExchangeClient` that has already been through
+ * `withRateLimit` and `withPriority` -- both of which are typed as the plain
+ * interface. Checking the method's presence is what survives those seams.
+ *
+ * `RateLimitedExchange` defines `cancelOrderBatch` only when the client it wraps
+ * does, so this answers for the VENUE underneath the gate rather than for the
+ * gate itself.
+ */
+export function supportsBatchCancel(
+  client: RestExchangeClient,
+): client is RestExchangeClient & BatchCancellingClient {
+  const candidate = client as Partial<BatchCancellingClient>;
+  return (
+    typeof candidate.cancelOrderBatch === "function" &&
+    typeof candidate.batchCancelMaxOrders === "number" &&
+    candidate.batchCancelMaxOrders >= 2
+  );
+}

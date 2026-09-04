@@ -1751,3 +1751,142 @@ describe("pollTierFor: which cadence a state earns", () => {
     expect(Math.max(...intervals)).toBe(POLL_TIER_INTERVAL_MS.dormant);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The halt path prefers ONE batch cancel where the venue has one (entry 90's
+// escape hatch)
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠ WHAT THIS BLOCK IS ABOUT, AND WHY THE GRID IS THE RIGHT PLACE FOR IT.
+ *
+ * Entry 90's worst case is a grid ladder, precisely: a bot that has just laid
+ * its rungs is holding the YOUNG orders Kraken prices at +8, and roughly seven
+ * of those exhaust a Starter engine threshold of 60 on the one pair. A DCA bot
+ * has at most one order open and never reaches it.
+ *
+ * `#batchCancelled` prefers the batch at TWO orders rather than keeping it as a
+ * fallback for when the sequential run is about to overflow. The argument is in
+ * its docblock; these tests pin the four consequences that argument has.
+ */
+describe("a halt cancels the whole ladder in one request where the venue can", () => {
+  /** A ladder of two resting buys, on a bot whose venue is given. */
+  async function ladderOn(exchangeId: "binance" | "kraken"): Promise<string[]> {
+    await run((bot) => bot.createGrid(creation({ exchange: exchangeId })));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds.length).toBeGreaterThan(1);
+    return [...snapshot.state.openOrderIds];
+  }
+
+  beforeEach(() => {
+    // A venue that CAN batch-cancel, as Kraken can. Absent by default, so every
+    // other test in this file keeps the venue it was written against.
+    exchange = new FakeExchange({ batchCancel: true });
+  });
+
+  it("sends ONE request for the whole ladder instead of one per rung", async () => {
+    const ids = await ladderOn("kraken");
+
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    // The whole point: one call, naming every open order.
+    expect(exchange.cancelBatches).toHaveLength(1);
+    expect(exchange.cancelBatches[0]).toEqual(ids);
+
+    // And it really cancelled them -- the ladder is cleared and nothing is left
+    // believed open, exactly as the sequential path leaves things.
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([]);
+    expect(snapshot.state.ladder!.slots.every((slot) => slot === null)).toBe(true);
+  });
+
+  it("does NOT batch on a venue without the endpoint, even with a capable client", async () => {
+    // ⚠ The venue decides. Binance spot has no endpoint that cancels a named SET
+    // of orders -- only one-at-a-time, or cancel-EVERYTHING on a symbol, and
+    // cancel-everything would take out another bot trading the same pair on the
+    // same account (nothing constrains `bot_instances` to one bot per pair).
+    const ids = await ladderOn("binance");
+
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    expect(exchange.cancelBatches).toEqual([]);
+    expect(exchange.cancelled).toEqual(ids);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([]);
+  });
+
+  it("falls back to one-at-a-time when the venue REFUSES the batch, and says so", async () => {
+    // ⚠ THE BRANCH THAT EXISTS BECAUSE THE BODY SHAPE IS DOCUMENTED, NOT LIVE.
+    // Kraken's own OpenAPI document contradicts its own example on the sibling
+    // field, and no unauthenticated probe can settle it (the key is checked
+    // before the parameters). A non-retryable refusal means the venue understood
+    // and rejected the request, so nothing was cancelled and re-issuing as
+    // singles is not a second cancellation of anything.
+    const ids = await ladderOn("kraken");
+    exchange.batchCancelFailure = {
+      kind: "exchange_error",
+      message: "EGeneral:Invalid arguments",
+    };
+
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    // It tried the batch once, then cancelled every order singly.
+    expect(exchange.cancelBatches).toHaveLength(1);
+    expect(exchange.cancelled).toEqual(ids);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([]);
+
+    // And it is VISIBLE. Degrading silently to the expensive path is how a
+    // broken batch endpoint would go unnoticed until the counter ran out again.
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "batch_cancel_unavailable" },
+    });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("warning");
+    expect(alerts[0]!.message).toContain("EGeneral:Invalid arguments");
+  });
+
+  it("does NOT re-cancel when the batch's fate is unknown -- it alerts and keeps them open", async () => {
+    // Section 5.6's distinction, and the reason the fallback is narrow. A
+    // `transport` failure means the request left this process and its effect is
+    // unknown; re-sending it as N single cancels would spend the engine counter
+    // a second time at the worst possible moment, on orders that may already be
+    // cancelled.
+    const ids = await ladderOn("kraken");
+    exchange.batchCancelFailure = { kind: "transport", message: "socket hang up" };
+
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    expect(exchange.cancelBatches).toHaveLength(1);
+    // No single cancels were issued at all.
+    expect(exchange.cancelled).toEqual([]);
+    // The orders stay tracked, so the poll keeps watching them and section 9
+    // reconciliation settles them.
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual(ids);
+    expect(await db.alerts.count({ alert_type: "cancel_failed" })).toBe(ids.length);
+    expect(await db.alerts.count({ alert_type: "batch_cancel_unavailable" })).toBe(0);
+  });
+
+  it("keeps an order the follow-up read could not see, without inventing a fill for it", async () => {
+    // Kraken's batch response carries no per-order result, so an id the one read
+    // did not find is honestly unresolved. It gets exactly the treatment a
+    // single cancel whose read found nothing gets: stay open, alert, do not
+    // re-cancel -- the batch WAS accepted, so its fate is unknown rather than
+    // untried.
+    const ids = await ladderOn("kraken");
+    exchange.batchCancelUnresolved.add(ids[0]!);
+
+    await run((bot) => bot.halt("manual", "operator review", ACTOR));
+
+    expect(exchange.cancelBatches).toHaveLength(1);
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.openOrderIds).toEqual([ids[0]]);
+    expect(await db.alerts.count({ alert_type: "cancel_failed" })).toBe(1);
+    // Its rung is kept too: the slot follows the resolution, never leads it.
+    const slots = snapshot.state.ladder!.slots.filter((slot) => slot !== null);
+    expect(slots.map((slot) => slot!.clientOrderId)).toEqual([ids[0]]);
+  });
+});
