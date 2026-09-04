@@ -646,6 +646,33 @@ describe("the cancel price depends on the order's age, which is the whole reason
     expect(result.ok === false && result.kind).not.toBe("rate_limited");
   });
 
+  it("keeps the fail-closed maximum on a record MISS, which is the call site's exact shape", async () => {
+    // `bot-instance.ts` installs `(await this.#order(id))?.createdAt ?? null`,
+    // and the branch that matters is the miss: `#cancelOpenOrders` iterates
+    // `state.openOrderIds` and has its own `order === undefined` case for an id
+    // the object has lost the record of. This drives that exact expression.
+    const records = new Map<string, { createdAt: number }>([["known-0001", { createdAt: NOW - 30_000 }]]);
+    const client = gated({
+      exchange: "kraken",
+      orderPlacedAt: (_pair, clientOrderId) => records.get(clientOrderId)?.createdAt ?? null,
+    });
+
+    await client.cancelOrder(TEST_PAIR, "known-0001");
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(4);
+
+    await client.cancelOrder(TEST_PAIR, "never-recorded-0001");
+    expect(limiter.requests[1]!.cost.trading!.count).toBe(8);
+  });
+
+  it("⚠ would charge NOTHING if a miss resolved to 0 instead of null, which is why it is null", async () => {
+    // The trap this pins. `?? 0` reads as the Unix epoch, making every unknown
+    // order fifty-odd years old and its cancel FREE -- the exact inversion of
+    // fail-closed, and silent. Asserted so nobody "tidies" the null away.
+    const client = gated({ exchange: "kraken", orderPlacedAt: () => 0 });
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(0);
+  });
+
   it("accepts an async resolver, since a real call site reads D1", async () => {
     const client = gated({
       exchange: "kraken",

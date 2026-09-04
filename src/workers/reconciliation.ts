@@ -372,6 +372,18 @@ export async function runScheduledReconciliation(
       priority: "routine",
       now,
       label: `reconciliation ${accountLabel}`,
+      // ⚠ NO `orderPlacedAt`, DELIBERATELY, AND THIS IS THE REASON.
+      //
+      // That option exists for venues that price a CANCEL by the order's age
+      // (Kraken). Reconciliation never cancels: it reads. `getOpenOrders`,
+      // `getOrderStatus`, `getAccountBalances` and `getSymbolFilters` are the
+      // only four methods `reconcile.ts` calls, none of which consults an age.
+      // What reconciliation does when it finds drift is HALT the bot, and the
+      // halt cancels through `BotInstance`'s own gate -- which is wired.
+      //
+      // A resolver here would therefore be code that never runs. If a cancel is
+      // ever added to this path, the cost table charges the unknown-age maximum
+      // until this line grows a resolver, which is the safe direction to fail.
       ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
     });
 

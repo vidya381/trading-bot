@@ -1291,6 +1291,27 @@ export class BotInstance extends DurableObject<Env> {
         priority: "routine",
         now: deps.now,
         label: config.botInstanceId,
+        /**
+         * When the order being cancelled was placed, for a venue that prices a
+         * cancel by how long it has rested (Kraken: +8 under five seconds, down
+         * to nothing past five minutes).
+         *
+         * READ FROM THIS OBJECT'S OWN STORAGE, not from D1, and the two carry
+         * the SAME value -- `#mirrorOrderInsert` writes `orders.created_at`
+         * from this very field. So this is `orders.created_at` without the
+         * round trip, and it is still readable on the halt path when D1 is not.
+         *
+         * `undefined` becomes `null`, which the cost table charges at the
+         * dearest rung. That is a REACHABLE branch, not a formality:
+         * `#cancelOpenOrders` iterates `state.openOrderIds` and has its own
+         * `order === undefined` case for an id this object has lost the record
+         * of. Paying the maximum for one is the right answer.
+         *
+         * Lazy, so the read happens per cancel and only on the venues whose
+         * cost table asks for an age -- Binance's and Gemini's never call it.
+         */
+        orderPlacedAt: async (_pair, clientOrderId) =>
+          (await this.#order(clientOrderId))?.createdAt ?? null,
         ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
       });
       this.#gated = { routine, riskExit: routine.withPriority("risk-exit") };

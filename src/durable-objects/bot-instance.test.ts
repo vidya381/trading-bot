@@ -38,6 +38,10 @@ import {
   GEMINI_METHOD_WEIGHTS,
   type RateLimiterPort,
 } from "../exchange/rate-limited";
+import {
+  KRAKEN_CANCEL_COST_UNKNOWN_AGE,
+  krakenCancelCost,
+} from "../exchange/kraken/rate-limits";
 
 /**
  * The fake clock's origin, and it is deliberately in the FUTURE.
@@ -1748,6 +1752,107 @@ describe("wired to the account's limiter (section 5.4)", () => {
       spy.requests.every((request) => request.cost.rest === GEMINI_METHOD_WEIGHTS.cancelOrder),
     ).toBe(true);
     expect(GEMINI_METHOD_WEIGHTS.cancelOrder).not.toBe(BINANCE_METHOD_WEIGHTS.cancelOrder);
+  });
+
+  // -------------------------------------------------------------------------
+  // Where the order's AGE comes from (decision-log 96 PART 8, item 3)
+  // -------------------------------------------------------------------------
+  //
+  // Kraken prices a cancel by how long the order has rested -- +8 under five
+  // seconds down to nothing past five minutes -- so the gate has to be TOLD the
+  // age. It cannot work one out: `cancelOrder(pair, clientOrderId)` carries no
+  // timestamp. Entry 96 shipped the cost function and the `orderPlacedAt` seam
+  // but wired no call site to it, so every cancel paid the unknown-age maximum.
+  // These pin the wiring itself, which is the half a cost-function unit test
+  // cannot see.
+
+  it("charges a Kraken cancel by the order's REAL age, not the unknown-age maximum", async () => {
+    await runSpied((bot) => bot.create(creation({ exchange: "kraken" })));
+    await runSpied((bot) => bot.start(ACTOR));
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+    expect(exchange.placed.length).toBeGreaterThan(0);
+
+    // The order has now rested for thirty seconds, which is Kraken's `<45s`
+    // rung: +4, half the price of the fail-closed default.
+    clock += 30_000;
+    spy.requests.length = 0;
+    await runSpied((bot) => bot.halt("manual", "risk check", ACTOR));
+
+    const cancels = spy.requests.filter((request) => request.cost.trading !== undefined);
+    expect(cancels).not.toHaveLength(0);
+    expect(cancels.every((request) => request.cost.trading!.count === 4)).toBe(true);
+
+    // ⚠ THE ASSERTION THAT FAILS AGAINST THE UNWIRED CODE. Said the other way
+    // round so this cannot pass by the two numbers happening to agree: the
+    // cancel is NOT being charged the unknown-age maximum any more.
+    expect(
+      cancels.some((request) => request.cost.trading!.count === KRAKEN_CANCEL_COST_UNKNOWN_AGE),
+    ).toBe(false);
+  });
+
+  // ⚠ WHICH OF THESE CASES ACTUALLY BITES. The 3-second row passes against the
+  // UNWIRED code too, and that is not a flaw in it: Kraken's dearest rung and the
+  // fail-closed default are both +8, so a freshly-placed order is the one age at
+  // which "we looked it up" and "we could not" agree. It is kept because it pins
+  // that coincidence deliberately. The 30-second and 200-second rows are the ones
+  // that fail without the wiring, and they were confirmed to.
+  it.each([
+    ["3s, where a real age and the fail-closed default agree", 3_000, 8],
+    ["30s", 30_000, 4],
+    ["200s", 200_000, 1],
+  ])(
+    "re-prices the same cancel as the order gets older (%s)",
+    async (_label, restedMs, expected) => {
+      // `it.each` rather than a loop with hand-rolled setup, so each case gets
+      // the file's real `beforeEach` -- a fresh database, a fresh Durable Object
+      // name, and `FakeExchange.now` set to `T0`. Rebuilding that by hand is how
+      // the first draft of this test silently placed its order at the fake
+      // exchange's own default origin, 140 billion ms before `T0`, and read an
+      // age of four years.
+      await runSpied((bot) => bot.create(creation({ exchange: "kraken" })));
+      await runSpied((bot) => bot.start(ACTOR));
+      await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+      expect(exchange.placed.length).toBeGreaterThan(0);
+
+      clock += restedMs;
+      spy.requests.length = 0;
+      await runSpied((bot) => bot.halt("manual", "risk check", ACTOR));
+
+      const cancels = spy.requests.filter((request) => request.cost.trading !== undefined);
+      expect(cancels).not.toHaveLength(0);
+      expect(cancels.map((request) => request.cost.trading!.count)).toEqual(
+        cancels.map(() => expected),
+      );
+      // And the charge agrees with the published ladder, read through the same
+      // function Kraken's own worked examples are pinned against.
+      expect(krakenCancelCost(restedMs)).toBe(expected);
+    },
+  );
+
+  it("applies the one-second younger-bias at the REAL call site, not just in the cost function", async () => {
+    // `orders.created_at` is written when this system starts placing an order;
+    // Kraken's engine clock starts when it ACCEPTS one. So a measured age runs
+    // slightly long, and every rung of the ladder gets cheaper with age --
+    // measuring naively under-charges exactly at the boundaries.
+    //
+    // The bias lives inside `krakenCancelCost`, so it reaches every call site
+    // structurally. This proves it end to end through the real wiring rather
+    // than trusting that: an order resting EXACTLY 5,000ms sits on Kraken's
+    // <10s boundary, where the venue would charge +6. It is charged +8.
+    await runSpied((bot) => bot.create(creation({ exchange: "kraken" })));
+    await runSpied((bot) => bot.start(ACTOR));
+    await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
+
+    clock += 5_000;
+    spy.requests.length = 0;
+    await runSpied((bot) => bot.halt("manual", "risk check", ACTOR));
+
+    const cancels = spy.requests.filter((request) => request.cost.trading !== undefined);
+    expect(cancels).not.toHaveLength(0);
+    expect(cancels.every((request) => request.cost.trading!.count === 8)).toBe(true);
+    // Over-charging by one rung, never under -- said explicitly so the
+    // direction of the safety margin is asserted and not merely described.
+    expect(cancels.every((request) => request.cost.trading!.count === 6)).toBe(false);
   });
 
   it("asks at risk-exit priority for the cancellations a halt issues", async () => {
