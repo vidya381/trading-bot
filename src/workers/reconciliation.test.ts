@@ -16,7 +16,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
-import { freshDatabase } from "../db/test-helpers";
+import { botInstanceRow, freshDatabase } from "../db/test-helpers";
 import type { AcquireRequest, AcquireResult } from "../durable-objects/rate-limiter";
 import { FakeExchange } from "../durable-objects/fake-exchange";
 import { inLimiter } from "../durable-objects/test-helpers";
@@ -25,7 +25,7 @@ import {
   GEMINI_METHOD_WEIGHTS,
   type RateLimiterPort,
 } from "../exchange/rate-limited";
-import { fromDecimalString as m } from "../shared/money";
+import { fromDecimalString as m, type Money } from "../shared/money";
 import { BLIND_AFTER_MS, runScheduledReconciliation } from "./reconciliation";
 
 const T0 = 1_760_000_000_000;
@@ -503,5 +503,215 @@ describe("a pass that runs but observes nothing says so", () => {
       where: { alert_type: "reconciliation_blind", resolved: false },
     });
     expect(alerts).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The independent price cross-check (entry 86 PART 6's open item)
+// ---------------------------------------------------------------------------
+
+/**
+ * `/src/reconciliation/price-cross-check.ts` tests every decision the check
+ * makes against injected numbers. This file tests the thing those tests cannot
+ * see: that the cron actually RUNS it, for the right pairs, from the right two
+ * sources, and that it cannot take reconciliation down with it.
+ */
+describe("the price cross-check rides the 5-minute reconciliation cron", () => {
+  const KRAKEN_BTC = m("80707.6"); // live Kraken close, 2026-09-04
+  const GEMINI_BTC = m("80760.01"); // live Gemini last, same capture
+
+  function crossCheckPorts(
+    reference: Record<string, Money>,
+    listing: readonly string[] = ["BTCUSD"],
+  ) {
+    const asked: string[] = [];
+    return {
+      asked,
+      portsFor: () => ({
+        primaryPrice: async (pair: string) => {
+          asked.push(`primary:${pair}`);
+          return {
+            ok: true as const,
+            value: { pair, price: exchange.currentPrice, at: T0 },
+            at: T0,
+          };
+        },
+        referenceListing: async () => ({ ok: true as const, value: listing, at: T0 }),
+        referencePrice: async (pair: string) => {
+          asked.push(`reference:${pair}`);
+          const price = reference[pair];
+          if (price === undefined) {
+            return {
+              ok: false as const,
+              kind: "transport" as const,
+              message: `no fixture for ${pair}`,
+              retryable: true,
+              at: T0,
+            };
+          }
+          return { ok: true as const, value: { pair, price, at: T0 }, at: T0 };
+        },
+      }),
+    };
+  }
+
+  async function runningBot(overrides: Record<string, unknown> = {}): Promise<void> {
+    await db.botInstances.insert(
+      botInstanceRow({
+        id: "grid-btc-1",
+        account_label: ACCOUNT,
+        exchange: "binance",
+        pair: "BTCUSD",
+        status: "running",
+        ...overrides,
+      }),
+    );
+  }
+
+  it("does not run outside production, even with running bots", async () => {
+    // ⚠ The gate, asserted from the cron's side. On testnet the primary feed IS
+    // a simulator (entry 86), so every pair would diverge on every pass forever.
+    await runningBot();
+    const { asked, portsFor } = crossCheckPorts({ BTCUSD: KRAKEN_BTC });
+
+    const result = await runScheduledReconciliation(
+      env,
+      options({ environment: "testnet", crossCheckPortsFor: portsFor }),
+    );
+
+    expect(result.ran).toBe(true);
+    expect(result.crossChecks).toEqual([]);
+    expect(asked).toEqual([]);
+  });
+
+  it("checks each running pair against both sources on production", async () => {
+    await runningBot();
+    exchange.currentPrice = GEMINI_BTC;
+    const { asked, portsFor } = crossCheckPorts({ BTCUSD: KRAKEN_BTC });
+
+    const result = await runScheduledReconciliation(
+      env,
+      options({ environment: "production", crossCheckPortsFor: portsFor }),
+    );
+
+    expect(result.crossChecks).toHaveLength(1);
+    expect(result.crossChecks[0]!.observed).toBe(true);
+    // Both venues were asked, for the pair the bot is actually on.
+    expect(asked).toEqual(["primary:BTCUSD", "reference:BTCUSD"]);
+    // Two live closes 0.065% apart: ordinary spread, no alert.
+    expect(result.crossChecks[0]!.outcomes[0]!.status).toBe("agreed");
+  });
+
+  it("alerts when the primary feed diverges, without halting the bot", async () => {
+    // ⚠ The 2026-09-02 shape, end to end through the cron: a frozen sandbox
+    // value against a live Kraken close. Entry 92's observe-don't-gate rule is
+    // the second half of the assertion and is the more important half.
+    await runningBot();
+    exchange.currentPrice = m("78172.34");
+    const { portsFor } = crossCheckPorts({ BTCUSD: KRAKEN_BTC });
+
+    await runScheduledReconciliation(
+      env,
+      options({ environment: "production", crossCheckPortsFor: portsFor }),
+    );
+
+    const alerts = await db.alerts.findMany({
+      where: { alert_type: "price_feed_reference_divergence" },
+    });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.severity).toBe("critical");
+    expect(alerts[0]!.message).toContain("BTCUSD");
+
+    const bot = await db.botInstances.findOne({ id: "grid-btc-1" });
+    expect(bot!.status).toBe("running");
+    expect(bot!.halt_reason).toBeNull();
+  });
+
+  it("only looks at RUNNING bots", async () => {
+    // A halted bot has unsubscribed and its price is frozen by design, so it
+    // would diverge permanently and mean nothing. A created one never traded.
+    // `halt_requires_reason` is a real CHECK constraint, so a halted row must
+    // carry one -- the same shape a real halt writes.
+    await runningBot({
+      id: "grid-halted",
+      status: "halted",
+      pair: "ETHUSD",
+      halt_reason: "manual",
+      halted_at: T0,
+    });
+    await runningBot({ id: "grid-created", status: "created", pair: "SOLUSD" });
+    const { asked, portsFor } = crossCheckPorts({ BTCUSD: KRAKEN_BTC });
+
+    const result = await runScheduledReconciliation(
+      env,
+      options({ environment: "production", crossCheckPortsFor: portsFor }),
+    );
+
+    expect(result.crossChecks).toEqual([]);
+    expect(asked).toEqual([]);
+  });
+
+  it("checks a pair once however many bots are on it", async () => {
+    await runningBot({ id: "grid-btc-1" });
+    await runningBot({ id: "grid-btc-2" });
+    await runningBot({ id: "grid-btc-3" });
+    const { asked, portsFor } = crossCheckPorts({ BTCUSD: KRAKEN_BTC });
+
+    await runScheduledReconciliation(
+      env,
+      options({ environment: "production", crossCheckPortsFor: portsFor }),
+    );
+
+    // Three bots, one pair, one pair of reads.
+    expect(asked).toEqual(["primary:BTCUSD", "reference:BTCUSD"]);
+  });
+
+  it("skips a pair Kraken does not list, and says so without alerting", async () => {
+    await runningBot({ pair: "PONSUSD" });
+    const { portsFor } = crossCheckPorts({}, ["BTCUSD", "ETHUSD"]);
+
+    const result = await runScheduledReconciliation(
+      env,
+      options({ environment: "production", crossCheckPortsFor: portsFor }),
+    );
+
+    expect(result.ran).toBe(true);
+    expect(result.crossChecks[0]!.outcomes[0]!.status).toBe("skipped");
+    expect(result.crossChecks[0]!.outcomes[0]!.reason).toContain("not listed on kraken");
+    expect(await db.alerts.count({ alert_type: "price_feed_reference_divergence" })).toBe(0);
+  });
+
+  it("⚠ cannot take reconciliation down with it", async () => {
+    // The whole reason `crossCheckAccountPrices` wraps itself. This is a SANITY
+    // CHECK riding on a RISK CONTROL: section 9's drift detection must not stop
+    // because the observer threw. Reconciliation still runs, still reconciles,
+    // and the cross-check simply reports nothing for the pass.
+    await runningBot();
+    const result = await runScheduledReconciliation(
+      env,
+      options({
+        environment: "production",
+        crossCheckPortsFor: () => {
+          throw new Error("a bug in the cross-check");
+        },
+      }),
+    );
+
+    expect(result.ran).toBe(true);
+    expect(result.runs).toHaveLength(1);
+    expect(result.crossChecks).toEqual([]);
+  });
+
+  it("does nothing for an account whose bots are all stopped", async () => {
+    await runningBot({ status: "stopped" });
+    const { portsFor } = crossCheckPorts({ BTCUSD: KRAKEN_BTC });
+
+    const result = await runScheduledReconciliation(
+      env,
+      options({ environment: "production", crossCheckPortsFor: portsFor }),
+    );
+
+    expect(result.ran).toBe(true);
+    expect(result.crossChecks).toEqual([]);
   });
 });

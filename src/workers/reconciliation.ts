@@ -79,6 +79,33 @@
  * cover (a cron that never fires at all).
  *
  * ---------------------------------------------------------------------------
+ * THE INDEPENDENT PRICE CROSS-CHECK (entry 86 PART 6's open item)
+ * ---------------------------------------------------------------------------
+ * `crossCheckAccountPrices` below hangs the second thing off this cron. The
+ * decision logic is all in `/src/reconciliation/price-cross-check.ts` and knows
+ * nothing about bindings; this file supplies the two sources.
+ *
+ * WHY IT RIDES THIS CRON RATHER THAN THE PRICE PATH. It is a sanity check, not
+ * a trading input, and it costs two REST reads per pair. Per tick that would be
+ * a cost on every price update for a question whose answer changes on the scale
+ * of an outage; on this cron it is at most one round of reads per pair per five
+ * minutes, which is the same budget shape reconciliation already runs on. The
+ * check is also structurally at home here: this is the system's existing
+ * periodic re-derived-condition pass, with a standing-alert lifecycle already
+ * wired and an `observed` flag already understood.
+ *
+ * THE PRIMARY read goes through `gatedExchange`, so it is charged to section
+ * 5.4's budget like every other read this pass makes. THE REFERENCE read does
+ * not, and deliberately: the limiter is keyed by ACCOUNT and charged in the
+ * ACCOUNT'S VENUE's weights, and Kraken's public counter here is neither this
+ * account's nor this account's venue's. Charging a Gemini account's Gemini
+ * budget for a request sent to Kraken would report a number that is wrong in
+ * both directions -- it would consume Gemini allowance that was never spent,
+ * and it would leave Kraken's own counter unmodelled anyway. The reference load
+ * is bounded instead by its own shape: one cached catalogue read per hour, plus
+ * one ticker per distinct pair per five minutes.
+ *
+ * ---------------------------------------------------------------------------
  * NO SCHEMA -> NO-OP
  * ---------------------------------------------------------------------------
  * Production is deployed but its D1 database is deliberately empty: migrations
@@ -100,11 +127,18 @@ import { isExchangeId, type AlertRow, type ExchangeId } from "../db/schema";
 import type { BotInstance, BotSnapshot } from "../durable-objects/bot-instance";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import {
+  crossCheckRunsIn,
   reconcileAccount,
+  runPriceCrossCheck,
+  type CrossCheckPorts,
+  type CrossCheckResult,
   type DriftThresholds,
   type HaltBotOutcome,
   type ReconciliationRunResult,
 } from "../reconciliation";
+import { KrakenCatalogueCache } from "../exchange/kraken/catalogue";
+import { krakenPublicClient } from "../exchange/kraken/public";
+import type { Pair } from "../shared/exchange-client";
 import type { RestExchangeClient, Timestamp } from "../shared/exchange-client";
 import { resolveExchangeForAccount } from "./exchange-dispatch";
 
@@ -162,12 +196,53 @@ export interface ScheduledOptions {
    * later, a dashboard "reconcile now" button) without reaching for the binding.
    */
   readonly db?: Database;
+  /**
+   * The environment name the price cross-check gates on. Defaults to
+   * `env.ENVIRONMENT`.
+   *
+   * A TEST SEAM, and it exists because the suite runs against the `testnet`
+   * wrangler environment (vitest.config.ts pins that deliberately, so tests can
+   * never load production config). The cross-check is production-only for a
+   * reason that has nothing to do with tests -- see `CROSS_CHECK_ENVIRONMENTS`
+   * -- so without this the check's own behaviour would be untestable from
+   * inside the suite, which is the one thing worse than not having it.
+   *
+   * It gates ONLY the cross-check. It reaches no base-URL derivation and no
+   * credential resolution: `resolveExchangeForAccount` still reads the real
+   * `env.ENVIRONMENT`, so this cannot be used to point a testnet Worker at a
+   * production venue. That property is what makes a plain override acceptable
+   * here where it would not be there.
+   */
+  readonly environment?: string;
+  /**
+   * How the cross-check reaches its two price sources, per account.
+   *
+   * Injected for the reason every other port in this file is: no test in this
+   * repository may fall through to a live venue call, and the reference source
+   * is a real, unauthenticated call to `api.kraken.com`. The production default
+   * pairs the account's own gated client with `krakenPublicClient`.
+   */
+  readonly crossCheckPortsFor?: (
+    accountLabel: string,
+    exchange: ExchangeId,
+    primary: RestExchangeClient,
+  ) => CrossCheckPorts;
 }
 
 export interface ScheduledResult {
   readonly ran: boolean;
   readonly reason?: string;
   readonly runs: readonly ReconciliationRunResult[];
+  /**
+   * One entry per account the price cross-check ran for.
+   *
+   * Empty in every environment the check does not run in, and empty for an
+   * account whose bots are all stopped. Reported rather than merged into `runs`
+   * because it is a different question with a different failure mode: a
+   * reconciliation run that found no drift and a cross-check that could not
+   * reach Kraken must not both read as "clean".
+   */
+  readonly crossChecks: readonly CrossCheckResult[];
 }
 
 /** An account to reconcile, and the venue its funds actually live on. */
@@ -248,6 +323,7 @@ export async function runScheduledReconciliation(
         "no RATE_LIMITER binding in this environment, so section 5.4's budget " +
         "cannot be enforced. Only testnet and production declare one.",
       runs: [],
+      crossChecks: [],
     };
   }
   const limiterFor =
@@ -266,6 +342,7 @@ export async function runScheduledReconciliation(
         "no BOT_INSTANCE binding in this environment. Only testnet and production " +
         "declare one; a deploy with no --env has neither a database nor any bots.",
       runs: [],
+      crossChecks: [],
     };
   }
 
@@ -284,13 +361,25 @@ export async function runScheduledReconciliation(
         "exist). Migrations are deferred to go-live (section 16.1). See " +
         "docs/d1-provisioning.md.",
       runs: [],
+      crossChecks: [],
     };
   }
 
   const accounts = await reconcilableAccounts(db);
   const labels = accounts.map((account) => account.label);
   const runs: ReconciliationRunResult[] = [];
+  const crossChecks: CrossCheckResult[] = [];
   const unresolvable: string[] = [];
+
+  // Whether the price cross-check runs at all in this environment, decided ONCE
+  // above the loop. Production only; see `CROSS_CHECK_ENVIRONMENTS`.
+  const crossChecking = crossCheckRunsIn(options.environment ?? env.ENVIRONMENT);
+  // ONE catalogue behind every account's reference client. Kraken's AssetPairs
+  // document is ~1.1MB of PUBLIC venue data, identical for every account, and
+  // this is the same argument `resolveKrakenExchange` makes for sharing one
+  // cache across the clients it hands out. Built lazily so a non-production
+  // deploy allocates nothing.
+  const referenceCatalogue = crossChecking ? new KrakenCatalogueCache() : null;
 
   for (const account of accounts) {
     const accountLabel = account.label;
@@ -414,6 +503,22 @@ export async function runScheduledReconciliation(
     // The run happened; whether it SAW anything is a separate question, and it
     // is the question nothing used to ask.
     await auditBlindness(db, options, accountLabel, run, now());
+
+    // And whether what it saw is TRUE is a third question, which nothing asked
+    // until entry 86 PART 6's open item was closed. Deliberately last: it must
+    // never be able to stop a reconciliation pass, so it comes after everything
+    // section 9 owns and it catches its own failures (see below).
+    if (crossChecking) {
+      const crossCheck = await crossCheckAccountPrices(
+        db,
+        options,
+        { label: accountLabel, exchange: account.exchange },
+        gatedExchange,
+        referenceCatalogue!,
+        now(),
+      );
+      if (crossCheck !== null) crossChecks.push(crossCheck);
+    }
   }
 
   if (labels.length > 0 && runs.length === 0) {
@@ -427,10 +532,11 @@ export async function runScheduledReconciliation(
         `for any of them, so nothing could be reconciled` +
         (unresolvable.length > 0 ? `: ${unresolvable.join("; ")}` : "."),
       runs: [],
+      crossChecks,
     };
   }
 
-  return { ran: true, runs };
+  return { ran: true, runs, crossChecks };
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +634,115 @@ async function auditBlindness(
   } satisfies AlertRow);
 }
 
+// ---------------------------------------------------------------------------
+// The independent price reference (entry 86 PART 6's open item)
+// ---------------------------------------------------------------------------
+
+/** The venue that supplies the second opinion. */
+const REFERENCE_EXCHANGE: ExchangeId = "kraken";
+
+/**
+ * The pairs this account is ACTUALLY TRADING right now.
+ *
+ * `status === "running"` and nothing else. The three other statuses are all
+ * cases where a divergence would be a fact about a market nobody has money in:
+ * a `created` bot has never traded, a `stopped` one is finished, and a `halted`
+ * one has already unsubscribed from prices -- "a halted bot's clock is frozen BY
+ * DESIGN" (`bot-instance.ts`) -- so its stored price is expected to disagree
+ * with the live market and would produce a permanent, meaningless alert.
+ *
+ * `archived` is deliberately NOT consulted. It is a DASHBOARD VIEW FILTER,
+ * orthogonal to status by the schema's own comment, and a running bot that
+ * someone hid from a list is still trading real money on a real feed. Filtering
+ * on it would let a UI preference silently switch off a risk control.
+ *
+ * De-duplicated, because the check is per PAIR: five grid bots on BTCUSD share
+ * one price and would otherwise cost five identical pairs of reads.
+ */
+async function runningPairsFor(db: Database, accountLabel: string): Promise<Pair[]> {
+  const bots = await db.botInstances.findMany({
+    where: { account_label: accountLabel, status: "running" },
+  });
+  return [...new Set(bots.map((bot) => bot.pair))].sort();
+}
+
+/**
+ * Build the two sources and run one account's cross-check.
+ *
+ * Returns `null` when there was nothing to check -- no running bots -- rather
+ * than an empty result, so `crossChecks` counts accounts genuinely examined.
+ *
+ * ⚠ THIS FUNCTION CANNOT THROW INTO THE RECONCILIATION PASS, and that is the
+ * point of the try/catch rather than an oversight about which errors it hides.
+ * The same argument `#trackFrozenValue` makes for wrapping its own D1 writes
+ * applies with more force here: this is a SANITY CHECK riding on the back of a
+ * RISK CONTROL, and a bug in the observer must never be able to stop the thing
+ * being observed. Section 9's drift detection halting because a Kraken
+ * catalogue parse threw would be a strictly worse outcome than never having
+ * built this check at all. Every ANTICIPATED failure -- Kraken unreachable, the
+ * pair unlisted, the budget refusing -- is already an ordinary `skipped`
+ * outcome inside `runPriceCrossCheck` and never reaches here; what this catches
+ * is the unanticipated, and it is logged rather than swallowed silently.
+ */
+async function crossCheckAccountPrices(
+  db: Database,
+  options: ScheduledOptions,
+  account: { readonly label: string; readonly exchange: ExchangeId },
+  primary: RestExchangeClient,
+  referenceCatalogue: KrakenCatalogueCache,
+  at: Timestamp,
+): Promise<CrossCheckResult | null> {
+  try {
+    const pairs = await runningPairsFor(db, account.label);
+    if (pairs.length === 0) return null;
+
+    const ports =
+      options.crossCheckPortsFor?.(account.label, account.exchange, primary) ??
+      defaultCrossCheckPorts(primary, referenceCatalogue, options.now ?? (() => Date.now()));
+
+    return await runPriceCrossCheck(db, options.newId ?? (() => crypto.randomUUID()), ports, {
+      accountLabel: account.label,
+      primaryExchange: account.exchange,
+      referenceExchange: REFERENCE_EXCHANGE,
+      pairs,
+      at,
+    });
+  } catch (error) {
+    console.error(
+      `price cross-check for account ${account.label} failed unexpectedly and was ` +
+        `abandoned for this pass (${(error as Error).message}). Reconciliation itself ` +
+        `is unaffected. This is a bug in the check, not evidence about the feed.`,
+    );
+    return null;
+  }
+}
+
+/**
+ * The real sources: the account's own gated client, and public Kraken.
+ *
+ * The primary side is the SAME client object reconciliation reads balances
+ * with, so the price this compares is the price that venue is serving this
+ * account through the path this system actually uses -- not a second connection
+ * that could be healthy while the real one is not.
+ *
+ * The reference side holds no credentials at all (`krakenPublicClient`), so it
+ * is incapable of placing an order however it is called. `listTradablePairs`
+ * answers "does Kraken carry this market", from the catalogue it has to fetch
+ * for the ticker anyway; a pair Kraken does not list is skipped, never alerted.
+ */
+function defaultCrossCheckPorts(
+  primary: RestExchangeClient,
+  catalogueCache: KrakenCatalogueCache,
+  now: () => Timestamp,
+): CrossCheckPorts {
+  const reference = krakenPublicClient({ catalogueCache, now });
+  return {
+    primaryPrice: (pair) => primary.getCurrentPrice(pair),
+    referenceListing: () => reference.listTradablePairs(),
+    referencePrice: (pair) => reference.getCurrentPrice(pair),
+  };
+}
+
 /** The same standing-alert treatment for an account no client could be built for. */
 async function alertUnreconcilable(
   db: Database,
@@ -576,6 +791,18 @@ export async function scheduled(
       `reconciliation ${run.runId} account=${run.accountLabel} tier=${run.tier ?? "clean"} ` +
         `findings=${run.findings.length} halted=${run.haltedBotIds.length} ` +
         `breaker=${run.circuitBreakerTripped} skipped=${run.skipped.length}`,
+    );
+  }
+  for (const check of result.crossChecks) {
+    // `checked` and `skipped` are reported separately on purpose: a pass that
+    // corroborated nothing because Kraken was down must not read in the logs
+    // like a pass that corroborated everything and found no divergence.
+    const counts = { agreed: 0, diverged: 0, skipped: 0 };
+    for (const outcome of check.outcomes) counts[outcome.status] += 1;
+    console.log(
+      `price cross-check account=${check.accountLabel} observed=${check.observed} ` +
+        `agreed=${counts.agreed} diverged=${counts.diverged} skipped=${counts.skipped} ` +
+        `raised=${check.raised.length} resolved=${check.resolved.length}`,
     );
   }
 }

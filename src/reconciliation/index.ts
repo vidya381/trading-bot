@@ -10,4 +10,5 @@
 export * from "./circuit-breaker";
 export * from "./findings";
 export * from "./kill-switch";
+export * from "./price-cross-check";
 export * from "./reconcile";
