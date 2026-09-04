@@ -89,7 +89,15 @@ async function withLimiter(
         clock = at;
       },
       acquire: (weight, priority, ticketId) =>
-        limiter.acquire({ weight, priority, ...(ticketId !== undefined ? { ticketId } : {}) }),
+        limiter.acquire({
+          // Every test in this file exercises the account-wide counter, which is
+          // the whole of Binance's model. The per-pair counter has its own
+          // describe block at the end, which passes a `trading` component.
+          exchange: "binance",
+          cost: { rest: weight },
+          priority,
+          ...(ticketId !== undefined ? { ticketId } : {}),
+        }),
     });
   });
 }
@@ -190,8 +198,8 @@ describe("budget accounting", () => {
 
   it("rejects a non-positive weight rather than silently granting it", async () => {
     await withLimiter({}, async ({ limiter }) => {
-      await expect(limiter.acquire({ weight: 0, priority: "routine" })).rejects.toThrow();
-      await expect(limiter.acquire({ weight: -5, priority: "routine" })).rejects.toThrow();
+      await expect(limiter.acquire({ exchange: "binance", cost: { rest: -1 }, priority: "routine" })).rejects.toThrow();
+      await expect(limiter.acquire({ exchange: "binance", cost: { rest: -5 }, priority: "routine" })).rejects.toThrow();
     });
   });
 });
@@ -434,7 +442,7 @@ describe("two acquires interleaving", () => {
             events.push("first-persist-begins");
             // A second caller arrives while the first has decided but not yet
             // written.
-            competitor = await limiter.acquire({ weight: 60, priority: "routine" });
+            competitor = await limiter.acquire({ exchange: "binance", cost: { rest: 60 }, priority: "routine" });
             events.push(`competitor-${competitor.granted ? "granted" : "denied"}`);
           }
           const result = await (original as (...a: unknown[]) => Promise<unknown>)(...args);
@@ -443,7 +451,7 @@ describe("two acquires interleaving", () => {
         },
       });
 
-      const first = await limiter.acquire({ weight: 60, priority: "routine" });
+      const first = await limiter.acquire({ exchange: "binance", cost: { rest: 60 }, priority: "routine" });
 
       // Routine ceiling is 100. Two 60s do not both fit, and exactly one won.
       expect(first.granted).toBe(true);
@@ -466,9 +474,9 @@ describe("two acquires interleaving", () => {
     // must be the sum rather than one of the two.
     await withLimiter({ limit: 1200 }, async ({ limiter }) => {
       const results = await Promise.all([
-        limiter.acquire({ weight: 20, priority: "routine" }),
-        limiter.acquire({ weight: 30, priority: "routine" }),
-        limiter.acquire({ weight: 6, priority: "risk-exit" }),
+        limiter.acquire({ exchange: "binance", cost: { rest: 20 }, priority: "routine" }),
+        limiter.acquire({ exchange: "binance", cost: { rest: 30 }, priority: "routine" }),
+        limiter.acquire({ exchange: "binance", cost: { rest: 6 }, priority: "risk-exit" }),
       ]);
       expect(results.every((result) => result.granted)).toBe(true);
       expect((await limiter.stats()).usedWeight).toBe(56);
@@ -552,13 +560,22 @@ describe("persistence", () => {
   it("persists the spent window, so an evicted object does not wake up with a fresh budget", async () => {
     await withLimiter({ limit: 120 }, async ({ acquire, state }) => {
       await acquire(70, "routine");
+      // The ceiling and the spend both moved under `account` when the persisted
+      // shape grew a second budget: an account-wide counter that is one of two
+      // shapes, plus a list of per-pair counters. `LegacyPersistedState` is what
+      // reads the flat version this replaced.
       const stored = await state.storage.get<{
-        limit: number;
-        snapshot: { entries: readonly { weight: number }[] };
+        exchange: string | null;
+        account: { limit: number; snapshot: { entries: readonly { weight: number }[] } };
+        trading: readonly unknown[];
       }>("budget");
-      expect(stored?.limit).toBe(120);
+      expect(stored?.account.limit).toBe(120);
+      expect(stored?.exchange).toBe("binance");
+      // A venue with no matching-engine counter persists an empty list, not a
+      // map of empty counters.
+      expect(stored?.trading).toEqual([]);
       expect(
-        stored?.snapshot.entries.reduce((total, entry) => total + entry.weight, 0),
+        stored?.account.snapshot.entries.reduce((total, entry) => total + entry.weight, 0),
       ).toBe(70);
     });
   });
@@ -607,7 +624,7 @@ describe("one budget per exchange account", () => {
     await inLimiter("account-a", async (limiter) => {
       limiter.attach({ now: () => NOW, newId: ids() });
       await limiter.syncLimit(120, 60_000, NOW);
-      expect((await limiter.acquire({ weight: 100, priority: "routine" })).granted).toBe(true);
+      expect((await limiter.acquire({ exchange: "binance", cost: { rest: 100 }, priority: "routine" })).granted).toBe(true);
     });
 
     await inLimiter("account-b", async (limiter) => {
@@ -616,7 +633,460 @@ describe("one budget per exchange account", () => {
       // Section 3's isolation principle: one account's spend is not the
       // other's, and the object name is what guarantees it.
       expect((await limiter.stats()).usedWeight).toBe(0);
-      expect((await limiter.acquire({ weight: 100, priority: "routine" })).granted).toBe(true);
+      expect((await limiter.acquire({ exchange: "binance", cost: { rest: 100 }, priority: "routine" })).granted).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Two budgets, one of them per pair (decision-log 90 PROBLEM 2 (b))
+// ---------------------------------------------------------------------------
+
+/**
+ * Kraken's model end to end, against real Durable Object storage.
+ *
+ * Every constant here is Kraken's published Starter tier, re-verified live on
+ * 2026-09-03 and pinned in `exchange/kraken/rate-limits.test.ts`. This file
+ * asserts what the OBJECT does with them; that file asserts they are the venue's.
+ */
+const BTC = "BTC/USD";
+const ARB = "ARB/USD";
+
+/** Run against a limiter that has adopted Kraken, with an injected clock. */
+async function withKraken(
+  body: (harness: {
+    limiter: RateLimiter;
+    state: DurableObjectState;
+    setNow: (at: number) => void;
+    rest: (units: number, priority?: "routine" | "risk-exit") => Promise<AcquireResult>;
+    trade: (
+      pair: string,
+      count: number,
+      rest?: number,
+      priority?: "routine" | "risk-exit",
+      ticketId?: string,
+    ) => Promise<AcquireResult>;
+  }) => Promise<void>,
+): Promise<void> {
+  await inLimiter(account, async (limiter, state) => {
+    let clock = NOW;
+    limiter.attach({ now: () => clock, newId: ids() });
+    await body({
+      limiter,
+      state,
+      setNow: (at) => {
+        clock = at;
+      },
+      rest: (units, priority = "routine") =>
+        limiter.acquire({ exchange: "kraken", cost: { rest: units }, priority }),
+      trade: (pair, count, rest = 0, priority = "routine", ticketId?: string) =>
+        limiter.acquire({
+          exchange: "kraken",
+          cost: { rest, trading: { pair, count } },
+          priority,
+          ...(ticketId !== undefined ? { ticketId } : {}),
+        }),
+    });
+  });
+}
+
+describe("the limiter takes its budget shape from the venue", () => {
+  it("gives Kraken a decaying account counter on Starter's published numbers", async () => {
+    await withKraken(async ({ rest, limiter }) => {
+      await rest(1);
+      const stats = await limiter.stats();
+
+      expect(stats.exchange).toBe("kraken");
+      expect(stats.shape).toBe("decaying");
+      expect(stats.limit).toBe(15);
+      // 15 units at 0.33/sec is the drain horizon, not a 60s window.
+      expect(stats.windowMs).toBe(45_455);
+    });
+  });
+
+  it("leaves Binance and Gemini on the sliding window they always had", async () => {
+    await inLimiter(account, async (limiter) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      await limiter.acquire({ exchange: "binance", cost: { rest: 1 }, priority: "routine" });
+
+      const stats = await limiter.stats();
+      expect(stats.shape).toBe("sliding");
+      expect(stats.limit).toBe(DEFAULT_WEIGHT_LIMIT);
+      expect(stats.windowMs).toBe(DEFAULT_WINDOW_MS);
+      // No per-pair counter exists for a venue that has none.
+      expect(stats.trading).toEqual([]);
+    });
+  });
+
+  it("refuses a request for a different venue rather than averaging the two", async () => {
+    // An account has exactly one exchange, so two venues at one limiter is a
+    // wiring bug. It is reported as its own reason and WITHOUT a ticket, because
+    // no amount of waiting turns a Binance call into a Kraken one.
+    await withKraken(async ({ rest, limiter }) => {
+      await rest(1);
+
+      const wrong = await limiter.acquire({
+        exchange: "binance",
+        cost: { rest: 1 },
+        priority: "routine",
+      });
+      expect(wrong).toMatchObject({
+        granted: false,
+        reason: "wrong_exchange",
+        ticketId: null,
+        retryAfterMs: 0,
+      });
+    });
+  });
+});
+
+describe("the per-pair trading counter", () => {
+  it("does not exist until a pair actually trades", async () => {
+    await withKraken(async ({ rest, limiter }) => {
+      await rest(1);
+      expect((await limiter.stats()).trading).toEqual([]);
+
+      await limiter.acquire({
+        exchange: "kraken",
+        cost: { rest: 0, trading: { pair: BTC, count: 1 } },
+        priority: "routine",
+      });
+
+      const trading = (await limiter.stats()).trading;
+      expect(trading).toHaveLength(1);
+      expect(trading[0]).toMatchObject({ pair: BTC, limit: 60, decayPerSecond: 1 });
+    });
+  });
+
+  it("keeps two markets completely independent, which one pooled budget could not", async () => {
+    // THE POINT OF THE SECOND BUDGET. Kraken meters order traffic per pair, so a
+    // ladder exhausting BTC/USD must leave ARB/USD untouched. A single account
+    // budget would refuse the ARB cancel here -- traffic the venue would accept,
+    // on the risk-exit path.
+    await withKraken(async ({ trade, limiter }) => {
+      // Spend BTC's whole risk-exit ceiling: 60 units at 8 apiece is 7 cancels.
+      for (let i = 0; i < 7; i++) {
+        expect((await trade(BTC, 8, 0, "risk-exit")).granted).toBe(true);
+      }
+      expect((await trade(BTC, 8, 0, "risk-exit")).granted).toBe(false);
+
+      // ARB has spent nothing and is unaffected.
+      expect((await trade(ARB, 8, 0, "risk-exit")).granted).toBe(true);
+
+      const stats = await limiter.stats();
+      expect(stats.trading.map((t) => t.pair)).toEqual([ARB, BTC]);
+      expect(stats.trading.find((t) => t.pair === BTC)!.usedWeight).toBe(56);
+      expect(stats.trading.find((t) => t.pair === ARB)!.usedWeight).toBe(8);
+    });
+  });
+
+  it("reproduces entry 90's worst case: seven fresh cancels exhaust one pair's ENGINE counter", async () => {
+    // ⚠ The warning entry 90 raised, driven through the real object rather than
+    // computed. A grid that has just laid a ladder holds exactly the young orders
+    // that cost the most: 8 apiece against a Starter threshold of 60.
+    //
+    // This charges the ENGINE ONLY, which isolates the counter entry 90 was
+    // talking about. The test below shows what a real cancel does.
+    await withKraken(async ({ trade, setNow }) => {
+      for (let i = 0; i < 7; i++) {
+        expect((await trade(BTC, 8, 0, "risk-exit")).granted).toBe(true);
+      }
+      const refused = await trade(BTC, 8, 0, "risk-exit");
+      expect(refused.granted).toBe(false);
+
+      // And the wait it quotes is Kraken's own arithmetic: 4 units of shortfall
+      // shedding at 1/sec. Waiting it out really does make room -- for the
+      // caller that RE-PRESENTS ITS TICKET, which is what the gate's retry loop
+      // does. A fresh arrival would sort behind the waiting ticket and be
+      // refused again, which is the head-of-line protection working, not a bug.
+      expect(refused.granted === false && refused.retryAfterMs).toBe(4_000);
+      const ticketId = refused.granted === false ? refused.ticketId! : "";
+      setNow(NOW + 4_000);
+
+      expect((await trade(BTC, 8, 0, "risk-exit")).granted).toBe(false);
+      expect((await trade(BTC, 8, 0, "risk-exit", ticketId)).granted).toBe(true);
+    });
+  });
+
+  it("⚠ but a REAL Kraken cancel is bound by the REST counter first, not the engine", async () => {
+    // A FINDING THIS SESSION TURNED UP, recorded as a test because it changes
+    // where the risk actually sits.
+    //
+    // Entry 90's worst case reasoned about the per-pair ENGINE counter: 8 units a
+    // cancel against 60, so roughly seven. But a Kraken `cancelOrder` is not only
+    // an engine charge. Entry 90 DECISION 2 makes it a cancel plus exactly one
+    // `ClosedOrders` read, and `ClosedOrders` is account history -- 4 units of a
+    // Starter REST counter whose whole ceiling is 15.
+    //
+    //     engine: 60 / 8 = 7 cancels
+    //     REST:   15 / 4 = 3 cancels     <-- binds more than twice as early
+    //
+    // So the tightest constraint on a halt is the account-wide counter, and it
+    // would have been invisible to a model that only added the second budget.
+    // It is also the constant sitting on Kraken's +2 / +4 contradiction: on the
+    // documented reading of 2 this would be 7 cancels instead of 3, which is why
+    // that contradiction was worth resolving deliberately rather than noting.
+    await withKraken(async ({ trade, limiter }) => {
+      for (let i = 0; i < 3; i++) {
+        expect((await trade(BTC, 8, 4, "risk-exit")).granted).toBe(true);
+      }
+      const refused = await trade(BTC, 8, 4, "risk-exit");
+      expect(refused.granted).toBe(false);
+
+      const stats = await limiter.stats();
+      expect(stats.usedWeight).toBe(12);
+      // The engine counter has plenty left -- it is not what refused this.
+      expect(stats.trading[0]!.usedWeight).toBe(24);
+      expect(stats.trading[0]!.remainingRiskExit).toBe(36);
+    });
+  });
+
+  it("charges a Kraken order to the engine only, never to the REST counter", async () => {
+    // Kraken's REST counter excludes AddOrder. A `rest: 0` charge must leave the
+    // account counter alone rather than being floored into it.
+    await withKraken(async ({ trade, limiter }) => {
+      for (let i = 0; i < 20; i++) {
+        expect((await trade(BTC, 1, 0)).granted).toBe(true);
+      }
+      const stats = await limiter.stats();
+      expect(stats.usedWeight).toBe(0);
+      expect(stats.trading[0]!.usedWeight).toBe(20);
+    });
+  });
+});
+
+describe("a charge on two counters is granted only if BOTH have room", () => {
+  it("refuses when the account counter is the one that is full", async () => {
+    // A Kraken cancel charges the engine AND four REST units for its follow-up
+    // read. Starter's REST ceiling is 15, routine gets 13, so three cancels fit
+    // and the fourth does not -- even though the engine counter is nearly empty.
+    await withKraken(async ({ trade, limiter }) => {
+      for (let i = 0; i < 3; i++) {
+        expect((await trade(BTC, 1, 4)).granted).toBe(true);
+      }
+      const refused = await trade(BTC, 1, 4);
+      expect(refused).toMatchObject({ granted: false, reason: "budget_exhausted" });
+
+      const stats = await limiter.stats();
+      expect(stats.usedWeight).toBe(12);
+      // ⚠ AND THE ENGINE CHARGE WAS NOT APPLIED. A partial charge would leave a
+      // counter spent for a call that never went, which is worse than refusing.
+      expect(stats.trading[0]!.usedWeight).toBe(3);
+    });
+  });
+
+  it("refuses when the pair counter is the one that is full", async () => {
+    await withKraken(async ({ trade, limiter, setNow }) => {
+      // Fill BTC's routine ceiling (60 - 10 = 50) without touching REST.
+      for (let i = 0; i < 50; i++) expect((await trade(BTC, 1, 0)).granted).toBe(true);
+
+      setNow(NOW + 1);
+      const refused = await trade(BTC, 5, 1);
+      expect(refused.granted).toBe(false);
+
+      // The REST unit was not spent either.
+      expect((await limiter.stats()).usedWeight).toBe(0);
+    });
+  });
+
+  it("quotes the LONGER of the two waits, because the call needs both", async () => {
+    await withKraken(async ({ trade, limiter }) => {
+      // Spend the REST routine ceiling (13) and most of BTC's (50).
+      for (let i = 0; i < 3; i++) await trade(BTC, 1, 4);
+      const refused = await trade(BTC, 1, 4);
+
+      expect(refused.granted).toBe(false);
+      if (refused.granted) return;
+      // REST is short by 3 units at 0.33/sec (~9091ms); the engine has ample
+      // room and would have quoted 0. The answer is the REST wait.
+      expect(refused.retryAfterMs).toBe(9_091);
+      void limiter;
+    });
+  });
+});
+
+describe("queue claims are held per counter, not pooled", () => {
+  it("does not let a queued cancel on one pair hold back a cancel on another", async () => {
+    // A single claimed-ahead total would make a ticket waiting on BTC/USD block
+    // an unrelated ARB/USD cancel -- refusing traffic the venue would take, on
+    // the risk-exit path. The claim is keyed by counter for exactly this.
+    await withKraken(async ({ trade, limiter }) => {
+      // Fill BTC so a request on it must queue.
+      for (let i = 0; i < 7; i++) await trade(BTC, 8, 0, "risk-exit");
+      const queued = await trade(BTC, 8, 0, "risk-exit");
+      expect(queued.granted).toBe(false);
+      expect(queued.granted === false && queued.ticketId).not.toBeNull();
+
+      // ARB shares no counter with it and goes straight through.
+      const other = await limiter.acquire({
+        exchange: "kraken",
+        cost: { rest: 0, trading: { pair: ARB, count: 8 } },
+        priority: "risk-exit",
+      });
+      expect(other.granted).toBe(true);
+    });
+  });
+});
+
+describe("the venue's own counter, when it is reported (the WebSocket seam)", () => {
+  // ⚠ NOT WIRED TO A LIVE SUBSCRIPTION. Kraken publishes `ratecount` and
+  // `maxratecount` on the WebSocket v2 `executions` feed with
+  // `ratecounter: true`; building that subscription is its own decision. These
+  // drive the seam it will arrive through, so adding it later changes a caller
+  // and not this object.
+
+  it("raises a pair's counter to the venue's figure", async () => {
+    await withKraken(async ({ trade, limiter }) => {
+      await trade(BTC, 1, 0);
+      expect((await limiter.stats()).trading[0]!.usedWeight).toBe(1);
+
+      // The engine says 30 -- traffic this object never granted, e.g. an order
+      // placed from another session on the same account.
+      await limiter.syncFromExchange(BTC, 30, null, NOW);
+      expect((await limiter.stats()).trading[0]!.usedWeight).toBe(30);
+    });
+  });
+
+  it("learns the real tier from maxratecount, so the tier need not be configured", async () => {
+    // THE PAYOFF OF THE SEAM. This system assumes Starter because no real account
+    // exists to confirm otherwise; an Intermediate account reports 125 and the
+    // counter corrects itself from its own traffic, with nothing configured.
+    await withKraken(async ({ trade, limiter }) => {
+      await trade(BTC, 1, 0);
+      expect((await limiter.stats()).trading[0]!.limit).toBe(60);
+
+      await limiter.syncFromExchange(BTC, 40, 125, NOW);
+
+      const stats = await limiter.stats();
+      expect(stats.trading[0]!.limit).toBe(125);
+      expect(stats.limitSource).toBe("exchangeCounter");
+      // The spend already made is carried across, not handed back.
+      expect(stats.trading[0]!.usedWeight).toBe(40);
+    });
+  });
+
+  it("creates the pair's counter if the venue reports one before this object charged it", async () => {
+    await withKraken(async ({ rest, limiter }) => {
+      await rest(1);
+      await limiter.syncFromExchange(ARB, 12, null, NOW);
+      expect((await limiter.stats()).trading[0]).toMatchObject({ pair: ARB, usedWeight: 12 });
+    });
+  });
+
+  it("still accepts the account-wide form, which is Binance's header path", async () => {
+    // The two shapes share one signature because a `DurableObjectStub` keeps only
+    // the last overload of a method, which broke `WeightReporter`. The number
+    // form must keep working exactly as it did.
+    await inLimiter(account, async (limiter) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      await limiter.acquire({ exchange: "binance", cost: { rest: 10 }, priority: "routine" });
+      await limiter.syncFromExchange(500, NOW);
+      expect((await limiter.stats()).usedWeight).toBe(500);
+    });
+  });
+
+  it("refuses the per-pair form with no timestamp rather than inventing one", async () => {
+    await withKraken(async ({ limiter }) => {
+      await expect(limiter.syncFromExchange(BTC, 30, null)).rejects.toThrow(/no timestamp/);
+    });
+  });
+});
+
+describe("both budgets survive eviction", () => {
+  it("persists the pair counters, so an evicted object does not forget a spend", async () => {
+    await inLimiter(account, async (limiter, state) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      await limiter.acquire({
+        exchange: "kraken",
+        cost: { rest: 4, trading: { pair: BTC, count: 8 } },
+        priority: "risk-exit",
+      });
+
+      const stored = await state.storage.get<{
+        exchange: string;
+        account: { shape: string; limit: number; decayPerSecond: number };
+        trading: readonly { pair: string; limit: number; snapshot: { value: number } }[];
+      }>("budget");
+
+      expect(stored?.exchange).toBe("kraken");
+      expect(stored?.account).toMatchObject({ shape: "decaying", limit: 15, decayPerSecond: 0.33 });
+      expect(stored?.trading).toHaveLength(1);
+      expect(stored?.trading[0]).toMatchObject({ pair: BTC, limit: 60 });
+      expect(stored?.trading[0]!.snapshot.value).toBe(8);
+    });
+
+    // A second entry into the same object name is a fresh instance reading storage.
+    await inLimiter(account, async (limiter) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      const stats = await limiter.stats();
+      expect(stats.exchange).toBe("kraken");
+      expect(stats.shape).toBe("decaying");
+      expect(stats.usedWeight).toBe(4);
+      expect(stats.trading[0]).toMatchObject({ pair: BTC, usedWeight: 8 });
+    });
+  });
+
+  it("does not hand a fresh budget to a restored object when it first names its venue", async () => {
+    // ⚠ THE BUG THIS CATCHES was mine, and it is the one persistence exists to
+    // prevent: rebuilding the budget whenever the venue is first named would
+    // discard a restored spend and grant a full ceiling to an account that had
+    // already spent one. The rebuild happens ONLY on a real shape change.
+    await inLimiter(account, async (limiter) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      await limiter.acquire({ exchange: "binance", cost: { rest: 900 }, priority: "routine" });
+    });
+
+    await inLimiter(account, async (limiter) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      const again = await limiter.acquire({
+        exchange: "binance",
+        cost: { rest: 900 },
+        priority: "routine",
+      });
+      // 900 + 900 is over the 1000-unit routine ceiling, so the restored spend
+      // is really being counted.
+      expect(again.granted).toBe(false);
+      expect((await limiter.stats()).usedWeight).toBe(900);
+    });
+  });
+});
+
+describe("a call that costs nothing anywhere is a bug, not a free pass", () => {
+  it("refuses an all-zero cost vector rather than granting an unmeasured call", async () => {
+    await withKraken(async ({ limiter }) => {
+      await expect(
+        limiter.acquire({ exchange: "kraken", cost: { rest: 0 }, priority: "routine" }),
+      ).rejects.toThrow(/costs nothing on any counter/);
+    });
+  });
+
+  it("rejects a negative component", async () => {
+    await withKraken(async ({ limiter }) => {
+      await expect(
+        limiter.acquire({ exchange: "kraken", cost: { rest: -1 }, priority: "routine" }),
+      ).rejects.toThrow(/must be non-negative/);
+      await expect(
+        limiter.acquire({
+          exchange: "kraken",
+          cost: { rest: 1, trading: { pair: BTC, count: -1 } },
+          priority: "routine",
+        }),
+      ).rejects.toThrow(/must be non-negative/);
+    });
+  });
+
+  it("refuses a trading charge on a venue that has no engine counter", async () => {
+    // The cost table and the venue model disagreeing is a bug worth surfacing,
+    // not one to hide by inventing a counter to hold the charge.
+    await inLimiter(account, async (limiter) => {
+      limiter.attach({ now: () => NOW, newId: ids() });
+      await expect(
+        limiter.acquire({
+          exchange: "binance",
+          cost: { rest: 1, trading: { pair: BTC, count: 1 } },
+          priority: "routine",
+        }),
+      ).rejects.toThrow(/no matching-engine counter/);
     });
   });
 });

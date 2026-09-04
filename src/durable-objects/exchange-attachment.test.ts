@@ -30,6 +30,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
+import { METHOD_COSTS } from "../exchange/rate-limited";
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
 import { freshDatabase } from "../db/test-helpers";
@@ -213,13 +214,29 @@ describe("exchange attachment (step 13)", () => {
     // whose switch has no kraken case and no default, returned `undefined`, and
     // the bot halted on `unhandled_error: TypeError: Cannot read properties of
     // undefined (reading 'ok')`. Same halt, no way for an operator to act on it.
-    await runResolving((bot) => bot.create(creation({ exchange: "kraken" })));
-    await runResolving((bot) => bot.start(ACTOR));
+    //
+    // ⚠ THE UNWIRED STATE IS CONSTRUCTED. Kraken really is wired now -- the
+    // rate-limiter session gave `METHOD_COSTS` its row -- so there is no
+    // unwired `ExchangeId` left to borrow, and the alternative to building the
+    // state was deleting the guard for whichever venue is half-added next.
+    // `runInDurableObject` runs the object in this isolate, so the object sees
+    // the same module object this line edits; the restore is in a `finally`.
+    const costs = METHOD_COSTS as Record<string, unknown>;
+    const savedKrakenCosts = costs.kraken;
+    delete costs.kraken;
 
-    const result = await runResolving((bot) => bot.onPriceUpdate(priceAt("100")));
-    expect(result.status).toBe("halted");
+    let row: Awaited<ReturnType<typeof db.botInstances.findOne>>;
+    try {
+      await runResolving((bot) => bot.create(creation({ exchange: "kraken" })));
+      await runResolving((bot) => bot.start(ACTOR));
 
-    const row = await db.botInstances.findOne({ id: BOT_ID });
+      const result = await runResolving((bot) => bot.onPriceUpdate(priceAt("100")));
+      expect(result.status).toBe("halted");
+
+      row = await db.botInstances.findOne({ id: BOT_ID });
+    } finally {
+      costs.kraken = savedKrakenCosts;
+    }
     expect(row!.halt_reason).toMatch(/"kraken"/);
     // The message is BUILT from the same two checks `isWiredExchange` uses, so
     // it names whichever blocker is actually open rather than asserting both.

@@ -44,6 +44,7 @@ import type { MarketPriceLister } from "../workers/market-price";
 import type { AssessModel } from "../research/assess";
 import type { DeriveModel } from "../research/derive";
 import { proposals } from "../db/schema";
+import { METHOD_COSTS } from "../exchange/rate-limited";
 import { PROPOSAL_LIST_COLUMNS, PROPOSAL_PAYLOAD_COLUMNS } from "./serialize";
 import type { Candle, SymbolFilters } from "../shared/exchange-client";
 /*
@@ -3444,8 +3445,11 @@ describe("bot creation dispatches exchange from the account registry (step 11)",
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("invalid_exchange");
     // The message offers only venues that really work -- never a venue the very
-    // next gate would refuse.
-    expect(res.body.error.message).not.toContain("kraken");
+    // next gate would refuse. That set is DERIVED (`wiredExchanges()`), which is
+    // why this assertion flipped when the rate-limiter session gave Kraken its
+    // cost model: kraken went from "a venue the next gate would refuse" to one
+    // that really works, and the message widened on its own with nothing edited.
+    expect(res.body.error.message).toContain("kraken");
   });
 
   /**
@@ -3475,7 +3479,31 @@ describe("bot creation dispatches exchange from the account registry (step 11)",
     await seedBalance(account);
     const id = `kb-${suffix}`;
 
-    const res = await createBotBody(account, id, "kraken");
+    // ⚠ THE UNWIRED VENUE IS NOW CONSTRUCTED, NOT BORROWED.
+    //
+    // This test used to name `kraken`, because Kraken was the venue that was in
+    // the union and had no cost model. The rate-limiter session closed that, and
+    // there is now no unwired `ExchangeId` left to point at -- so the choice was
+    // between deleting a regression test and building the state it guards.
+    //
+    // Borrowing whichever venue happens to be unwired is what made the previous
+    // wiring table go stale, and `venue-wiring.test.ts` already argues the case
+    // for constructing the state instead: it tests the DERIVATION, which is what
+    // has to keep working when the NEXT venue is half-added. That is exactly the
+    // hole this test exists for, so it does the same.
+    //
+    // `handleApiRequest` is called in-process, so removing the row is visible to
+    // the handler. Tests within a file run sequentially, and the restore is in a
+    // `finally`.
+    const costs = METHOD_COSTS as Record<string, unknown>;
+    const savedKrakenCosts = costs.kraken;
+    delete costs.kraken;
+    let res: { status: number; body: any };
+    try {
+      res = await createBotBody(account, id, "kraken");
+    } finally {
+      costs.kraken = savedKrakenCosts;
+    }
 
     expect(res.status).not.toBe(201);
     expect(res.status).toBe(400);

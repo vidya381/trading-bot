@@ -8,7 +8,7 @@
  * to answer it, and this test existed to catch them answering it wrongly. That
  * hazard is now gone at the source: `exchange-dispatch.ts` dispatches through
  * `EXCHANGE_RESOLVERS`, whose `null` entry IS the askable form of that question,
- * and `isWiredExchange` computes the answer from it and from `METHOD_WEIGHTS`.
+ * and `isWiredExchange` computes the answer from it and from `METHOD_COSTS`.
  *
  * So this file no longer asserts WHICH venues are wired. Pinning today's answer
  * is exactly the staleness the derivation removes -- `wiredExchanges()` used to
@@ -43,9 +43,9 @@ import {
   type ExchangeResolver,
 } from "./exchange-dispatch";
 import {
-  GEMINI_METHOD_WEIGHTS,
-  METHOD_WEIGHTS,
-  type MethodWeights,
+  GEMINI_METHOD_COSTS,
+  METHOD_COSTS,
+  type MethodCosts,
 } from "../exchange/rate-limited";
 
 const NOW = () => 1_700_000_000_000;
@@ -100,8 +100,8 @@ describe("wiredness is derived from the two real blockers", () => {
     },
   );
 
-  it.each([...EXCHANGE_IDS])("%s: the cost-model check reads METHOD_WEIGHTS itself", (exchange) => {
-    expect(hasRateLimitCostModel(exchange)).toBe(METHOD_WEIGHTS[exchange] !== undefined);
+  it.each([...EXCHANGE_IDS])("%s: the cost-model check reads METHOD_COSTS itself", (exchange) => {
+    expect(hasRateLimitCostModel(exchange)).toBe(METHOD_COSTS[exchange] !== undefined);
   });
 
   it("covers every ExchangeId in both source tables, with no venue unanswered", () => {
@@ -109,11 +109,12 @@ describe("wiredness is derived from the two real blockers", () => {
     // cannot be missing a key, but this also catches a key added to the object
     // that is not an ExchangeId at all.
     expect(Object.keys(EXCHANGE_RESOLVERS).sort()).toEqual([...EXCHANGE_IDS].sort());
-    // METHOD_WEIGHTS is deliberately NOT asserted total here: it is missing its
-    // kraken row on purpose (entry 90 step (d)), which is the open `tsc` error
-    // at rate-limited.ts:196 and the reason Kraken is unwired. Asserting
-    // totality would duplicate rate-limited.test.ts's own failing assertion and
-    // add a second red test for one gap.
+    // METHOD_COSTS is now asserted total too. It could not be while Kraken's row
+    // was deliberately missing (entry 90 step (d)) -- asserting totality then
+    // would have duplicated rate-limited.test.ts's own failing assertion and
+    // added a second red test for one gap. The row landed with the rate-limiter
+    // session, so the assertion that was withheld can now be made.
+    expect(Object.keys(METHOD_COSTS).sort()).toEqual([...EXCHANGE_IDS].sort());
   });
 
   it("a venue is wired only if BOTH blockers are closed, never just one", () => {
@@ -137,7 +138,7 @@ const STUB_RESOLVER: ExchangeResolver = () => ({ ok: false, reason: "stub resolv
  * WHY THE TESTS BELOW USE THIS INSTEAD OF WHICHEVER VENUE HAPPENS TO BE UNWIRED.
  * Asserting against Kraken's real state would pin TODAY's answer, which is the
  * staleness this whole rewrite removes -- every such test would go red on the
- * day the rate-limiter session lands its `METHOD_WEIGHTS` row, and would have to
+ * day the rate-limiter session lands its `METHOD_COSTS` row, and would have to
  * be hand-edited to say the opposite. Constructing the state instead tests the
  * DERIVATION, which is what has to keep working. These stay green through that
  * transition.
@@ -152,24 +153,24 @@ function withWiringState(
   body: () => void,
 ): void {
   const resolvers = EXCHANGE_RESOLVERS as Record<string, ExchangeResolver | null>;
-  const weights = METHOD_WEIGHTS as Record<string, MethodWeights | undefined>;
+  const costs = METHOD_COSTS as Record<string, MethodCosts | undefined>;
   // `?? null` only covers an absent key, which cannot happen: EXCHANGE_RESOLVERS
   // is total over ExchangeId. It is here to satisfy the index-signature read,
   // not to paper over a real case.
   const savedResolver: ExchangeResolver | null = resolvers[exchange] ?? null;
-  const savedWeights = weights[exchange];
+  const savedCosts = costs[exchange];
   // `delete` vs assignment matters: the missing kraken row is an ABSENT KEY, not
   // a key holding undefined, and the restore has to reproduce whichever it was.
-  const hadWeightsKey = Object.prototype.hasOwnProperty.call(weights, exchange);
+  const hadCostsKey = Object.prototype.hasOwnProperty.call(costs, exchange);
   try {
     resolvers[exchange] = state.resolver ? (savedResolver ?? STUB_RESOLVER) : null;
-    if (state.costModel) weights[exchange] = savedWeights ?? GEMINI_METHOD_WEIGHTS;
-    else delete weights[exchange];
+    if (state.costModel) costs[exchange] = savedCosts ?? GEMINI_METHOD_COSTS;
+    else delete costs[exchange];
     body();
   } finally {
     resolvers[exchange] = savedResolver;
-    if (hadWeightsKey) weights[exchange] = savedWeights;
-    else delete weights[exchange];
+    if (hadCostsKey) costs[exchange] = savedCosts;
+    else delete costs[exchange];
   }
 }
 
@@ -225,11 +226,11 @@ describe("wiredness follows the code, with no manual flag to flip", () => {
     // that runs after one of these depends on it. Captured and compared rather
     // than asserted against known values, so this holds whatever state the
     // build is in, and so it also catches the subtle half: an ABSENT
-    // METHOD_WEIGHTS key must be restored as absent, not as a key holding
+    // METHOD_COSTS key must be restored as absent, not as a key holding
     // undefined. `hasOwnProperty` is what tells those two apart.
     const resolverBefore = hasCredentialsResolver(exchange);
     const costModelBefore = hasRateLimitCostModel(exchange);
-    const keyBefore = Object.prototype.hasOwnProperty.call(METHOD_WEIGHTS, exchange);
+    const keyBefore = Object.prototype.hasOwnProperty.call(METHOD_COSTS, exchange);
 
     withWiringState(exchange, { resolver: !resolverBefore, costModel: !costModelBefore }, () => {
       expect(hasCredentialsResolver(exchange)).toBe(!resolverBefore);
@@ -238,7 +239,7 @@ describe("wiredness follows the code, with no manual flag to flip", () => {
 
     expect(hasCredentialsResolver(exchange)).toBe(resolverBefore);
     expect(hasRateLimitCostModel(exchange)).toBe(costModelBefore);
-    expect(Object.prototype.hasOwnProperty.call(METHOD_WEIGHTS, exchange)).toBe(keyBefore);
+    expect(Object.prototype.hasOwnProperty.call(METHOD_COSTS, exchange)).toBe(keyBefore);
   });
 });
 
@@ -257,7 +258,7 @@ describe("describeUnwiredExchange names what is ACTUALLY missing", () => {
       const message = describeUnwiredExchange(SUBJECT);
       expect(message).toContain(SUBJECT);
       expect(message).toContain("rate-limit cost model");
-      expect(message).toContain("METHOD_WEIGHTS");
+      expect(message).toContain("METHOD_COSTS");
       expect(message).not.toContain("no credentials resolver");
     });
   });

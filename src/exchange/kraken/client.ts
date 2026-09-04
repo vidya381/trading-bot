@@ -50,9 +50,12 @@
  * ── WHAT THIS FILE DELIBERATELY DOES NOT DO ──
  *
  * RATE LIMITING. `KRAKEN_REQUEST_COSTS` below counts the requests these methods
- * send and is explicitly NOT Kraken's cost model; see its docblock. Entry 90
- * PROBLEM 2 and PART 6 step (d) make the real model its own build session, and
- * this file does not pre-empt it.
+ * send and is explicitly NOT Kraken's cost model; see its docblock. That model
+ * now exists -- `KRAKEN_METHOD_COSTS` in `exchange/rate-limited.ts`, built by
+ * entry 90 PART 6 step (d)'s own session -- and it is what the gate charges. The
+ * table below survives because a REQUEST COUNT and a COUNTER COST are different
+ * facts and this file's methods are documented by the first; anything deciding
+ * whether a call may be sent must read the second.
  *
  * RETRYING, and GATING, for the reasons both existing clients record: `withRetry`
  * takes an operation of exactly this shape and the call site composes it (never

@@ -24,9 +24,10 @@ import { GEMINI_RATE_LIMITS, GEMINI_REQUEST_COSTS } from "./gemini/client";
 import {
   BINANCE_METHOD_WEIGHTS,
   GEMINI_METHOD_WEIGHTS,
-  METHOD_WEIGHTS,
-  methodWeightsFor,
+  METHOD_COSTS,
+  methodCostsFor,
   withRateLimit,
+  type MethodCosts,
   type MethodWeights,
   type RateLimitedExchangeOptions,
   type RateLimiterPort,
@@ -53,8 +54,9 @@ class RecordingLimiter implements RateLimiterPort {
     if (scripted !== undefined) return scripted;
     return {
       granted: true,
-      weight: request.weight,
-      usedWeight: request.weight,
+      cost: request.cost,
+      usedWeight: request.cost.rest,
+      usedTrading: request.cost.trading?.count ?? null,
       remainingForPriority: 1000,
       at: NOW,
     };
@@ -117,7 +119,7 @@ describe("asking before calling", () => {
     await client.getAccountBalances();
     await client.cancelOrder(TEST_PAIR, "v1-bot-0");
 
-    expect(limiter.requests.map((request) => request.weight)).toEqual([
+    expect(limiter.requests.map((request) => request.cost.rest)).toEqual([
       BINANCE_METHOD_WEIGHTS.getServerTime,
       BINANCE_METHOD_WEIGHTS.getSymbolFilters,
       BINANCE_METHOD_WEIGHTS.listTradablePairs,
@@ -282,13 +284,13 @@ describe("charging the venue it is actually in front of", () => {
   it("charges GEMINI's weights for a Gemini-gated call, not Binance's", async () => {
     await callEachMethod(gated({ exchange: "gemini" }));
 
-    expect(limiter.requests.map((request) => request.weight)).toEqual(
+    expect(limiter.requests.map((request) => request.cost.rest)).toEqual(
       CALLED.map((method) => GEMINI_METHOD_WEIGHTS[method]),
     );
 
     // And say it the other way round too, so this cannot pass by the two tables
     // happening to agree: the weights actually sent are NOT Binance's.
-    expect(limiter.requests.map((request) => request.weight)).not.toEqual(
+    expect(limiter.requests.map((request) => request.cost.rest)).not.toEqual(
       CALLED.map((method) => BINANCE_METHOD_WEIGHTS[method]),
     );
   });
@@ -296,7 +298,7 @@ describe("charging the venue it is actually in front of", () => {
   it("still charges Binance's weights for a Binance-gated call", async () => {
     await callEachMethod(gated({ exchange: "binance" }));
 
-    expect(limiter.requests.map((request) => request.weight)).toEqual(
+    expect(limiter.requests.map((request) => request.cost.rest)).toEqual(
       CALLED.map((method) => BINANCE_METHOD_WEIGHTS[method]),
     );
   });
@@ -322,29 +324,44 @@ describe("charging the venue it is actually in front of", () => {
 
     expect(limiter.requests[0]).toMatchObject({
       priority: "risk-exit",
-      weight: GEMINI_METHOD_WEIGHTS.cancelOrder,
+      cost: { rest: GEMINI_METHOD_WEIGHTS.cancelOrder },
     });
   });
 
   it("declares a table for every known exchange", () => {
     // A `Record<ExchangeId, ...>`, so widening `ExchangeId` for Kraken breaks
     // the map rather than silently handing it another venue's numbers. This
-    // asserts the runtime half: no venue resolves to `undefined`.
+    // asserts the runtime half: no venue resolves to `undefined`. It was RED for
+    // five entries while Kraken's row was deliberately withheld; the
+    // rate-limiter session is what turned it green.
     for (const exchange of EXCHANGE_IDS) {
-      expect(methodWeightsFor(exchange)).toBe(METHOD_WEIGHTS[exchange]);
-      expect(methodWeightsFor(exchange)).toBeDefined();
+      expect(methodCostsFor(exchange)).toBe(METHOD_COSTS[exchange]);
+      expect(methodCostsFor(exchange)).toBeDefined();
     }
   });
 
-  it("gives every method in every table a weight the budget will accept", () => {
-    // `WeightBudget.check` throws on a non-positive weight. Gemini's
-    // `getServerTime` sends no request at all, so its true cost is zero and it
-    // has to be floored -- this is the assertion that keeps that floor honest
-    // for every table, not just the one that needed it.
+  it("gives every method in every table a cost the budget will accept", () => {
+    // A budget refuses a non-positive charge, so every method has to cost
+    // SOMETHING on at least one counter -- Gemini's `getServerTime` sends no
+    // request at all and is floored to one unit for exactly that reason.
+    //
+    // The check is now "positive on some counter" rather than "positive", which
+    // is the change Kraken forced: its `placeOrder` genuinely costs ZERO on the
+    // account counter, because Kraken's REST counter excludes AddOrder, and is
+    // measured entirely by its per-pair trading charge. Demanding a positive
+    // account cost would have meant inventing one.
     for (const exchange of EXCHANGE_IDS) {
-      for (const weight of Object.values(methodWeightsFor(exchange))) {
-        expect(weight).toBeGreaterThan(0);
-        expect(Number.isFinite(weight)).toBe(true);
+      for (const [method, cost] of Object.entries(methodCostsFor(exchange))) {
+        // Every table is priced with an age of `null` here -- the unknown-age
+        // case, which is the most expensive one any venue charges.
+        const charged = cost({ pair: TEST_PAIR, orderAgeMs: null });
+        const total = charged.rest + (charged.trading?.count ?? 0);
+        expect(
+          total,
+          `${exchange}.${method} costs nothing on any counter`,
+        ).toBeGreaterThan(0);
+        expect(Number.isFinite(charged.rest)).toBe(true);
+        expect(charged.rest).toBeGreaterThanOrEqual(0);
       }
     }
   });
@@ -413,7 +430,7 @@ describe("against the real RateLimiter", () => {
       await object.syncLimit(60, 60_000, NOW);
       // Routine traffic has already spent its whole ceiling (60 - 10 = 50).
       for (let i = 0; i < 50; i++) {
-        await object.acquire({ weight: 1, priority: "routine" });
+        await object.acquire({ exchange: "binance", cost: { rest: 1 }, priority: "routine" });
       }
     });
 
@@ -483,5 +500,236 @@ describe("against the real RateLimiter", () => {
       ok: false,
       kind: "rate_limited",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Kraken: two counters, and a price that depends on the order's age
+// ---------------------------------------------------------------------------
+
+/**
+ * What the gate charges on Kraken, and where the age comes from.
+ *
+ * The constants are pinned against Kraken's published tables in
+ * `kraken/rate-limits.test.ts`; these assert that the GATE reaches for the right
+ * ones and puts them in the right component of the cost vector.
+ */
+describe("the Kraken cost model, through the gate", () => {
+  it("charges an order to the matching engine only, and names the pair", async () => {
+    // Kraken's REST counter excludes AddOrder entirely, so `rest` is genuinely
+    // zero rather than floored -- the trading charge is what measures this call.
+    const client = gated({ exchange: "kraken" });
+    await client.placeOrder({
+      pair: TEST_PAIR,
+      side: "buy",
+      type: "limit",
+      price: fromDecimalString("100"),
+      quantity: fromDecimalString("1"),
+      clientOrderId: "bot-1toiyz-0001",
+    });
+
+    expect(limiter.requests[0]!.cost).toEqual({
+      rest: 0,
+      trading: { pair: TEST_PAIR, count: 1 },
+    });
+    expect(limiter.requests[0]!.exchange).toBe("kraken");
+  });
+
+  it("charges a cancel to BOTH counters: the engine, and its one status read", async () => {
+    // Entry 90 DECISION 2 makes the follow-up `ClosedOrders` read part of what
+    // `cancelOrder` does, so the gate prices both halves. The 4 is the account
+    // history rate -- the constant sitting on Kraken's own +2/+4 contradiction.
+    const client = gated({ exchange: "kraken" });
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+
+    expect(limiter.requests[0]!.cost).toEqual({
+      rest: 4,
+      trading: { pair: TEST_PAIR, count: 8 },
+    });
+  });
+
+  it("charges the status read for both endpoints it may call, not just the first", async () => {
+    // `OpenOrders` always, `ClosedOrders` only if the order has stopped resting.
+    // A gate prices a call before it is made and cannot know which branch runs --
+    // and the dearer branch is the one that runs when an order has just filled,
+    // which is when a strategy is most likely to be asking.
+    const client = gated({ exchange: "kraken" });
+    await client.getOrderStatus(TEST_PAIR, "bot-1toiyz-0001");
+
+    expect(limiter.requests[0]!.cost).toEqual({ rest: 5 });
+  });
+
+  it("prices the public market-data calls at the honest minimum", async () => {
+    const client = gated({ exchange: "kraken" });
+    await client.getCurrentPrice(TEST_PAIR);
+    await client.getCandles(TEST_PAIR, "1m");
+    await client.getOpenOrders(TEST_PAIR);
+    await client.getAccountBalances();
+
+    expect(limiter.requests.map((request) => request.cost.rest)).toEqual([1, 1, 1, 1]);
+    // None of them touches the matching engine.
+    expect(limiter.requests.every((request) => request.cost.trading === undefined)).toBe(true);
+  });
+});
+
+describe("the cancel price depends on the order's age, which is the whole reason costs are functions", () => {
+  /** A gate that knows when the order was placed, as a call site with D1 would. */
+  function withAge(placedAt: number | null) {
+    return gated({
+      exchange: "kraken",
+      orderPlacedAt: () => placedAt,
+    });
+  }
+
+  it.each([
+    ["3 seconds old (a ladder just laid)", NOW - 3_000, 8],
+    ["8 seconds old", NOW - 8_000, 6],
+    ["30 seconds old", NOW - 30_000, 4],
+    ["2 minutes old", NOW - 120_000, 1],
+    ["10 minutes old", NOW - 600_000, 0],
+  ])("charges a cancel on an order %s -> %d engine units", async (_label, placedAt, expected) => {
+    const client = withAge(placedAt);
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(expected);
+  });
+
+  it("charges the same method eight times as much on a young order as on an old one", async () => {
+    // THE PROPERTY `Record<keyof RestExchangeClient, number>` COULD NOT EXPRESS.
+    // Same method, same arguments, eight times the price.
+    const young = withAge(NOW - 3_000);
+    await young.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    const youngCost = limiter.requests[0]!.cost.trading!.count;
+
+    limiter.requests.length = 0;
+    const old = withAge(NOW - 200_000);
+    await old.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    const oldCost = limiter.requests[0]!.cost.trading!.count;
+
+    expect(youngCost).toBe(8);
+    expect(oldCost).toBe(1);
+    expect(youngCost).toBe(oldCost * 8);
+  });
+
+  it("charges the maximum when no resolver is wired at all", async () => {
+    // ⚠ THE FAIL-CLOSED DEFAULT. A call site that has not wired the lookup is
+    // throttled harder than it needs to be and is never under-charged, which is
+    // the only acceptable direction for a default on a risk control.
+    const client = gated({ exchange: "kraken" });
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(8);
+  });
+
+  it("charges the maximum when the resolver cannot find the order", async () => {
+    // The path most likely to lack a local record is reconciliation, which
+    // cancels orders this system has lost track of.
+    const client = withAge(null);
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(8);
+  });
+
+  it("charges the maximum when the resolver THROWS, rather than failing the cancel", async () => {
+    // A halt that could not cancel because its rate-limit gate could not read a
+    // timestamp would be a risk control defeated by its own accounting.
+    const client = gated({
+      exchange: "kraken",
+      orderPlacedAt: () => {
+        throw new Error("D1 unavailable");
+      },
+    });
+    const result = await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(8);
+    // And the cancel was SENT -- the gate granted and called through. Whether
+    // the fake exchange knows this order is beside the point; what matters is
+    // that a failed timestamp lookup did not become a rate-limit refusal.
+    expect(limiter.requests).toHaveLength(1);
+    expect(result.ok === false && result.kind).not.toBe("rate_limited");
+  });
+
+  it("accepts an async resolver, since a real call site reads D1", async () => {
+    const client = gated({
+      exchange: "kraken",
+      orderPlacedAt: async () => NOW - 30_000,
+    });
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    expect(limiter.requests[0]!.cost.trading!.count).toBe(4);
+  });
+
+  it("asks the resolver for the pair and id it is actually cancelling", async () => {
+    const asked: [string, string][] = [];
+    const client = gated({
+      exchange: "kraken",
+      orderPlacedAt: (pair, clientOrderId) => {
+        asked.push([pair, clientOrderId]);
+        return NOW - 30_000;
+      },
+    });
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+    expect(asked).toEqual([[TEST_PAIR, "bot-1toiyz-0001"]]);
+  });
+
+  it("does not consult the resolver for any method but cancelOrder", async () => {
+    let calls = 0;
+    const client = gated({
+      exchange: "kraken",
+      orderPlacedAt: () => {
+        calls += 1;
+        return NOW;
+      },
+    });
+    await client.getCurrentPrice(TEST_PAIR);
+    await client.getOrderStatus(TEST_PAIR, "bot-1toiyz-0001");
+    await client.placeOrder({
+      pair: TEST_PAIR,
+      side: "buy",
+      type: "limit",
+      price: fromDecimalString("100"),
+      quantity: fromDecimalString("1"),
+      clientOrderId: "bot-1toiyz-0001",
+    });
+    expect(calls).toBe(0);
+  });
+
+  it("carries the resolver across withPriority, so the halt path is not the one that loses it", async () => {
+    // A risk-exit view that dropped the resolver would silently start charging
+    // every cancel the unknown-age maximum -- safe, but throttling hardest of
+    // all on exactly the path that can least afford it.
+    const client = gated({ exchange: "kraken", orderPlacedAt: () => NOW - 200_000 });
+    await client.withPriority("risk-exit").cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+
+    expect(limiter.requests[0]).toMatchObject({
+      priority: "risk-exit",
+      cost: { rest: 4, trading: { pair: TEST_PAIR, count: 1 } },
+    });
+  });
+
+  it("prices the cancel ONCE, so an order cannot get cheaper while it waits in the queue", async () => {
+    // Recomputing per attempt would let a caller be granted a charge smaller than
+    // the one it queued for, and everything behind it would have been ordered
+    // against a claim that no longer existed.
+    let clock = NOW;
+    const client = withRateLimit(exchange, limiter, {
+      exchange: "kraken",
+      now: () => clock,
+      sleep: async (ms) => {
+        slept.push(ms);
+        clock += ms;
+      },
+      orderPlacedAt: () => NOW - 4_000,
+    });
+
+    limiter.script = [
+      denial({ reason: "budget_exhausted", ticketId: "t1", retryAfterMs: 20_000 }),
+      denial({ reason: "budget_exhausted", ticketId: "t1", retryAfterMs: 20_000 }),
+    ];
+    await client.cancelOrder(TEST_PAIR, "bot-1toiyz-0001");
+
+    // Three attempts, ONE price. The order was 4 seconds old at the first
+    // attempt and 44 seconds old by the third -- two rungs cheaper on the ladder
+    // (8 -> 4) had the gate re-priced it. It did not.
+    expect(slept).toEqual([20_000, 20_000]);
+    expect(clock - NOW).toBe(40_000);
+    expect(limiter.requests).toHaveLength(3);
+    expect(limiter.requests.map((request) => request.cost.trading!.count)).toEqual([8, 8, 8]);
   });
 });

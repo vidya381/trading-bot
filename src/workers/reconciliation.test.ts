@@ -52,8 +52,9 @@ class SpyLimiter implements RateLimiterPort {
     }
     return {
       granted: true,
-      weight: request.weight,
-      usedWeight: request.weight,
+      cost: request.cost,
+      usedWeight: request.cost.rest,
+      usedTrading: request.cost.trading?.count ?? null,
       remainingForPriority: 1000,
       at: T0,
     };
@@ -114,7 +115,7 @@ describe("the reconciliation pass is routed through section 5.4", () => {
     // everything in /src/reconciliation would still behave identically -- which
     // is exactly why this assertion lives here.
     expect(limiter.requests).not.toHaveLength(0);
-    expect(limiter.requests.some((request) => request.weight === BINANCE_METHOD_WEIGHTS.getAccountBalances)).toBe(
+    expect(limiter.requests.some((request) => request.cost.rest === BINANCE_METHOD_WEIGHTS.getAccountBalances)).toBe(
       true,
     );
   });
@@ -184,7 +185,7 @@ describe("what the pass actually costs", () => {
     // reconciliation being routine rather than reserved, and an accidental
     // extra call per pass would quietly invalidate it.
     await runScheduledReconciliation(env, options());
-    const total = limiter.requests.reduce((sum, request) => sum + request.weight, 0);
+    const total = limiter.requests.reduce((sum, request) => sum + request.cost.rest, 0);
     expect(total).toBe(BINANCE_METHOD_WEIGHTS.getAccountBalances);
   });
 });
@@ -267,7 +268,7 @@ describe("each account is reconciled against the exchange it is registered on", 
     expect(result.ran).toBe(true);
 
     const weightsFor = (accountLabel: string): number[] =>
-      (limiters.get(accountLabel)?.requests ?? []).map((request) => request.weight);
+      (limiters.get(accountLabel)?.requests ?? []).map((request) => request.cost.rest);
 
     // One balance read per account (pinned by the budget test above), each
     // priced by the venue that account is registered on.

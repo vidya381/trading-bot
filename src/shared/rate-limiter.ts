@@ -90,6 +90,32 @@ export interface WeightBudgetSnapshot {
 }
 
 /**
+ * What the `RateLimiter` Durable Object needs from a budget, whichever shape it is.
+ *
+ * Introduced when Kraken's decaying counters arrived beside Binance's sliding
+ * window. The Durable Object's grant logic -- ceiling, claims ahead, consume,
+ * how long to wait -- is identical for both and should stay written once; the
+ * ONLY thing that differs is how a charge stops counting over time.
+ *
+ * Deliberately structural rather than an inheritance hierarchy: `WeightBudget`
+ * and `DecayingCounter` share no implementation, only an obligation, and a base
+ * class would have nothing to put in it but the reserve arithmetic.
+ */
+export interface Budget {
+  readonly limit: number;
+  readonly reserveForRiskExit: number;
+  readonly horizonMs: number;
+  ceilingFor(priority: RequestPriority): number;
+  usedWeight(now: Timestamp): number;
+  remainingFor(priority: RequestPriority, now: Timestamp): number;
+  check(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision;
+  consume(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision;
+  syncFromExchange(value: number, at: Timestamp): void;
+  reset(): void;
+  waitFor(weight: number, priority: RequestPriority, now: Timestamp): number;
+}
+
+/**
  * A rolling request-weight budget.
  *
  * Sliding rather than fixed-window: entries are held with their timestamps and
@@ -97,7 +123,7 @@ export interface WeightBudgetSnapshot {
  * traffic on either side of a boundary, i.e. double the intended rate across
  * the boundary, which is what gets an account rate-limited.
  */
-export class WeightBudget {
+export class WeightBudget implements Budget {
   readonly #limit: number;
   readonly #windowMs: number;
   readonly #reserve: number;
@@ -141,6 +167,19 @@ export class WeightBudget {
 
   get reserveForRiskExit(): number {
     return this.#reserve;
+  }
+
+  /**
+   * How long until waiting stops being worth it.
+   *
+   * On a sliding window that is the window itself: everything inside one has
+   * aged out after one. Named separately from `windowMs` so that callers which
+   * only need "how long is the longest honest wait" -- the Durable Object's
+   * ticket TTL, the gate's maximum wait -- can ask both budget shapes the same
+   * question. `DecayingCounter` answers it with a drain time instead.
+   */
+  get horizonMs(): number {
+    return this.#windowMs;
   }
 
   /** The ceiling a given priority may consume up to. */
@@ -316,6 +355,281 @@ export class WeightBudget {
       }
     }
     return this.#windowMs;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The second budget shape: a counter that decays continuously
+// ---------------------------------------------------------------------------
+
+export interface DecayingCounterOptions {
+  /** The value at or above which the venue starts refusing. */
+  limit: number;
+  /** How much the counter sheds per second. Kraken publishes this per tier. */
+  decayPerSecond: number;
+  /** Held back for risk-exit traffic, exactly as `WeightBudget` holds it back. */
+  reserveForRiskExit: number;
+}
+
+/**
+ * A decaying counter's whole mutable state, for persisting and restoring it.
+ *
+ * Two numbers and an optional report, against `WeightBudgetSnapshot`'s unbounded
+ * list of entries. That is not an incidental saving: a sliding window has to
+ * remember every request that is still inside it, and a decaying counter has to
+ * remember only where the counter was and when. The Durable Object persists this
+ * on every grant, so the difference is a storage write of constant size instead
+ * of one that grows with traffic.
+ */
+export interface DecayingCounterSnapshot {
+  readonly value: number;
+  readonly at: Timestamp;
+  readonly exchangeReported: { value: number; at: Timestamp } | null;
+}
+
+/**
+ * A counter that rises on each charge and falls continuously with time.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS EXISTS RATHER THAN A `WeightBudget` WITH DIFFERENT CONSTANTS
+ * ---------------------------------------------------------------------------
+ * Decision-log 90 PROBLEM 2 (a). Kraken's counters fall CONTINUOUSLY; a
+ * `WeightBudget` holds each entry at full cost for a whole window and then drops
+ * it all at once. Those are not the same rule with different numbers, and the
+ * sliding window is not the conservative side of the difference in the way one
+ * might assume:
+ *
+ *   - It UNDER-PERMITS in the middle of a window. Kraken has already shed part
+ *     of a charge three seconds after it was made; the window still holds every
+ *     unit of it for the full sixty.
+ *   - Its `retryAfterMs` is arithmetic about something the venue is not doing.
+ *     "When does the oldest entry leave the window" has no counterpart at a
+ *     venue where nothing ever leaves and everything shrinks. A caller told to
+ *     sleep on that figure sleeps for the wrong reason and usually too long.
+ *
+ * Here the wait is closed-form and exact, because the venue's own rule is:
+ *
+ *     wait = (used + wanted - ceiling) / decayPerSecond
+ *
+ * ---------------------------------------------------------------------------
+ * WHY NO WINDOW GUARDS THE EXCHANGE-REPORTED FIGURE
+ * ---------------------------------------------------------------------------
+ * `WeightBudget.usedWeight` ignores a reported figure older than one window,
+ * because a sliding window has no way to age one gradually. A decay does: a
+ * stale report simply decays to zero on its own, at the same rate the venue
+ * would have decayed it. So the report is decayed from the instant it was
+ * observed and then compared, and there is no cutoff to choose or to get wrong.
+ *
+ * As on `WeightBudget`, a report only ever RAISES the local figure. A low
+ * reading arriving late must never re-open a counter that has been spent.
+ */
+export class DecayingCounter implements Budget {
+  readonly #limit: number;
+  readonly #decayPerSecond: number;
+  readonly #reserve: number;
+  /** The counter's value as of `#at`. Not the value now; see `usedWeight`. */
+  #value = 0;
+  #at = 0;
+  #exchangeReported: { value: number; at: Timestamp } | null = null;
+
+  constructor(options: DecayingCounterOptions) {
+    const { limit, decayPerSecond, reserveForRiskExit } = options;
+
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new RateLimiterError(`limit must be positive, got ${limit}`);
+    }
+    if (!Number.isFinite(decayPerSecond) || decayPerSecond <= 0) {
+      // A counter that never decays is one that permanently fills, and every
+      // `waitFor` on it would divide by zero and answer `Infinity`.
+      throw new RateLimiterError(
+        `decayPerSecond must be positive, got ${decayPerSecond}`,
+      );
+    }
+    if (!Number.isFinite(reserveForRiskExit) || reserveForRiskExit < 0) {
+      throw new RateLimiterError(
+        `reserveForRiskExit must be non-negative, got ${reserveForRiskExit}`,
+      );
+    }
+    if (reserveForRiskExit >= limit) {
+      throw new RateLimiterError(
+        `reserveForRiskExit (${reserveForRiskExit}) must be below limit (${limit}), ` +
+          `otherwise routine traffic could never proceed`,
+      );
+    }
+
+    this.#limit = limit;
+    this.#decayPerSecond = decayPerSecond;
+    this.#reserve = reserveForRiskExit;
+  }
+
+  get limit(): number {
+    return this.#limit;
+  }
+
+  get decayPerSecond(): number {
+    return this.#decayPerSecond;
+  }
+
+  get reserveForRiskExit(): number {
+    return this.#reserve;
+  }
+
+  /**
+   * How long a counter sitting at the limit takes to drain to zero.
+   *
+   * The decaying counterpart of `WeightBudget.windowMs`, and it is what the
+   * Durable Object's ticket TTL and the gate's maximum wait are derived from.
+   * Both of those need one honest answer to "after how long is waiting
+   * pointless", and on a sliding window that is the window; here it is this.
+   */
+  get horizonMs(): number {
+    return Math.ceil((this.#limit / this.#decayPerSecond) * 1000);
+  }
+
+  /** The ceiling a given priority may consume up to. */
+  ceilingFor(priority: RequestPriority): number {
+    return priority === "risk-exit" ? this.#limit : this.#limit - this.#reserve;
+  }
+
+  /** The counter's value as of `now`, after decay. Never negative. */
+  usedWeight(now: Timestamp): number {
+    const local = this.#decayed(this.#value, this.#at, now);
+    const reported = this.#exchangeReported;
+    if (reported === null) return local;
+    return Math.max(local, this.#decayed(reported.value, reported.at, now));
+  }
+
+  /** Counter headroom still available to the given priority. Never negative. */
+  remainingFor(priority: RequestPriority, now: Timestamp): number {
+    return Math.max(0, this.ceilingFor(priority) - this.usedWeight(now));
+  }
+
+  /**
+   * Ask whether a charge may proceed, without applying it.
+   *
+   * Same decision type as `WeightBudget.check`, so the Durable Object's grant
+   * logic reads identically whichever budget shape is underneath it.
+   */
+  check(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision {
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new RateLimiterError(`weight must be positive, got ${weight}`);
+    }
+
+    const used = this.usedWeight(now);
+    const ceiling = this.ceilingFor(priority);
+    const remaining = Math.max(0, ceiling - used);
+
+    if (weight > ceiling) {
+      return {
+        allowed: false,
+        reason: "weight_exceeds_limit",
+        retryAfterMs: 0,
+        remainingForPriority: remaining,
+        usedWeight: used,
+      };
+    }
+
+    if (weight > remaining) {
+      return {
+        allowed: false,
+        reason: "budget_exhausted",
+        retryAfterMs: this.#waitFor(used + weight - ceiling),
+        remainingForPriority: remaining,
+        usedWeight: used,
+      };
+    }
+
+    return { allowed: true, remainingForPriority: remaining - weight, usedWeight: used };
+  }
+
+  /**
+   * Apply a charge if there is room for it.
+   *
+   * The charge is applied to the DECAYED value, and `#at` moves to `now`, so the
+   * counter carries forward exactly what the venue's own counter would carry.
+   * This is also where an exchange-reported figure is absorbed: once it has been
+   * taken as the truth it becomes the local value, and cannot later be undone by
+   * the report expiring.
+   */
+  consume(weight: number, priority: RequestPriority, now: Timestamp): RateLimitDecision {
+    const decision = this.check(weight, priority, now);
+    if (decision.allowed) {
+      this.#value = this.usedWeight(now) + weight;
+      this.#at = now;
+    }
+    return decision;
+  }
+
+  /**
+   * The venue's own view of this counter.
+   *
+   * On Kraken this is the WebSocket `ratecount` field -- see the module note in
+   * `exchange/kraken/rate-limits.ts`. NOT wired to a live subscription in this
+   * session by decision; this is the seam it will arrive through.
+   */
+  syncFromExchange(value: number, at: Timestamp): void {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new RateLimiterError(`reported counter must be non-negative, got ${value}`);
+    }
+    const current = this.#exchangeReported;
+    if (current === null || at >= current.at) {
+      this.#exchangeReported = { value, at };
+    }
+  }
+
+  /** Drop everything. For a hard reset after a ban. */
+  reset(): void {
+    this.#value = 0;
+    this.#at = 0;
+    this.#exchangeReported = null;
+  }
+
+  snapshot(): DecayingCounterSnapshot {
+    return {
+      value: this.#value,
+      at: this.#at,
+      exchangeReported:
+        this.#exchangeReported === null ? null : { ...this.#exchangeReported },
+    };
+  }
+
+  restore(snapshot: DecayingCounterSnapshot): void {
+    this.#value = snapshot.value;
+    this.#at = snapshot.at;
+    this.#exchangeReported =
+      snapshot.exchangeReported === null ? null : { ...snapshot.exchangeReported };
+  }
+
+  /**
+   * How long until `weight` would fit under this priority's ceiling.
+   *
+   * Public for the same reason `WeightBudget.waitFor` is: the Durable Object has
+   * to answer for a queued request whose true requirement is its own charge PLUS
+   * everything claimed ahead of it.
+   */
+  waitFor(weight: number, priority: RequestPriority, now: Timestamp): number {
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new RateLimiterError(`weight must be positive, got ${weight}`);
+    }
+    const ceiling = this.ceilingFor(priority);
+    // Asking for more than the ceiling can never be satisfied; answer with the
+    // wait for the whole ceiling to free, which is the longest honest answer.
+    const wanted = Math.min(weight, ceiling);
+    return this.#waitFor(this.usedWeight(now) + wanted - ceiling);
+  }
+
+  /** Elapsed decay, clamped at zero in both directions. */
+  #decayed(value: number, from: Timestamp, now: Timestamp): number {
+    // A clock that has gone backwards decays nothing rather than accruing
+    // negative time. The failure direction is "holds the charge longer".
+    const elapsedMs = Math.max(0, now - from);
+    return Math.max(0, value - (this.#decayPerSecond * elapsedMs) / 1000);
+  }
+
+  /** Milliseconds for `shortfall` units to decay away. Zero when none is owed. */
+  #waitFor(shortfall: number): number {
+    if (shortfall <= 0) return 0;
+    return Math.ceil((shortfall / this.#decayPerSecond) * 1000);
   }
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DecayingCounter,
   prioritize,
   RateLimiterError,
   WeightBudget,
@@ -355,5 +356,280 @@ describe("waitFor", () => {
 
   it("rejects a non-positive weight", () => {
     expect(() => budget().waitFor(0, "routine", AT)).toThrow(RateLimiterError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DecayingCounter -- the second budget shape (decision-log 90 PROBLEM 2 (a))
+// ---------------------------------------------------------------------------
+
+/**
+ * Kraken's real published numbers are used throughout, not round ones.
+ *
+ * A fractional decay is not an incidental detail of Kraken's model, it IS the
+ * model -- 0.33/sec on Starter's REST counter and 2.34/sec on Intermediate's
+ * trading counter -- and a test suite built on a tidy 1.0 would not have
+ * exercised the arithmetic that actually runs. Several assertions below are
+ * Kraken's own worked examples, which is the closest thing to real data
+ * available for a mechanism that reports nothing over the wire.
+ */
+function counter(overrides: Partial<ConstructorParameters<typeof DecayingCounter>[0]> = {}) {
+  return new DecayingCounter({
+    limit: 60,
+    decayPerSecond: 1,
+    reserveForRiskExit: 10,
+    ...overrides,
+  });
+}
+
+describe("DecayingCounter construction", () => {
+  it("exposes its configuration", () => {
+    const c = counter();
+    expect(c.limit).toBe(60);
+    expect(c.decayPerSecond).toBe(1);
+    expect(c.reserveForRiskExit).toBe(10);
+  });
+
+  it.each([
+    ["a zero limit", { limit: 0 }],
+    ["a negative limit", { limit: -1 }],
+    ["a zero decay", { decayPerSecond: 0 }],
+    ["a negative decay", { decayPerSecond: -1 }],
+    ["a negative reserve", { reserveForRiskExit: -1 }],
+    ["a reserve equal to the limit", { reserveForRiskExit: 60 }],
+    ["a reserve above the limit", { reserveForRiskExit: 100 }],
+  ])("rejects %s", (_label, overrides) => {
+    expect(() => counter(overrides)).toThrow(RateLimiterError);
+  });
+
+  it("rejects a zero decay specifically, because it makes every wait infinite", () => {
+    // Not a tidy validation: `waitFor` divides by this. A counter that never
+    // decays fills permanently and would answer `Infinity` to "come back when?".
+    expect(() => counter({ decayPerSecond: 0 })).toThrow(/decayPerSecond must be positive/);
+  });
+
+  it("reports a horizon of the time a full counter takes to drain", () => {
+    // The decaying counterpart of `windowMs`, and what the Durable Object's
+    // ticket TTL and the gate's maximum wait are derived from.
+    expect(counter({ limit: 60, decayPerSecond: 1 }).horizonMs).toBe(60_000);
+    // Kraken Starter's REST counter: 15 units at 0.33/sec is a little over 45s.
+    expect(counter({ limit: 15, decayPerSecond: 0.33, reserveForRiskExit: 2 }).horizonMs).toBe(
+      45_455,
+    );
+  });
+});
+
+describe("DecayingCounter decays continuously rather than expiring in a block", () => {
+  it("sheds the decay rate every second, and partial seconds pro rata", () => {
+    const c = counter();
+    c.consume(30, "routine", AT);
+
+    expect(c.usedWeight(AT)).toBe(30);
+    // THE DIFFERENCE FROM A SLIDING WINDOW, stated as an assertion: a window
+    // would still be holding all 30 at every timestamp below, and would then
+    // drop the lot at once. This is what makes a window's `retryAfterMs` describe
+    // something the venue is not doing.
+    expect(c.usedWeight(AT + 1_000)).toBe(29);
+    expect(c.usedWeight(AT + 5_500)).toBe(24.5);
+    expect(c.usedWeight(AT + 30_000)).toBe(0);
+  });
+
+  it("never decays below zero, however long it has been idle", () => {
+    const c = counter();
+    c.consume(5, "routine", AT);
+    expect(c.usedWeight(AT + 3_600_000)).toBe(0);
+  });
+
+  it("reproduces Kraken's own worked example: 50 orders, intermediate tier, 10 seconds", () => {
+    // docs.kraken.com/api/docs/guides/spot-ratelimits, verbatim:
+    //   "rate counter = (50 orders * add order) - (10 seconds * intermediate
+    //    decay rate) = (50 * 1) - (10 * 2.34) = 26.6"
+    const c = new DecayingCounter({
+      limit: 125,
+      decayPerSecond: 2.34,
+      reserveForRiskExit: 20,
+    });
+    for (let i = 0; i < 50; i++) c.consume(1, "risk-exit", AT);
+
+    expect(c.usedWeight(AT)).toBe(50);
+    expect(c.usedWeight(AT + 10_000)).toBeCloseTo(26.6, 10);
+  });
+
+  it("reproduces Kraken's worked example for clearing a full pro counter: 48 seconds", () => {
+    // support 360045239571: "180 points / 3.75 points per second = 48 seconds".
+    const c = new DecayingCounter({
+      limit: 180,
+      decayPerSecond: 3.75,
+      reserveForRiskExit: 30,
+    });
+    for (let i = 0; i < 20; i++) c.consume(9, "risk-exit", AT);
+    expect(c.usedWeight(AT)).toBe(180);
+
+    expect(c.usedWeight(AT + 47_000)).toBeGreaterThan(0);
+    expect(c.usedWeight(AT + 48_000)).toBe(0);
+  });
+
+  it("carries the decayed value forward when it is charged again, not the raw one", () => {
+    const c = counter();
+    c.consume(40, "routine", AT);
+    // 10 seconds later 30 remain; adding 10 gives 40, not 50.
+    c.consume(10, "routine", AT + 10_000);
+    expect(c.usedWeight(AT + 10_000)).toBe(40);
+  });
+
+  it("does not accrue negative time when the clock goes backwards", () => {
+    // Reading a backwards clock as decay would shed budget that was never spent.
+    const c = counter();
+    c.consume(20, "routine", AT);
+    expect(c.usedWeight(AT - 30_000)).toBe(20);
+  });
+});
+
+describe("DecayingCounter reserves and refusals", () => {
+  it("holds the reserve back from routine traffic and grants it to risk-exit", () => {
+    const c = counter();
+    expect(c.ceilingFor("routine")).toBe(50);
+    expect(c.ceilingFor("risk-exit")).toBe(60);
+
+    for (let i = 0; i < 50; i++) expect(c.consume(1, "routine", AT).allowed).toBe(true);
+
+    expect(c.check(1, "routine", AT).allowed).toBe(false);
+    // The reserve is exactly what a halt needs and routine traffic cannot touch.
+    expect(c.check(10, "risk-exit", AT).allowed).toBe(true);
+  });
+
+  it("refuses a charge larger than the whole ceiling as unsatisfiable, not as busy", () => {
+    const c = counter();
+    const decision = c.check(61, "risk-exit", AT);
+    expect(decision).toMatchObject({ allowed: false, reason: "weight_exceeds_limit" });
+    // No wait is offered, because no wait helps.
+    expect(decision.allowed === false && decision.retryAfterMs).toBe(0);
+  });
+
+  it("rejects a non-positive charge rather than silently accepting it", () => {
+    const c = counter();
+    expect(() => c.check(0, "routine", AT)).toThrow(RateLimiterError);
+    expect(() => c.check(-1, "routine", AT)).toThrow(RateLimiterError);
+  });
+
+  it("records nothing when it refuses", () => {
+    const c = counter();
+    c.consume(50, "routine", AT);
+    expect(c.consume(5, "routine", AT).allowed).toBe(false);
+    expect(c.usedWeight(AT)).toBe(50);
+  });
+});
+
+describe("DecayingCounter answers 'come back when' in closed form", () => {
+  it("computes the wait from the shortfall and the decay rate, exactly", () => {
+    const c = counter();
+    for (let i = 0; i < 50; i++) c.consume(1, "routine", AT);
+
+    // Routine ceiling 50, all spent. One more unit needs one unit to decay, and
+    // the decay is 1/sec.
+    expect(c.waitFor(1, "routine", AT)).toBe(1_000);
+    expect(c.waitFor(10, "routine", AT)).toBe(10_000);
+    // THE PROPERTY A SLIDING WINDOW CANNOT HAVE: waiting the quoted time really
+    // does make room, because the quote describes the venue's own arithmetic.
+    expect(c.check(10, "routine", AT + c.waitFor(10, "routine", AT)).allowed).toBe(true);
+  });
+
+  it("rounds the wait up, so the caller never returns one millisecond early", () => {
+    const c = new DecayingCounter({ limit: 15, decayPerSecond: 0.33, reserveForRiskExit: 2 });
+    c.consume(13, "routine", AT);
+    // Routine ceiling is 13, fully spent; one unit at 0.33/sec is 3030.30...ms.
+    const wait = c.waitFor(1, "routine", AT);
+    expect(wait).toBe(3_031);
+    expect(c.check(1, "routine", AT + wait).allowed).toBe(true);
+    expect(c.check(1, "routine", AT + wait - 2).allowed).toBe(false);
+  });
+
+  it("answers zero when the charge already fits", () => {
+    expect(counter().waitFor(5, "routine", AT)).toBe(0);
+  });
+
+  it("quotes the wait for the whole ceiling when asked for more than it", () => {
+    // The longest honest answer, rather than a misleadingly short one.
+    const c = counter();
+    c.consume(60, "risk-exit", AT);
+    expect(c.waitFor(1_000, "risk-exit", AT)).toBe(60_000);
+  });
+});
+
+describe("DecayingCounter and the venue's own view", () => {
+  it("raises the local figure but never lowers it", () => {
+    const c = counter();
+    c.consume(10, "routine", AT);
+
+    // The venue knows about traffic this object never granted -- another client
+    // on the same key, or a charge this system misjudged.
+    c.syncFromExchange(40, AT);
+    expect(c.usedWeight(AT)).toBe(40);
+
+    // A NEWER, LOWER report replaces the older one, but the counter still cannot
+    // fall below what local accounting knows was really spent. At AT + 1s that
+    // is 10 units minus one second of decay, and the report's 5 is disregarded
+    // for being under it -- exactly the same rule `WeightBudget` follows.
+    c.syncFromExchange(5, AT + 1_000);
+    expect(c.usedWeight(AT + 1_000)).toBe(9);
+
+    // And an OLDER report than the one already held is dropped, so a message
+    // arriving out of order cannot resurrect a superseded figure.
+    c.syncFromExchange(55, AT - 5_000);
+    expect(c.usedWeight(AT + 1_000)).toBe(9);
+  });
+
+  it("decays a reported figure at the same rate, so it needs no expiry rule", () => {
+    // `WeightBudget` has to ignore a report older than one window, because a
+    // window cannot age one gradually. A decay can, and does.
+    const c = counter();
+    c.syncFromExchange(40, AT);
+    expect(c.usedWeight(AT + 10_000)).toBe(30);
+    expect(c.usedWeight(AT + 40_000)).toBe(0);
+  });
+
+  it("absorbs the reported figure once it is charged against, so it cannot be undone", () => {
+    const c = counter();
+    c.syncFromExchange(40, AT);
+    c.consume(5, "risk-exit", AT);
+    expect(c.usedWeight(AT)).toBe(45);
+  });
+
+  it("rejects a negative report", () => {
+    expect(() => counter().syncFromExchange(-1, AT)).toThrow(RateLimiterError);
+  });
+});
+
+describe("DecayingCounter survives eviction", () => {
+  it("round-trips its whole state through a snapshot", () => {
+    const c = counter();
+    c.consume(30, "routine", AT);
+    c.syncFromExchange(35, AT);
+
+    const restored = counter();
+    restored.restore(c.snapshot());
+
+    expect(restored.usedWeight(AT)).toBe(35);
+    expect(restored.usedWeight(AT + 10_000)).toBe(25);
+  });
+
+  it("takes a snapshot of two numbers, not a list that grows with traffic", () => {
+    // The practical reason this shape matters: the Durable Object persists on
+    // every grant, and a sliding window's snapshot grows with the traffic inside
+    // it while this one does not.
+    const c = counter();
+    for (let i = 0; i < 40; i++) c.consume(1, "routine", AT + i);
+
+    const snapshot = c.snapshot();
+    expect(Object.keys(snapshot).sort()).toEqual(["at", "exchangeReported", "value"]);
+    expect(typeof snapshot.value).toBe("number");
+  });
+
+  it("resets to empty", () => {
+    const c = counter();
+    c.consume(30, "routine", AT);
+    c.syncFromExchange(50, AT);
+    c.reset();
+    expect(c.usedWeight(AT)).toBe(0);
   });
 });

@@ -1615,8 +1615,9 @@ class SpyLimiter implements RateLimiterPort {
     }
     return {
       granted: true,
-      weight: request.weight,
-      usedWeight: request.weight,
+      cost: request.cost,
+      usedWeight: request.cost.rest,
+      usedTrading: request.cost.trading?.count ?? null,
       remainingForPriority: 1000,
       at: clock,
     };
@@ -1686,7 +1687,7 @@ describe("wired to the account's limiter (section 5.4)", () => {
     await runSpied((bot) => bot.start(ACTOR));
     await runSpied((bot) => bot.onPriceUpdate(priceAt("100")));
 
-    expect(spy.requests.map((request) => [request.priority, request.weight])).toEqual([
+    expect(spy.requests.map((request) => [request.priority, request.cost.rest])).toEqual([
       // The filter read and the order itself are both entry work, so both are
       // routine and may only draw on `limit - reserveForRiskExit`.
       ["routine", BINANCE_METHOD_WEIGHTS.getSymbolFilters],
@@ -1712,7 +1713,7 @@ describe("wired to the account's limiter (section 5.4)", () => {
 
     // The same two calls the Binance test above makes -- a filter read then the
     // order -- priced by the venue this bot actually trades on.
-    expect(spy.requests.map((request) => [request.priority, request.weight])).toEqual([
+    expect(spy.requests.map((request) => [request.priority, request.cost.rest])).toEqual([
       ["routine", GEMINI_METHOD_WEIGHTS.getSymbolFilters],
       ["routine", GEMINI_METHOD_WEIGHTS.placeOrder],
     ]);
@@ -1721,7 +1722,7 @@ describe("wired to the account's limiter (section 5.4)", () => {
     // against the old code: those are NOT Binance's weights. `getSymbolFilters`
     // is the one that moves furthest -- 20 on Binance's `exchangeInfo`, 10 for
     // one public request on Gemini.
-    expect(spy.requests.map((request) => request.weight)).not.toEqual([
+    expect(spy.requests.map((request) => request.cost.rest)).not.toEqual([
       BINANCE_METHOD_WEIGHTS.getSymbolFilters,
       BINANCE_METHOD_WEIGHTS.placeOrder,
     ]);
@@ -1744,7 +1745,7 @@ describe("wired to the account's limiter (section 5.4)", () => {
     expect(spy.requests).not.toHaveLength(0);
     expect(spy.requests.every((request) => request.priority === "risk-exit")).toBe(true);
     expect(
-      spy.requests.every((request) => request.weight === GEMINI_METHOD_WEIGHTS.cancelOrder),
+      spy.requests.every((request) => request.cost.rest === GEMINI_METHOD_WEIGHTS.cancelOrder),
     ).toBe(true);
     expect(GEMINI_METHOD_WEIGHTS.cancelOrder).not.toBe(BINANCE_METHOD_WEIGHTS.cancelOrder);
   });
@@ -1762,7 +1763,7 @@ describe("wired to the account's limiter (section 5.4)", () => {
     // out on the reserved slice -- which is the whole point of the reserve.
     expect(spy.requests).not.toHaveLength(0);
     expect(spy.requests.every((request) => request.priority === "risk-exit")).toBe(true);
-    expect(spy.requests.every((request) => request.weight === BINANCE_METHOD_WEIGHTS.cancelOrder)).toBe(
+    expect(spy.requests.every((request) => request.cost.rest === BINANCE_METHOD_WEIGHTS.cancelOrder)).toBe(
       true,
     );
   });
@@ -1789,7 +1790,7 @@ describe("a refused budget (section 5.4) is not a halt", () => {
 
   /** Refuse only the order itself, letting the filter read through. */
   const refusePlacement = (request: AcquireRequest): boolean =>
-    request.weight === BINANCE_METHOD_WEIGHTS.placeOrder;
+    request.cost.rest === BINANCE_METHOD_WEIGHTS.placeOrder;
 
   it("skips the entry, records why, and leaves the bot running", async () => {
     await runSpied((bot) => bot.create(creation()));

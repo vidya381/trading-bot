@@ -3,7 +3,7 @@ import { isUsable } from "../../shared/downtime";
 import type { OrderRequest } from "../../shared/exchange-client";
 import { fromDecimalString as m, ZERO } from "../../shared/money";
 import { fakeKrakenCredentialProvider } from "../credentials";
-import { METHOD_WEIGHTS } from "../rate-limited";
+import { METHOD_COSTS } from "../rate-limited";
 import { KrakenCatalogueCache } from "./catalogue";
 import {
   KrakenClient,
@@ -1390,14 +1390,14 @@ describe("KRAKEN_REQUEST_COSTS", () => {
     });
   });
 
-  it("is NOT wired into the gate, and Kraken is deliberately absent from METHOD_WEIGHTS", async () => {
-    // ⚠ THE PLACEHOLDER ASSERTION. Entry 90 PROBLEM 2 and PART 6 step (d) make
-    // Kraken's real cost model -- a decaying counter, a second per-pair budget,
-    // and an age-dependent cancel price -- its own build session. Until then a
-    // Kraken client is ungated VISIBLY (an unwired venue) rather than quietly
-    // gated by Binance's or Gemini's numbers. If this test ever fails, that
-    // session has begun and this expectation is what it should replace.
-    expect(Object.keys(METHOD_WEIGHTS).sort()).toEqual(["binance", "gemini"]);
-    expect(METHOD_WEIGHTS).not.toHaveProperty("kraken");
+  it("IS wired into the gate: Kraken has its own row in METHOD_COSTS", async () => {
+    // This assertion is the replacement the placeholder above asked for. It used
+    // to read `not.toHaveProperty("kraken")` and said, in as many words, "if this
+    // test ever fails, that session has begun and this expectation is what it
+    // should replace". Entry 90 PART 6 step (d) is that session; the row it
+    // landed is a decaying account counter, a second PER-PAIR counter, and a
+    // cancel priced by the order's age.
+    expect(METHOD_COSTS).toHaveProperty("kraken");
+    expect(Object.keys(METHOD_COSTS).sort()).toEqual(["binance", "gemini", "kraken"]);
   });
 });
