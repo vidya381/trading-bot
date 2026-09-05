@@ -99,6 +99,15 @@ export class FakeExchange implements RestExchangeClient {
   /** Set to force `getOrderStatus` to fail. Stays set until cleared. */
   orderStatusFailure: { kind: "transport" | "exchange_error"; message: string } | null = null;
   /**
+   * Every clientOrderId `getOrderStatus` was asked about, in order.
+   *
+   * The read-set recorder, alongside `placed` and `cancelled`. A test clears it
+   * and drives one pass to see which orders the bot still OBSERVES -- the
+   * property `openOrderIds` actually controls, and the one a wholesale clear of
+   * that list takes away without touching anything visible in D1.
+   */
+  getOrderStatusCalls: string[] = [];
+  /**
    * clientOrderIds whose `getOrderStatus` fails while the rest succeed.
    *
    * The MIXED pass, which the all-or-nothing flag above cannot express and which
@@ -386,6 +395,12 @@ export class FakeExchange implements RestExchangeClient {
   }
 
   async getOrderStatus(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>> {
+    // RECORDED BEFORE THE FAILURE BRANCHES, so it answers "did the bot ASK about
+    // this order?" rather than "did it get an answer?". The two are different
+    // questions and only the first one tells you whether an order is still in the
+    // poll's read set -- which is what `openOrderIds` decides, and what dropping
+    // an id silently takes away.
+    this.getOrderStatusCalls.push(clientOrderId);
     if (this.orderStatusFailure !== null) {
       return failure(this.orderStatusFailure.message, this.orderStatusFailure.kind, this.now);
     }

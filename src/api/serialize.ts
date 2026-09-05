@@ -743,6 +743,24 @@ export function botSummary(row: BotInstanceRow, snapshot: BotSnapshot | null, fe
     // Null for an orphan, matching `position`: an object holding no state has
     // not completed zero cycles, it has no record of cycles at all.
     cycleCount: snapshot === null ? null : snapshot.state.cycleCount,
+    // ON THE SUMMARY, not only in `botDetail`'s `state` blob, and that placement
+    // is the whole point of the field.
+    //
+    // `haltReason` two lines up is read from the D1 ROW and describes the halt
+    // that is in force -- correctly, and it is deliberately never overwritten by
+    // a later event (see `BotRuntimeState.postHaltEvents`). The consequence is
+    // that a halted bot whose books moved AFTERWARDS looks, on this surface,
+    // exactly like one that has sat untouched: same status, same reason, same
+    // `updatedAt`, because nothing wrote the row. That is the invisibility this
+    // publishes past. It reads from the SNAPSHOT rather than D1 -- the object
+    // owns the fact, and `lastPrice` and `cycleCount` beside it already take
+    // their values from the same place, so no new precedent is set.
+    //
+    // `[]` for an orphan rather than `null`, unlike its two neighbours: absent
+    // and empty are defined to mean the same thing on this field (nothing has
+    // happened since the halt), so an object holding no state has nothing to
+    // report and says so in the same shape a healthy bot does.
+    postHaltEvents: snapshot === null ? [] : (snapshot.state.postHaltEvents ?? []),
     fees,
     orphaned: snapshot === null,
   };

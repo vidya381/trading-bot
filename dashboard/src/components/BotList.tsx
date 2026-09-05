@@ -28,6 +28,7 @@ import { StatusBadge } from "./StatusBadge";
 import { Unit } from "./Unit";
 import { baseAssetOf, formatMoney, formatQuantity, signOf } from "../format";
 import { entryPriceOf, strategyLabel } from "../strategyView";
+import { postHaltTagTitle } from "../postHaltEvents";
 
 const SIGN_CLASS: Record<ReturnType<typeof signOf>, string> = {
   positive: "text-emerald-300",
@@ -119,6 +120,35 @@ function OrphanTag({ bot }: { bot: Bot }) {
   );
 }
 
+/**
+ * "Something happened to this bot after it halted."
+ *
+ * ⚠ WHY THE LIST CARRIES THIS AT ALL, when the detail page has the full band.
+ * Because the whole defect was INVISIBILITY, and a detail page only helps an
+ * operator who already suspects something. A bot whose resting take-profit filled
+ * days after a stop-loss is, on every column of this table, identical to one that
+ * has sat untouched: same status badge, same halt reason, same updated time,
+ * because the backend deliberately writes none of them. Putting the indicator
+ * only behind a click would leave the fleet view lying exactly as it did before.
+ *
+ * Amber, matching `OrphanTag` beside it and the dashboard's warning severity
+ * (`AlertList.tsx`) -- never red, which belongs to the halt itself. The word does
+ * the work for anyone who cannot see the colour, and the whole fact travels in
+ * the `title`, as both its neighbours already do.
+ */
+function PostHaltTag({ bot }: { bot: Bot }) {
+  const title = postHaltTagTitle(bot);
+  if (title === null) return null;
+  return (
+    <span
+      title={title}
+      className="ml-2 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300 ring-1 ring-inset ring-amber-500/30"
+    >
+      post-halt activity
+    </span>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Desktop: real table (md and up)
 // ---------------------------------------------------------------------------
@@ -150,6 +180,7 @@ function BotTable({ bots }: { bots: Bot[] }) {
                 </Link>
                 <ArchivedTag bot={bot} />
                 <OrphanTag bot={bot} />
+                <PostHaltTag bot={bot} />
                 <div className="text-xs text-zinc-500">{bot.accountLabel}</div>
               </td>
               <td className="px-4 py-3">
@@ -193,6 +224,7 @@ function BotCard({ bot }: { bot: Bot }) {
             {bot.id}
             <ArchivedTag bot={bot} />
             <OrphanTag bot={bot} />
+            <PostHaltTag bot={bot} />
           </div>
           <div className="text-xs text-zinc-500">{bot.accountLabel}</div>
         </div>

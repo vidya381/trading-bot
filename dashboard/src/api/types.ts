@@ -250,9 +250,64 @@ export interface Bot {
    * "cycles" heading it reads as though the grid bots have done nothing.
    */
   readonly cycleCount: number | null;
+  /**
+   * Things that happened to this bot AFTER it halted, which its halt lifecycle
+   * deliberately did not act on. Empty for a bot that is running, for one that
+   * has sat quietly since halting, and for an orphan.
+   *
+   * ⚠ READ IT ALONGSIDE `haltReason`, NEVER INSTEAD OF IT. `haltReason` is the
+   * halt that is in force and it is deliberately never overwritten by a later
+   * event -- the first, safety-relevant reason stays the primary one. So a
+   * halted bot whose books moved afterwards is INDISTINGUISHABLE on every other
+   * field in this shape: same `status`, same `haltReason`, same `updatedAt`,
+   * because the backend does not touch the row. This array is the only thing
+   * that says otherwise, which is why it is on the summary rather than buried in
+   * the detail view's `state`.
+   *
+   * The realistic case: a take-profit sell left resting by a halt whose
+   * cancellation failed, filling days later. The profit IS booked and the cycle
+   * IS counted; what did not happen is the restart or the second halt.
+   */
+  readonly postHaltEvents: readonly PostHaltEvent[];
   /** Fees paid, in this bot's capital asset. See `BotFees` -- `reported` is a floor. */
   readonly fees: BotFees;
   readonly orphaned: boolean;
+}
+
+/**
+ * One entry of `BotSummary.postHaltEvents`.
+ *
+ * Mirrors the backend's `PostHaltEvent` (bot-instance.ts), which carries the
+ * full reasoning. `auditId` and `alertId` are real row ids, so a UI can link
+ * straight to the audit entry and the `post_halt_activity` alert rather than
+ * searching by timestamp.
+ */
+export interface PostHaltEvent {
+  readonly kind: "cycle_completed";
+  readonly at: number;
+  readonly status: BotStatus;
+  /**
+   * The halt reason in force when this landed, captured at that moment. Kept
+   * here as well as on the bot because a resume clears the live field, and this
+   * one has to stay true afterwards.
+   */
+  readonly haltReasonAtTime: string | null;
+  readonly clientOrderId: string;
+  readonly summary: string;
+  /**
+   * What the cycle earned, gross, as a decimal string in `capitalAsset` -- the
+   * SAME string the `bot.cycle_completed` audit row at `auditId` carries, so the
+   * screen and the log cannot disagree.
+   *
+   * ⚠ REAL, BOOKED MONEY. The suppressed transition below did not happen; this
+   * did. A renderer must never present the two with the same emphasis.
+   */
+  readonly grossProfit: string;
+  readonly capitalAsset: string;
+  /** The transition that WOULD have run and did not. Never phrased as if it did. */
+  readonly suppressed: string;
+  readonly auditId: string;
+  readonly alertId: string;
 }
 
 // ---------------------------------------------------------------------------

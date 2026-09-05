@@ -111,6 +111,7 @@ import {
   haltAlertType,
   ORDER_STATE_DRIFT_ALERT_TYPES,
   POLL_HEALTH_ALERT_TYPES,
+  POST_HALT_ACTIVITY_ALERT_TYPE,
 } from "../shared/alert-types";
 import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import {
@@ -395,6 +396,135 @@ export type HaltReason = DcaHaltReason | GridHaltReason | TrailingStopHaltReason
  * `EMPTY_POSITION` and `cycleCount` at 0. The authoritative discriminator is
  * always `config.strategy`, not the presence of a field here.
  */
+/**
+ * Something that happened to this bot AFTER it halted, which its halt lifecycle
+ * deliberately did not act on.
+ *
+ * ── WHY THIS EXISTS ──
+ *
+ * A halted bot is not inert. `#halt` cancels its open orders, but a cancellation
+ * that cannot be confirmed keeps the id (it alerts `cancel_failed` and leaves the
+ * order live), and step 82's incident left a resting sell on `bot-xs0ufw` for ten
+ * days. When that sell finally filled, `#pollOpenOrders` folded it -- correctly,
+ * because the books must stay right -- and DCA's cycle completion ran on a bot
+ * that had been halted since a stop-loss ten days earlier.
+ *
+ * What it could NOT do was drive the transition it exists to drive. A completed
+ * cycle either auto-restarts a `running` bot or halts it `take_profit_reached`,
+ * and neither is available: the bot is already halted for an unrelated, EARLIER,
+ * safety-relevant reason. `#halt` answers `already_halted` and writes nothing;
+ * the auto-restart branch used to return `{ status: "running" }` for a bot that
+ * was halted, unsubscribed from its feed, and going nowhere.
+ *
+ * ── WHY NOT JUST OVERWRITE `haltReason` ──
+ *
+ * Because the FIRST halt is the one a human needs to see. A stop-loss says the
+ * position moved against the bot; a later `take_profit_reached` from a resting
+ * order describes a different, smaller fact, and letting it win would replace the
+ * safety-relevant reason with an incidental one purely because it arrived second.
+ * `haltReason`, `haltedAt` and the D1 row are therefore left EXACTLY as the
+ * original halt wrote them -- `#mirrorStatus` is never called on this path and
+ * `bot_instances.updated_at` does not move.
+ *
+ * That is the correct treatment of `haltReason` and, on its own, it made the
+ * event invisible: the only trace was an `audit_log` row and an alert, neither of
+ * which is on the surface an operator reads to decide what a halted bot needs.
+ * This is that surface. It is ADDITIVE -- a note that something happened after
+ * the halt, beside the reason rather than instead of it.
+ *
+ * ── THE POINTER ──
+ *
+ * `auditId` is the real `audit_log.id` of the row this event's own handler wrote,
+ * not a reconstruction from `(action, at)`. That is why `#audit` returns its
+ * generated id: a pointer built by re-deriving a lookup key is one rename away
+ * from pointing at nothing, silently, which is the failure `shared/alert-types.ts`
+ * exists to end. `alertId` is the `post_halt_activity` row, same reasoning.
+ */
+export interface PostHaltEvent {
+  /**
+   * What happened. A union rather than a free string so a new post-halt event
+   * type is a typecheck, not a convention -- and so a reader can tell the kinds
+   * apart without parsing `summary`.
+   *
+   * `cycle_completed` is the only member today: a DCA take-profit exit that
+   * fully filled while the bot was not `running`. `#completeLiquidation` needs
+   * no member because a liquidation is a human's deliberate action ON a halted
+   * bot -- it EXPECTS that status and stays there, so nothing about it is
+   * suppressed.
+   */
+  readonly kind: "cycle_completed";
+  /** The fill's execution time, not receipt time: when the event really happened. */
+  readonly at: Timestamp;
+  /** The bot's real status when the event landed. Normally `halted`. */
+  readonly status: BotStatus;
+  /**
+   * The halt this event happened UNDERNEATH, captured verbatim at the moment it
+   * landed. Recorded here as well as on the bot because a later resume clears
+   * `haltReason`, and an event that says "this arrived under a stop-loss" stays
+   * true afterwards; re-reading the live field would make it say something else.
+   */
+  readonly haltReasonAtTime: string | null;
+  /** The order whose fill caused it. */
+  readonly clientOrderId: string;
+  /** Human-readable, for the dashboard and the operator. */
+  readonly summary: string;
+  /**
+   * What this cycle actually earned, gross, as a decimal string.
+   *
+   * ⚠ A STRING, NOT A `Money` BIGINT, and this is the one field here that
+   * departs from how money is held everywhere else in this state. Two reasons,
+   * both specific to what this object IS:
+   *
+   *  1. IT IS A RECORD, NOT AN INPUT. Nothing computes with it -- no sizing, no
+   *     PnL rollup, no comparison. It is a number a human reads once. Money is a
+   *     bigint in this codebase so arithmetic cannot lose precision; there is no
+   *     arithmetic here to protect.
+   *  2. IT MUST AGREE WITH THE AUDIT ROW IT POINTS AT, BY CONSTRUCTION. `auditId`
+   *     addresses a `bot.cycle_completed` entry whose `gross_profit` is this
+   *     exact `toDecimalString(gross)` output. Storing the bigint and rendering
+   *     it again on the way out would be a second derivation of one number,
+   *     free to disagree with the first at any future rounding change.
+   *
+   * It is also what keeps `botSummary` honest: that view returns these events
+   * verbatim rather than through `jsonSafe`, so a bigint here would not survive
+   * `JSON.stringify` at all.
+   */
+  readonly grossProfit: string;
+  /** The asset `grossProfit` is denominated in, so a renderer never guesses. */
+  readonly capitalAsset: string;
+  /**
+   * What the normal lifecycle WOULD have done and did not. The honest half: it
+   * names the transition that was refused, so nobody reads a suppressed
+   * auto-restart as a restart that happened.
+   */
+  readonly suppressed: string;
+  /** `audit_log.id` of the row recording the event itself. */
+  readonly auditId: string;
+  /** `alerts.id` of the `post_halt_activity` row raised for it. */
+  readonly alertId: string;
+}
+
+/**
+ * How many `PostHaltEvent`s one bot retains.
+ *
+ * THE REAL BOUND IS 1, and the cap is defence in depth rather than the mechanism.
+ * A post-halt cycle completion needs a fully-filled EXIT order; a halted bot
+ * places none (`#placeTakeProfitSell` and `#placeBuy` both stop at
+ * `#statusChangedFrom("running")`, and grid's poll gates replacement placement on
+ * `running`); at most one exit is live at a time, since `exitOrderId` is a single
+ * field that `#placeTakeProfitSell` refuses to overwrite; and completing the
+ * cycle clears it. So one halt episode admits one such event, and `#resumePass`
+ * empties the list when the episode ends.
+ *
+ * The cap exists because that argument is about TODAY'S single `kind`. A future
+ * member could loosen it, and an unbounded array in Durable Object state is
+ * rewritten in full on every `#mutateState` -- a cost that would grow silently.
+ * Oldest are dropped rather than newest: the newest is the one an operator has
+ * not seen. Nothing is lost by it -- `audit_log` is the complete record, and
+ * every retained event names its row.
+ */
+const POST_HALT_EVENT_LIMIT = 10;
+
 export interface BotRuntimeState {
   readonly schemaVersion: number;
   readonly status: BotStatus;
@@ -560,6 +690,25 @@ export interface BotRuntimeState {
    * field existed stays valid.
    */
   readonly pendingReplacements?: readonly GridOrderIntent[];
+  /**
+   * Events that landed on this bot AFTER it halted, which the halt lifecycle
+   * deliberately did not act on. See `PostHaltEvent` for the whole argument.
+   *
+   * ⚠ NOT A REPLACEMENT FOR `haltReason`, and that is the design. The original,
+   * safety-relevant halt reason stays primary and untouched; this sits beside it
+   * and says "and then this happened". Cleared by `#resumePass` when the halt
+   * episode ends, in the same write that clears `haltReason`, so the two never
+   * disagree about whether there is a halt to annotate.
+   *
+   * Optional and defaulted to empty on read, for the same reason `unmodelledBase`
+   * and `highWaterMark` are: this is ADDITIVE to a state shape live bots already
+   * hold on disk, and `#state()` casts stored JSON rather than parsing it, so a
+   * non-optional declaration would be a type lie for every bot that exists.
+   * ABSENT means "nothing has happened since the halt", which is also what an
+   * empty array means -- the two are deliberately equivalent and no reader may
+   * distinguish them.
+   */
+  readonly postHaltEvents?: readonly PostHaltEvent[];
 }
 
 export interface CreateDcaBotRequest {
@@ -1470,7 +1619,13 @@ export class BotInstance extends DurableObject<Env> {
   async #cleanupStep(
     config: BotConfigBase,
     step: string,
-    run: () => Promise<void>,
+    /**
+     * `Promise<unknown>`, not `Promise<void>`: `#alert` and `#audit` now return
+     * the row id they generated, and a cleanup step has no use for it. Widened
+     * rather than made generic because the value is DISCARDED here by design --
+     * the return type says what this method does with it.
+     */
+    run: () => Promise<unknown>,
   ): Promise<string | undefined> {
     try {
       await run();
@@ -3994,6 +4149,14 @@ export class BotInstance extends DurableObject<Env> {
       status: "running",
       haltReason: null,
       haltedAt: null,
+      // IN THE SAME WRITE AS `haltReason`, and that is the point rather than
+      // tidiness. A `PostHaltEvent` is an annotation ON a halt -- "the bot is
+      // stopped for X, and then Y happened underneath it". Clearing the reason
+      // while leaving the annotation would leave a running bot advertising
+      // events that happened during a halt it is no longer in, which is step
+      // 16's bug 3 and step 27's, one layer out again. One write, so the two
+      // cannot disagree about whether there is a halt to annotate.
+      postHaltEvents: [],
     }));
 
     // Step 27, and the same principle as the paragraph above applied one layer
@@ -4013,6 +4176,14 @@ export class BotInstance extends DurableObject<Env> {
       source: BOT_ALERT_SOURCE,
       botInstanceId: config.botInstanceId,
     });
+    // SEPARATELY, AND BY NAME. `post_halt_activity` is about a halt without
+    // being one, so it deliberately does not start with `halt_` and
+    // `resolveHaltAlerts` does not match it -- see `POST_HALT_ACTIVITY_ALERT_TYPE`
+    // and the warning in `haltAlertType`'s header about exactly this. Closing it
+    // here keeps it to ONE owner (the object that raises it) and keeps it in
+    // lockstep with the state field cleared just above, which is the discipline
+    // `#observeOpenOrders` already applies to the poll's flags and rows.
+    const resolvedPostHaltAlertIds = await this.#resolvePostHaltActivityAlerts(config);
 
     await this.#audit(
       config,
@@ -4024,6 +4195,14 @@ export class BotInstance extends DurableObject<Env> {
         // Which rows this resume closed, so the append-only log records the
         // alert-table effect and not just the status change.
         resolved_halt_alert_ids: resolvedAlertIds,
+        // Listed separately rather than merged into the array above: they are
+        // closed by a different owner for a different reason, and an audit row
+        // that flattened them would lose which.
+        resolved_post_halt_alert_ids: resolvedPostHaltAlertIds,
+        // What the halt episode accumulated before it ended, preserved here for
+        // the same reason `previous_halt_reason` is: the state field is cleared
+        // above, and an append-only log is where the history belongs.
+        previous_post_halt_events: state.postHaltEvents ?? [],
       },
       now,
     );
@@ -5023,6 +5202,14 @@ export class BotInstance extends DurableObject<Env> {
    *
    * Either way the capital reservation is untouched. Releasing it is a close,
    * and a close is a human decision.
+   *
+   * ⚠ BOTH OF THOSE ASSUME THE BOT IS `running`, and it is not always. An exit
+   * left resting by a halt whose cancellation could not be confirmed can fill
+   * days later, and the poll folds it -- correctly -- into a bot that has been
+   * halted since. Neither branch is available then, and neither may be reported
+   * as though it ran: see the precondition at the bottom of this method and
+   * `#recordPostHaltCycleCompletion`. Everything ABOVE that check is unaffected
+   * by status, because the books of a halted bot must still be right.
    */
   async #completeCycle(config: DcaConfig, exit: TrackedOrder, at: Timestamp): Promise<PipelineResult> {
     // NO LONGER THE PLACE THE PROFIT IS BOOKED. `applyExit` realizes each exit
@@ -5088,13 +5275,42 @@ export class BotInstance extends DurableObject<Env> {
         cycleCount: current.cycleCount + 1,
         unmodelledBase: (current.unmodelledBase ?? ZERO) + stranded,
         position: EMPTY_POSITION,
-        openOrderIds: [],
+        // ⚠ THE EXIT'S OWN ID, BY NAME -- not `[]`, which is what this said and
+        // which quietly dropped every OTHER id in the set.
+        //
+        // WHY THE WHOLESALE CLEAR WAS WRONG. It reads as a tidy-up on the
+        // assumption that a completed cycle leaves nothing open, and on the
+        // healthy path that assumption holds -- so this line is a NO-OP exactly
+        // when everything went well. `#applyFillToOrder` has already removed this
+        // exit by name on `fullyFilled`, and `#placeTakeProfitSell` cancels the
+        // resting buys before sizing the exit at all.
+        //
+        // It differs only where an id was DELIBERATELY RETAINED, and every such
+        // id means "this order may still be live on the exchange": a cancellation
+        // whose outcome could not be confirmed keeps its id and alerts
+        // `cancel_failed` (see `unmodelledBase`'s header for the same case seen
+        // from the accounting side), and `#foldTerminalState` REFUSES to close an
+        // order the exchange reports as more filled than this bot recorded. Both
+        // are conditions a human owns. Dropping the id does not resolve either --
+        // it removes the order from the 30-second poll's read set, so the one
+        // observer that would have noticed it move goes quiet, while `orders` in
+        // D1 still carries the row. `findInactiveBotsWithOpenOrders` would still
+        // find it; this bot would not.
+        //
+        // NOT GATED ON STATUS, though a halted bot is where it was found. The
+        // reasoning above is about what the id MEANS, and that does not change
+        // with status -- and `#completeLiquidation` and `#completeTrailingStopExit`,
+        // the two sibling completion paths, already filter by name exactly like
+        // this. This was the odd one out, not the pioneer.
+        openOrderIds: current.openOrderIds.filter((id) => id !== exit.clientOrderId),
         exitOrderId: null,
         exitKind: undefined,
       };
     });
     const gross = proceeds - spent;
-    await this.#audit(
+    // HELD, NOT DISCARDED: a `PostHaltEvent` points at this exact row. See
+    // `#audit`'s return note.
+    const auditId = await this.#audit(
       config,
       "bot.cycle_completed",
       "system",
@@ -5141,6 +5357,37 @@ export class BotInstance extends DurableObject<Env> {
       });
     }
 
+    // ⚠ THE PRECONDITION THIS METHOD HAD NO WAY TO STATE UNTIL NOW.
+    //
+    // Everything above is bookkeeping and it is correct on ANY status: the fill
+    // happened, the proceeds are real, `applyExit` booked the profit as each fill
+    // landed, and the audit row says what this cycle earned. None of that is
+    // conditional on the bot being alive, and none of it moves below this line.
+    //
+    // What IS conditional is the LIFECYCLE TRANSITION -- the two branches below,
+    // which between them decide what the bot does next. Both assume the bot is
+    // `running`, because a cycle completing is normally the thing that ENDS a
+    // running cycle. Neither is available otherwise, and until this check existed
+    // both ran anyway and reported a transition that had not happened:
+    //
+    //   - autoRestart ON  -> `{ status: "running" }`, on a bot that is halted,
+    //     unsubscribed from its feed, and whose next price update would return
+    //     `ignored` before reaching any order-placing site. Entry 83 established
+    //     that this branch performs no action at all -- the restart is EMERGENT,
+    //     from a bot that is already flat and already running. On a halted bot
+    //     that premise is simply false, so the return value was the only part of
+    //     the "restart" that ever existed.
+    //   - autoRestart OFF -> `#halt("take_profit_reached")`, which answers
+    //     `already_halted` and writes NOTHING: no status, no halt reason, no
+    //     `#mirrorStatus`, so `bot_instances.updated_at` does not move. On a
+    //     STOPPED bot it is worse than a no-op -- it THROWS `invalid_status`.
+    //
+    // So the transition is refused explicitly instead, and said out loud. The
+    // halt reason is deliberately NOT overwritten: see `PostHaltEvent`.
+    if (completed.status !== "running") {
+      return await this.#recordPostHaltCycleCompletion(config, completed, exit, gross, auditId, at);
+    }
+
     if (config.params.autoRestart) {
       return { status: "running", action: "cycle_completed", detail: "auto-restarting" };
     }
@@ -5151,6 +5398,113 @@ export class BotInstance extends DurableObject<Env> {
         `${config.capitalAsset}; autoRestart is off, so it is awaiting review`,
       "system",
     );
+  }
+
+  /**
+   * A cycle completed on a bot that is not `running`, so the transition it would
+   * normally drive is refused -- visibly.
+   *
+   * REACHED FROM ONE PLACE and deliberately not generalised past it. The shape it
+   * records (`PostHaltEvent`) is general; this handler is DCA's cycle completion
+   * specifically, because that is the only lifecycle transition in the system a
+   * fill can trigger against a status that forbids it. Its two neighbours cannot:
+   * `#completeLiquidation` EXPECTS a halted bot and stays halted, and
+   * `#completeTrailingStopExit` is terminal by construction (spec 22.9).
+   *
+   * THE THREE WRITES, and why each is where it is:
+   *
+   *  1. The ALERT, first, because it is the surface an operator actually watches
+   *     and the state field points AT it. `warning`, not `info`: this is an open
+   *     condition -- a halted bot's books moved and nobody has looked -- rather
+   *     than a receipt of something finished. The `take_profit` receipt raised
+   *     just above is the receipt, and it stays `resolved: true`; this does not.
+   *  2. The STATE field, second, so it can carry the alert's real id. Bounded by
+   *     `POST_HALT_EVENT_LIMIT`.
+   *  3. Nothing to D1's `bot_instances` row at all. `#mirrorStatus` is NOT called
+   *     and must not be: the status has not changed, and the halt reason is the
+   *     earlier, safety-relevant one that stays primary. Entry 82 already
+   *     declined to widen `#halt` into that convergence (it belongs to
+   *     `docs/open-items/resume-split-brain.md` part 3b), and this path has even
+   *     less claim to it -- there is no transition here to mirror.
+   *
+   * NEITHER WRITE IS BEST-EFFORT, and that is a departure from entry 82's
+   * `#cleanupStep` rule worth stating. That rule wraps steps that tidy up after a
+   * transition which HAS ALREADY COMMITTED -- correct without them. These two are
+   * not tidying: they are the entire visible record of an event that changed the
+   * books and moved nothing else. A silent failure here restores exactly the
+   * invisibility this exists to end, so it throws and `#onFillPass`'s
+   * `#haltOnUnexpected` sees it.
+   */
+  async #recordPostHaltCycleCompletion(
+    config: DcaConfig,
+    completed: BotRuntimeState,
+    exit: TrackedOrder,
+    gross: Money,
+    auditId: string,
+    at: Timestamp,
+  ): Promise<PipelineResult> {
+    // WHAT WOULD HAVE HAPPENED, phrased as the counterfactual it is. Read off the
+    // same `config.params.autoRestart` the live branches read, so the two cannot
+    // describe different bots.
+    const suppressed = config.params.autoRestart
+      ? "a fresh cycle would have begun and the bot would have stayed running (autoRestart is on)"
+      : "the bot would have halted `take_profit_reached` for review (autoRestart is off)";
+
+    const summary =
+      `cycle ${completed.cycleCount} completed while this bot was ${completed.status}: ` +
+      `${exit.clientOrderId} filled ${toDecimalString(exit.filledQuantity)} for a gross ` +
+      `${toDecimalString(gross)} ${config.capitalAsset}`;
+
+    const standing =
+      completed.haltReason === null
+        ? "no halt reason is recorded"
+        : `the halt reason is still ${JSON.stringify(completed.haltReason)}`;
+
+    const alertId = await this.#alert(config, {
+      severity: "warning",
+      category: "trading",
+      alertType: POST_HALT_ACTIVITY_ALERT_TYPE,
+      message:
+        `${summary}. The exit was resting from before the bot stopped running, and the poll ` +
+        `folded its fill. The fills ARE recorded and the profit IS booked. What did NOT happen ` +
+        `is the transition: ${suppressed}. This bot's status is unchanged and ${standing}, ` +
+        `deliberately -- the first halt reason stays the primary one. Nothing has restarted and ` +
+        `nothing will; resuming or closing is a human decision.`,
+    });
+
+    const event: PostHaltEvent = {
+      kind: "cycle_completed",
+      at,
+      status: completed.status,
+      haltReasonAtTime: completed.haltReason,
+      clientOrderId: exit.clientOrderId,
+      summary,
+      // THE SAME EXPRESSION THE AUDIT ROW ABOVE WAS BUILT FROM, deliberately,
+      // so the pointer and the number can never drift apart.
+      grossProfit: toDecimalString(gross),
+      capitalAsset: config.capitalAsset,
+      suppressed,
+      auditId,
+      alertId,
+    };
+
+    // A DELTA, like every other write on this path: `{ ...current }`, never the
+    // `completed` snapshot above, which was read before two D1 writes and is
+    // therefore a re-entry point behind us.
+    const stored = await this.#mutateState((current) => ({
+      ...current,
+      postHaltEvents: [...(current.postHaltEvents ?? []), event].slice(-POST_HALT_EVENT_LIMIT),
+    }));
+
+    return {
+      // THE REAL STATUS, read back after the write. Never `"running"`.
+      status: stored.status,
+      // ITS OWN ACTION, not `cycle_completed`. A caller that only knows the old
+      // string must not read this as an ordinary completion, and one that reads
+      // `status` alone must not have to infer the difference.
+      action: "cycle_completed_while_not_running",
+      detail: `${summary}; ${suppressed} -- neither was done. See audit ${auditId}, alert ${alertId}.`,
+    };
   }
 
   /**
@@ -7328,7 +7682,17 @@ export class BotInstance extends DurableObject<Env> {
        */
       resolved?: boolean;
     },
-  ): Promise<void> {
+    /**
+     * RETURNS THE ROW ID it generated, rather than `void`.
+     *
+     * A widening, and every existing caller ignores it unchanged. It exists so a
+     * caller that needs to POINT at the row it just raised -- `#completeCycle`
+     * recording a `PostHaltEvent` -- can hold the real id instead of re-deriving
+     * a lookup key from `(alert_type, created_at)`. A re-derived pointer is one
+     * rename away from silently addressing nothing, which is the whole argument
+     * of `shared/alert-types.ts` applied to a row reference.
+     */
+  ): Promise<string> {
     const row: AlertRow = {
       id: this.#newId(),
       severity: alert.severity,
@@ -7345,6 +7709,32 @@ export class BotInstance extends DurableObject<Env> {
       notified_at: null,
     };
     await this.#db().alerts.insert(row);
+    return row.id;
+  }
+
+  /**
+   * Close every open `post_halt_activity` row for this bot.
+   *
+   * Scoped by `source` as well as bot, exactly as `resolveHaltAlerts` is and for
+   * the same reason its header gives: a writer may only close an incident it was
+   * in a position to observe. The bot object raises these rows and nothing else
+   * does, so it is the only thing entitled to close them.
+   */
+  async #resolvePostHaltActivityAlerts(config: BotConfigBase): Promise<string[]> {
+    const open = await this.#db().alerts.findMany({
+      where: {
+        source: BOT_ALERT_SOURCE,
+        bot_instance_id: config.botInstanceId,
+        alert_type: POST_HALT_ACTIVITY_ALERT_TYPE,
+        resolved: false,
+      },
+    });
+    const resolved: string[] = [];
+    for (const row of open) {
+      await this.#db().alerts.update({ id: row.id }, { resolved: true });
+      resolved.push(row.id);
+    }
+    return resolved;
   }
 
   async #audit(
@@ -7353,7 +7743,8 @@ export class BotInstance extends DurableObject<Env> {
     actor: string,
     details: Record<string, unknown>,
     now: Timestamp,
-  ): Promise<void> {
+    /** Returns the generated `audit_log.id`. See `#alert`'s counterpart note. */
+  ): Promise<string> {
     const row: AuditLogRow = {
       id: this.#newId(),
       actor,
@@ -7363,5 +7754,6 @@ export class BotInstance extends DurableObject<Env> {
       created_at: now,
     };
     await this.#db().auditLog.insert(row);
+    return row.id;
   }
 }

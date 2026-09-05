@@ -21,7 +21,7 @@ import { fromDecimalString as m, toDecimalString, ZERO } from "../shared/money";
 import { TERMINAL_STATES } from "../shared/order-state";
 import type { Price } from "../shared/exchange-client";
 import { EMPTY_POSITION, type DcaParams } from "../strategies/dca";
-import { RECEIPT_ALERT_TYPES } from "../shared/alert-types";
+import { POST_HALT_ACTIVITY_ALERT_TYPE, RECEIPT_ALERT_TYPES } from "../shared/alert-types";
 import type {
   BotInstance,
   BotRuntimeState,
@@ -4477,5 +4477,303 @@ describe("a single open order is not worth a batch", () => {
     expect(exchange.cancelled).toEqual([only]);
     const after = await run((bot) => bot.snapshot());
     expect(after.state.openOrderIds).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A cycle that completes on a bot which is no longer running
+// ---------------------------------------------------------------------------
+
+/**
+ * `bot-xs0ufw`, ten days after entry 82's incident.
+ *
+ * THE REAL SEQUENCE, and every step of it is reachable through the ordinary API:
+ *
+ *   1. A DCA bot holds a position and rests a take-profit sell.
+ *   2. It halts for an UNRELATED, EARLIER, safety-relevant reason -- a stop-loss.
+ *      The halt's cancel sweep cannot confirm the cancellations, so it keeps the
+ *      ids and alerts `cancel_failed` (section 5.6: an unconfirmed cancellation
+ *      is not a cancellation). The sell is still live on the exchange.
+ *   3. Days later that sell fills. The 30-second poll reads it and folds it,
+ *      correctly -- `#applyFillToOrder` has no status gate, deliberately, because
+ *      the books of a halted bot must still be right.
+ *   4. It is a fully-filled exit with `exitKind: "take_profit"`, so it reaches
+ *      DCA's `#completeCycle` -- on a bot that has been halted for ten days.
+ *
+ * WHAT USED TO HAPPEN AT STEP 4, and what these tests hold shut. The completion
+ * ran in full and then drove a lifecycle transition that was not available:
+ * `autoRestart` on returned `{ status: "running" }` for a bot that was halted and
+ * unsubscribed from its feed, and `autoRestart` off called `#halt`, which answers
+ * `already_halted` and writes NOTHING -- no status, no reason, no `#mirrorStatus`.
+ * The audit row was written, the profit was booked, and `bot_instances` was never
+ * touched: on the live bot, `updated_at` still pointed at the stop-loss ten days
+ * earlier. The cycle completion was real and invisible.
+ */
+describe("a take-profit exit that fills after the bot has already halted", () => {
+  /**
+   * Drives steps 1 and 2 above and returns the two ids left live on the exchange.
+   *
+   * The additional buy is the load-bearing part of the fixture and not scenery:
+   * it is a REAL, UNRELATED open order that outlives the halt, which is what
+   * makes "does completion drop it?" an observable question rather than a
+   * hypothetical. It gets there honestly -- a 5% drop opens it, it never fills,
+   * and both cancel attempts (the take-profit's sweep, then the halt's) fail to
+   * confirm, exactly as they did on the live bot.
+   */
+  async function haltedWithRestingExit(): Promise<{ restingBuyId: string; sellId: string }> {
+    exchange.filters = testFilters({
+      stepSize: m("0.00000001"),
+      minQuantity: m("0.00000001"),
+    });
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+
+    // A base buy, filled IN FULL: 0.00166666 at 60000 (100 USDT, floored).
+    // Fully, not partly, because a part-filled base order stays in
+    // `openOrderIds` and `decide` holds on `hasOpenOrder` instead of opening the
+    // additional buy this fixture needs.
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId)));
+
+    // A 5% drop opens an additional buy. It is never filled.
+    await run((bot) => bot.onPriceUpdate(priceAt("57000")));
+    const restingBuyId = exchange.placed[1]!.clientOrderId;
+
+    // From here on no cancellation can be confirmed, which is the whole reason
+    // anything survives to fill later.
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+
+    // 2% above the average entry: `decide` returns `take_profit` before it ever
+    // reaches its `hasOpenOrder` hold, so the resting buy does not block the exit.
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[2]!.clientOrderId;
+
+    // THE UNRELATED HALT, and it is the earlier one. Everything after this
+    // happens underneath it.
+    await run((bot) =>
+      bot.halt("stop_loss", "price fell through the stop-loss while the exit rested", "system"),
+    );
+
+    const halted = await run((bot) => bot.snapshot());
+    expect(halted.state.status).toBe("halted");
+    expect(halted.state.haltReason).toContain("stop_loss");
+    // Both orders survived both sweeps: this is entry 82's incident, reproduced.
+    expect([...halted.state.openOrderIds].sort()).toEqual([restingBuyId, sellId].sort());
+    expect(halted.state.exitOrderId).toBe(sellId);
+
+    return { restingBuyId, sellId };
+  }
+
+  it("completes the cycle honestly and says so, without claiming a transition that did not happen", async () => {
+    const { sellId } = await haltedWithRestingExit();
+    const before = (await db.botInstances.findOne({ id: BOT_ID }))!;
+    clock += 10 * 24 * 60 * 60 * 1000; // ten days later, as on the live bot
+    exchange.now = clock;
+
+    const result = await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    // ── THE RESULT IS HONEST ──
+    // Not `"running"`, which is what the `autoRestart` branch used to answer for
+    // a bot that was halted and had no feed subscription to restart onto.
+    expect(result.status).toBe("halted");
+    // Its OWN action. A caller that knows only `cycle_completed` must not read
+    // this as an ordinary completion, and one reading `status` alone must not
+    // have to infer the difference.
+    expect(result.action).toBe("cycle_completed_while_not_running");
+    // And it NAMES the transition it refused rather than staying silent about it.
+    expect(result.detail).toContain("autoRestart is off");
+    expect(result.detail).toContain("neither was done");
+
+    // ── THE ACCOUNTING IS UNCHANGED AND STILL CORRECT ──
+    // This half must not regress: the fill happened and the money is real,
+    // whatever the bot's status. 0.00166666 x (61200 - 60000) = 1.999992.
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.realizedGross).toBe(m("1.999992"));
+    expect(after.state.position).toEqual(EMPTY_POSITION);
+    expect(after.state.cycleCount).toBe(1);
+    expect(after.state.exitOrderId).toBeNull();
+    const audit = await db.auditLog.findMany({ where: { action: "bot.cycle_completed" } });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.details_json).toMatchObject({ cycle: 1, gross_profit: "1.99999200" });
+
+    // ── THE ORIGINAL HALT REASON IS UNTOUCHED ──
+    // Decision (b): the first, safety-relevant reason stays the primary one. It
+    // is NOT overwritten by `take_profit_reached`, and it is not concatenated
+    // with anything either.
+    expect(after.state.status).toBe("halted");
+    expect(after.state.haltReason).toBe(before.halt_reason);
+    expect(after.state.haltReason).toContain("stop_loss");
+    expect(after.state.haltReason).not.toContain("take_profit");
+
+    // ── AND D1 IS GENUINELY UNTOUCHED, WHICH IS THE ORIGINAL EVIDENCE ──
+    // `updated_at` not moving is exactly what was observed on the live bot. It
+    // stays true: there was no status transition, so there is nothing to mirror.
+    const row = (await db.botInstances.findOne({ id: BOT_ID }))!;
+    expect(row.status).toBe("halted");
+    expect(row.halt_reason).toBe(before.halt_reason);
+    expect(row.halted_at).toBe(before.halted_at);
+    expect(row.updated_at).toBe(before.updated_at);
+  });
+
+  it("leaves a visible record on the bot, pointing at the audit row and the alert", async () => {
+    const { sellId } = await haltedWithRestingExit();
+    clock += 10 * 24 * 60 * 60 * 1000;
+    exchange.now = clock;
+    const at = clock;
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    const events = after.state.postHaltEvents ?? [];
+    expect(events).toHaveLength(1);
+    const [event] = events;
+
+    expect(event!.kind).toBe("cycle_completed");
+    expect(event!.status).toBe("halted");
+    expect(event!.clientOrderId).toBe(sellId);
+    expect(event!.at).toBe(at);
+    // The halt it happened UNDERNEATH, captured at the time rather than read
+    // back later -- a resume clears the live field and this must stay true.
+    expect(event!.haltReasonAtTime).toBe(after.state.haltReason);
+    expect(event!.haltReasonAtTime).toContain("stop_loss");
+    // Phrased as the counterfactual it is. It must never read as though the
+    // transition happened.
+    expect(event!.suppressed).toContain("would have halted");
+
+    // ── THE BOOKED MONEY, STRUCTURED ──
+    // Carried as its own field rather than left inside `summary` for a reader to
+    // parse back out: the dashboard renders this figure, and a screen deriving it
+    // from prose would break silently the first time the wording changed. It is
+    // the SAME string the audit row carries, by construction.
+    expect(event!.grossProfit).toBe("1.99999200");
+    expect(event!.capitalAsset).toBe("USDT");
+
+    // ── THE POINTERS ARE REAL ROW IDS, not a timestamp to search by ──
+    const auditRow = await db.auditLog.findOne({ id: event!.auditId });
+    expect(auditRow!.action).toBe("bot.cycle_completed");
+    // AND THE FIGURE AGREES WITH THE ROW IT POINTS AT, which is the property that
+    // makes the pointer worth having: both come from one `toDecimalString(gross)`,
+    // so the screen and the log cannot tell different stories about one cycle.
+    expect((auditRow!.details_json as { gross_profit: string }).gross_profit).toBe(
+      event!.grossProfit,
+    );
+    const raised = await db.alerts.findOne({ id: event!.alertId });
+    expect(raised!.alert_type).toBe(POST_HALT_ACTIVITY_ALERT_TYPE);
+
+    // ── THE ALERT IS AN OPEN CONDITION, NOT A RECEIPT ──
+    // The `take_profit` row beside it IS a receipt and stays resolved; this one
+    // says a halted bot's books moved and nobody has looked.
+    expect(raised!.severity).toBe("warning");
+    expect(raised!.resolved).toBe(false);
+    expect(raised!.message).toContain("Nothing has restarted");
+    const receipt = await db.alerts.findOne({ alert_type: "take_profit" });
+    expect(receipt!.resolved).toBe(true);
+  });
+
+  it("does NOT drop the unrelated resting order from its own polling set", async () => {
+    // The secondary finding. `#completeCycle` used to write `openOrderIds: []`
+    // wholesale, so completing this cycle silently dropped the additional buy --
+    // an order still live on the exchange, whose cancellation was never
+    // confirmed, and which D1's `orders` table still carried. The row survived;
+    // the bot's own observation of it did not.
+    const { restingBuyId, sellId } = await haltedWithRestingExit();
+
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    const after = await run((bot) => bot.snapshot());
+    // The exit leaves BY NAME. Everything else stays.
+    expect(after.state.openOrderIds).toEqual([restingBuyId]);
+
+    // AND IT IS STILL OBSERVED, which is the property that actually matters --
+    // the poll reads `openOrderIds` and nothing else, so an id dropped from it is
+    // an order this bot has stopped watching. `checkOpenOrders` runs the same
+    // `#observeOpenOrders` body the 30-second alarm does.
+    exchange.getOrderStatusCalls = [];
+    await run((bot) => bot.checkOpenOrders(ACTOR));
+    expect(exchange.getOrderStatusCalls).toContain(restingBuyId);
+  });
+
+  it("ends the annotation when the halt episode ends, in lockstep with the alert", async () => {
+    const { sellId } = await haltedWithRestingExit();
+    await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+    expect((await run((bot) => bot.snapshot())).state.postHaltEvents).toHaveLength(1);
+
+    exchange.cancelFailure = null;
+    await run((bot) => bot.resume(ACTOR));
+
+    const after = await run((bot) => bot.snapshot());
+    // Cleared in the SAME write as `haltReason`: a running bot must not
+    // advertise events that happened during a halt it is no longer in.
+    expect(after.state.haltReason).toBeNull();
+    expect(after.state.postHaltEvents).toEqual([]);
+
+    // And the row is closed by its own owner -- `resolveHaltAlerts` never
+    // matched it, because it is about a halt without being one.
+    const alert = await db.alerts.findOne({ alert_type: POST_HALT_ACTIVITY_ALERT_TYPE });
+    expect(alert!.resolved).toBe(true);
+    // The history is preserved where history belongs, not in a status column.
+    const resumed = await db.auditLog.findOne({ action: "bot.resumed" });
+    expect(resumed!.details_json).toMatchObject({ resolved_post_halt_alert_ids: [alert!.id] });
+    expect((resumed!.details_json as { previous_post_halt_events: unknown[] })
+      .previous_post_halt_events).toHaveLength(1);
+  });
+
+  it("reports the OTHER suppressed branch when autoRestart is on, and still does not restart", async () => {
+    // The `autoRestart: true` half, which is the one that used to answer
+    // `{ status: "running" }`. Entry 83 established the restart is EMERGENT --
+    // it works because the bot is already flat and already RUNNING. Neither
+    // holds here, so there was never a restart to report.
+    exchange.filters = testFilters({ stepSize: m("0.00000001"), minQuantity: m("0.00000001") });
+    await run((bot) => bot.create(creation({ params: { ...params, autoRestart: true } })));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.001") })));
+    exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+    await run((bot) => bot.halt("stop_loss", "unrelated stop-loss", "system"));
+
+    const placedBefore = exchange.placed.length;
+    const result = await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    expect(result.status).toBe("halted");
+    expect(result.action).toBe("cycle_completed_while_not_running");
+    expect(result.detail).toContain("autoRestart is on");
+
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.postHaltEvents![0]!.suppressed).toContain("would have stayed running");
+    expect(after.state.status).toBe("halted");
+    // NOTHING RESTARTED, and a price tick does not start it either: a halted bot
+    // is `ignored` before it reaches any order-placing site.
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    expect(exchange.placed).toHaveLength(placedBefore);
+  });
+
+  it("is unchanged on a RUNNING bot: the ordinary completion still halts for review", async () => {
+    // The regression guard for the healthy path. The status check must cost the
+    // normal case nothing -- same action, same halt, same reason.
+    exchange.filters = testFilters({ stepSize: m("0.00000001"), minQuantity: m("0.00000001") });
+    await run((bot) => bot.create(creation()));
+    await run((bot) => bot.start(ACTOR));
+    await run((bot) => bot.onPriceUpdate(priceAt("60000")));
+    const buyId = exchange.placed[0]!.clientOrderId;
+    await run((bot) => bot.onFill(buyId, exchange.fillFor(buyId, { quantity: m("0.001") })));
+    await run((bot) => bot.onPriceUpdate(priceAt("61200")));
+    const sellId = exchange.placed[1]!.clientOrderId;
+
+    const result = await run((bot) => bot.onFill(sellId, exchange.fillFor(sellId)));
+
+    expect(result.action).toBe("halted");
+    expect(result.status).toBe("halted");
+    const after = await run((bot) => bot.snapshot());
+    expect(after.state.haltReason).toContain("take_profit_reached");
+    // No annotation: nothing was suppressed, because nothing needed to be.
+    expect(after.state.postHaltEvents ?? []).toEqual([]);
+    expect(await db.alerts.count({ alert_type: POST_HALT_ACTIVITY_ALERT_TYPE })).toBe(0);
+    // And D1 DID move, which is the difference from the halted case above.
+    const row = (await db.botInstances.findOne({ id: BOT_ID }))!;
+    expect(row.halt_reason).toContain("take_profit_reached");
   });
 });

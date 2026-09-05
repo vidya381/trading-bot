@@ -19,6 +19,7 @@
 
 import type { ReactNode } from "react";
 import type { BotDetail } from "../api/types";
+import { PostHaltNotice } from "./PostHaltNotice";
 import { StatusBadge } from "./StatusBadge";
 import { Unit } from "./Unit";
 import { baseAssetOf, formatMoney, formatQuantity, formatTime, signOf } from "../format";
@@ -122,6 +123,23 @@ export function BotSummary({ bot }: { bot: BotDetail }) {
           Halted: <span className="font-medium">{bot.haltReason}</span>
         </div>
       )}
+
+      {/*
+       * DIRECTLY BELOW THE HALT BANNER, and the placement is the point.
+       *
+       * The two are read together or not at all: the red band says why the bot
+       * stopped, this amber one says what happened to it afterwards, and the
+       * backend deliberately never merges the second into the first (the earlier,
+       * safety-relevant reason stays primary). Anywhere further down the page and
+       * an operator reading the halt reason would have already decided.
+       *
+       * ⚠ NOT NESTED INSIDE THE HALT CONDITION ABOVE. It renders its own gate,
+       * which is the presence of events rather than the status -- so events that
+       * somehow outlive their halt are shown and flagged rather than hidden by a
+       * condition that stopped being true. See `postHaltNotice`'s
+       * `staleForStatus`.
+       */}
+      <PostHaltNotice bot={bot} />
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         <Stat label="Realized (gross)">

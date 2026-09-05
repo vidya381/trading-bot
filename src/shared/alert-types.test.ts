@@ -36,6 +36,7 @@ import {
   ALERTING_TIERS,
   ORDER_STATE_DRIFT_ALERT_TYPES,
   POLL_HEALTH_ALERT_TYPES,
+  POST_HALT_ACTIVITY_ALERT_TYPE,
   haltAlertType,
   isHaltAlertType,
   isReconciliationAlertType,
@@ -129,6 +130,12 @@ describe("the halt alert-type contract", () => {
       // Reconciliation's own, which is the one string in the system that
       // contains "halt_" without being a halt alert. It does not START with it.
       "reconciliation_halt_failed",
+      // ABOUT a halt without BEING one, which is the case `haltAlertType`'s
+      // header warns must never be named `halt_*`. If it were, a resume would
+      // close it through `resolveHaltAlerts` AS WELL as through the bot object's
+      // own explicit resolve -- two owners for one row, and the second would be
+      // silently redundant until someone changed one of them.
+      POST_HALT_ACTIVITY_ALERT_TYPE,
       ...POLL_HEALTH_ALERT_TYPES,
     ];
     for (const alertType of notHalts) {

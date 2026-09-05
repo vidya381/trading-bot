@@ -221,3 +221,32 @@ export const POLL_HEALTH_ALERT_TYPES = [
 export function isPollHealthAlertType(alertType: string): boolean {
   return (POLL_HEALTH_ALERT_TYPES as readonly string[]).includes(alertType);
 }
+
+/**
+ * "Something happened to this bot AFTER it halted, and its halt lifecycle did
+ * not act on it."
+ *
+ * THE CONDITION. A halted bot can still have orders resting on the exchange --
+ * `#halt` cancels, but a cancellation that cannot be confirmed keeps the id, and
+ * step 82's incident left a sell live for ten days. When such an order finally
+ * fills, the fill is recorded honestly (the books must stay right) but the
+ * lifecycle transition it would normally drive is REFUSED, because the bot is
+ * not in the state that transition acts on. That refusal is correct and it is
+ * also invisible: `bot_instances.status` and `halt_reason` keep describing the
+ * ORIGINAL halt, which is deliberate (see `BotRuntimeState.postHaltEvents`), so
+ * without this row the only trace is an audit entry nobody is watching.
+ *
+ * ⚠ NOT A `halt_*` TYPE, and the name is chosen for that. `isHaltAlertType`
+ * matches on the `halt_` PREFIX, and `resolveHaltAlerts` closes everything it
+ * matches on any successful resume. This row is about a halt without being one,
+ * which is precisely the case `haltAlertType`'s header warns must not be named
+ * `halt_*`. It is still closed on resume -- by `#resumePass` naming it
+ * explicitly, so it has ONE owner and gains nothing by resemblance.
+ *
+ * ⚠ NOT A RECEIPT either, so it is absent from `RECEIPT_ALERT_TYPES` and is
+ * raised UNRESOLVED. The `take_profit` row beside it is a receipt: the cycle
+ * closed, nothing is left to do. This one says a halted bot's books moved and
+ * nobody has looked -- an open condition that resume or close ends, which is
+ * exactly what `resolved` is for.
+ */
+export const POST_HALT_ACTIVITY_ALERT_TYPE = "post_halt_activity";

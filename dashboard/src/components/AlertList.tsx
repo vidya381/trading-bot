@@ -30,6 +30,7 @@ import { Link } from "react-router-dom";
 import type { Alert, AlertCategory, AlertSeverity } from "../api/types";
 import { APPLY_MISSED_FILLS_ANCHOR, isOpenDriftAlert } from "../driftAlerts";
 import { CHECK_OPEN_ORDERS_ANCHOR, isOpenPollAlert } from "../pollAlerts";
+import { alertRowAnchor } from "../postHaltEvents";
 import { formatTime } from "../format";
 
 const SEVERITY_ACCENT: Record<AlertSeverity, string> = {
@@ -129,9 +130,25 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
     alert.resolved ? "opacity-60" : "",
   ].join(" ");
 
+  /*
+   * THE ROW'S OWN ANCHOR, so something on the page can link to THIS alert rather
+   * than to the top of the list.
+   *
+   * `PostHaltNotice` is the first caller: a post-halt event names the exact
+   * `alerts.id` it raised, and "see the alert below" has to land on that row and
+   * not on a list the operator then has to search. Same arrangement as
+   * `APPLY_MISSED_FILLS_ANCHOR` and `CHECK_OPEN_ORDERS_ANCHOR`, and built through
+   * the same one shared function so a rename cannot move only one side.
+   *
+   * Harmless where nothing links to it: an unreferenced id costs nothing, and
+   * every row carrying one means a future linker needs no change here.
+   */
+  const rowId = alertRowAnchor(alert.id);
+
   if (linked) {
     return (
       <Link
+        id={rowId}
         to={`/bots/${encodeURIComponent(alert.botInstanceId!)}${anchor}`}
         className={`group block transition-colors hover:bg-zinc-900 ${className}`}
       >
@@ -140,7 +157,11 @@ function AlertRow({ alert, linkToBot }: { alert: Alert; linkToBot: boolean }) {
     );
   }
 
-  return <div className={className}>{body}</div>;
+  return (
+    <div id={rowId} className={className}>
+      {body}
+    </div>
+  );
 }
 
 export function AlertList({
