@@ -377,8 +377,11 @@ real account is a rare, high-privilege human act, seeded by hand exactly like
 `capital_ledger.total_balance` is (step 5). This is that manual step.
 
 `account_label` is the primary key and is the label your `capital_ledger` rows
-and bots already use. `exchange` must be `'binance'` or `'gemini'` (the CHECK
-constraint rejects anything else). Timestamps are milliseconds since the epoch.
+and bots already use. `exchange` must be `'binance'`, `'gemini'` or `'kraken'`
+(the CHECK constraint rejects anything else). `'kraken'` was added by **migration
+0012**; against a database that has not had 0012 applied the INSERT fails on the
+CHECK, so apply migrations before registering one. Timestamps are milliseconds
+since the epoch.
 
 **Register one account on each exchange** (testnet), so there is one of each to
 test with:
@@ -397,6 +400,27 @@ npx wrangler d1 execute DB --env testnet --remote \
 npx wrangler d1 execute DB --env testnet --remote \
   --command "INSERT INTO accounts (account_label, exchange, created_at, updated_at)
              VALUES ('gemini-main', 'gemini', unixepoch()*1000, unixepoch()*1000)"
+```
+
+**Kraken is PRODUCTION-ONLY, and its example is deliberately not `--env testnet`
+like the two above.** `resolveKrakenExchange` (`src/workers/exchange-kraken.ts`)
+refuses to build a client in the testnet environment at all: Kraken publishes no
+sandbox or testnet host, so there is no non-real venue to point at, and the
+resolver fails closed rather than aiming testnet at `https://api.kraken.com` and
+trading real funds from the test environment. Setting `KRAKEN_API_KEY` in testnet
+does not change this. A Kraken row registered in testnet is therefore a dead
+entry: it appears in the dashboard's account dropdown, but loading its tradable
+pairs returns `exchange_unavailable` and no bot can be created on it.
+
+```sh
+# A Kraken account labelled "kraken-main", on PRODUCTION only. Its client is
+# built from KRAKEN_API_KEY / KRAKEN_API_SECRET by convention (see migration
+# 0006's header); set those for this environment with
+# `wrangler secret put KRAKEN_API_KEY --env production` (and the secret) BEFORE
+# registering, so the account is never selectable while it cannot build a client.
+npx wrangler d1 execute DB --env production --remote \
+  --command "INSERT INTO accounts (account_label, exchange, created_at, updated_at)
+             VALUES ('kraken-main', 'kraken', unixepoch()*1000, unixepoch()*1000)"
 ```
 
 Confirm, and see them the way the dashboard will (`GET /api/accounts` reads this

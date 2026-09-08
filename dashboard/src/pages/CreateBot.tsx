@@ -494,9 +494,23 @@ function isAbort(error: unknown): boolean {
 
 /**
  * The symbols endpoint's real failures → an honest, DISTINCT message (brief item
- * 4). `exchange_unavailable` is the confirmed Binance geo-block: it is OUR side
- * that could not reach the venue, so the copy says so plainly rather than
- * implying the person did something wrong.
+ * 4). `exchange_unavailable` means the venue could not be reached from OUR side,
+ * so the copy says so plainly rather than implying the person did something
+ * wrong.
+ *
+ * ⚠ IT CARRIES `error.message`, and used to not. The arm previously replaced the
+ * server's reason with a fixed sentence — "this is most likely a connection
+ * problem on our end … Try again" — which was written when the only known cause
+ * WAS a transient one (the Binance geo-block). It is no longer the only cause,
+ * and the substitution turned the other one into a lie: `resolveKrakenExchange`
+ * refuses the testnet environment permanently (Kraken publishes no sandbox host),
+ * and its 502 explains exactly that, including that setting KRAKEN_API_KEY will
+ * not help. Under the old copy the operator was told to retry something that can
+ * never succeed, and the one sentence that said so was discarded on the way.
+ *
+ * So the guess is gone and the server's own reason is shown, which is what the
+ * `default` arm below has always done. What survives is the part that is true of
+ * every cause: this is our side, not yours.
  */
 function describeSymbolsError(error: unknown, accountLabel: string): Outcome {
   if (error instanceof ApiError) {
@@ -505,7 +519,7 @@ function describeSymbolsError(error: unknown, accountLabel: string): Outcome {
         return {
           tone: "warning",
           title: "This exchange couldn’t be reached",
-          text: `We couldn’t load the tradable pairs for “${accountLabel}”. This is most likely a connection problem on our end reaching the exchange, not anything you did. Try again, or pick a different account.`,
+          text: `We couldn’t load the tradable pairs for “${accountLabel}” — this is on our side reaching the exchange, not anything you did. ${error.message} If that reads as a permanent limit rather than a blip, pick a different account rather than retrying.`,
         };
       case "unknown_account":
         return {

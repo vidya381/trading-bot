@@ -41,8 +41,8 @@
 
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { ApiError, fetchBots, logManualAdjustment } from "../api/client";
-import type { Bot, ManualAdjustment as ManualAdjustmentRow } from "../api/types";
+import { ApiError, fetchAccounts, fetchBots, logManualAdjustment } from "../api/client";
+import type { Account, Bot, ManualAdjustment as ManualAdjustmentRow } from "../api/types";
 import { formatDateTime, formatQuantity } from "../format";
 
 // ---------------------------------------------------------------------------
@@ -210,15 +210,44 @@ export function ManualAdjustment() {
   const [submitting, setSubmitting] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
 
-  // Best-effort suggestions for the account and asset fields, so an operator can
-  // pick a label that already exists rather than retype it. Purely a convenience
-  // (there is no accounts endpoint, and none is invented): the fields stay free
-  // text -- a brand-new account works -- and a failed fetch is ignored.
+  /*
+   * Best-effort suggestions for the account and asset fields, so an operator can
+   * pick a label that already exists rather than retype it. Purely a convenience:
+   * the fields stay free text -- a brand-new account works -- and a failed fetch
+   * is ignored.
+   *
+   * TWO SOURCES, UNIONED, AND NEITHER REPLACES THE OTHER. This used to read the
+   * bot list alone, under a comment asserting "there is no accounts endpoint, and
+   * none is invented". That stopped being true when `GET /api/accounts` landed
+   * (step 11); `Dashboard` and `CreateBot` both read it. Deriving suggestions
+   * only from bots meant an account with NO BOTS YET was absent from the list --
+   * which is exactly the state a freshly registered, freshly funded account is
+   * in, and exactly when logging the opening deposit is the thing you came here
+   * to do.
+   *
+   * The bot list is still read, and is NOT redundant with the registry: bot
+   * creation falls back to the request's own exchange for an UNREGISTERED
+   * account (see docs/d1-provisioning.md, "Seeding order"), and migration 0006's
+   * backfill deliberately skipped any bot whose free-typed exchange was never a
+   * recognised value. Both cases are real accounts carrying real bots and real
+   * ledger rows that the `accounts` table does not list. Swapping one source for
+   * the other would have fixed the new account by losing those.
+   *
+   * Each fetch is independent and each failure is ignored on its own, so one
+   * endpoint being down still leaves the other's suggestions -- and neither can
+   * block the form, which never needed either to work.
+   */
   const [known, setKnown] = useState<Bot[]>([]);
+  const [registered, setRegistered] = useState<Account[]>([]);
   useEffect(() => {
     const controller = new AbortController();
     fetchBots(controller.signal)
       .then(setKnown)
+      .catch(() => {
+        /* suggestions are optional; ignore */
+      });
+    fetchAccounts(controller.signal)
+      .then(setRegistered)
       .catch(() => {
         /* suggestions are optional; ignore */
       });
@@ -289,7 +318,10 @@ export function ManualAdjustment() {
       </div>
 
       <datalist id={accountList}>
-        {unique(known.map((b) => b.accountLabel)).map((v) => (
+        {unique([
+          ...registered.map((a) => a.accountLabel),
+          ...known.map((b) => b.accountLabel),
+        ]).map((v) => (
           <option key={v} value={v} />
         ))}
       </datalist>
