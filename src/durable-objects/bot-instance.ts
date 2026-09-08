@@ -274,7 +274,43 @@ export type BotInstanceErrorCode =
    * untrustworthy. This is about an ORDER whose fate is unresolved, on the one
    * transition after which nothing observes this bot ever again.
    */
-  | "orders_unresolved";
+  | "orders_unresolved"
+  /**
+   * `resume` on a trailing-stop bot that has already spent its entry budget
+   * (spec 22.10) -- `entryAttempts >= MAX_ENTRY_ATTEMPTS`.
+   *
+   * A code of its own for the same reason `position_unverified` is one: the bot
+   * IS halted and resuming a halted bot is what this method is for, so
+   * `invalid_status` would send an operator looking at the wrong thing. What is
+   * wrong is the state it would resume ONTO.
+   *
+   * ⚠ WHAT THIS PREVENTS, AND IT IS NOT A HYPOTHETICAL. `#resumePass` clears
+   * `status`, `haltReason`, `haltedAt` and `postHaltEvents` and NOTHING ELSE, so
+   * `entryAttempts` survives the resume. `#trailingStopOnPrice` then feeds the
+   * carried-over count straight back into `decide`, whose 22.10 gate is checked
+   * BEFORE `open_entry` can be returned -- so the very next candle re-halts
+   * without `#placeTrailingStopEntry` ever being reached and without a single
+   * order being sent. `bot-ts1` on gemini-main testnet sat in that loop from
+   * 2026-09-01 to 2026-09-08: resumed repeatedly, `halt_entry_unfilled` re-fired
+   * every time, and the orders table gained nothing after 2026-09-01T22:42.
+   *
+   * The loop was not merely useless, it was ACTIVELY MISLEADING: `resume`
+   * returned `{status: "running", action: "resumed"}`, wrote a `bot.resumed`
+   * audit row and mirrored `running` to D1, so every surface said the retry had
+   * been accepted. Refusing here is what makes the API's answer match what the
+   * bot will actually do on its next candle.
+   *
+   * ⚠ UNLIKE ITS TWO NEIGHBOURS, THIS REFUSAL IS PERMANENT. Both of those are
+   * conditions someone else clears -- reconciliation closes a drift row, a
+   * cancel sweep resolves an order -- after which the identical request works.
+   * Nothing anywhere resets `entryAttempts`: the only write in this codebase is
+   * the increment in `#placeTrailingStopEntry`, and the field's own header in
+   * `trailing-stop.ts` says "Never reset" by design, because a trailing stop has
+   * exactly one entry in its whole life (22.2 decision 4). So the message below
+   * must not tell an operator to fix something and retry; it has to say the bot
+   * is finished and a new one is the way forward.
+   */
+  | "entry_budget_spent";
 
 export class BotInstanceError extends Error {
   readonly code: BotInstanceErrorCode;
@@ -4071,6 +4107,51 @@ export class BotInstance extends DurableObject<Env> {
           `already gone terminal locally, there is no automated correction for it today and ` +
           `this needs a human decision about the position.`,
       );
+    }
+
+    // THE FOURTH LATCH, and the only permanent one: this bot's entry budget
+    // (spec 22.10). See `entry_budget_spent` for the incident that produced it.
+    //
+    // ⚠ BEFORE `#subscribeToFeed`, WITH THE OTHER REFUSALS, AND THAT PLACEMENT
+    // IS LOAD-BEARING. Everything above this line is a pure check; the
+    // subscribe below is the first side effect in the method, and it can bring a
+    // whole `PriceFeed` socket back up for a pair whose last subscriber left. A
+    // resume that is going to be refused must not do that first and then throw,
+    // leaving a feed connected for a bot that never re-entered `running`.
+    //
+    // ⚠ STRATEGY-GATED, not a bare read of the field. `entryAttempts` is written
+    // ONLY on the trailing-stop branch and the key is never added to a DCA or
+    // grid bot's state at all -- so on those it is `undefined`, `?? 0` makes it
+    // zero, and the comparison is false anyway. The explicit `strategy` check is
+    // here so that stays true by construction rather than by arithmetic: this
+    // gate must never be able to refuse a DCA or grid resume, whose entry
+    // retries are bounded by their own cycle and ladder logic and have nothing
+    // to do with this counter.
+    //
+    // ⚠ `>=`, NOT `===`, matching `decide`'s own gate exactly. The two must
+    // agree about what "spent" means or this refusal and the halt it is
+    // predicting would disagree at the edges -- and a count above the cap is
+    // reachable, since the cap was deployed onto live bots that had already
+    // placed entries under no bound at all.
+    if (config.strategy === "trailing_stop") {
+      const spent = state.entryAttempts ?? 0;
+      if (spent >= MAX_ENTRY_ATTEMPTS) {
+        throw new BotInstanceError(
+          "entry_budget_spent",
+          `bot ${config.botInstanceId} cannot resume: its single entry order was placed ` +
+            `${spent} times without ever filling, which is the cap (${MAX_ENTRY_ATTEMPTS}), so ` +
+            `the entry budget is spent. Resuming would flip this bot to running and place ` +
+            `NOTHING -- the cap is re-evaluated on the next candle and re-halts it with the ` +
+            `same entry_unfilled reason, because the attempt count is deliberately never ` +
+            `reset. A trailing stop has exactly one entry in its whole life, and this bot ` +
+            `never got it, so there is no position to trail and nothing for a resume to do. ` +
+            `This is not a condition to clear and retry: if you still want this strategy on ` +
+            `this pair, create a new bot. Before you do, find out why the entries did not ` +
+            `fill -- each one was a limit priced to cross the spread, so an order that did ` +
+            `not fill was almost certainly cancelled at the venue rather than left behind by ` +
+            `the market, and a new bot would spend its three attempts the same way.`,
+        );
+      }
     }
 
     // Fail-closed, as in `start`: re-subscribe to the feed before re-entering

@@ -10,10 +10,28 @@
  * WHAT RESUMING ACTUALLY DOES (confirmed from source, not assumed)
  * ---------------------------------------------------------------
  * `resume` refuses a bot that is not `halted`, then asserts BOTH risk latches
- * (`assertGlobalArmed`, `assertAccountArmed`), then re-subscribes the bot to its
- * `PriceFeed` fail-closed, then flips `halted -> running`, mirrors to D1 and
- * audits `bot.resumed` carrying the previous halt reason. `halt_reason` is
- * deliberately NOT cleared, so the row keeps saying why it stopped.
+ * (`assertGlobalArmed`, `assertAccountArmed`), then refuses again on either of
+ * two conditions the status alone does not show -- an unresolved
+ * order-state-drift alert (`position_unverified`) or, on a trailing stop, an
+ * already-spent entry budget (`entry_budget_spent`) -- then re-subscribes the
+ * bot to its `PriceFeed` fail-closed, then flips `halted -> running`, writing
+ * D1 BEFORE this object's own state (that order is deliberate and pinned by
+ * `resume-write-order.test.ts`), and audits `bot.resumed` carrying the previous
+ * halt reason.
+ *
+ * `halt_reason` IS cleared, along with `halted_at` and any accumulated
+ * `postHaltEvents`. ⚠ THIS REVERSES WHAT THIS COMMENT USED TO SAY -- it claimed
+ * the reason was "deliberately NOT cleared, so the row keeps saying why it
+ * stopped", which was true when written and stopped being true when the DO
+ * changed. Keeping it was the bug: `halt_reason` is a CURRENT-state column, and
+ * a real bot sat `running` for hours advertising an `order_rejected` that had
+ * already been fixed. Nothing is lost -- the reason moves into this resume's own
+ * `bot.resumed` audit row as `previous_halt_reason`, which is where the history
+ * of why a bot stopped belongs. See `#resumePass` in `bot-instance.ts` for the
+ * full reasoning.
+ *
+ * ⚠ SO THE DIALOG BELOW IS THE LAST PLACE THE HALT REASON IS SHOWN before it is
+ * cleared from the row. That is an argument for it being there, not against.
  *
  * The re-subscribe is the same fail-closed call `start` makes, and it matters
  * more here: the halt path unsubscribed this bot, and if it was the pair's last

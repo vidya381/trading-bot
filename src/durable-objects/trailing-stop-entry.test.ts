@@ -100,6 +100,24 @@ async function startedTrailingStop(name: string, allocated = "1000"): Promise<vo
   await inNamed(name, (bot) => bot.start(ACTOR));
 }
 
+/**
+ * The venue takes the entry away with no request from this system, and the real
+ * poll then discovers it -- which is what clears `openOrderIds` and lets
+ * `decide` ask for the entry again.
+ *
+ * MODULE SCOPE rather than inside one `describe`: the resume block at the foot
+ * of this file drives a bot to the cap the same way, and a second copy of this
+ * would be a second definition of "the venue cancelled it" free to drift from
+ * the one the cap tests use.
+ */
+async function loseEntryToTheVenue(name: string, clientOrderId: string): Promise<void> {
+  const resting = exchange.resting.get(clientOrderId);
+  if (resting === undefined) throw new Error(`no resting order ${clientOrderId}`);
+  resting.cancelled = true;
+  const pass = await inNamed(name, (bot) => bot.checkOpenOrders(ACTOR));
+  expect(pass.closed).toContain(clientOrderId);
+}
+
 const DCA_PARAMS: DcaParams = {
   baseOrderSize: m("100"),
   additionalOrderSize: m("100"),
@@ -211,19 +229,6 @@ describe("the trailing-stop entry is priced to fill (22.10)", () => {
 });
 
 describe("the entry retry cap halts instead of looping (22.10)", () => {
-  /**
-   * The venue takes the entry away with no request from this system, and the
-   * real poll then discovers it -- which is what clears `openOrderIds` and lets
-   * `decide` ask for the entry again.
-   */
-  async function loseEntryToTheVenue(name: string, clientOrderId: string): Promise<void> {
-    const resting = exchange.resting.get(clientOrderId);
-    if (resting === undefined) throw new Error(`no resting order ${clientOrderId}`);
-    resting.cancelled = true;
-    const pass = await inNamed(name, (bot) => bot.checkOpenOrders(ACTOR));
-    expect(pass.closed).toContain(clientOrderId);
-  }
-
   it(`places the entry ${MAX_ENTRY_ATTEMPTS} times, then halts with a reason a human can read`, async () => {
     const name = `ts-cap-${counter}`;
     await startedTrailingStop(name);
@@ -318,5 +323,146 @@ describe("the entry retry cap halts instead of looping (22.10)", () => {
     const snap = await inNamed(name, (bot) => bot.snapshot());
     expect(snap.state.entryAttempts ?? 0).toBe(0);
     expect(snap.state.status).toBe("running");
+  });
+});
+
+/**
+ * SPEC 22.10, THE OTHER HALF: the cap must also be visible to `resume`.
+ *
+ * ⚠ WHAT PRODUCED THIS BLOCK, and like the file's own header it is an incident
+ * rather than a design note. `bot-ts1` on gemini-main testnet halted
+ * `entry_unfilled` on 2026-09-01 and was resumed repeatedly over the following
+ * week. Every resume SUCCEEDED -- `{status: "running", action: "resumed"}`, a
+ * `bot.resumed` audit row, `running` mirrored to D1 -- and every one of them was
+ * undone by the next candle, which re-halted the bot for the same reason. The
+ * orders table gained nothing after 2026-09-01T22:42.
+ *
+ * The cause is that `#resumePass` clears `status`, `haltReason`, `haltedAt` and
+ * `postHaltEvents` AND NOTHING ELSE, so `entryAttempts` survives -- correctly,
+ * since the field is documented "Never reset". `decide` then re-reads the
+ * carried-over count and its 22.10 gate fires BEFORE `open_entry` can be
+ * returned, so `#placeTrailingStopEntry` is never reached and no order is ever
+ * sent. Everything there is behaving as designed except `resume`, which
+ * advertised a retry it could not deliver.
+ *
+ * ⚠ WHY THE ASSERTIONS BELOW ARE ABOUT WHAT DID *NOT* HAPPEN. A test that only
+ * checked `rejects` would also pass against the old code if the throw were moved
+ * anywhere after the status writes -- which is the exact bug, one layer along:
+ * a bot flipped to `running`, its halt alert closed, and then refused. So these
+ * pin the absence of every side effect the successful-looking resume had.
+ */
+describe("resume respects the entry cap it cannot reset (22.10)", () => {
+  /** Drive a fresh bot to the cap and leave it halted `entry_unfilled`. */
+  async function haltedAtTheCap(name: string): Promise<void> {
+    await startedTrailingStop(name);
+    for (let candle = 0; candle < MAX_ENTRY_ATTEMPTS + 1; candle += 1) {
+      const before = exchange.placed.length;
+      await inNamed(name, (bot) => bot.onPriceUpdate(priceAt("100")));
+      if (exchange.placed.length > before) {
+        await loseEntryToTheVenue(name, exchange.placed[exchange.placed.length - 1]!.clientOrderId);
+      }
+    }
+    const snap = await inNamed(name, (bot) => bot.snapshot());
+    expect(snap.state.status).toBe("halted");
+    expect(snap.state.entryAttempts).toBe(MAX_ENTRY_ATTEMPTS);
+  }
+
+  it("refuses the resume outright rather than accepting it and re-halting", async () => {
+    const name = `ts-resume-cap-${counter}`;
+    await haltedAtTheCap(name);
+    const placedAtHalt = exchange.placed.length;
+
+    await expect(inNamed(name, (bot) => bot.resume(ACTOR))).rejects.toMatchObject({
+      code: "entry_budget_spent",
+    });
+
+    // THE REFUSAL IS BEFORE EVERY WRITE. Same property the drift gate has, and
+    // it is what separates this fix from the bug: a gate that flipped the status
+    // first would leave exactly the misleading `running` row the incident had.
+    const snap = await inNamed(name, (bot) => bot.snapshot());
+    expect(snap.state.status).toBe("halted");
+    expect(snap.state.entryAttempts).toBe(MAX_ENTRY_ATTEMPTS);
+    expect((await db.botInstances.findOne({ id: name }))!.status).toBe("halted");
+    // The halt reason is NOT cleared, because the clear lives past the throw.
+    expect(snap.state.haltReason ?? "").toContain("entry_unfilled");
+
+    // The halt alert stays OPEN. `resolveHaltAlerts` runs after the status
+    // writes, so a refused resume must not have closed it -- an operator
+    // counting open criticals has to keep seeing this bot.
+    expect(await db.alerts.count({ alert_type: "halt_entry_unfilled", resolved: false })).toBe(1);
+
+    // No audit row claiming a resume that did not happen.
+    expect(await db.auditLog.count({ target_bot_instance_id: name, action: "bot.resumed" })).toBe(0);
+
+    // And the point of the whole exercise: still nothing on the exchange.
+    expect(exchange.placed).toHaveLength(placedAtHalt);
+  });
+
+  it("says why, in terms an operator can act on -- including that retrying will not help", async () => {
+    const name = `ts-resume-cap-msg-${counter}`;
+    await haltedAtTheCap(name);
+
+    const error = await inNamed(name, (bot) => bot.resume(ACTOR)).catch((e: unknown) => e);
+    const message = error instanceof Error ? error.message : String(error);
+
+    // What happened, and how many times.
+    expect(message).toContain(`placed ${MAX_ENTRY_ATTEMPTS} times`);
+    // That a resume would place nothing -- the fact the successful-looking
+    // resume hid for a week.
+    expect(message).toMatch(/place\s+NOTHING/);
+    // That this is terminal, not a condition to clear and retry. This is the
+    // sentence that distinguishes the message from `position_unverified`'s,
+    // which correctly tells the operator to go and fix something.
+    expect(message).toMatch(/create a new bot/);
+    // And a pointer at the real open question, so the new bot is not started
+    // blind into the same venue behaviour.
+    expect(message).toMatch(/cancelled at the venue/);
+  });
+
+  it("still resumes a trailing stop that has attempts left", async () => {
+    // The gate is the CAP, not the counter being non-zero. A bot that used one
+    // attempt and halted for some other reason must resume normally, or this
+    // fix would quietly retire bots that are entitled to keep trying.
+    const name = `ts-resume-under-${counter}`;
+    await startedTrailingStop(name);
+    await inNamed(name, (bot) => bot.onPriceUpdate(priceAt("100")));
+    await loseEntryToTheVenue(name, exchange.placed[exchange.placed.length - 1]!.clientOrderId);
+    await inNamed(name, (bot) => bot.halt("manual", "operator paused for review", ACTOR));
+
+    const before = await inNamed(name, (bot) => bot.snapshot());
+    expect(before.state.entryAttempts).toBe(1);
+
+    const resumed = await inNamed(name, (bot) => bot.resume(ACTOR));
+    expect(resumed.action).toBe("resumed");
+
+    const after = await inNamed(name, (bot) => bot.snapshot());
+    expect(after.state.status).toBe("running");
+    // Carried over, NOT reset. The resume is allowed; the budget still shrinks.
+    expect(after.state.entryAttempts).toBe(1);
+  });
+
+  it("never refuses a DCA bot, whose entries this counter does not describe", async () => {
+    // The gate is strategy-scoped by construction rather than by arithmetic.
+    // DCA's ladder places many buys and bounds them its own way; if this gate
+    // ever read the field without checking the strategy, a busy DCA bot would
+    // become unresumable for a reason that does not apply to it.
+    const name = `dca-resume-${counter}`;
+    await inNamed(name, (bot) =>
+      bot.create({
+        botInstanceId: name,
+        accountLabel: "main",
+        exchange: "gemini",
+        pair: PAIR,
+        capitalAsset: "USD",
+        allocatedCapital: m("1000"),
+        params: DCA_PARAMS,
+        actor: ACTOR,
+      }),
+    );
+    await inNamed(name, (bot) => bot.start(ACTOR));
+    await inNamed(name, (bot) => bot.halt("manual", "operator paused for review", ACTOR));
+
+    const resumed = await inNamed(name, (bot) => bot.resume(ACTOR));
+    expect(resumed.action).toBe("resumed");
   });
 });

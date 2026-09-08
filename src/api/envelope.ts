@@ -121,6 +121,16 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   // conflicts with current state, and resolving the outstanding orders makes the
   // identical request work.
   orders_unresolved: 409,
+  // 409, joining the two above -- but for a DIFFERENT reason, and the difference
+  // is worth stating because the sentence those two share is false here. Both of
+  // them are conflicts someone else clears, after which the identical request
+  // works. A spent trailing-stop entry budget is never cleared by anything (see
+  // `entry_budget_spent` in `bot-instance.ts`), so this 409 will be returned for
+  // that bot forever. It is still a conflict with current state rather than a
+  // malformed request, which is what picks the status -- and NOT 403, which
+  // would say the caller lacks permission when in fact no actor can do this.
+  // The remedy is a new bot, and the error message is what carries that.
+  entry_budget_spent: 409,
   // Account circuit breaker (section 7.3).
   account_tripped: 409,
   reset_requires_human_actor: 403,
