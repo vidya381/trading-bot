@@ -42,21 +42,29 @@
  *
  * HOW THE VISIBLE FIELDS ADAPT PER STRATEGY (brief item 2)
  * -------------------------------------------------------
- * A grid/DCA segmented toggle drives which fieldset MOUNTS. Only the selected
- * strategy's inputs exist in the DOM, so the payload can never carry a stale
- * field from the other strategy. Shared fields (bot id, account, exchange, pair,
- * capital asset, allocated capital) sit above the switch and stay put.
+ * A DCA/grid/trailing-stop segmented toggle drives which fieldset MOUNTS. Only
+ * the selected strategy's inputs exist in the DOM, so the payload can never carry
+ * a stale field from another strategy. Shared fields (bot id, account, exchange,
+ * pair, capital asset, allocated capital) sit above the switch and stay put.
  *
  * THE MANDATORY-VS-OPTIONAL TAKE-PROFIT DISTINCTION (brief item 3)
  * ---------------------------------------------------------------
- * The two strategies genuinely differ (spec 6.1) and the form reflects it rather
- * than treating them identically:
- *   - stop-loss is REQUIRED for both, always marked with a `*`.
+ * The strategies genuinely differ (spec 6.1, spec 22) and the form reflects it
+ * rather than treating them identically:
+ *   - stop-loss is REQUIRED for DCA and grid, always marked with a `*`.
  *   - DCA take-profit (`takeProfitPct`) is REQUIRED -- it defines the cycle's
  *     exit -- and marked `*`.
  *   - grid take-profit (`takeProfitAmount`) is OPTIONAL, labelled (optional), and
  *     it is a realized-profit AMOUNT, not a percentage; grid also cashes out on
  *     an upside breakout by default (the `breakoutTakeProfit` checkbox alongside).
+ *   - TRAILING STOP HAS NEITHER, and its Risk-controls panel says so instead of
+ *     rendering empty boxes. Its single `trailPct` is at once the trail below the
+ *     high-water mark and the initial stop below entry (22.2 decision 1), so a
+ *     second percentage would be a control with nothing to control -- and
+ *     `TrailingStopParamsInput` has no field to carry one. Its entry is sized by
+ *     `allocatedCapital` (22.2 decision 4), which is why it asks for no order
+ *     size either. Its one bound is imported from the backend's own validator;
+ *     see `trailPct.ts` for why the numbers are not written here.
  *
  * CAPITAL IS THE SERVER'S TRUTH (brief items 4, 5)
  * ------------------------------------------------
@@ -155,6 +163,8 @@ import { CloneSourceBanner } from "../components/CloneSourceBanner";
 import { readProposalPrefill, withProposalId } from "../research/proposalPrefill";
 import { readBotClonePrefill, type FormPrefillSeed } from "../research/botClonePrefill";
 import { botInstanceIdError, maxBotInstanceIdLengthFor } from "../botId";
+import { TRAIL_PCT_MAX_TEXT, TRAIL_PCT_MIN_TEXT, trailPctError } from "../trailPct";
+import { strategyLabel } from "../strategyView";
 
 // ---------------------------------------------------------------------------
 // Validation helpers -- pure string checks, no float ever constructed. The
@@ -888,20 +898,32 @@ export function CreateBot() {
   const seed: FormPrefillSeed | null = prefill ?? clonePrefill;
   const gridPrefill = seed?.fields.strategy === "grid" ? seed.fields : null;
   const dcaPrefill = seed?.fields.strategy === "dca" ? seed.fields : null;
+  const trailPrefill = seed?.fields.strategy === "trailing_stop" ? seed.fields : null;
 
   /*
-   * ⚠ `CreatableStrategy`, NOT `Strategy`. The two diverged when `Strategy` grew
-   * its `trailing_stop` member (spec 22): the bot LIST and DETAIL pages must
-   * render every strategy that exists, but this form can only build the ones
+   * ⚠ `CreatableStrategy`, NOT `Strategy`. The bot LIST and DETAIL pages must
+   * render every strategy that EXISTS; this form can only build the ones
    * `CreateBotRequest` has a params shape for, and the toggle below offers
    * exactly those. Deriving the type from the request rather than restating it
    * means a strategy becomes selectable here only when the request it produces
    * is real -- and until then the omission is a compile error, not a form that
    * submits a body the backend has no branch for.
    *
-   * The seed cannot widen it either: both prefill decoders refuse an
-   * unrecognised strategy outright (`isCloneStrategy`), so a clone link from a
-   * trailing-stop bot yields no prefill rather than a half-filled DCA form.
+   * ⚠ THE TWO UNIONS HAVE JUST RE-CONVERGED, AND THAT IS NOT A REASON TO ALIAS
+   * THEM. `trailing_stop` now has a params shape and a `POST /api/bots` branch
+   * (`createBot` in src/api/handlers.ts), so `CreatableStrategy` and `Strategy`
+   * happen to hold the same three members again. They still answer different
+   * questions, and this one is derived from the request precisely so the next
+   * strategy to be readable-before-creatable separates them again without
+   * anybody having to notice.
+   *
+   * ⚠ THE SEED CAN NOW NAME ANY OF THE THREE, and that is the change that closed
+   * the last gap: `PREFILL_STRATEGIES` holds `trailing_stop`, so both decoders
+   * produce a trailing-stop seed and `CloneBotLink`'s `strategy_not_creatable`
+   * refusal stopped firing for it -- by one edit to a list, with no branch added
+   * anywhere. `PrefillStrategy` is still its own union rather than this one, so
+   * the next strategy that is proposable before it is creatable narrows the seed
+   * without narrowing the toggle.
    */
   const [strategy, setStrategy] = useState<CreatableStrategy>(() => seed?.strategy ?? "dca");
 
@@ -948,6 +970,20 @@ export function CreateBot() {
     () => gridPrefill?.breakoutThresholdPct ?? "",
   );
   const [takeProfitAmount, setTakeProfitAmount] = useState(() => gridPrefill?.takeProfitAmount ?? "");
+
+  /*
+   * Trailing-stop fields -- ALL ONE OF THEM (spec 22.2 decision 1).
+   *
+   * Seeded exactly like grid's and DCA's, falling back to the same `""` a manual
+   * visit has always had. Both decoders can now produce a trailing-stop seed
+   * (`PREFILL_STRATEGIES` holds the label, `WIRE_FIELDS.trailing_stop` carries
+   * `trailPct`), so a proposal link and a clone link both land here -- and, as
+   * with every other field on this form, what arrives is a DEFAULT VALUE and
+   * nothing more. The field is the same field, `validate()` is unchanged and
+   * unaware, and `trailPctError` judges a pre-filled value exactly as it judges a
+   * typed one.
+   */
+  const [trailPct, setTrailPct] = useState(() => trailPrefill?.trailPct ?? "");
 
   const [fieldErrors, setFieldErrors] = useState<Errors>({});
   const [submitting, setSubmitting] = useState(false);
@@ -1132,7 +1168,23 @@ export function CreateBot() {
     if (capitalAsset.trim() === "") errors.capitalAsset = "Required.";
     requirePositive(errors, "allocatedCapital", allocatedCapital);
 
-    if (strategy === "dca") {
+    if (strategy === "trailing_stop") {
+      /*
+       * ONE PARAMETER, AND ITS RULE IS THE SERVER'S OWN. See `trailPct.ts`: the
+       * bounds are imported from `validateTrailingStopParams`'s constants rather
+       * than restated, so the field cannot refuse a value the server takes or
+       * wave through one it does not.
+       *
+       * ⚠ NO STOP-LOSS CHECK HERE, and that is the strategy's shape rather than a
+       * gap. DCA and grid each carry a mandatory `stopLossPct` because their exits
+       * are separate from their entries; a trailing stop's trail IS its stop, so
+       * there is no second percentage to require and `TrailingStopParamsInput` has
+       * no field for one. Requiring an extra number the request cannot carry would
+       * block every submission.
+       */
+      const trailError = trailPctError(trailPct);
+      if (trailError !== null) errors.trailPct = trailError;
+    } else if (strategy === "dca") {
       requirePositive(errors, "baseOrderSize", baseOrderSize);
       requireInteger(errors, "maxAdditionalBuys", maxAdditionalBuys, 0);
       // additionalOrderSize/stepMultiplier are only USED when there are additional
@@ -1150,6 +1202,10 @@ export function CreateBot() {
       requirePercentPositive(errors, "dcaTakeProfitPct", dcaTakeProfitPct); // mandatory
       requirePercentUnder100(errors, "dcaStopLossPct", dcaStopLossPct); // mandatory
     } else {
+      // Grid -- the remaining member of `CreatableStrategy`. Left as `else` rather
+      // than `else if (strategy === "grid")` so that a FOURTH strategy added to the
+      // request type lands here loudly (grid's mandatory bounds and stop-loss fire
+      // against fields it does not have) instead of silently validating nothing.
       requirePositive(errors, "upperBound", upperBound);
       requirePositive(errors, "lowerBound", lowerBound);
       if (
@@ -1185,6 +1241,22 @@ export function CreateBot() {
       capitalAsset: capitalAsset.trim(),
       allocatedCapital: allocatedCapital.trim(),
     };
+    if (strategy === "trailing_stop") {
+      /*
+       * ONE FIELD IN `params`, and nothing else reaches the wire. The DO's
+       * `createTrailingStop` re-runs `validateTrailingStopParams` on it (as
+       * `create()` re-runs `validateDcaParams`), so the field check above is the
+       * operator's early warning, never the only one.
+       *
+       * The single entry is sized by `allocatedCapital` from `base` -- there is
+       * no order-size field here to send, which is why this strategy needs none.
+       */
+      return {
+        ...base,
+        strategy: "trailing_stop",
+        params: { trailPct: trailPct.trim() },
+      };
+    }
     if (strategy === "dca") {
       return {
         ...base,
@@ -1427,7 +1499,14 @@ export function CreateBot() {
         <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
           <h2 className="text-base font-semibold text-zinc-200">Strategy</h2>
           <div className="inline-flex rounded-lg border border-zinc-700 p-0.5" role="tablist" aria-label="Strategy">
-            {(["dca", "grid"] as const).map((option) => {
+            {/*
+              * Every strategy `CreateBotRequest` has a params shape for, written
+              * out in the order an operator meets them. `strategyLabel` supplies
+              * the words so the toggle, the bot list and the detail page all call
+              * this strategy the same thing -- a raw `{option}` would render the
+              * wire label "trailing_stop" here and "Trailing stop" everywhere else.
+              */}
+            {(["dca", "grid", "trailing_stop"] as const).map((option) => {
               const active = strategy === option;
               return (
                 <button
@@ -1442,13 +1521,41 @@ export function CreateBot() {
                     active ? "bg-emerald-600 text-white" : "text-zinc-300 hover:bg-zinc-800",
                   ].join(" ")}
                 >
-                  {option}
+                  {strategyLabel(option)}
                 </button>
               );
             })}
           </div>
 
-          {strategy === "dca" ? (
+          {strategy === "trailing_stop" ? (
+            <div className="space-y-4">
+              <TextInput
+                id="trailPct"
+                label="Trail %"
+                value={trailPct}
+                onChange={setTrailPct}
+                required
+                numeric
+                error={fieldErrors.trailPct}
+                help={`How far below the high-water mark the stop follows, and — until a new high is made — how far below the entry it sits. ${TRAIL_PCT_MIN_TEXT}-${TRAIL_PCT_MAX_TEXT}%.`}
+                placeholder="5"
+                disabled={submitting}
+              />
+              {/*
+                * ⚠ STATED, BECAUSE THE ABSENCE IS THE SURPRISING PART. Every other
+                * strategy on this toggle asks for an order size, and an operator who
+                * has just filled in DCA's or grid's will read a single field as a
+                * half-built form. It is not: the entry is sized by the allocated
+                * capital above (spec 22.2 decisions 1 and 4), and there is no
+                * parameter here that could size it otherwise.
+                */}
+              <p className="rounded-lg border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-xs leading-relaxed text-zinc-400">
+                <span className="font-medium text-zinc-300">There is no order-size field, and none is missing.</span>{" "}
+                A trailing stop makes ONE entry, sized by the allocated capital above. The trail
+                percentage is the whole of its configuration.
+              </p>
+            </div>
+          ) : strategy === "dca" ? (
             <div className="space-y-4">
               <TextInput
                 id="baseOrderSize"
@@ -1588,7 +1695,24 @@ export function CreateBot() {
         <section className="space-y-4 rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
           <h2 className="text-base font-semibold text-zinc-200">Risk controls</h2>
 
-          {strategy === "dca" ? (
+          {strategy === "trailing_stop" ? (
+            /*
+             * ⚠ NO FIELDS, AND THIS PANEL IS STILL HERE ON PURPOSE. Dropping the
+             * section for this strategy would read as "a trailing stop has no risk
+             * controls", which is the opposite of true: it is the one strategy whose
+             * exit is its entire configuration. What it does not have is a SECOND,
+             * separate percentage -- so the panel says which field is doing the work
+             * and points back at it, rather than showing a stop-loss box the request
+             * has nowhere to put.
+             */
+            <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm leading-relaxed text-zinc-400">
+              <span className="font-medium text-zinc-300">The trail is the stop.</span> There is no
+              separate stop-loss or take-profit for a trailing stop: the exit rides up with the
+              price and triggers when it falls back by the trail percentage set above. DCA and grid
+              need a stop-loss because their exits are separate from their entries; this one does
+              not, so there is nothing to fill in here.
+            </div>
+          ) : strategy === "dca" ? (
             <>
               <TextInput
                 id="dcaStopLossPct"

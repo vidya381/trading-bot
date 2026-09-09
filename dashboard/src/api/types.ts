@@ -560,8 +560,9 @@ export interface BotDetail extends Bot {
 // Bot creation REQUEST (`POST /api/bots`, `createBot` handler)
 //
 // The shape the create form SENDS -- mirrored from the backend handler's decode
-// (`createBot` in src/api/handlers.ts) and the two strategy param decoders
-// (`decodeDcaParams`/`decodeGridParams`). Money is a decimal string on the way
+// (`createBot` in src/api/handlers.ts) and the three strategy param decoders
+// (`decodeDcaParams`/`decodeGridParams`/`decodeTrailingStopParams`). Money is a
+// decimal string on the way
 // IN too, exactly as it comes back out; a percentage is a plain decimal string
 // ("20" = 20%). The strategy-specific `params` object is what each decoder
 // expects, minus `strategy`/`schemaVersion`, which the backend stamps itself.
@@ -609,6 +610,30 @@ export interface GridParamsInput {
    * bot relying on its stop-loss and breakout exit.
    */
   readonly takeProfitAmount?: string | null;
+}
+
+/**
+ * The trailing-stop `params` object `decodeTrailingStopParams` expects.
+ *
+ * ONE FIELD, and that is the entire shape (spec 22.2 decision 1) -- the same
+ * single field `TrailingStopParams` above carries, deliberately declared a
+ * SECOND time rather than aliased to it. The two answer different questions:
+ * that one mirrors what the backend STORES and publishes, this one is what the
+ * form SENDS, and the DCA/grid pairs above are already split on exactly that
+ * line (`DcaParams` vs `DcaParamsInput`). Aliasing them would read as an
+ * economy today and silently couple the wire format to the stored format the
+ * first time either grows a field the other does not have.
+ *
+ * ⚠ NO ORDER SIZE, AND NO STOP-LOSS, AND NEITHER IS AN OMISSION. The single
+ * entry is sized by `allocatedCapital` (22.2 decisions 1 and 4), and the trail
+ * IS the stop -- there is no separate `stopLossPct` for this strategy the way
+ * there is for DCA and grid, so the create form must not send one and does not
+ * offer one. `validateTrailingStopParams` in src/strategies/trailing-stop.ts is
+ * the authority on `trailPct` itself; `dashboard/src/trailPct.ts` applies that
+ * same authority's bounds in the field.
+ */
+export interface TrailingStopParamsInput {
+  readonly trailPct: string;
 }
 
 interface CreateBotBase {
@@ -666,7 +691,11 @@ export interface ProposalLink {
 /** The discriminated body of `POST /api/bots`. */
 export type CreateBotRequest =
   | (CreateBotBase & { readonly strategy: "dca"; readonly params: DcaParamsInput })
-  | (CreateBotBase & { readonly strategy: "grid"; readonly params: GridParamsInput });
+  | (CreateBotBase & { readonly strategy: "grid"; readonly params: GridParamsInput })
+  | (CreateBotBase & {
+      readonly strategy: "trailing_stop";
+      readonly params: TrailingStopParamsInput;
+    });
 
 /**
  * COMPILE-TIME GUARD on the note in `CreateBotBase`: `exchange` is not part of

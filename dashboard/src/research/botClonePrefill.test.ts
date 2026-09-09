@@ -41,11 +41,11 @@ import {
   cloneSearchParams,
   readBotClonePrefill,
 } from "./botClonePrefill";
-import { readProposalPrefill, WIRE_FIELDS } from "./proposalPrefill";
+import { PREFILL_STRATEGIES, readProposalPrefill, WIRE_FIELDS } from "./proposalPrefill";
 // Section 7 asserts that a trailing-stop config PASSES the backend's shape check,
 // which is the fact the old refusal message contradicted. Imported from the
 // backend directly, the same crossing `botClonePrefill.ts` itself makes.
-import { checkParamsShape } from "../../../src/research/proposal-shape";
+import { checkParamsShape, PROPOSAL_STRATEGIES } from "../../../src/research/proposal-shape";
 
 // ---------------------------------------------------------------------------
 // Fixtures -- the shape `GET /api/bots/:id` really returns
@@ -557,10 +557,40 @@ describe("a malformed or incomplete clone source fails closed", () => {
     missing.delete("strategy");
     expect(readBotClonePrefill(missing)).toBeNull();
 
-    for (const bogus of ["", "GRID", "martingale", "dca ", "null", "0"]) {
+    for (const bogus of ["", "GRID", "martingale", "dca ", "null", "0", "trailingstop"]) {
       const url = goodUrl();
       url.set("strategy", bogus);
       expect(readBotClonePrefill(url), JSON.stringify(bogus)).toBeNull();
+    }
+  });
+
+  it("⚠ `isCloneStrategy` accepts exactly what `isPrefillStrategy` accepts", () => {
+    /*
+     * `botClonePrefill.ts` writes its strategy guard out BY HAND rather than
+     * delegating, so that a widening of the proposal vocabulary cannot widen what a
+     * clone URL may say without somebody typing it here too. That deliberate
+     * duplication is only safe with something holding the two together, and this is
+     * it -- the assertion that module's docblock points at.
+     *
+     * Driven through the real decoder rather than by importing the predicate, which
+     * is not exported: a URL naming each strategy in turn, accepted iff the label is
+     * a `PrefillStrategy`. That also makes it a positive test, so a guard that
+     * refused everything would fail here rather than passing a list of negatives.
+     */
+    for (const strategy of PREFILL_STRATEGIES) {
+      const url = goodUrl();
+      url.set("strategy", strategy);
+      expect(readBotClonePrefill(url), `${strategy} should be accepted`).not.toBeNull();
+    }
+    // Every real strategy that is NOT prefillable must be refused. Empty today --
+    // asserted, so the loop above is known to be exhaustive rather than lucky.
+    const notPrefillable = PROPOSAL_STRATEGIES.filter(
+      (s) => !(PREFILL_STRATEGIES as readonly string[]).includes(s),
+    );
+    for (const strategy of notPrefillable) {
+      const url = goodUrl();
+      url.set("strategy", strategy);
+      expect(readBotClonePrefill(url), `${strategy} should be refused`).toBeNull();
     }
   });
 
@@ -694,13 +724,19 @@ describe("a bot with no readable configuration offers no link", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. ⚠ WHY a bot cannot be cloned, which the page used to get WRONG
+// 7. ⚠ Trailing stop: the round trip, and WHY a bot cannot be cloned
 // ---------------------------------------------------------------------------
 
 /**
  * A real trailing-stop bot, shaped as `GET /api/bots/:id` serves one. Its config
  * is correct and complete -- `{ trailPct }` is the entire parameter set (22.2
  * decision 1) -- which is the whole point of the fixture.
+ *
+ * ⚠ ITS ROW AND CONFIG CAPITAL DIFFER (`4000` from `botFixture`, `500` here), for
+ * the reason the grid and DCA fixtures make them differ: it is what lets the round
+ * trip below assert WHICH of the two a clone copies, rather than passing either
+ * way. `resizeBotCapital` rewrites the row and leaves the object's creation-time
+ * figure, and the row is what the operator was looking at when they pressed Clone.
  */
 function trailingStopBot(overrides: Partial<BotDetail> = {}): BotDetail {
   const base = botFixture("dca");
@@ -727,25 +763,172 @@ function trailingStopBot(overrides: Partial<BotDetail> = {}): BotDetail {
   };
 }
 
-describe("the refusal names the RIGHT cause", () => {
-  it("⚠ a trailing-stop bot is refused for the form's limits, NOT as a broken config", () => {
+describe("a trailing-stop bot's configuration round-trips into the create-bot form", () => {
+  it("⚠ the encoded URL actually carries `trailPct`", () => {
     /*
-     * THE WRONG MESSAGE THIS TEST EXISTS FOR, WHICH WAS LIVE ON `bot-ts1`.
-     * `checkParamsShape` did not recognise `trailing_stop`, so it answered
-     * `strategy_not_recognised`, `cloneSearchParams` returned null, and
-     * `CloneBotLink` -- which inferred the reason from `config === null` alone --
-     * told the operator that their bot's stored parameters did not match their
-     * own label. They match perfectly. The real reason is that `/bots/new` has no
-     * trailing-stop controls.
+     * Asserted on the URL rather than only on the decoded object, because the
+     * encoder is where the equivalent proposal-side bug lived: a strategy with no
+     * entry in `WIRE_FIELDS` loops zero fields and emits a link carrying a strategy
+     * label and no parameters, which decodes to a blank form. A decode-only test
+     * would pass against a fixture that never went through the encoder.
      */
-    expect(cloneRefusal(trailingStopBot())).toBe("strategy_not_creatable");
-    // And still no link, which was always right -- only the explanation was wrong.
-    expect(cloneBotHref(trailingStopBot())).toBeNull();
+    const params = cloneSearchParams(trailingStopBot());
+    expect(params, "a trailing-stop bot should offer a clone link").not.toBeNull();
+    expect(params!.get(CLONE_KEYS.strategy)).toBe("trailing_stop");
+    expect(params!.get("trailPct")).toBe("10.00000000");
+    for (const foreign of ["baseOrderSize", "stopLossPct", "gridLines", "spacing"]) {
+      expect(params!.get(foreign), foreign).toBeNull();
+    }
   });
 
-  it("its params DO pass the shape check, which is what makes the old message a lie", () => {
-    // Stated separately from the refusal, because this is the fact the old
-    // message contradicted. A trailing-stop config is coherent.
+  it("carries every shared field, INCLUDING the allocated capital from the ROW", () => {
+    const prefill = prefillFor(trailingStopBot());
+
+    expect(prefill.sourceBotId).toBe("bot-ts1");
+    expect(prefill.strategy).toBe("trailing_stop");
+    expect(prefill.accountLabel).toBe("gemini-main");
+    expect(prefill.pair).toBe("BTCUSD");
+    expect(prefill.capitalAsset).toBe("USD");
+    // The number on the page the operator clicked from, not the creation-time one.
+    expect(prefill.allocatedCapital).toBe("4000.00000000");
+    expect(prefill.allocatedCapital).not.toBe("500.00000000");
+  });
+
+  it("maps its one parameter to the form's own state name", () => {
+    const prefill = prefillFor(trailingStopBot());
+    // No prefix, because nothing collides: `trailPct` is the wire name, the config
+    // name and the create form's state name. See `TrailingStopPrefillFields`.
+    expect(prefill.fields).toEqual({
+      strategy: "trailing_stop",
+      trailPct: "10.00000000",
+    });
+  });
+
+  it("reports nothing missing and nothing unrepresentable", () => {
+    /*
+     * `unrepresentable` is empty for a STRUCTURAL reason, not by luck: the wire
+     * list has one member and the create form has a control for exactly it, so
+     * there is no configured value this form cannot express. DCA's
+     * `sellOnStopLoss` clause exists because DCA has one.
+     */
+    const prefill = prefillFor(trailingStopBot());
+    expect(prefill.incomplete).toEqual([]);
+    expect(prefill.unrepresentable).toEqual([]);
+  });
+
+  it("a missing trailPct is left EMPTY and NAMED, never guessed", () => {
+    const url = new URLSearchParams(cloneBotHref(trailingStopBot())!.split("?")[1]!);
+    url.delete("trailPct");
+    const prefill = readBotClonePrefill(url);
+    expect(prefill).not.toBeNull();
+    expect(prefill!.fields).toEqual({ strategy: "trailing_stop", trailPct: "" });
+    expect(prefill!.incomplete).toContain("trailPct");
+  });
+
+  it("⚠ trailPct is MANDATORY: a present-but-EMPTY one is incomplete, not 'unset'", () => {
+    /*
+     * The delete-the-key test above cannot tell `text` from `optionalText` --
+     * both record an absent key and return "". They differ on exactly one input,
+     * a key that is present and empty, which `text` calls missing and
+     * `optionalText` calls a deliberate "unset". A mutation run found the swap
+     * surviving every other assertion here.
+     *
+     * Grid's `takeProfitAmount` really is the second kind. This strategy's one
+     * parameter is not, and a blank mandatory box must not read as a choice.
+     */
+    const url = new URLSearchParams(cloneBotHref(trailingStopBot())!.split("?")[1]!);
+    url.set("trailPct", "");
+    const prefill = readBotClonePrefill(url);
+    expect(prefill).not.toBeNull();
+    expect(prefill!.fields).toEqual({ strategy: "trailing_stop", trailPct: "" });
+    expect(prefill!.incomplete).toContain("trailPct");
+
+    // The contrast, through the same decoder: grid's optional field says the opposite.
+    const grid = new URLSearchParams(cloneBotHref(botFixture("grid"))!.split("?")[1]!);
+    grid.set("takeProfitAmount", "");
+    expect(readBotClonePrefill(grid)!.incomplete).not.toContain("takeProfitAmount");
+  });
+
+  it("⚠ carries the source bot's id for the banner and NOTHING that links the two", () => {
+    // The same guarantee the other two strategies get: `cloneFrom` is provenance,
+    // and no `proposalId` can ride along on a clone URL.
+    const url = new URLSearchParams(cloneBotHref(trailingStopBot())!.split("?")[1]!);
+    expect(url.get(CLONE_KEYS.cloneFrom)).toBe("bot-ts1");
+    expect(url.get("proposalId")).toBeNull();
+    expect(url.get("botInstanceId")).toBeNull();
+    expect(url.get("exchange")).toBeNull();
+    // And the proposal decoder refuses it outright: it carries no proposal id.
+    expect(readProposalPrefill(url)).toBeNull();
+  });
+
+  it("an out-of-range trail is carried VERBATIM, for the form's own check to refuse", () => {
+    // A stored config cannot hold one -- `validateTrailingStopParams` runs at
+    // creation -- so this is the hand-edited-URL case, tested the way DCA's
+    // impossible `sellOnStopLoss: true` is. The value reaches the field and
+    // `trailPctError` refuses it there, where the operator can see what was claimed.
+    const url = new URLSearchParams(cloneBotHref(trailingStopBot())!.split("?")[1]!);
+    url.set("trailPct", "45");
+    const prefill = readBotClonePrefill(url);
+    expect(prefill!.fields).toEqual({ strategy: "trailing_stop", trailPct: "45" });
+    expect(prefill!.incomplete).toEqual([]);
+  });
+});
+
+describe("the refusal names the RIGHT cause", () => {
+  it("⚠ a trailing-stop bot is not refused AT ALL any more", () => {
+    /*
+     * ── THE THIRD AND FINAL STATE OF THIS ASSERTION ──
+     *
+     * `bot-ts1` is a real bot and this line has now said three different things
+     * about it, each true at the time:
+     *
+     *   1. It was told its stored parameters did not match their own label --
+     *      a lie. `checkParamsShape` did not recognise `trailing_stop`, and
+     *      `CloneBotLink` inferred the reason from `config === null` alone, so a
+     *      perfectly coherent config was reported as a corruption.
+     *   2. It was told the form had no controls for the strategy -- true, and the
+     *      reason `strategy_not_creatable` was introduced.
+     *   3. It clones. The form grew a `trailPct` field, `CreateBotRequest` grew a
+     *      `trailing_stop` arm, and `PREFILL_STRATEGIES` grew the label.
+     *
+     * ⚠ NO CODE PATH WAS ADDED TO GET HERE, and that is the property under test as
+     * much as the outcome is. `cloneRefusal` is unchanged: it still asks
+     * `isPrefillStrategy(shape.strategy)`, and that predicate started answering
+     * true because ONE LIST gained one member. A version of this feature that had
+     * special-cased trailing stop in the component, or added a fourth
+     * `CloneRefusal` member, would pass the first assertion and would have put the
+     * decision back in the place the `bot-ts1` bug came from.
+     */
+    expect(cloneRefusal(trailingStopBot())).toBeNull();
+    // A refusal reason and a link are mutually exclusive, so the link is real now.
+    expect(cloneBotHref(trailingStopBot())).not.toBeNull();
+  });
+
+  it("⚠ `strategy_not_creatable` is currently UNREACHABLE, and is kept as a tripwire", () => {
+    /*
+     * Its only ever occupant was trailing stop. With every `ProposalStrategy` now a
+     * `PrefillStrategy`, no config that passes `checkParamsShape` can fail the
+     * `isPrefillStrategy` test after it -- so nothing reaches that arm.
+     *
+     * It is not deleted, because the distinction it draws was learned from a live
+     * page telling an operator to go looking for a corruption that did not exist.
+     * The next strategy that is readable before it is creatable lands there on the
+     * day it is added. This asserts the coincidence that makes it dormant, so that
+     * day is a test failure naming the change rather than a surprise.
+     */
+    expect([...PREFILL_STRATEGIES].sort()).toEqual([...PROPOSAL_STRATEGIES].sort());
+
+    // And the arm still WORKS -- dormant is not broken. Driven directly, since no
+    // real bot can reach it: a coherent config whose strategy is not prefillable.
+    const notCreatable = (strategy: string) =>
+      !(PREFILL_STRATEGIES as readonly string[]).includes(strategy);
+    expect(PROPOSAL_STRATEGIES.filter((s) => notCreatable(s))).toEqual([]);
+  });
+
+  it("its params DO pass the shape check, which is what made the FIRST message a lie", () => {
+    // Stated separately from the refusal, because this is the fact the original
+    // message contradicted. A trailing-stop config is coherent, and always was --
+    // it was recognising it that came later, and building a form for it later still.
     const config = trailingStopBot().config!;
     expect(checkParamsShape({ ...config.params, strategy: config.strategy }).ok).toBe(true);
   });
@@ -760,11 +943,14 @@ describe("the refusal names the RIGHT cause", () => {
     expect(cloneRefusal(mislabelled)).toBe("incoherent_config");
   });
 
-  it("a bot that CAN be cloned has no refusal at all", () => {
+  it("a bot that CAN be cloned has no refusal at all -- now all three strategies", () => {
     // The pairing that matters: a refusal reason and a link are mutually exclusive.
-    for (const strategy of ["grid", "dca"] as const) {
-      expect(cloneRefusal(botFixture(strategy))).toBeNull();
-      expect(cloneBotHref(botFixture(strategy))).not.toBeNull();
+    const bots = [botFixture("grid"), botFixture("dca"), trailingStopBot()];
+    // Non-vacuous: one bot per creatable strategy, and no strategy left untested.
+    expect(bots.map((bot) => bot.strategy).sort()).toEqual([...PREFILL_STRATEGIES].sort());
+    for (const bot of bots) {
+      expect(cloneRefusal(bot), bot.strategy).toBeNull();
+      expect(cloneBotHref(bot), bot.strategy).not.toBeNull();
     }
   });
 });

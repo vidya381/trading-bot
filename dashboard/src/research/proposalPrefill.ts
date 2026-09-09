@@ -126,33 +126,41 @@ export const CREATE_BOT_PATH = "/bots/new";
 /**
  * THE STRATEGIES THE CREATE-BOT FORM CAN BE PREFILLED FOR.
  *
- * ⚠ THIS WAS `= ProposalStrategy`, AND THE TWO HAVE NOW GENUINELY DIVERGED.
- * `ProposalStrategy` answers "what can a proposal be about", and it gained
- * `trailing_stop` when `validatedProposalView` learned to emit one. This answers
- * a different question -- "what can `/bots/new` actually build" -- and the answer
- * is still the two strategies `CreateBotRequest` has a params shape for. The form
- * has no trailing-stop controls and `POST /api/bots` has no branch for one.
+ * ⚠ IT HAS BEEN THREE THINGS, AND THE HISTORY IS THE ARGUMENT FOR ITS PRESENT
+ * SHAPE. It began as `= ProposalStrategy` while both unions held the same two
+ * members. It became its own two-member literal when `ProposalStrategy` grew
+ * `trailing_stop` and this one could not follow, because `/bots/new` had no
+ * trailing-stop controls and `POST /api/bots` had no branch for one. It now holds
+ * all three, because both of those are built: `CreateBotRequest` has a
+ * `TrailingStopParamsInput` arm and the form has a `trailPct` field.
  *
- * Aliasing them was correct while both unions were the same two members and
- * silently wrong the moment one grew. Written out as its own literal, with its
- * own guard below, so the divergence is stated rather than inherited -- and so a
- * prefill URL naming a strategy the form cannot build is refused at the decoder
- * instead of half-filling a form.
+ * ⚠ THAT IT CURRENTLY MATCHES `ProposalStrategy` AGAIN IS NOT A REASON TO ALIAS
+ * IT. The two questions stayed different the whole way through -- "what can a
+ * proposal be ABOUT" against "what can `/bots/new` BUILD" -- and the aliased
+ * version was silently wrong for however long it took somebody to notice that one
+ * union had grown. Written out as its own literal, with its own guard below, so
+ * the next strategy that is proposable before it is creatable separates them
+ * again by being absent HERE rather than by being wrong everywhere.
  *
  * It is deliberately NOT pinned to `CreateBotRequest["strategy"]` by an import:
  * this module is one of the two the dashboard shares across the `tsc` seam. The
  * agreement is pinned by a test instead, the same way every other mirror here is.
  */
-export const PREFILL_STRATEGIES = ["grid", "dca"] as const;
+export const PREFILL_STRATEGIES = ["grid", "dca", "trailing_stop"] as const;
 
 export type PrefillStrategy = (typeof PREFILL_STRATEGIES)[number];
 
 /**
  * A label the create-bot form can actually be filled from.
  *
- * Narrower than `isProposalStrategy` on purpose, and the narrowing is the guard:
- * a `trailing_stop` label is a REAL strategy that this form cannot build, so it
- * is refused here rather than passed through to a form with no controls for it.
+ * ⚠ IT STILL ASKS TWO QUESTIONS, THOUGH BOTH CURRENTLY ANSWER THE SAME SET. A
+ * label must be a real proposal strategy AND be in `PREFILL_STRATEGIES`. Today
+ * every member of the first is a member of the second, so the second conjunct
+ * rejects nothing -- and it is kept, because it is the entire mechanism by which
+ * a future proposable-but-not-yet-creatable strategy gets refused here instead of
+ * being passed through to a form with no controls for it. `proposalPrefill.test.ts`
+ * asserts the present coincidence explicitly, so the day it stops holding is a
+ * test failure that names the change rather than a silent widening.
  */
 export function isPrefillStrategy(value: unknown): value is PrefillStrategy {
   return (
@@ -225,7 +233,36 @@ export interface DcaPrefillFields {
    */
 }
 
-export type PrefillFields = GridPrefillFields | DcaPrefillFields;
+/**
+ * Section 22's one parameter, and the one case in this table where the wire name
+ * and the form's state name are THE SAME WORD.
+ *
+ * ⚠ THAT SAMENESS IS A FACT, NOT A SHORTCUT, and it is worth saying why the
+ * mapping table above does not gain a row. Grid and DCA both carry a parameter
+ * literally called `stopLossPct` into two different DOM nodes, which is what
+ * forces `gridStopLossPct` / `dcaStopLossPct` and is the specific bug the mutation
+ * run for that step targeted first. `trailPct` collides with nothing: no other
+ * strategy has a field of that name, and the create form's state is called
+ * `trailPct` too. So the identity mapping here is the CORRECT mapping rather than
+ * an unwritten one, and a later strategy that did collide would still have to
+ * declare its own prefixed name.
+ *
+ * ⚠ NO STOP-LOSS AND NO ORDER SIZE, matching `TrailingStopParamsInput`. The trail
+ * is the stop and the single entry is sized by `allocatedCapital` (spec 22.2
+ * decisions 1 and 4), so there is no third value for a URL to carry -- which also
+ * means this strategy has no optional field, no boolean, and nothing that can
+ * arrive as `null`. It is the simplest arm of this union by some distance, and
+ * the encode/decode round trip below is correspondingly total.
+ */
+export interface TrailingStopPrefillFields {
+  readonly strategy: "trailing_stop";
+  readonly trailPct: string;
+}
+
+export type PrefillFields =
+  | GridPrefillFields
+  | DcaPrefillFields
+  | TrailingStopPrefillFields;
 
 /**
  * Everything `/bots/new` needs in order to open pre-filled AND to say honestly
@@ -360,6 +397,24 @@ export function prefillSearchParams(derive: DeriveResponse): URLSearchParams | n
   const proposal = derive.derive.proposal;
   const shape = checkParamsShape(proposal.params);
   if (!shape.ok) return null;
+  /*
+   * ⚠ A SECOND REFUSAL, AND IT IS NOT A SHAPE FAULT -- the same one
+   * `cloneSearchParams` has always made explicitly, and the one THIS function was
+   * missing. `checkParamsShape` answers "are these params coherent for their own
+   * label"; a trailing-stop proposal's are, and were, long before the form could
+   * build one. What it cannot answer is whether `/bots/new` has anywhere to PUT
+   * them.
+   *
+   * Without this line the answer came from a ternary further down, which sent
+   * every non-grid strategy through the DCA field list -- so a trailing-stop
+   * proposal produced an offered link carrying no parameters, and the operator
+   * landed on a blank form with no banner. Refused HERE, the proposal page states
+   * it on the page the button is on, which is where a person can act on it.
+   *
+   * Today this rejects nothing: every `ProposalStrategy` is a `PrefillStrategy`.
+   * It is the guard for the next one that is not.
+   */
+  if (!isPrefillStrategy(shape.strategy)) return null;
 
   const params = new URLSearchParams();
   params.set(KEY.proposalId, derive.proposalId);
@@ -379,8 +434,10 @@ export function prefillSearchParams(derive: DeriveResponse): URLSearchParams | n
    * would let the type system claim a guarantee it did not verify.
    */
   const p = proposal.params as unknown as Readonly<Record<string, unknown>>;
-  const wire = shape.strategy === "grid" ? GRID_WIRE_FIELDS : DCA_WIRE_FIELDS;
-  for (const field of wire) {
+  // The table, not a ternary. A ternary has a fall-through arm and this does not:
+  // an unlisted strategy cannot silently take another strategy's field list,
+  // because `isPrefillStrategy` above has already refused it.
+  for (const field of WIRE_FIELDS[shape.strategy]) {
     const value = p[field];
     // `null` is a real, present value for the two optional grid fields and it
     // encodes as the empty string. `undefined` cannot occur — `checkParamsShape`
@@ -426,6 +483,15 @@ const GRID_WIRE_FIELDS: readonly string[] = [
   "takeProfitAmount",
 ];
 
+/**
+ * ONE FIELD, pinned against `TRAILING_STOP_PROPOSAL_FIELDS` by the same test that
+ * pins the other two. A one-element list looks like a thing not worth a constant;
+ * it is here for exactly the reason the other two are -- so that a field added to
+ * the backend's list and not to this one fails a test rather than dropping out of
+ * every prefilled form in silence.
+ */
+const TRAILING_STOP_WIRE_FIELDS: readonly string[] = ["trailPct"];
+
 const DCA_WIRE_FIELDS: readonly string[] = [
   "baseOrderSize",
   "additionalOrderSize",
@@ -441,13 +507,25 @@ const DCA_WIRE_FIELDS: readonly string[] = [
 /** Exposed for the test that pins them against the backend's own lists. */
 /**
  * Keyed by `PrefillStrategy`, NOT by `ProposalStrategy`, and the annotation is
- * what says so. There is no trailing-stop entry because there is no
- * trailing-stop form to fill; a strategy is refused before this is indexed
- * (`isPrefillStrategy`), rather than indexed and found undefined.
+ * still what says so even now that the two hold the same members. A strategy is
+ * refused BEFORE this is indexed (`isPrefillStrategy`, at both the encoder and
+ * both decoders), rather than indexed and found `undefined` -- which would loop
+ * zero fields and emit a URL carrying a strategy label and no parameters at all.
+ *
+ * ⚠ THAT IS NOT HYPOTHETICAL: IT IS WHAT THIS FILE USED TO DO. Before trailing
+ * stop was creatable, `prefillSearchParams` chose its field list with
+ * `shape.strategy === "grid" ? GRID : DCA` and had no guard, so a trailing-stop
+ * proposal took the DCA list, found every one of those nine fields `undefined` on
+ * a `{ trailPct }` object, set none of them, and produced a real, offered link
+ * whose query string carried `strategy=trailing_stop` and no parameters. The
+ * decoder then refused it and the operator landed on a blank manual form with no
+ * banner and no statement of why. The guard below is what makes that shape
+ * impossible rather than merely absent today.
  */
 export const WIRE_FIELDS: Readonly<Record<PrefillStrategy, readonly string[]>> = Object.freeze({
   grid: GRID_WIRE_FIELDS,
   dca: DCA_WIRE_FIELDS,
+  trailing_stop: TRAILING_STOP_WIRE_FIELDS,
 });
 
 // ---------------------------------------------------------------------------
@@ -538,8 +616,9 @@ export function readProposalPrefill(params: URLSearchParams): ProposalPrefill | 
   if (proposalId === null || proposalId.trim() === "") return null;
 
   const rawStrategy = params.get(KEY.strategy);
-  // `isPrefillStrategy`, not `isProposalStrategy`: a trailing-stop proposal is a
-  // real proposal, and still not something this form can be filled from.
+  // `isPrefillStrategy`, not `isProposalStrategy`. The two accept the same set
+  // today; this is the one that answers "can this FORM be filled from it", which
+  // is the question being asked here, and it is the one that will narrow first.
   if (!isPrefillStrategy(rawStrategy)) return null;
 
   const incomplete: string[] = [];
@@ -554,7 +633,26 @@ export function readProposalPrefill(params: URLSearchParams): ProposalPrefill | 
   if (stalenessInputs.length === 0) incomplete.push(KEY.freshness);
 
   let fields: PrefillFields;
-  if (rawStrategy === "grid") {
+  if (rawStrategy === "trailing_stop") {
+    /*
+     * ONE FIELD, and no mapping: the proposal's `trailPct` is the form's
+     * `trailPct` (see `TrailingStopPrefillFields`). `text` rather than
+     * `optionalText` because it is mandatory -- an absent one is genuinely
+     * incomplete and the banner must say so, exactly as it does for a missing
+     * grid bound.
+     *
+     * ⚠ NOTHING IS RANGE-CHECKED HERE, deliberately. A value that arrives outside
+     * `TRAIL_PCT_MIN`/`MAX` is passed through VERBATIM, the way every other field
+     * in this module is: the create form's own `trailPctError` judges it, in the
+     * field, against the backend's own constants. Silently dropping or clamping it
+     * would hide from the operator that the URL claimed it -- which is the failure
+     * this whole module is written against.
+     */
+    fields = {
+      strategy: "trailing_stop",
+      trailPct: text(params, "trailPct", incomplete),
+    };
+  } else if (rawStrategy === "grid") {
     fields = {
       strategy: "grid",
       lowerBound: text(params, "lowerBound", incomplete),

@@ -53,6 +53,8 @@ import { fetchLabel, formatAge, refreshAdvice } from "../proposal";
 import type { StalenessVerdict } from "../../../src/research/staleness";
 import { prefillStaleness, type ProposalPrefill } from "../research/proposalPrefill";
 import { formatDateTime } from "../format";
+import { strategyLabel } from "../strategyView";
+import type { CreateBotRequest } from "../api/types";
 
 /** A 1s tick, so an age on screen stays true while a form is being filled in. */
 function useNow(): number {
@@ -91,7 +93,7 @@ export function ProposalPrefillBanner({
   prefill,
   /**
    * The strategy the form is CURRENTLY showing, which is not necessarily the
-   * proposal's: the grid/DCA toggle is an ordinary editable control and switching
+   * proposal's: the strategy toggle is an ordinary editable control and switching
    * it is a legitimate thing to do.
    *
    * ⚠ IT IS PASSED IN RATHER THAN ASSUMED, BECAUSE THE BANNER GOES STALE OTHERWISE.
@@ -104,7 +106,16 @@ export function ProposalPrefillBanner({
   currentStrategy,
 }: {
   prefill: ProposalPrefill;
-  currentStrategy: "grid" | "dca";
+  /*
+   * ⚠ EVERY CREATABLE STRATEGY, NOT THE TWO A PREFILL CAN NAME. `prefill.strategy`
+   * is a `PrefillStrategy` and always will be, but `currentStrategy` is whatever
+   * the operator has switched the toggle TO -- and the toggle grew a third option
+   * when trailing stop became creatable. Typing this as the prefill's own narrow
+   * union made the mismatch warning below unreachable for exactly the switch that
+   * strands the most fields, and broke the build the moment the toggle widened,
+   * which is where a change with this consequence should be noticed.
+   */
+  currentStrategy: CreateBotRequest["strategy"];
 }) {
   const now = useNow();
   // The backend's own comparison, over the triples the proposal page paired.
@@ -196,9 +207,10 @@ export function ProposalPrefillBanner({
 
       {currentStrategy !== prefill.strategy && (
         <p className="border-t border-amber-500/20 pt-3 text-xs leading-relaxed text-amber-100/90">
-          <strong>You have switched this form to {currentStrategy.toUpperCase()}.</strong> This is a{" "}
-          {prefill.strategy.toUpperCase()} proposal, so <strong>none</strong> of the{" "}
-          {currentStrategy.toUpperCase()} parameters below came from it — they are the form&rsquo;s
+          <strong>You have switched this form to {strategyLabel(currentStrategy).toUpperCase()}.</strong>{" "}
+          This is a {strategyLabel(prefill.strategy).toUpperCase()} proposal, so <strong>none</strong>{" "}
+          of the {strategyLabel(currentStrategy).toUpperCase()} parameters below came from it — they
+          are the form&rsquo;s
           own empty defaults and are yours to fill in. The shared fields (account, pair, capital)
           are still the proposal&rsquo;s unless you have changed them. Submitting will still record
           this proposal as approved, because you reached the form from it — that is what the link

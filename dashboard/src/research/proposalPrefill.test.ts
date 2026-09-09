@@ -39,9 +39,11 @@ import type {
   DeriveResponse,
   EvidenceItem,
   GridParams,
+  TrailingStopParams,
 } from "../api/research-types";
 import {
   CREATE_BOT_PATH,
+  PREFILL_STRATEGIES,
   WIRE_FIELDS,
   createBotHref,
   prefillSearchParams,
@@ -53,6 +55,8 @@ import {
 import {
   DCA_PROPOSAL_FIELDS,
   GRID_PROPOSAL_FIELDS,
+  PROPOSAL_STRATEGIES,
+  TRAILING_STOP_PROPOSAL_FIELDS,
 } from "../../../src/research/proposal-shape";
 import { DEFAULT_STALENESS_POLICY, priceThresholdFor } from "../../../src/research/staleness";
 
@@ -101,7 +105,23 @@ const DCA_PARAMS: DcaParams = {
   sellOnStopLoss: false,
 };
 
-function response(params: GridParams | DcaParams, overrides: Partial<DeriveResponse> = {}): DeriveResponse {
+/**
+ * ⚠ SYNTHETIC, like the DCA one, and for a sharper reason: no live derivation has
+ * ever produced a trailing stop either, and `TRAILING_STOP_PROPOSAL_FIELDS` has a
+ * single member, so there is no field-collision bug for a fixture to catch here.
+ * What it DOES establish is that the encode/decode round trip carries that one
+ * field at all -- which the code it replaces did not (see the round-trip block
+ * below).
+ */
+const TRAILING_STOP_PARAMS: TrailingStopParams = {
+  strategy: "trailing_stop",
+  trailPct: "7.50000000",
+};
+
+function response(
+  params: GridParams | DcaParams | TrailingStopParams,
+  overrides: Partial<DeriveResponse> = {},
+): DeriveResponse {
   const base: DeriveResponse = {
     entryPoint: "named",
     selectedAt: SELECTED_AT,
@@ -253,6 +273,210 @@ describe("the wire field lists are the backend's own", () => {
 
   it("dca's wire fields equal DCA_PROPOSAL_FIELDS, element for element", () => {
     expect([...WIRE_FIELDS.dca].sort()).toEqual([...DCA_PROPOSAL_FIELDS].sort());
+  });
+
+  it("trailing stop's wire fields equal TRAILING_STOP_PROPOSAL_FIELDS", () => {
+    expect([...WIRE_FIELDS.trailing_stop].sort()).toEqual(
+      [...TRAILING_STOP_PROPOSAL_FIELDS].sort(),
+    );
+  });
+
+  it("⚠ every strategy that can be PROPOSED has a wire list, with none left over", () => {
+    /*
+     * The table's completeness, checked against the backend's own strategy list
+     * rather than against a hand-written one here. A `PrefillStrategy` with no
+     * entry would loop zero fields and emit a URL carrying a strategy label and no
+     * parameters at all -- which is precisely what this module did for trailing
+     * stop before this step, and the reason it went unnoticed is that no test
+     * asked this question.
+     */
+    expect(Object.keys(WIRE_FIELDS).sort()).toEqual([...PREFILL_STRATEGIES].sort());
+    for (const strategy of PREFILL_STRATEGIES) {
+      expect(WIRE_FIELDS[strategy].length, strategy).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("the prefill vocabulary against the proposal vocabulary", () => {
+  it("⚠ every proposable strategy is currently prefillable, and that is a COINCIDENCE", () => {
+    /*
+     * The two unions answer different questions -- "what can a proposal be about"
+     * against "what can `/bots/new` build" -- and they have been unequal before,
+     * for as long as trailing stop was proposable but had no form.
+     *
+     * This assertion is not a claim that they must stay equal. It is a tripwire on
+     * the day they stop being: `cloneRefusal`'s `strategy_not_creatable` arm and
+     * the `isPrefillStrategy` guards at the encoder and both decoders are all
+     * unreachable exactly while this passes, and all three come back to life
+     * together when it fails. A failure here is the signal to check them, not a
+     * defect in itself.
+     */
+    expect([...PREFILL_STRATEGIES].sort()).toEqual([...PROPOSAL_STRATEGIES].sort());
+  });
+
+  it("⚠ documents THREE guards that no test can currently kill, and why", () => {
+    /*
+     * ── HONEST ACCOUNTING, WRITTEN DOWN RATHER THAN LEFT AS A GREEN TICK ──
+     *
+     * The mutation run for this step killed 8 of 10 mutants. The two survivors were
+     * the same edit applied to the two encoders: deleting
+     * `if (!isPrefillStrategy(shape.strategy)) return null;` from
+     * `prefillSearchParams` and from `cloneSearchParams`. `cloneRefusal`'s
+     * `strategy_not_creatable` arm is a third instance of the same thing.
+     *
+     * They are EQUIVALENT MUTANTS today, not gaps. All three guards ask "is this
+     * strategy one `/bots/new` can build", and while the assertion above holds the
+     * answer is yes for every input `checkParamsShape` can produce -- so removing
+     * them changes no observable behaviour and no test can legitimately detect it.
+     * A test that appeared to kill them would have to fabricate a strategy the
+     * type system says cannot exist, and would be testing its own fixture.
+     *
+     * ⚠ WHAT KEEPS THEM HONEST IS THE ASSERTION ABOVE, and that one IS
+     * mutation-tested: narrowing `PREFILL_STRATEGIES` back to two members fails it
+     * along with 21 others. The chain is: the day a strategy becomes proposable
+     * before it is creatable, that assertion fails and names the change; at that
+     * same moment all three guards become reachable and killable. Until then they
+     * are load-bearing for a future that has not arrived, which is the same status
+     * `strategy_not_creatable` is documented with in `botClonePrefill.ts`.
+     *
+     * This test asserts nothing new. It is here so the survivors are a recorded
+     * decision rather than something a later reader has to rediscover.
+     */
+    expect(PREFILL_STRATEGIES.every((s) => (PROPOSAL_STRATEGIES as readonly string[]).includes(s))).toBe(
+      true,
+    );
+  });
+});
+
+describe("a TRAILING-STOP proposal pre-fills the form correctly", () => {
+  /*
+   * ── ⚠ THE BUG THIS BLOCK IS WRITTEN AGAINST, WHICH WAS LIVE ──
+   *
+   * `prefillSearchParams` chose its field list with
+   * `shape.strategy === "grid" ? GRID_WIRE_FIELDS : DCA_WIRE_FIELDS` and had no
+   * `isPrefillStrategy` guard. A trailing-stop proposal passed `checkParamsShape`
+   * -- its params ARE coherent -- fell into the DCA arm, found all nine DCA fields
+   * `undefined` on a `{ trailPct }` object, and set none of them.
+   *
+   * The result was not a refusal. `createBotHref` returned a REAL href, so
+   * `ProposalCreateBotLink` rendered an ordinary "create a bot from this proposal"
+   * button, and pressing it navigated to `/bots/new?...&strategy=trailing_stop`
+   * carrying no parameters -- which `readProposalPrefill` then refused, leaving the
+   * operator on a blank manual form with no banner and no statement of why. Every
+   * test in this file passed throughout, because none of them asked about a third
+   * strategy.
+   *
+   * So the first assertion below is deliberately about the URL rather than the
+   * decoded object: the decode could be made to pass by a fixture that never went
+   * through the encoder, and it was the ENCODER that was silently dropping the
+   * field.
+   */
+  it("⚠ the encoded URL actually carries `trailPct`", () => {
+    const params = prefillSearchParams(response(TRAILING_STOP_PARAMS));
+    expect(params, "a trailing-stop proposal should offer a link").not.toBeNull();
+    expect(params!.get("strategy")).toBe("trailing_stop");
+    expect(params!.get("trailPct")).toBe("7.50000000");
+  });
+
+  it("carries no other strategy's parameters into the URL", () => {
+    // The other half of the old fault: the DCA list was looped, so a bug that set
+    // those keys to the literal string "undefined" would have been just as silent.
+    const params = prefillSearchParams(response(TRAILING_STOP_PARAMS))!;
+    for (const foreign of ["baseOrderSize", "stopLossPct", "gridLines", "orderSize", "spacing"]) {
+      expect(params.get(foreign), foreign).toBeNull();
+    }
+  });
+
+  it("maps its one parameter to the form's own field name", () => {
+    const prefill = roundTrip(response(TRAILING_STOP_PARAMS));
+
+    expect(prefill.strategy).toBe("trailing_stop");
+    // ⚠ NO MAPPING, and that is the correct mapping rather than a missing one:
+    // `trailPct` collides with no other strategy's field, so the wire name and the
+    // form's state name are the same word. See `TrailingStopPrefillFields`.
+    expect(prefill.fields).toEqual({
+      strategy: "trailing_stop",
+      trailPct: "7.50000000",
+    });
+    expect(prefill.incomplete).toEqual([]);
+    expect(prefill.unrepresentable).toEqual([]);
+  });
+
+  it("carries the shared fields and the proposal's identity", () => {
+    const prefill = roundTrip(response(TRAILING_STOP_PARAMS));
+    expect(prefill.proposalId).toBe("prop-01JABCDEF");
+    expect(prefill.accountLabel).toBe("gemini-main");
+    expect(prefill.pair).toBe("BTCUSD");
+    expect(prefill.capitalAsset).toBe("USD");
+    expect(prefill.allocatedCapital).toBe("400.00000000");
+    expect(prefill.generatedAt).toBe(SELECTED_AT);
+  });
+
+  it("⚠ a value outside the permitted trail range is carried VERBATIM, not clamped", () => {
+    /*
+     * `TRAIL_PCT_MIN`/`MAX` are 1 and 20, and 45 is outside them. The prefill's job
+     * is to put what the proposal said in front of a human, not to correct it:
+     * `trailPctError` in the create form refuses it in the field, against the
+     * backend's own constants. Silently clamping or dropping it would hide from the
+     * operator that the model proposed it -- the failure this whole module exists
+     * to prevent, and the same rule the header states for every other field.
+     */
+    const wild: TrailingStopParams = { strategy: "trailing_stop", trailPct: "45.00000000" };
+    const prefill = roundTrip(response(wild));
+    expect(prefill.fields).toEqual({ strategy: "trailing_stop", trailPct: "45.00000000" });
+    expect(prefill.incomplete).toEqual([]);
+  });
+
+  it("a missing trailPct is left EMPTY and NAMED, never guessed", () => {
+    // Substituting a plausible percentage would be a degraded result
+    // indistinguishable from a good one, on the screen that commits capital.
+    const params = prefillSearchParams(response(TRAILING_STOP_PARAMS))!;
+    params.delete("trailPct");
+    const prefill = readProposalPrefill(params);
+    expect(prefill).not.toBeNull();
+    expect(prefill!.fields).toEqual({ strategy: "trailing_stop", trailPct: "" });
+    expect(prefill!.incomplete).toContain("trailPct");
+  });
+
+  it("⚠ trailPct is MANDATORY: a present-but-EMPTY one is incomplete, not 'unset'", () => {
+    /*
+     * ⚠ THIS IS THE ASSERTION THE DELETE-THE-KEY TEST ABOVE CANNOT MAKE, and a
+     * mutation run is what said so. `text` and `optionalText` behave IDENTICALLY
+     * for an absent key -- both record it and return "" -- and differ on exactly
+     * one input: a key that is present and empty. `text` calls that incomplete
+     * (the value is missing); `optionalText` calls it a real answer meaning "this
+     * was deliberately left unset".
+     *
+     * So swapping `text` for `optionalText` on this field passed every other test
+     * in this file. It matters because the two describe different fields: grid's
+     * `takeProfitAmount` genuinely is optional and empty means "no target", while
+     * an empty `trailPct` means the one parameter this strategy has did not
+     * arrive -- and the banner must say so rather than presenting a blank
+     * mandatory box as a considered choice.
+     */
+    const params = prefillSearchParams(response(TRAILING_STOP_PARAMS))!;
+    params.set("trailPct", "");
+    const prefill = readProposalPrefill(params);
+    expect(prefill).not.toBeNull();
+    expect(prefill!.fields).toEqual({ strategy: "trailing_stop", trailPct: "" });
+    expect(prefill!.incomplete).toContain("trailPct");
+
+    // The contrast, on the same run: grid's optional field says the opposite.
+    const grid = prefillSearchParams(response(GRID_PARAMS))!;
+    grid.set("takeProfitAmount", "");
+    expect(readProposalPrefill(grid)!.incomplete).not.toContain("takeProfitAmount");
+  });
+
+  it("the staleness carry-over works the same as for the other two", () => {
+    // The price-history threshold is per-strategy (`priceThresholdFor`), so this is
+    // the one shared mechanism a third strategy could have broken.
+    const prefill = roundTrip(response(TRAILING_STOP_PARAMS));
+    expect(prefill.stalenessInputs.length).toBeGreaterThan(0);
+    const price = prefill.stalenessInputs.find((input) => input.key === "candles");
+    expect(price).toBeDefined();
+    expect(price!.thresholdMs).toBe(
+      priceThresholdFor("trailing_stop", DEFAULT_STALENESS_POLICY),
+    );
   });
 });
 

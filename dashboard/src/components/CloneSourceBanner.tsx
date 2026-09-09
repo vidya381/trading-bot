@@ -36,12 +36,14 @@
 
 import { Link } from "react-router-dom";
 import type { BotClonePrefill } from "../research/botClonePrefill";
+import { strategyLabel } from "../strategyView";
+import type { CreateBotRequest } from "../api/types";
 
 export function CloneSourceBanner({
   prefill,
   /**
    * The strategy the form is CURRENTLY showing, which is not necessarily the
-   * source bot's: the grid/DCA toggle is an ordinary editable control.
+   * source bot's: the strategy toggle is an ordinary editable control.
    *
    * ⚠ PASSED IN RATHER THAN ASSUMED, because the banner goes stale otherwise.
    * Switching the toggle mounts the other strategy's fieldset, whose inputs hold
@@ -52,7 +54,14 @@ export function CloneSourceBanner({
   currentStrategy,
 }: {
   prefill: BotClonePrefill;
-  currentStrategy: "grid" | "dca";
+  /*
+   * ⚠ EVERY CREATABLE STRATEGY, for the reason `ProposalPrefillBanner` states at
+   * the same prop: a clone seed can only ever name one of the two strategies the
+   * clone wire format carries, but the toggle the operator can switch to now has
+   * three options, and the widest of those switches is the one this warning most
+   * needs to fire on.
+   */
+  currentStrategy: CreateBotRequest["strategy"];
 }) {
   return (
     <section
@@ -104,9 +113,10 @@ export function CloneSourceBanner({
 
       {currentStrategy !== prefill.strategy && (
         <p className="border-t border-amber-500/30 pt-3 text-xs leading-relaxed text-amber-100/90">
-          <strong>You have switched this form to {currentStrategy.toUpperCase()}.</strong> The
-          source bot is {prefill.strategy.toUpperCase()}, so <strong>none</strong> of the{" "}
-          {currentStrategy.toUpperCase()} parameters below came from it — they are the form&rsquo;s
+          <strong>You have switched this form to {strategyLabel(currentStrategy).toUpperCase()}.</strong>{" "}
+          The source bot is {strategyLabel(prefill.strategy).toUpperCase()}, so <strong>none</strong>{" "}
+          of the {strategyLabel(currentStrategy).toUpperCase()} parameters below came from it — they
+          are the form&rsquo;s
           own empty defaults and are yours to fill in. The shared fields (account, pair, capital)
           are still the source bot&rsquo;s unless you have changed them.
         </p>

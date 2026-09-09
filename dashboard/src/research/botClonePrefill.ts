@@ -126,6 +126,7 @@ import {
   type GridPrefillFields,
   type PrefillFields,
   type PrefillStrategy,
+  type TrailingStopPrefillFields,
 } from "./proposalPrefill";
 
 /**
@@ -244,15 +245,21 @@ export function cloneSearchParams(bot: BotDetail): URLSearchParams | null {
   if (!shape.ok) return null;
   /*
    * ⚠ A THIRD REFUSAL, AND IT IS NOT A SHAPE FAULT. `checkParamsShape` answers
-   * "are these params coherent for their own label", and a trailing-stop bot's
-   * are: `{ trailPct }` is exactly right. What it cannot answer is whether
-   * `/bots/new` has anywhere to PUT them, and it does not -- the form builds the
-   * two strategies `CreateBotRequest` has a params shape for.
+   * "are these params coherent for their own label". What it cannot answer is
+   * whether `/bots/new` has anywhere to PUT them.
    *
-   * Refused here rather than encoded, because the alternative is silent: the
-   * decoder at the other end would reject the URL (`isCloneStrategy`) and the
-   * operator would land on a blank create form with no statement of why. A
-   * refusal at the link says it on the page they pressed it from.
+   * ⚠ IT NO LONGER REFUSES TRAILING STOP, AND NOT ONE CHARACTER OF THIS LINE
+   * CHANGED TO ACHIEVE THAT. `trailing_stop` joined `PREFILL_STRATEGIES` when the
+   * form grew a `trailPct` field and `CreateBotRequest` grew an arm for it, and
+   * the answer here followed from that alone -- which is the property this guard
+   * was written to have. `cloneRefusal` below is a second reader of the same
+   * predicate, so `strategy_not_creatable` stopped firing for trailing stop by the
+   * same single edit, with no branch anywhere saying so.
+   *
+   * It still refuses, and must: the alternative is silent. The decoder at the
+   * other end would reject the URL (`isCloneStrategy`) and the operator would land
+   * on a blank create form with no statement of why. A refusal at the link says it
+   * on the page they pressed it from.
    */
   if (!isPrefillStrategy(shape.strategy)) return null;
 
@@ -326,6 +333,13 @@ export function cloneBotHref(bot: BotDetail): string | null {
  * names the wrong cause is worse than a refusal, because it sends someone to
  * look for a corruption that is not there.
  *
+ * ⚠ `bot-ts1` NOW CLONES, AND GETS NO MESSAGE AT ALL. The create-bot form grew a
+ * trailing-stop fieldset and `PREFILL_STRATEGIES` grew the label, so this function
+ * returns null for it and `CloneBotLink` renders an ordinary link. Both earlier
+ * states of that page were wrong in different ways — the first named a corruption
+ * that did not exist, the second named a real limitation that has since been
+ * lifted — and neither is reachable now.
+ *
  * Three causes, told apart HERE rather than guessed at in the component, so each
  * has a message that is true and so the decision is one a test can reach (this
  * module is React-free for exactly that reason).
@@ -341,6 +355,19 @@ export type CloneRefusal =
   /**
    * The config is FINE and this form cannot build it. A real strategy with no
    * controls on `/bots/new` — `CreateBotRequest` has no params shape for it.
+   *
+   * ⚠ NOTHING CAN CURRENTLY REACH THIS ARM, AND IT IS KEPT ANYWAY.
+   * `trailing_stop` was its only ever occupant and it is creatable now, so with
+   * `PREFILL_STRATEGIES` holding every member of `ProposalStrategy` the
+   * `isPrefillStrategy` test below cannot fail once `checkParamsShape` has
+   * passed. Deleting the arm would delete the distinction it was introduced to
+   * make, and that distinction was learned from a live page: `bot-ts1` was told
+   * its parameters were incoherent when they were perfect, because the component
+   * inferred the reason from `config === null` and had nowhere to put a third
+   * cause. The next strategy that is readable before it is creatable lands here
+   * on the day it is added, so until then this is a tripwire rather than dead
+   * weight — `botClonePrefill.test.ts` pins the coincidence that makes it
+   * unreachable, so it becomes reachable loudly rather than by surprise.
    */
   | "strategy_not_creatable";
 
@@ -417,16 +444,21 @@ function spacingOf(params: URLSearchParams, incomplete: string[]): "arithmetic" 
 /**
  * A strategy label this form can be filled from, or null.
  *
- * ⚠ IT DELIBERATELY DOES NOT ACCEPT EVERY REAL STRATEGY. `trailing_stop` is a
- * genuine one and is still refused, for the reason `cloneSearchParams` refuses to
- * encode one: the create-bot form has no controls for it. Kept as its own literal
- * pair rather than delegating to `isPrefillStrategy`, so this decoder's refusal
- * does not depend on the proposal vocabulary's guard -- the same independence the
- * original comment claimed and the reason it was written out by hand. The two are
- * asserted equal by `botClonePrefill.test.ts`.
+ * ⚠ WRITTEN OUT BY HAND RATHER THAN DELEGATING TO `isPrefillStrategy`, and the
+ * duplication is the point: this decoder's refusal does not depend on the proposal
+ * vocabulary's guard, so a widening over there cannot widen what a clone URL is
+ * allowed to say without somebody typing it here too. `botClonePrefill.test.ts`
+ * asserts the two accept exactly the same set, so the copy cannot drift unnoticed
+ * either -- deliberate duplication with a test holding it, not an accident.
+ *
+ * ⚠ IT ACCEPTS `trailing_stop` AS OF THIS STEP. It did not before, and the reason
+ * it did not was never about clone URLs: the create-bot form had no controls for
+ * the strategy, so a decoded prefill had nowhere to go. It has a `trailPct` field
+ * now, so the refusal that existed to prevent a half-filled form has nothing left
+ * to prevent.
  */
 function isCloneStrategy(value: unknown): value is PrefillStrategy {
-  return value === "grid" || value === "dca";
+  return value === "grid" || value === "dca" || value === "trailing_stop";
 }
 
 /**
@@ -459,7 +491,21 @@ export function readBotClonePrefill(params: URLSearchParams): BotClonePrefill | 
   const unrepresentable: string[] = [];
 
   let fields: PrefillFields;
-  if (rawStrategy === "grid") {
+  if (rawStrategy === "trailing_stop") {
+    /*
+     * ONE FIELD, no mapping, no optional value and no boolean -- see
+     * `TrailingStopPrefillFields`. There is deliberately no `unrepresentable`
+     * check on this arm, and its absence is checkable rather than assumed:
+     * `TRAILING_STOP_WIRE_FIELDS` has exactly one member, the create form has a
+     * control for exactly that member, so there is no configured value this form
+     * cannot express. DCA's `sellOnStopLoss` clause exists because DCA has one.
+     */
+    const trailing: TrailingStopPrefillFields = {
+      strategy: "trailing_stop",
+      trailPct: text(params, "trailPct", incomplete),
+    };
+    fields = trailing;
+  } else if (rawStrategy === "grid") {
     const grid: GridPrefillFields = {
       strategy: "grid",
       lowerBound: text(params, "lowerBound", incomplete),
