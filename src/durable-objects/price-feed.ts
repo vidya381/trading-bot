@@ -36,8 +36,8 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { GeminiPriceFeedCodec } from "../exchange/gemini/price-feed";
 import type { PriceFeedCodec } from "../exchange/price-feed-codec";
+import { priceFeedCodecFor } from "../exchange/price-feed-dispatch";
 import { databaseFrom } from "../db";
 import type { AlertRow, ExchangeId } from "../db/schema";
 import type { Candle, Pair, Price, Timestamp } from "../shared/exchange-client";
@@ -251,7 +251,19 @@ export interface PriceFeedDependencies {
    * spy so fan-out and failure isolation are testable without real BotInstances.
    */
   deliver: (botInstanceId: string, price: Price) => Promise<unknown>;
-  codec: PriceFeedCodec;
+  /**
+   * TESTS ONLY. `null` in production, which is what makes the venue choice
+   * correct: the codec is then resolved per-frame and per-connect from
+   * `config.exchange` through `priceFeedCodecFor`, a total table over
+   * `ExchangeId`.
+   *
+   * ⚠ A NON-NULL VALUE HERE IS THE ORIGINAL BUG'S SHAPE -- one codec used
+   * regardless of which venue this feed is for. It stays only because the
+   * engine tests drive `handleMessage` with hand-built frames and need to
+   * inject a stub; it is never set on a deployed object, and `#codec()` reads
+   * the table whenever it is null.
+   */
+  codec: PriceFeedCodec | null;
   /** Open the outbound socket. Rejects/throws if the connection cannot be made. */
   connect: (url: string, handlers: SocketHandlers) => Promise<FeedSocket>;
 }
@@ -333,7 +345,11 @@ export class PriceFeed extends DurableObject<Env> {
     now: () => Date.now(),
     forward: (price) => this.#fanOut(price),
     deliver: (botInstanceId, price) => this.#deliverToBot(botInstanceId, price),
-    codec: new GeminiPriceFeedCodec(),
+    // NOT a codec. See `PriceFeedDependencies.codec`: production resolves the
+    // codec from this feed's own `config.exchange`, every time it is needed.
+    // The value that used to sit here was `new GeminiPriceFeedCodec()`, and it
+    // is why `kraken:BTCUSDT` spent its life quoting Gemini.
+    codec: null,
     connect: openOutboundSocket,
   };
 
@@ -408,6 +424,23 @@ export class PriceFeed extends DurableObject<Env> {
       codec: deps.codec ?? this.#deps.codec,
       connect: deps.connect ?? this.#deps.connect,
     };
+  }
+
+  /**
+   * The codec for THIS feed's venue -- the fix for the misrouting bug.
+   *
+   * Resolved from `config.exchange` at every use rather than chosen once when
+   * the object was constructed, because the config does not exist yet when the
+   * field initialisers run: `configure()` supplies it when the first subscriber
+   * arrives. That ordering is exactly why the old code hardcoded a codec, and
+   * why the hardcoded one could never be right for more than one venue.
+   *
+   * A venue with no codec throws (`priceFeedCodecFor`), which surfaces as a
+   * failed connect and a `price_feed_blind` escalation -- a loud outage. The
+   * alternative it replaces was a silent connection to someone else's market.
+   */
+  #codec(config: PriceFeedConfig): PriceFeedCodec {
+    return this.#deps.codec ?? priceFeedCodecFor(config.exchange);
   }
 
   // -------------------------------------------------------------------------
@@ -589,7 +622,7 @@ export class PriceFeed extends DurableObject<Env> {
     const at = this.#deps.now();
     this.#lastMessageAt = at;
 
-    const events = this.#deps.codec.parseMessage(raw, config.pair, at);
+    const events = this.#codec(config).parseMessage(raw, config.pair, at);
     const candles: Candle[] = [];
     for (const event of events) {
       switch (event.kind) {
@@ -984,9 +1017,17 @@ export class PriceFeed extends DurableObject<Env> {
     const config = this.#state.config;
     if (config === null) return;
 
-    const url = this.#deps.codec.socketUrl(this.env.ENVIRONMENT);
     let socket: FeedSocket;
     try {
+      // INSIDE the try, deliberately. Both of these throw for a venue this
+      // build cannot serve -- no codec at all (`priceFeedCodecFor`), or an
+      // `ENVIRONMENT` neither codec will guess a URL for. Treating that as a
+      // failed open routes it into the ordinary backoff-and-alert path
+      // (`price_feed_blind`, escalating after 30 minutes) instead of throwing
+      // out of the alarm handler, so the feed is loudly down rather than
+      // silently connected to the wrong place.
+      const codec = this.#codec(config);
+      const url = codec.socketUrl(this.env.ENVIRONMENT);
       socket = await this.#deps.connect(url, {
         onMessage: (raw) => this.handleMessage(raw),
         onClose: () => this.#onSocketClosed(),
@@ -1012,7 +1053,7 @@ export class PriceFeed extends DurableObject<Env> {
       this.#state = { ...this.#state, reconnectAttempts: 0, blindSince: null, escalated: false };
       await this.#persist();
     }
-    socket.send(this.#deps.codec.subscribeMessage(config.pair));
+    socket.send(this.#codec(config).subscribeMessage(config.pair));
     await this.#armAlarm(this.#deps.now() + HEALTH_CHECK_MS);
     // LAST, and only for a feed that actually went blind. Everything that makes
     // the feed live again -- the subscribe frame, the health-check alarm -- runs
