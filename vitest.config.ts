@@ -1,5 +1,5 @@
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 // Read every file in /migrations, ordered by leading number, and split each
 // into individual SQL statements. Tests apply these to the real (local) D1
@@ -100,4 +100,25 @@ export default defineConfig({
       },
     }),
   ],
+  // `scripts/` is outside the Workers pool, and must stay that way. Everything
+  // the pool runs has to load inside a workerd isolate, and
+  // `scripts/verify-dashboard-build.test.mjs` cannot: it is a `node:test` file
+  // that spawns child processes and writes real temp directories to prove the
+  // pre-deploy guard actually aborts a deploy (see its header). Vitest's
+  // default `include` glob matches `.test.mjs`, so without this exclude the
+  // pool imported it anyway, registered ZERO tests, and killed the isolate --
+  // "Worker exited unexpectedly", one unhandled error, and `npm test` exiting
+  // 1 while all 4246 real tests passed. The failure looked like a pool bug and
+  // was only ever a routing mistake.
+  //
+  // That file runs under `npm run test:deploy-guard` (`node --test`), which is
+  // what its own header specifies.
+  //
+  // Spread rather than replace: `configDefaults.exclude` is vitest's own list
+  // (node_modules and .git), so this stays correct if vitest changes it. Scoped
+  // to `scripts/**` and nothing wider ON PURPOSE -- 31 of the suite's 147 files
+  // live under `dashboard/` and must keep running.
+  test: {
+    exclude: [...configDefaults.exclude, "scripts/**"],
+  },
 });
