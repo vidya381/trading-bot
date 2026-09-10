@@ -232,6 +232,40 @@ function orderRecord(
   };
 }
 
+/**
+ * Kraken's published reference example for QueryTrades, NOT a live capture --
+ * the same payload `parse.test.ts` uses, re-keyed to the trade id that
+ * `orderRecord()` above actually carries in its `trades` array, and re-priced to
+ * that order's own 0.375 executed quantity so the two fixtures describe ONE
+ * order rather than two unrelated ones.
+ *
+ * Note the absence that drives `feeAssetFor`: `fee` is a bare string with no
+ * currency field anywhere in the record.
+ *
+ * ⚠ THE RESULT IS A BARE `{txid: trade}` MAP, with no `trades` wrapper. Verified
+ * against Kraken's published OpenAPI document (`getTradesInfo`'s 200 example) on
+ * 2026-09-10 -- `TradesHistory` wraps, `QueryTrades` does not, and `parseTrades`
+ * accepts either.
+ */
+const QUERY_TRADES_RESULT = {
+  "TCCCTY-WE2O6-P3NB37": {
+    ordertxid: "OQCLML-BW3P3-BUCMWZ",
+    postxid: "TKH2SE-M7IF5-CFI7LT",
+    pair: "XXBTZUSD",
+    time: 1688666570.1234,
+    type: "buy",
+    ordertype: "limit",
+    price: "30010.00000",
+    cost: "11253.75000",
+    fee: "0.96032",
+    vol: "0.37500000",
+    margin: "0.00000",
+    misc: "",
+    trade_id: 93748276,
+    maker: true,
+  },
+};
+
 /** Kraken's published reference example for BalanceEx. NOT a live capture. */
 const BALANCE_EX_RESULT = {
   ZUSD: { balance: "25435.21", hold_trade: "8249.76" },
@@ -968,11 +1002,12 @@ describe("cancelOrder", () => {
 // --------------------------------------------------------------------------
 
 describe("getOrderStatus", () => {
-  it("finds a resting order in ONE request, from OpenOrders", async () => {
+  it("finds a resting order in ONE order read, from OpenOrders", async () => {
     const { client, requests } = catalogued((recorded) => {
       if (recorded.path === KRAKEN_ENDPOINTS.openOrders) {
         return envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } });
       }
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) return envelope(QUERY_TRADES_RESULT);
       throw new Error(`unexpected path ${recorded.path}`);
     });
     const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
@@ -994,8 +1029,10 @@ describe("getOrderStatus", () => {
     // A resting order has NO updatedAt key, rather than one holding the
     // creation time.
     expect("updatedAt" in outcome.value).toBe(false);
-    expect(paths(requests).at(-1)).toBe(KRAKEN_ENDPOINTS.openOrders);
+    // ONE order read. ClosedOrders is never reached for an order that is still
+    // resting -- the trades read that follows it is a separate leg, below.
     expect(requests.filter((r) => r.path === KRAKEN_ENDPOINTS.closedOrders)).toHaveLength(0);
+    expect(requests.filter((r) => r.path === KRAKEN_ENDPOINTS.openOrders)).toHaveLength(1);
   });
 
   it("falls through to ClosedOrders for a terminated order -- open FIRST, and that ordering matters", async () => {
@@ -1016,6 +1053,7 @@ describe("getOrderStatus", () => {
           count: 1,
         });
       }
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) return envelope(QUERY_TRADES_RESULT);
       throw new Error(`unexpected path ${recorded.path}`);
     });
     const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
@@ -1023,9 +1061,10 @@ describe("getOrderStatus", () => {
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
     expect(outcome.value.state).toBe("filled");
-    expect(paths(requests).slice(-2)).toEqual([
+    expect(paths(requests).slice(-3)).toEqual([
       KRAKEN_ENDPOINTS.openOrders,
       KRAKEN_ENDPOINTS.closedOrders,
+      KRAKEN_ENDPOINTS.queryTrades,
     ]);
   });
 
@@ -1040,26 +1079,171 @@ describe("getOrderStatus", () => {
     expect(error.message).toMatch(/reconciliation must not miss/);
   });
 
-  it("asks for no trades, because Kraken's `trades` field is ids and not executions", async () => {
-    const { client, requests } = catalogued(() =>
-      envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } }),
+  it("ASKS for trades, which is the only way an order record carries any ids", async () => {
+    // ⚠ THIS ASSERTION USED TO READ `trades: "false"`, and that one boolean is
+    // the whole of the defect this block now pins. Kraken populates an order
+    // record's `trades` array only "if trades info requested" (its own OpenAPI
+    // wording), so asking false meant no ids, which meant `parseOrderStatus` had
+    // nothing to carry, which meant `fills` was absent on EVERY Kraken order
+    // this system ever read -- and every repair path that needs a real fill id
+    // refused every fill it found, permanently.
+    const { client, requests } = catalogued((recorded) =>
+      recorded.path === KRAKEN_ENDPOINTS.queryTrades
+        ? envelope(QUERY_TRADES_RESULT)
+        : envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } }),
     );
     await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
-    expect(bodyOf(requests.at(-1)!)).toMatchObject({
+
+    const orderRead = requests.find((r) => r.path === KRAKEN_ENDPOINTS.openOrders)!;
+    expect(bodyOf(orderRead)).toMatchObject({
       cl_ord_id: CLIENT_ORDER_ID,
-      trades: "false",
+      trades: "true",
     });
   });
 
-  it("leaves `fills` ABSENT rather than asserting an order has none", async () => {
-    const { client } = catalogued(() =>
-      envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } }),
+  it("attaches the order's REAL executions, read from QueryTrades", async () => {
+    const { client, requests } = catalogued((recorded) =>
+      recorded.path === KRAKEN_ENDPOINTS.queryTrades
+        ? envelope(QUERY_TRADES_RESULT)
+        : envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } }),
     );
     const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
+
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
-    // An empty array would be false about this partially filled order.
+    expect(outcome.value.fills).toEqual([
+      {
+        // Kraken's own trade txid -- the MAP KEY, never the numeric `trade_id`,
+        // and never anything synthesised here. This is the value `applyFill`
+        // deduplicates on, which is why the whole repair path depends on it.
+        fillId: "TCCCTY-WE2O6-P3NB37",
+        price: m("30010.00000"),
+        quantity: m("0.37500000"),
+        // Rounded UP: a fee is money owed, and understating it is the direction
+        // that flatters the books.
+        feeAmount: m("0.96032"),
+        // From the order's OWN `oflags=fciq`, not from a guess about the side.
+        feeAsset: "USD",
+        executedAt: 1_688_666_570_123,
+      },
+    ]);
+
+    // And it asked for exactly the ids the order record named.
+    const tradesRead = requests.find((r) => r.path === KRAKEN_ENDPOINTS.queryTrades)!;
+    expect(bodyOf(tradesRead)).toMatchObject({ txid: "TCCCTY-WE2O6-P3NB37" });
+  });
+
+  it("takes the fee asset from the ORDER's oflags, so a sell is not assumed to pay in quote", async () => {
+    // Section 5.5 forbids assuming a fee is in the quote currency, and Kraken is
+    // the venue where the assumption is wrong half the time: with no flag, its
+    // default flips to `fcib` on a sell. This system sends `fciq` on everything
+    // it places (DECISION 4) -- so a SELL order carrying that flag must still
+    // report the fee in the QUOTE asset, which is only true if the flag actually
+    // travels from the order record to `parseTrades`.
+    const { client } = catalogued((recorded) =>
+      recorded.path === KRAKEN_ENDPOINTS.queryTrades
+        ? envelope({
+            "TCCCTY-WE2O6-P3NB37": {
+              ...QUERY_TRADES_RESULT["TCCCTY-WE2O6-P3NB37"],
+              type: "sell",
+            },
+          })
+        : envelope({
+            open: {
+              "OQCLML-BW3P3-BUCMWZ": orderRecord({ oflags: "fciq" }, { type: "sell" }),
+            },
+          }),
+    );
+    const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.fills?.[0]!.feeAsset).toBe("USD");
+  });
+
+  it("leaves `fills` ABSENT, and sends NO trades request, for an order with no executions", async () => {
+    // ⚠ THE UNCHANGED-BEHAVIOUR CASE, and the one most worth pinning: wiring an
+    // endpoint in must not turn "this order has not filled" into a claim, a
+    // request, or an empty array. An order Kraken lists with no `trades` array
+    // still reports NO `fills` key at all, exactly as it did before -- because
+    // `[]` and `undefined` mean different things to the poll, and only the
+    // second one correctly says "no per-fill detail was reported".
+    const { client, requests } = catalogued((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) {
+        return envelope({
+          open: {
+            "OQCLML-BW3P3-BUCMWZ": orderRecord({ vol_exec: "0.00000000", trades: undefined }),
+          },
+        });
+      }
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+    const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
     expect("fills" in outcome.value).toBe(false);
+    // The handler above would THROW on a QueryTrades path, so this is doubly
+    // asserted: no request was made, and none could have been.
+    expect(requests.filter((r) => r.path === KRAKEN_ENDPOINTS.queryTrades)).toHaveLength(0);
+  });
+
+  it("pages the trade ids, because Kraken caps `txid` at twenty per request", async () => {
+    // Silently dropping the twenty-first id would UNDER-report a fill, and an
+    // execution this system cannot see is one it never records -- the direction
+    // that loses money.
+    const ids = Array.from({ length: 23 }, (_, index) => `TCCCTY-WE2O6-P3NB${index}`);
+    const sent: string[] = [];
+    const { client } = catalogued((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) {
+        const requested = bodyOf(recorded)["txid"]!.split(",");
+        sent.push(...requested);
+        return envelope(
+          Object.fromEntries(
+            requested.map((id, index) => [
+              id,
+              {
+                ...QUERY_TRADES_RESULT["TCCCTY-WE2O6-P3NB37"],
+                // Descending times, so the cross-page sort below is doing work.
+                time: 1688666570 + (ids.length - ids.indexOf(id)) / 1000,
+                vol: "0.00100000",
+                trade_id: index,
+              },
+            ]),
+          ),
+        );
+      }
+      return envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord({ trades: ids }) } });
+    });
+    const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(sent).toEqual(ids); // every id asked for, none dropped
+    expect(outcome.value.fills).toHaveLength(23);
+    // Sorted ACROSS pages, not merely within each: two sorted pages concatenated
+    // are not a sorted list.
+    const times = outcome.value.fills!.map((fill) => fill.executedAt);
+    expect(times).toEqual([...times].sort((left, right) => left - right));
+  });
+
+  it("FAILS the whole call when the trades read fails, rather than reporting no fills", async () => {
+    // ⚠ THE TEMPTING ALTERNATIVE IS WRONG. Returning the order without its fills
+    // looks tolerant, but `fills` absent is a positive claim on this venue --
+    // "Kraken sent no per-fill breakdown" -- which the poll turns into a critical
+    // `unattributable_fill` alert. That would tell a human Kraken withheld
+    // something it was never asked for. Section 5.6: an unreachable exchange is
+    // not data.
+    const { client } = catalogued((recorded) =>
+      recorded.path === KRAKEN_ENDPOINTS.queryTrades
+        ? failure("EService:Unavailable")
+        : envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } }),
+    );
+    const error = failureOf(await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID));
+    expect(error.message).toBe("EService:Unavailable");
+    // Propagated verbatim, keeping the classification the failure arrived with,
+    // so a retryable outage stays retryable.
+    expect(error.retryable).toBe(true);
   });
 });
 

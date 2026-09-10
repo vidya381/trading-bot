@@ -74,6 +74,7 @@ import type {
   BatchCancelResult,
   Candle,
   CandleInterval,
+  Fill,
   OrderRequest,
   OrderResult,
   OrderStatus,
@@ -106,17 +107,21 @@ import {
   parseBatchCancelResult,
   parseCancelResult,
   parseCandles,
+  parseClosedOrderRecords,
   parseClosedOrders,
+  parseOpenOrderRecords,
   parseOpenOrders,
   parseOrderResult,
   parseServerTime,
   parseTickerResult,
+  parseTrades,
   readEnvelope,
   requireResult,
   type KrakenBatchCancelResult,
   type KrakenCancelResult,
+  type KrakenOrderRecord,
 } from "./parse";
-import { KRAKEN_BATCH_CANCEL_MAX_IDS } from "./rate-limits";
+import { KRAKEN_BATCH_CANCEL_MAX_IDS, KRAKEN_QUERY_TRADES_MAX_IDS } from "./rate-limits";
 import {
   KRAKEN_FORM_CONTENT_TYPE,
   KRAKEN_JSON_CONTENT_TYPE,
@@ -165,6 +170,16 @@ export const KRAKEN_ENDPOINTS = {
   cancelOrderBatch: "/0/private/CancelOrderBatch",
   openOrders: "/0/private/OpenOrders",
   closedOrders: "/0/private/ClosedOrders",
+  /**
+   * Per-fill detail, and the ONLY place on this venue that has any.
+   *
+   * An order record's `trades` field is a list of ids and nothing else -- no
+   * price, no quantity, no fee -- so `OrderStatus.fills` cannot be populated
+   * from an order read alone. This endpoint turns those ids into executions.
+   * `parse.ts`'s `parseTrades` has existed since the venue was built and named
+   * this endpoint in its own docblock; until now nothing called either.
+   */
+  queryTrades: "/0/private/QueryTrades",
   balanceEx: "/0/private/BalanceEx",
 } as const;
 
@@ -208,8 +223,9 @@ export const KRAKEN_ENDPOINTS = {
 export interface KrakenRequestCost {
   /**
    * Requests charged against the ACCOUNT-WIDE REST counter, worst case.
-   * Worst case, because `getOrderStatus` sends one or two depending on whether
-   * the order is still open (see the method).
+   * Worst case, because `getOrderStatus` sends one or two order reads depending
+   * on whether the order is still open, plus a `QueryTrades` page when it has
+   * executions to read (see the method).
    */
   readonly restRequests: number;
   /** Requests charged against the PER-PAIR matching-engine counter. */
@@ -242,7 +258,20 @@ export const KRAKEN_REQUEST_COSTS: Readonly<
   // The cancel charges the matching engine (age-dependent); the ONE follow-up
   // read charges REST. Both, during a halt. See `cancelOrder`.
   cancelOrder: { restRequests: 1, tradingRequests: 1, ageDependent: true, needsCatalogue: true },
-  getOrderStatus: { restRequests: 2, tradingRequests: 0, ageDependent: false, needsCatalogue: true },
+  // ONE or TWO order reads (open first, then closed) PLUS ONE `QueryTrades`.
+  //
+  // ⚠ 3 IS THE ORDINARY WORST CASE, NOT AN INVARIANT, and saying so here is
+  // cheaper than a reader discovering it. `QueryTrades` names at most
+  // `KRAKEN_QUERY_TRADES_MAX_IDS` (20) trade ids per request, so an order filled
+  // in more than twenty pieces costs one further request per additional page.
+  // Every order this system places is a single entry or one ladder rung and is
+  // nowhere near that in practice -- but "in practice" is not "never", and the
+  // batch-cancel note below is precedent for writing a fact the table's shape
+  // cannot hold beside it rather than rounding it away.
+  //
+  // The trades read is SKIPPED ENTIRELY for an order with no executions, which
+  // is the common case for a resting order, so 2 remains the real cost there.
+  getOrderStatus: { restRequests: 3, tradingRequests: 0, ageDependent: false, needsCatalogue: true },
   getOpenOrders: { restRequests: 1, tradingRequests: 0, ageDependent: false, needsCatalogue: true },
   getAccountBalances: { restRequests: 1, tradingRequests: 0, ageDependent: false, needsCatalogue: true },
 });
@@ -849,7 +878,34 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
    * already closed is found by the second. The race that costs nothing is the one
    * to take.
    *
-   * One request when the order is resting, two when it has terminated.
+   * ── AND THEN A THIRD REQUEST, FOR THE FILLS ──
+   *
+   * ⚠ THIS METHOD REPORTS `fills`, AND UNTIL 2026-09-10 IT COULD NOT. Both order
+   * reads asked `trades: false`, so Kraken returned no trade ids, so
+   * `parseOrderStatus` had nothing to carry and left `fills` absent on every
+   * order this venue ever reported -- correctly, given what it was handed, which
+   * is why nothing here looked broken.
+   *
+   * WHAT THAT COST, stated because it is the reason this changed. Every path
+   * that repairs an unrecorded execution needs a REAL exchange fill id --
+   * `applyFill` deduplicates on it, and this codebase refuses to synthesise one
+   * (see `#recordCancellation` and `applyMissedFills`). Absent `fills` therefore
+   * meant `checkOpenOrders`, the 30-second poll and `applyMissedFills` ALL
+   * refused every Kraken fill they found, permanently, and said so in the
+   * `unattributable_fill` alert: "the status response carries no per-fill
+   * breakdown and therefore no trade id". A real production bot sat halted
+   * holding a real position its own books said was zero, with no automated
+   * correction reachable, because of one boolean.
+   *
+   * The parser for this has existed since the venue was built -- `parseTrades`
+   * names `QueryTrades` in its own docblock -- and nothing called it. This wires
+   * the two together. Nothing about the fill's meaning is invented here: the ids
+   * are Kraken's, the executions are Kraken's, and `oflags` comes off the order
+   * record so `feeAssetFor` states a fact rather than inferring one.
+   *
+   * One request when a resting order has no executions, two when it has
+   * terminated with none, and one more than that whenever there are fills to
+   * read. See `#withFills` for what happens when THAT read fails.
    */
   async getOrderStatus(
     pair: Pair,
@@ -859,34 +915,46 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
     if (!resolved.ok) return resolved.outcome;
     const { catalogue, kraken } = resolved;
 
-    const open = await this.#request<OrderStatus[]>({
+    const open = await this.#request<KrakenOrderRecord[]>({
       path: KRAKEN_ENDPOINTS.openOrders,
       signed: true,
       context: "OpenOrders",
       params: [
         ["cl_ord_id", clientOrderId],
-        ["trades", false],
+        // TRUE, and it is what makes `fills` reachable at all: Kraken populates
+        // an order record's `trades` array only "if trades info requested"
+        // (its own OpenAPI wording). Asking false -- which this did until the
+        // fix below -- meant every order came back with no ids, so
+        // `getOrderStatus` could never report a fill and every repair path that
+        // needs one refused. The ids are still not executions; see `#withFills`.
+        ["trades", true],
       ],
-      parse: (result) => parseOpenOrders(result, catalogue),
+      parse: (result) => parseOpenOrderRecords(result, catalogue),
     });
     if (!open.ok) return open;
-    const resting = this.#singleOrder(open.value, clientOrderId, kraken, open.at);
-    if (resting !== undefined) return resting;
+    const resting = this.#singleRecord(open.value, clientOrderId, kraken, open.at);
+    if (resting !== undefined) {
+      if (!resting.ok) return resting;
+      return await this.#withFills(resting.value, catalogue, open.at);
+    }
 
-    const closed = await this.#request<OrderStatus[]>({
+    const closed = await this.#request<KrakenOrderRecord[]>({
       path: KRAKEN_ENDPOINTS.closedOrders,
       signed: true,
       context: "ClosedOrders",
       params: [
         ["cl_ord_id", clientOrderId],
-        ["trades", false],
+        ["trades", true],
       ],
-      parse: (result) => parseClosedOrders(result, catalogue),
+      parse: (result) => parseClosedOrderRecords(result, catalogue),
     });
     if (!closed.ok) return closed;
 
-    const terminated = this.#singleOrder(closed.value, clientOrderId, kraken, closed.at);
-    if (terminated !== undefined) return terminated;
+    const terminated = this.#singleRecord(closed.value, clientOrderId, kraken, closed.at);
+    if (terminated !== undefined) {
+      if (!terminated.ok) return terminated;
+      return await this.#withFills(terminated.value, catalogue, closed.at);
+    }
 
     return this.#refused<OrderStatus>(
       `no order carrying ${JSON.stringify(clientOrderId)} is open on Kraken, and none ` +
@@ -1197,6 +1265,106 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
       );
     }
     return ok(found, at);
+  }
+
+  /**
+   * `#singleOrder`, over records that still carry their raw Kraken fields.
+   *
+   * DELEGATES rather than reimplements, and that is the whole point of its
+   * existence: the duplicate-id refusal and the cross-pair refusal are the two
+   * gates that make `getOrderStatus`' `pair` argument load-bearing, and a second
+   * copy of them here would be free to disagree with the first. This maps to
+   * statuses, asks `#singleOrder` the question, and maps the winner back by
+   * `exchangeOrderId` -- which is the map key Kraken itself supplied, so it is
+   * unique across the list by construction.
+   */
+  #singleRecord(
+    records: readonly KrakenOrderRecord[],
+    clientOrderId: string,
+    kraken: KrakenPair,
+    at: Timestamp,
+  ): ExchangeOutcome<KrakenOrderRecord> | undefined {
+    const chosen = this.#singleOrder(
+      records.map((record) => record.status),
+      clientOrderId,
+      kraken,
+      at,
+    );
+    if (chosen === undefined || !chosen.ok) return chosen;
+    const record = records.find(
+      (candidate) => candidate.status.exchangeOrderId === chosen.value.exchangeOrderId,
+    );
+    // Unreachable: `chosen.value` came out of this same array. Asserted rather
+    // than `!`-ed so that if it ever DOES happen it says what went wrong instead
+    // of throwing on a property of undefined three lines later.
+    if (record === undefined) {
+      return this.#refused<KrakenOrderRecord>(
+        `internal: order ${chosen.value.exchangeOrderId} was selected from a list it is ` +
+          `not in. Refusing to report a status whose raw record cannot be found.`,
+        at,
+      );
+    }
+    return ok(record, at);
+  }
+
+  /**
+   * Attach the order's real executions, read from `QueryTrades`.
+   *
+   * NO IDS, NO REQUEST, AND NO `fills` KEY. An order Kraken lists with an empty
+   * `trades` array has no executions to report, and the right answer is the one
+   * this venue has always given: leave `fills` ABSENT. Not `[]` -- `parse.ts`
+   * argues that at length and it holds just as well here, because a caller
+   * cannot tell an asserted-empty array from a genuinely-empty one, and the
+   * poll's `remote.fills === undefined` branch is what correctly reports "no
+   * per-fill detail" rather than "no executions". So an unfilled order behaves
+   * EXACTLY as it did before this endpoint was wired: one or two requests, no
+   * fills, nothing to apply.
+   *
+   * ⚠ A FAILED TRADES READ FAILS THE WHOLE CALL, deliberately, and it is the
+   * only interesting decision in this method. The tempting alternative is to
+   * return the order without its fills and carry on -- it looks tolerant. It is
+   * not: `fills` absent is a POSITIVE CLAIM on this venue ("Kraken sent no
+   * per-fill breakdown"), the poll turns that claim into a critical
+   * `unattributable_fill` alert, and a human then reads that Kraken did not
+   * report something Kraken was never asked for. Section 5.6's rule decides it --
+   * an unreachable exchange is not data -- so the outcome is propagated verbatim,
+   * keeping its `kind` and its `retryable` flag. `applyMissedFills` already has
+   * the right behaviour for that: it skips the order and reports the reason.
+   *
+   * PAGED at `KRAKEN_QUERY_TRADES_MAX_IDS`, because Kraken caps `txid` at twenty
+   * and silently ignoring the twenty-first would under-report a fill -- the one
+   * direction that loses money, since an execution this system cannot see is one
+   * it does not record.
+   */
+  async #withFills(
+    record: KrakenOrderRecord,
+    catalogue: KrakenCatalogue,
+    at: Timestamp,
+  ): Promise<ExchangeOutcome<OrderStatus>> {
+    if (record.tradeIds.length === 0) return ok(record.status, at);
+
+    const fills: Fill[] = [];
+    for (let from = 0; from < record.tradeIds.length; from += KRAKEN_QUERY_TRADES_MAX_IDS) {
+      const page = record.tradeIds.slice(from, from + KRAKEN_QUERY_TRADES_MAX_IDS);
+      const read = await this.#request<Fill[]>({
+        path: KRAKEN_ENDPOINTS.queryTrades,
+        signed: true,
+        context: "QueryTrades",
+        params: [["txid", page.join(",")]],
+        // `oflags` is the ORDER's, passed down because a trade record has no
+        // currency field anywhere in it (DECISION 4). This system sends
+        // `oflags=fciq` on everything it places, so the asserted branch fires
+        // and the fee asset is a fact the request established.
+        parse: (result) => parseTrades(result, catalogue, { oflags: record.oflags }),
+      });
+      if (!read.ok) return read;
+      fills.push(...read.value);
+    }
+
+    // Sorted across pages, not just within one: `parseTrades` orders each page
+    // by `executedAt`, and concatenating two sorted pages is not sorted.
+    fills.sort((left, right) => left.executedAt - right.executedAt);
+    return ok({ ...record.status, fills }, at);
   }
 
   /**

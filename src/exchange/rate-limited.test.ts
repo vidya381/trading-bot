@@ -551,15 +551,29 @@ describe("the Kraken cost model, through the gate", () => {
     });
   });
 
-  it("charges the status read for both endpoints it may call, not just the first", async () => {
-    // `OpenOrders` always, `ClosedOrders` only if the order has stopped resting.
-    // A gate prices a call before it is made and cannot know which branch runs --
-    // and the dearer branch is the one that runs when an order has just filled,
-    // which is when a strategy is most likely to be asking.
+  it("charges the status read for ALL THREE endpoints it may call, not just the first", async () => {
+    // `OpenOrders` always, `ClosedOrders` only if the order has stopped resting,
+    // `QueryTrades` only if it has executions to read. A gate prices a call
+    // before it is made and cannot know which branch runs -- and the dearest
+    // branch is the one that runs when an order has just filled, which is when a
+    // strategy is most likely to be asking.
+    //
+    // ⚠ THIS WAS 5 UNTIL 2026-09-10, when `getOrderStatus` gained its trades
+    // leg. Following it here is not bookkeeping: leaving the gate at 5 would
+    // under-charge the account-wide counter on precisely the call a fill
+    // provokes, which is the failure this test's own "charge for both" rule was
+    // written to prevent, one endpoint later.
+    //
+    // 1 (standardPrivate) + 4 (accountHistory, for ClosedOrders) + 2
+    // (tradeHistoryQuery, for QueryTrades). The trades leg is 2 rather than 4 on
+    // evidence rather than analogy, and because at 4 this method would cost 9 of
+    // the 13 units routine traffic may touch -- starving the repair path that
+    // walks a halted bot's orders one status read at a time. The constant's own
+    // docblock carries the argument.
     const client = gated({ exchange: "kraken" });
     await client.getOrderStatus(TEST_PAIR, "bot-1toiyz-0001");
 
-    expect(limiter.requests[0]!.cost).toEqual({ rest: 5 });
+    expect(limiter.requests[0]!.cost).toEqual({ rest: 7 });
   });
 
   it("prices the public market-data calls at the honest minimum", async () => {

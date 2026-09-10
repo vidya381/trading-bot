@@ -147,6 +147,40 @@ export const KRAKEN_REST_COUNTER_COSTS = Object.freeze({
   standardPrivate: 1,
   /** `Ledgers`, `TradesHistory`, `ClosedOrders`. See the contradiction above. */
   accountHistory: 4,
+  /**
+   * `QueryTrades` -- a trade-history call NEITHER source names, priced at the
+   * category rate the only source that describes the category gives.
+   *
+   * ⚠ WHY NOT `accountHistory`, WHICH IS THE OBVIOUS GUESS. The rule above --
+   * "charged at 4, the higher of the two" -- is specifically about
+   * `ClosedOrders`, and it turns on the fact that *(support)* NAMES that
+   * endpoint. Neither source names `QueryTrades`: *(support)*'s +4 list is an
+   * enumeration of three endpoints and this is not one of them, while *(docs)*
+   * describes a CATEGORY -- "ledger/trade history calls" -- that this plainly
+   * belongs to, and prices that category at 2. So the evidence for 2 here is
+   * strictly better than the evidence for 4, which rests on an analogy to an
+   * endpoint that was named.
+   *
+   * ⚠ AND THE DIRECTION OF HARM IS THE OTHER WAY ROUND HERE, which is what
+   * settled it. The constant above takes the cautious reading because
+   * `ClosedOrders` sits on the path a HALT runs down, where being rate-limited
+   * is the expensive failure. `QueryTrades` sits behind `getOrderStatus` at
+   * ROUTINE priority, and routine traffic may draw only on
+   * `limit - reserveForRiskExit` -- 13 of 15 on the starter tier. At 4 the whole
+   * of `getOrderStatus` costs 9, so ONE status read at a time fits, and with a
+   * 0.33/sec decay the next waits ~27 seconds. That does not protect a halt; it
+   * starves the REPAIR path, whose whole job is to walk a halted bot's open
+   * orders one `getOrderStatus` at a time. A repair that times out is not the
+   * safe direction -- it is the position staying unrecorded, which is the
+   * failure this endpoint was wired in to end.
+   *
+   * A 429 on a routine read, by contrast, is already handled: `withRetry` backs
+   * off, the poll reschedules, and reconciliation reports the order as UNREADABLE
+   * rather than concluding anything about it (section 5.6).
+   *
+   * If a live 429 ever says otherwise, this is the one constant to change.
+   */
+  tradeHistoryQuery: 2,
   /** `AddOrder` / `CancelOrder` charge the matching engine, not this counter. */
   trading: 0,
 });
@@ -269,6 +303,25 @@ export function krakenCancelCost(ageMs: number | null): number {
  * the cost function below for the other one.
  */
 export const KRAKEN_BATCH_CANCEL_MAX_IDS = 50;
+
+/**
+ * The most trade ids one `QueryTrades` request may name *(docs)*.
+ *
+ * "Comma delimited list of transaction IDs to query info about (20 maximum)",
+ * read off Kraken's published OpenAPI document (`docs.kraken.com/openapi/
+ * spot-rest.yaml`, the shared `query` request body) on 2026-09-10, on the same
+ * day the endpoint was first wired into the client.
+ *
+ * A DIFFERENT number again from both batch endpoints -- 50 for `CancelOrderBatch`
+ * above, 2-to-15 for `AddOrderBatch`. Three endpoints, three caps, no symmetry to
+ * infer from: this one is written down rather than assumed for exactly the reason
+ * the batch-cancel note gives about the other two.
+ *
+ * `getOrderStatus` pages its trade ids through this. An order with more fills
+ * than this sends more than one `QueryTrades` -- see `KRAKEN_REQUEST_COSTS`,
+ * which says so rather than pretending the count is fixed.
+ */
+export const KRAKEN_QUERY_TRADES_MAX_IDS = 20;
 
 /**
  * The engine cost of cancelling several orders in one `CancelOrderBatch`.

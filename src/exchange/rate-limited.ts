@@ -324,16 +324,32 @@ export const KRAKEN_METHOD_COSTS: MethodCosts = {
   }),
 
   /**
-   * `OpenOrders`, then `ClosedOrders` only if the order is no longer resting.
+   * `OpenOrders`, then `ClosedOrders` only if the order is no longer resting,
+   * then `QueryTrades` whenever the order has executions to read.
    *
-   * Charged for BOTH every time. A gate prices a call before it is made and
+   * Charged for ALL THREE every time. A gate prices a call before it is made and
    * cannot know which branch it will take, and the branch that costs more is the
    * one that runs when an order has just filled -- the moment a strategy is most
    * likely to be asking.
+   *
+   * ⚠ THE THIRD TERM ARRIVED WITH THE FILLS. `getOrderStatus` gained a
+   * `QueryTrades` leg on 2026-09-10 (see the method), and a cost model that did
+   * not follow it would under-charge the account-wide counter on precisely the
+   * call a fill provokes -- the same failure this table's own "charge for both"
+   * rule was written to avoid, one endpoint later.
+   *
+   * `tradeHistoryQuery` for that leg, NOT `accountHistory` -- 2 rather than 4,
+   * on evidence rather than on the analogy to `ClosedOrders`. That constant's
+   * own docblock carries the argument and the reason the cautious reading is the
+   * wrong one HERE specifically: at 4 this method costs 9 of the 13 units routine
+   * traffic may touch, which does not protect anything and starves the repair
+   * path that walks a halted bot's orders one status read at a time.
    */
   getOrderStatus: () => ({
     rest:
-      KRAKEN_REST_COUNTER_COSTS.standardPrivate + KRAKEN_REST_COUNTER_COSTS.accountHistory,
+      KRAKEN_REST_COUNTER_COSTS.standardPrivate +
+      KRAKEN_REST_COUNTER_COSTS.accountHistory +
+      KRAKEN_REST_COUNTER_COSTS.tradeHistoryQuery,
   }),
 
   /** `POST /0/private/OpenOrders`. Not account history; the ordinary rate. */

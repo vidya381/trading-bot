@@ -1026,7 +1026,15 @@ function parseCommonOrderFields(
  * an array of trade IDS, not of executions -- there is no price, quantity or fee
  * in it. An empty array here would assert "this order has no executions" about a
  * partially filled order, which is false; per-fill detail comes from
- * `QueryTrades` and `parseTrades`, which is reconciliation's concern.
+ * `QueryTrades` and `parseTrades`.
+ *
+ * THIS FUNCTION STILL NEVER SETS `fills`, and that has not changed now that
+ * `KrakenClient.getOrderStatus` populates them. It cannot: the ids live here but
+ * the executions behind them are a second request away, and a parser does no
+ * I/O. `parseOrderRecordMap` carries the ids out to the client, the client
+ * fetches them, and the client attaches the result. The absence here is still
+ * the honest one -- the caller that did not ask for trades gets no claim about
+ * them either way.
  */
 export function parseOrderStatus(
   txid: string,
@@ -1059,6 +1067,52 @@ export function parseOrderStatus(
 }
 
 /**
+ * One order record, plus the two RAW fields `OrderStatus` has nowhere to put.
+ *
+ * WHY THIS TYPE EXISTS. `parseOrderStatus` above returns the cross-venue
+ * `OrderStatus`, and that is where it must stop: `trades` and `oflags` are
+ * Kraken's own, and widening the shared interface so one venue can carry two
+ * extra keys is how a shared interface stops meaning anything. But the client
+ * needs both to fetch per-fill detail -- the txids say WHICH trades to query,
+ * and `oflags` is what makes `feeAssetFor`'s asserted branch a fact rather than
+ * an inference (DECISION 4) -- and by the time `#request` has run its parser the
+ * raw record is gone.
+ *
+ * So the two travel BESIDE the status rather than inside it, and only as far as
+ * the client, which unwraps them and returns a plain `OrderStatus`. Nothing
+ * outside `kraken/` ever sees this type.
+ */
+export interface KrakenOrderRecord {
+  readonly status: OrderStatus;
+  /**
+   * Kraken's trade transaction ids for this order, from the record's `trades`
+   * array. EMPTY rather than absent when the order has none, and the difference
+   * between "none" and "not asked for" is the caller's to know: Kraken populates
+   * this field only when the request set `trades: true` (its OpenAPI document
+   * says "if trades info requested and data available"), so a client that did
+   * not ask sees an empty array here and must not read it as "no executions".
+   * `getOrderStatus` asks; `getOpenOrders` does not, and does not use this.
+   */
+  readonly tradeIds: readonly string[];
+  /**
+   * The order's own `oflags`, verbatim and UNPARSED -- `feeAssetFor` owns
+   * reading it, and re-reading it here would be a second implementation of that
+   * rule, free to disagree. `unknown` because a record Kraken did not write for
+   * this system may carry anything or nothing.
+   */
+  readonly oflags: unknown;
+}
+
+/** The `trades` array off one raw order record, or empty. */
+function tradeIdsOf(order: Record<string, unknown>): readonly string[] {
+  const trades = order["trades"];
+  if (!Array.isArray(trades)) return [];
+  // Filtered rather than asserted: a non-string element cannot be a txid, and
+  // passing one to `QueryTrades` would query a name Kraken never issued.
+  return trades.filter((id): id is string => typeof id === "string");
+}
+
+/**
  * Parse a `{txid: order}` map -- `QueryOrders`' whole result, and the inner
  * `open` / `closed` object of the list endpoints.
  *
@@ -1066,17 +1120,31 @@ export function parseOrderStatus(
  * ascending for a stable, oldest-first list. That mirrors `parseCandles`'
  * refusal to trust the venue's ordering, and costs nothing.
  */
+export function parseOrderRecordMap(
+  result: unknown,
+  catalogue: KrakenCatalogue,
+  context = "orders",
+): KrakenOrderRecord[] {
+  const record = asRecord(result, context);
+  const orders = Object.entries(record).map(([txid, entry]) => {
+    const raw = asRecord(entry, `order ${txid}`);
+    return {
+      status: parseOrderStatus(txid, entry, catalogue),
+      tradeIds: tradeIdsOf(raw),
+      oflags: raw["oflags"],
+    } satisfies KrakenOrderRecord;
+  });
+  orders.sort((a, b) => (a.status.createdAt ?? 0) - (b.status.createdAt ?? 0));
+  return orders;
+}
+
+/** `parseOrderRecordMap`, for the callers that want only the status. */
 export function parseOrderStatusMap(
   result: unknown,
   catalogue: KrakenCatalogue,
   context = "orders",
 ): OrderStatus[] {
-  const record = asRecord(result, context);
-  const orders = Object.entries(record).map(([txid, entry]) =>
-    parseOrderStatus(txid, entry, catalogue),
-  );
-  orders.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
-  return orders;
+  return parseOrderRecordMap(result, catalogue, context).map((entry) => entry.status);
 }
 
 /**
@@ -1087,21 +1155,35 @@ export function parseOrderStatusMap(
  * filtering to the requested pair is the client's job, done locally, on the same
  * reasoning recorded on the Gemini side.
  */
+export function parseOpenOrderRecords(
+  result: unknown,
+  catalogue: KrakenCatalogue,
+): KrakenOrderRecord[] {
+  const record = asRecord(result, "OpenOrders");
+  return parseOrderRecordMap(record["open"], catalogue, "OpenOrders");
+}
+
 export function parseOpenOrders(
   result: unknown,
   catalogue: KrakenCatalogue,
 ): OrderStatus[] {
-  const record = asRecord(result, "OpenOrders");
-  return parseOrderStatusMap(record["open"], catalogue, "OpenOrders");
+  return parseOpenOrderRecords(result, catalogue).map((entry) => entry.status);
 }
 
 /** `POST /0/private/ClosedOrders` -> `{closed: {txid: order}, count: n}`. */
+export function parseClosedOrderRecords(
+  result: unknown,
+  catalogue: KrakenCatalogue,
+): KrakenOrderRecord[] {
+  const record = asRecord(result, "ClosedOrders");
+  return parseOrderRecordMap(record["closed"], catalogue, "ClosedOrders");
+}
+
 export function parseClosedOrders(
   result: unknown,
   catalogue: KrakenCatalogue,
 ): OrderStatus[] {
-  const record = asRecord(result, "ClosedOrders");
-  return parseOrderStatusMap(record["closed"], catalogue, "ClosedOrders");
+  return parseClosedOrderRecords(result, catalogue).map((entry) => entry.status);
 }
 
 /**

@@ -12,8 +12,11 @@ import {
   parseBalances,
   parseCancelResult,
   parseCandles,
+  parseClosedOrderRecords,
   parseClosedOrders,
+  parseOpenOrderRecords,
   parseOpenOrders,
+  parseOrderRecordMap,
   parseOrderFlags,
   parseOrderResult,
   parseOrderStatus,
@@ -821,6 +824,15 @@ const CLOSED_ORDER = {
   closetm: 1688665499.4374,
 };
 
+/** The same order still RESTING: opened earlier, nothing executed, no closetm. */
+const older = {
+  ...CLOSED_ORDER,
+  opentm: 1688665000.0,
+  closetm: 0,
+  status: "open",
+  vol_exec: "0.00000000",
+};
+
 describe("parseOrderStatus", () => {
   it("maps a fully executed order", () => {
     expect(parseOrderStatus("OBCMZD-JIEE7-77TH3F", CLOSED_ORDER, catalogue())).toEqual({
@@ -961,8 +973,6 @@ describe("toOrderState", () => {
 });
 
 describe("parseOrderStatusMap / parseOpenOrders / parseClosedOrders", () => {
-  const older = { ...CLOSED_ORDER, opentm: 1688665000.0, closetm: 0, status: "open", vol_exec: "0.00000000" };
-
   it("parses a {txid: order} map oldest-first", () => {
     const orders = parseOrderStatusMap(
       { "OBCMZD-JIEE7-77TH3F": CLOSED_ORDER, "OOLDER-11111-22222": older },
@@ -991,6 +1001,81 @@ describe("parseOrderStatusMap / parseOpenOrders / parseClosedOrders", () => {
 
   it("returns an empty list for an account with no open orders", () => {
     expect(parseOpenOrders({ open: {} }, catalogue())).toEqual([]);
+  });
+});
+
+describe("parseOrderRecordMap / parseOpenOrderRecords / parseClosedOrderRecords", () => {
+  /**
+   * The RAW fields `OrderStatus` has nowhere to put, carried out to the client
+   * so it can turn ids into executions. Both are needed and neither is
+   * derivable: the txids say which trades to query, and `oflags` is what makes
+   * `feeAssetFor` state a fact instead of inferring one (DECISION 4).
+   */
+  it("carries the order's trade ids and its oflags beside the status", () => {
+    const records = parseClosedOrderRecords(
+      {
+        closed: {
+          "OBCMZD-JIEE7-77TH3F": {
+            ...CLOSED_ORDER,
+            trades: ["TCCCTY-WE2O6-P3NB37", "TZX2WP-XSEUP-JEGT4E"],
+          },
+        },
+        count: 1,
+      },
+      catalogue(),
+    );
+
+    expect(records).toHaveLength(1);
+    expect(records[0]!.tradeIds).toEqual(["TCCCTY-WE2O6-P3NB37", "TZX2WP-XSEUP-JEGT4E"]);
+    expect(records[0]!.oflags).toBe("fciq");
+    // The status half is the SAME object the status-only parsers return, so the
+    // two views of one record cannot disagree.
+    expect(records[0]!.status).toEqual(
+      parseOrderStatus("OBCMZD-JIEE7-77TH3F", CLOSED_ORDER, catalogue()),
+    );
+  });
+
+  it("reports NO trade ids -- not a missing key -- when the record has no `trades`", () => {
+    // Kraken omits the field entirely unless the request asked for trades. An
+    // empty array here is the honest reading of "nothing to query"; whether that
+    // means "no executions" or "did not ask" is the CALLER's to know, and
+    // `getOrderStatus` is the only caller that asks.
+    const records = parseOpenOrderRecords(
+      { open: { "OQCLML-BW3P3-BUCMWZ": older } },
+      catalogue(),
+    );
+    expect(records[0]!.tradeIds).toEqual([]);
+  });
+
+  it("drops a non-string element rather than querying a name Kraken never issued", () => {
+    const records = parseOpenOrderRecords(
+      { open: { "OQCLML-BW3P3-BUCMWZ": { ...older, trades: ["TREAL-11111-22222", 7, null] } } },
+      catalogue(),
+    );
+    expect(records[0]!.tradeIds).toEqual(["TREAL-11111-22222"]);
+  });
+
+  it("leaves oflags UNPARSED, including when the order carries none", () => {
+    // `feeAssetFor` owns reading this. Re-reading it here would be a second
+    // implementation of the same rule, free to disagree with the first.
+    const { oflags, ...withoutFlag } = CLOSED_ORDER;
+    expect(oflags).toBe("fciq");
+    const records = parseClosedOrderRecords(
+      { closed: { "OBCMZD-JIEE7-77TH3F": withoutFlag }, count: 1 },
+      catalogue(),
+    );
+    expect(records[0]!.oflags).toBeUndefined();
+  });
+
+  it("orders records oldest-first, exactly as the status-only view does", () => {
+    const records = parseOrderRecordMap(
+      { "OBCMZD-JIEE7-77TH3F": CLOSED_ORDER, "OOLDER-11111-22222": older },
+      catalogue(),
+    );
+    expect(records.map((record) => record.status.exchangeOrderId)).toEqual([
+      "OOLDER-11111-22222",
+      "OBCMZD-JIEE7-77TH3F",
+    ]);
   });
 });
 
