@@ -1,15 +1,44 @@
 # Provisioning the alert-cooldown KV namespace and the Discord webhook secret
 
-> **Status: NOT executed.** Neither the `ALERT_COOLDOWNS` KV namespace nor the
-> `DISCORD_WEBHOOK_URL` secret exists in either environment. Until both exist,
-> the step-8 notification dispatcher no-ops on every tick — the same way
-> reconciliation no-ops without exchange credentials — and no alert leaves the
-> system as a ping, though every alert is still recorded in D1.
+> **Status (sections 1–3): EXECUTED. Verified live 2026-09-10.** Both the
+> `ALERT_COOLDOWNS` KV namespace and the `DISCORD_WEBHOOK_URL` secret now exist
+> in **both** environments, so the step-8 notification dispatcher no longer
+> no-ops on missing configuration.
 >
-> This document is a runbook, not a record. It parallels
+> | | testnet | production |
+> | --- | --- | --- |
+> | `ALERT_COOLDOWNS` KV | ✅ `bf4f637666bd42a09a25b729744a7c16` | ✅ `f62b31ae1787470ebc81b93f07d55521` |
+> | `DISCORD_WEBHOOK_URL` secret | ✅ set | ✅ set |
+> | Delivery confirmed end to end | ❌ **never exercised** | ✅ 2026-09-10 |
+>
+> **Read that last row carefully: provisioned in both, but delivery is confirmed
+> in production ONLY.** Testnet's secret is set and has never been POSTed to, so
+> whether that URL is valid is unknown. Do not quote this table as "both
+> environments work" — that is the exact overclaim this header previously made
+> in the other direction.
+>
+> **How production was confirmed:** the dispatcher sends only for alert rows with
+> `notified_at IS NULL`, and production's `alerts` table is empty, so the cron
+> can run forever without ever exercising the webhook. It was therefore proved
+> with a temporary `POST /api/debug/notification-check` route that built the real
+> `DiscordNotifier` from the real secret and sent one synthetic `system`/`info`
+> alert, touching no table and no queue — built, run once (`200`,
+> `delivered: true`, message seen in the channel), and **removed the same day**,
+> per the `/api/debug/ws-check` and `/api/debug/feed-check` convention
+> (decision-log 14.6, 14.7). The route is gone; do not look for it.
+>
+> **Still outstanding:** `npm run cf-typegen` has been run, so
+> `ALERT_COOLDOWNS` is in `worker-configuration.d.ts` and the KV half of the
+> `declare global` in `src/workers/notifications.ts` is now redundant. The
+> `DISCORD_WEBHOOK_URL` half must **stay** — `wrangler types` cannot emit a
+> secret, so nothing else declares it. Section 4's `SYMBOL_CACHE` is a separate
+> resource with its own, different status; see there.
+>
+> This document is a runbook first and a record second. It parallels
 > [`d1-provisioning.md`](./d1-provisioning.md), which deferred D1 provisioning
-> out of the build session that wrote the schema; this defers KV and the secret
-> out of the build session that wrote the dispatcher.
+> out of the build session that wrote the schema; this deferred KV and the secret
+> out of the build session that wrote the dispatcher. The commands below are kept
+> as written so a third environment can be provisioned the same way.
 
 These are two separate resources with two different lifecycles:
 
@@ -18,7 +47,7 @@ These are two separate resources with two different lifecycles:
 | `ALERT_COOLDOWNS` | KV namespace | yes, separate ids | yes, once created (a real id) |
 | `DISCORD_WEBHOOK_URL` | secret | yes, separate URLs | **never** — secrets are not config |
 
-## Why neither is in the repo yet
+## Why neither was in the repo at first (historical)
 
 - The KV namespace is not in `wrangler.jsonc` because this project does not
   commit placeholder resource ids (step 4, decision 1): a fake id sitting in
@@ -86,16 +115,29 @@ no-opping. Confirm by checking the Worker's logs (observability is on) for a
 line like `notification dispatch: scanned=… sent=… throttled=… failed=…`
 instead of `notification dispatch did not run: …`.
 
+**⚠ That log line does NOT prove the webhook works.** In production it currently
+reads `scanned=0 sent=0 throttled=0 failed=0` every minute, because the `alerts`
+table is empty and the dispatcher only sends for rows with `notified_at IS NULL`.
+A perfectly healthy-looking cron log is therefore compatible with a completely
+invalid webhook URL: with nothing to send, `DiscordNotifier` is never handed an
+alert and never POSTs. Proving delivery needs an actual send — see the header for
+how that was done on 2026-09-10, and note that the route used was removed the
+same day.
+
 ---
 
 ## 4. (Step 11) The tradable-pair cache KV namespace `SYMBOL_CACHE`
 
-> **Status: NOT executed.** The `SYMBOL_CACHE` namespace does not exist in either
-> environment yet. Until it does, `GET /api/accounts/:label/symbols` still works
-> but **degrades to a live exchange call on every request** (the response says
-> `cached: false`) rather than serving a one-hour-cached list. A missing cache is
-> a performance concern, not a correctness one — unlike a missing credential,
-> which fails closed.
+> **Status: PARTIALLY executed, as of 2026-09-10 — testnet only.**
+> `SYMBOL_CACHE` exists and is bound for **testnet**
+> (`987f8b7b34c747be94652ba6d23dcfd6`); it does **not** exist for **production**,
+> which has no such namespace on the account and no binding in `wrangler.jsonc`.
+> So testnet serves the one-hour-cached list, and production still
+> **degrades to a live exchange call on every request** (the response says
+> `cached: false`). A missing cache is a performance concern, not a correctness
+> one — unlike a missing credential, which fails closed.
+>
+> To finish, run only the production half of the commands below.
 
 Same kind of resource, same reason it is not in the repo yet, and the same
 handling as `ALERT_COOLDOWNS`: it is a second KV namespace (step 11, section
