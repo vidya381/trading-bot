@@ -36,7 +36,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { seedPlaceholderTotalBalance } from "../capital";
 import type { Database } from "../db/database";
 import { freshDatabase } from "../db/test-helpers";
-import { fromDecimalString as m, mul, type Money } from "../shared/money";
+import { fromDecimalString as m, mul, ZERO, type Money } from "../shared/money";
 import type { Price } from "../shared/exchange-client";
 import { ENTRY_CROSS_PCT, MAX_ENTRY_ATTEMPTS, entryLimitPrice } from "../strategies/trailing-stop";
 import type { DcaParams } from "../strategies/dca";
@@ -417,6 +417,84 @@ describe("resume respects the entry cap it cannot reset (22.10)", () => {
     // And a pointer at the real open question, so the new bot is not started
     // blind into the same venue behaviour.
     expect(message).toMatch(/cancelled at the venue/);
+  });
+
+  it("resumes a bot at the cap that actually HOLDS a position (2026-09-11)", async () => {
+    // ⚠ THE REFUSAL THIS PROVES WRONG, and it cost a real position. The gate
+    // read `entryAttempts` and nothing else, and then SPOKE as though it had
+    // checked the position: "without ever filling", "this bot never got it, so
+    // there is no position to trail". Both are inferences from the counter, and
+    // both are false for the bot below.
+    //
+    // `bot-x93xux` was refused this way on 2026-09-11 while holding 2.59420419
+    // LINK worth 29.96 USDT. Its trailing stop could not run, so the stop was
+    // unenforceable, and the only way out was to liquidate a position the
+    // strategy was perfectly capable of managing.
+    //
+    // ⚠ AND THE SEQUENCE IS ORDINARY, not a legacy artefact. Two entries
+    // cancelled at the venue is exactly what `MAX_ENTRY_ATTEMPTS = 3` was sized
+    // to absorb ("Three allows two transient cancellations to be absorbed
+    // silently"), and the third one filling is the strategy WORKING. Any
+    // account-wide halt after that -- a circuit breaker, an operator pause --
+    // then made the bot permanently unresumable.
+    const name = `ts-cap-held-${counter}`;
+    await startedTrailingStop(name);
+
+    // Two entries lost to the venue: attempts 1 and 2, still flat.
+    for (let i = 0; i < 2; i += 1) {
+      await inNamed(name, (bot) => bot.onPriceUpdate(priceAt("100")));
+      await loseEntryToTheVenue(name, exchange.placed[exchange.placed.length - 1]!.clientOrderId);
+    }
+
+    // The third entry is placed -- the cap is now spent -- and it FILLS.
+    await inNamed(name, (bot) => bot.onPriceUpdate(priceAt("100")));
+    const entryId = exchange.placed[exchange.placed.length - 1]!.clientOrderId;
+    exchange.fillsByOrder.set(entryId, [exchange.fillFor(entryId)]);
+    const pass = await inNamed(name, (bot) => bot.checkOpenOrders(ACTOR));
+    expect(pass.applied.map((e) => e.clientOrderId)).toContain(entryId);
+
+    // The state the gate has to reason about: cap spent AND a real position.
+    const held = await inNamed(name, (bot) => bot.snapshot());
+    expect(held.state.entryAttempts).toBe(MAX_ENTRY_ATTEMPTS);
+    expect(held.state.position.quantity).toBeGreaterThan(ZERO);
+
+    // Halted for an unrelated reason -- the account-wide breaker on the night.
+    await inNamed(name, (bot) =>
+      bot.halt("manual", "account circuit breaker tripped for this account", ACTOR),
+    );
+
+    // THE ASSERTION THE OLD GATE FAILS: this resume must be allowed.
+    const resumed = await inNamed(name, (bot) => bot.resume(ACTOR));
+    expect(resumed.status).toBe("running");
+
+    // And it must actually TRAIL, not sit there or re-halt. `decide` checks
+    // `position.quantity <= ZERO` first, so a bot holding something never
+    // reaches the cap branch at all -- which is the whole reason the refusal's
+    // prediction ("re-halts it with the same entry_unfilled reason") was wrong.
+    const placedBefore = exchange.placed.length;
+    const tick = await inNamed(name, (bot) => bot.onPriceUpdate(priceAt("101")));
+    expect(tick.status).toBe("running");
+    expect(tick.action).not.toBe("halt");
+    // No new entry either: the cap still bars THAT, it just no longer bars the
+    // bot from managing what it already owns.
+    expect(exchange.placed).toHaveLength(placedBefore);
+
+    // And the trail is live: a crash through it exits rather than being ignored.
+    const exit = await inNamed(name, (bot) => bot.onPriceUpdate(priceAt("50")));
+    expect(exit.action).toBe("placed-trailing-exit");
+  });
+
+  it("still refuses when the cap is spent AND the bot is genuinely flat", async () => {
+    // The other half, so the fix does not simply delete the latch. This is the
+    // case the gate was built for and it must be untouched.
+    const name = `ts-cap-flat-${counter}`;
+    await haltedAtTheCap(name);
+    const snap = await inNamed(name, (bot) => bot.snapshot());
+    expect(snap.state.position.quantity).toBe(ZERO);
+
+    await expect(inNamed(name, (bot) => bot.resume(ACTOR))).rejects.toMatchObject({
+      code: "entry_budget_spent",
+    });
   });
 
   it("still resumes a trailing stop that has attempts left", async () => {

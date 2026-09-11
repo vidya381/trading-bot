@@ -4330,23 +4330,48 @@ export class BotInstance extends DurableObject<Env> {
     // predicting would disagree at the edges -- and a count above the cap is
     // reachable, since the cap was deployed onto live bots that had already
     // placed entries under no bound at all.
+    //
+    // ⚠ AND IT CHECKS THE POSITION, NOT JUST THE COUNTER. This gate read
+    // `entryAttempts` alone until 2026-09-11, and every sentence it spoke --
+    // "without ever filling", "this bot never got it, so there is no position to
+    // trail" -- was an INFERENCE from the counter rather than something it had
+    // checked. The inference is the same one the over-entry bug was built on:
+    // that a spent budget means nothing was acquired.
+    //
+    // `bot-x93xux` is the counterexample, and it was holding 2.59420419 LINK
+    // (29.96 USDT, against a 10.00 USDT allocation) when this gate told an
+    // operator it had no position. All three entries filled; the poll was
+    // rate-limited out of confirming them in time, so the counter reached the
+    // cap while the position filled up behind it. The refusal was not just
+    // wrong in its prose -- it was wrong in its PREDICTION, and it left a real
+    // position with its trailing stop unenforceable. The only way out was to
+    // liquidate a position the strategy was perfectly able to manage.
+    //
+    // ⚠ THE CONDITION IS COPIED FROM `decide`, WHICH IS THE AUTHORITY. There,
+    // `entryAttempts` is consulted ONLY inside the `position.quantity <= ZERO`
+    // branch -- a bot holding anything takes the trailing branch and never
+    // reaches the cap at all. So a resume refusal predicated on the cap is only
+    // ever truthful when the position is also empty, and the two must agree
+    // about that or this gate goes on predicting a halt that `decide` will not
+    // produce. Both halves are required, exactly as they are there.
     if (config.strategy === "trailing_stop") {
       const spent = state.entryAttempts ?? 0;
-      if (spent >= MAX_ENTRY_ATTEMPTS) {
+      if (spent >= MAX_ENTRY_ATTEMPTS && state.position.quantity <= ZERO) {
         throw new BotInstanceError(
           "entry_budget_spent",
           `bot ${config.botInstanceId} cannot resume: its single entry order was placed ` +
             `${spent} times without ever filling, which is the cap (${MAX_ENTRY_ATTEMPTS}), so ` +
-            `the entry budget is spent. Resuming would flip this bot to running and place ` +
-            `NOTHING -- the cap is re-evaluated on the next candle and re-halts it with the ` +
-            `same entry_unfilled reason, because the attempt count is deliberately never ` +
-            `reset. A trailing stop has exactly one entry in its whole life, and this bot ` +
-            `never got it, so there is no position to trail and nothing for a resume to do. ` +
-            `This is not a condition to clear and retry: if you still want this strategy on ` +
-            `this pair, create a new bot. Before you do, find out why the entries did not ` +
-            `fill -- each one was a limit priced to cross the spread, so an order that did ` +
-            `not fill was almost certainly cancelled at the venue rather than left behind by ` +
-            `the market, and a new bot would spend its three attempts the same way.`,
+            `the entry budget is spent, and it holds no position. Resuming would flip this ` +
+            `bot to running and place NOTHING -- the cap is re-evaluated on the next candle ` +
+            `and re-halts it with the same entry_unfilled reason, because the attempt count ` +
+            `is deliberately never reset. A trailing stop has exactly one entry in its whole ` +
+            `life, and this bot never got it, so there is no position to trail and nothing ` +
+            `for a resume to do. This is not a condition to clear and retry: if you still ` +
+            `want this strategy on this pair, create a new bot. Before you do, find out why ` +
+            `the entries did not fill -- each one was a limit priced to cross the spread, so ` +
+            `an order that did not fill was almost certainly cancelled at the venue rather ` +
+            `than left behind by the market, and a new bot would spend its three attempts ` +
+            `the same way.`,
         );
       }
     }
