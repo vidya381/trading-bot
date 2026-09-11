@@ -223,7 +223,7 @@ export async function reconcileAccount(
   );
 
   // 3. Balances, per asset, as a delta from the previous run.
-  pending.push(...(await reconcileBalances(ports, accountLabel, bots, runId, at, skipped)));
+  pending.push(...(await reconcileBalances(ports, accountLabel, runId, at, skipped)));
 
   // 4. Step 5's open question 2: does the ledger agree with the bot rows?
   pending.push(...(await reconcileAllocations(db, accountLabel)));
@@ -1307,10 +1307,32 @@ function unknownOrderFindings(
 // 3. Balances
 // ---------------------------------------------------------------------------
 
+/**
+ * The `checked_at` that every row of this account's most recent run shares.
+ *
+ * One run stamps ONE instant onto every snapshot it writes (`checked_at: at`),
+ * so this identifies the previous run by the only thing that groups its rows
+ * without depending on a run id being unique -- which fixtures do not
+ * guarantee and production does not need.
+ *
+ * `undefined` means this account has never been snapshotted, which is the
+ * first-run case the caller already handles by adopting rather than accusing.
+ */
+async function lastRunCheckedAt(
+  db: Database,
+  accountLabel: string,
+): Promise<Timestamp | undefined> {
+  const [last] = await db.balanceSnapshots.findMany({
+    where: { account_label: accountLabel },
+    orderBy: [{ column: "checked_at", direction: "desc" }],
+    limit: 1,
+  });
+  return last?.checked_at;
+}
+
 async function reconcileBalances(
   ports: ReconciliationPorts,
   accountLabel: string,
-  bots: readonly BotInstanceRow[],
   runId: string,
   at: Timestamp,
   skipped: string[],
@@ -1337,22 +1359,99 @@ async function reconcileBalances(
     where: { account_label: accountLabel },
   });
 
+  // What the VENUE says it holds, kept separate from the union below because
+  // the two answer different questions. See `empty`.
+  const heldAtVenue = balances.filter((balance) => balance.free + balance.locked > ZERO);
+
   // The union: assets this system allocates capital in, plus anything the
   // account actually holds. The second half is what makes an asset APPEARING
   // out of nowhere visible at all.
   const assets = new Set<string>([
     ...ledgerRows.map((row) => row.asset),
-    ...balances.filter((balance) => balance.free + balance.locked > ZERO).map((b) => b.asset),
+    ...heldAtVenue.map((balance) => balance.asset),
   ]);
 
   // An exchange reporting NOTHING is not the same as an account with nothing
   // to check, and until step 24 those two cases shared one silent early return.
   // See `auditEmptyBalanceSet` for the incident that distinguished them.
-  const empty = assets.size === 0;
+  //
+  // ⚠ MEASURED ON `heldAtVenue`, NOT ON `assets` (step 106). `assets` is a
+  // union with `capital_ledger`, which is this system's own CONFIGURATION and
+  // not an observation of anything -- so `assets.size === 0` could never be
+  // true on an account that has capital, and step 24's protection was dead on
+  // exactly the accounts it was built to protect. Confirmed against
+  // `kraken-main`, whose single USDT ledger row made it unreachable.
+  //
+  // Recording the zero above makes getting this right load-bearing rather than
+  // tidy: carrying forward the previous run's assets into a response that is
+  // empty because it could not be READ would report every holding on the
+  // account as drained at once and trip the breaker on it, which is the exact
+  // failure step 24 built this check to prevent.
+  const empty = heldAtVenue.length === 0;
   await auditEmptyBalanceSet(ports, accountLabel, empty, at, skipped);
   if (empty) return [];
 
-  const activity = await recordedActivity(ports, accountLabel, bots, skipped);
+  // -------------------------------------------------------------------------
+  // AN ASSET THAT REACHED ZERO MUST BE RECORDED AT ZERO (step 106)
+  // -------------------------------------------------------------------------
+  // The set above holds an asset only while it has a ledger row or a non-zero
+  // balance. A base asset has neither once it is sold out -- `kraken-main`'s
+  // ledger is USDT alone -- so an asset reaching EXACTLY zero used to leave the
+  // loop entirely: no snapshot row, no finding, not even a `skipped` entry.
+  // Two things followed, and entry 106 is both of them:
+  //
+  //   - The next non-zero reading took `ORDER BY checked_at DESC LIMIT 1` back
+  //     PAST the unrecorded zero to a stale pre-zero baseline, and reported the
+  //     whole vanished holding as unexplained. `-2.59420419 LINK`, breaker
+  //     tripped, six bots halted, and nothing actually wrong.
+  //   - Worse, and silently: an asset drained to zero by something REAL -- an
+  //     unauthorised withdrawal, a compromised key -- raised NOTHING, because
+  //     the comparison that would have caught it never ran. Draining an asset
+  //     to dust was caught; taking all of it was not.
+  //
+  // So the previous run's non-zero assets are carried into this one. Writing
+  // the zero row is what makes the NEXT baseline lookup correct, and because
+  // that row is itself zero the asset is not carried again -- it drops out on
+  // the following run. Self-terminating: an asset traded once and never again
+  // costs ONE extra row, not one per run forever.
+  //
+  // AFTER the `empty` check on purpose. An empty balance SET is unread, not a
+  // set of true zeros (`auditEmptyBalanceSet`), and adding assets here before
+  // that decision would mask the incident that check exists to catch and report
+  // every holding on the account as drained at once.
+  const previousRunCheckedAt = await lastRunCheckedAt(db, accountLabel);
+  if (previousRunCheckedAt !== undefined) {
+    const previousRun = await db.balanceSnapshots.findMany({
+      where: { account_label: accountLabel, checked_at: previousRunCheckedAt },
+    });
+    for (const row of previousRun) {
+      if (row.exchange_reported_balance > ZERO) assets.add(row.asset);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // BALANCE ACTIVITY IS EVERY BOT'S, INCLUDING STOPPED ONES (step 106)
+  // -------------------------------------------------------------------------
+  // Deliberately NOT `RECONCILED_STATUSES`. That filter is right for orders and
+  // positions -- a stopped bot has no live order to chase and no position to
+  // compare -- and it is wrong here, because this sum is not about what a bot
+  // HOLDS. It is about money that MOVED. A stopped bot holds nothing precisely
+  // BECAUSE it sold, and that sale is exactly the movement this delta exists to
+  // explain.
+  //
+  // The cost of the narrower filter was that a liquidate-then-close -- the
+  // ordinary cleanup flow -- made a bot's own closing trade permanently
+  // invisible to every later run. In entry 106 the sale left the activity set
+  // 28 seconds after the only pass that could still have absorbed it, and the
+  // account was one arbitrary two-minute difference away from the zero row
+  // itself being written wrong.
+  //
+  // This cannot double-count, and that is a property of `activitySince` rather
+  // than an assumption here: it drops every contribution at or before the
+  // asset's OWN baseline `checked_at`, so widening the pool can only add trades
+  // the baseline does not already contain.
+  const allBots = await db.botInstances.findMany({ where: { account_label: accountLabel } });
+  const activity = await recordedActivity(ports, accountLabel, allBots, skipped);
   const pending: PendingFinding[] = [];
 
   for (const asset of [...assets].sort()) {
@@ -1401,6 +1500,20 @@ async function reconcileBalances(
       discrepancy = exchangeTotal - internal - adjustmentTotal;
 
       if (discrepancy !== ZERO) {
+        // Step 106: say WHEN the baseline was observed, not just what it said.
+        // "From the last observation of 2.59420419" was true-sounding and
+        // twenty-five minutes stale, and a stale baseline was indistinguishable
+        // on the incident surface from a fresh one -- which is the difference
+        // between reading this alert and opening an investigation. The
+        // staleness clause is the one that would have ended entry 106 on sight.
+        const stale =
+          previousRunCheckedAt !== undefined && baseline.checked_at !== previousRunCheckedAt
+            ? `, and NOT from the previous run -- this asset went unrecorded by every ` +
+              `run since, so this baseline may predate changes no delta below accounts for`
+            : ``;
+        const observedAt =
+          `${new Date(baseline.checked_at).toISOString()} ` +
+          `(${Math.floor((at - baseline.checked_at) / 60_000)} minute(s) ago${stale})`;
         pending.push({
           finding: {
             kind: "balance_drift",
@@ -1409,13 +1522,26 @@ async function reconcileBalances(
             asset,
             detail:
               `${asset}: the exchange reports ${toDecimalString(exchangeTotal)}. From the ` +
-              `last observation of ${toDecimalString(baseline.exchange_reported_balance)} ` +
+              `observation at ${observedAt} of ` +
+              `${toDecimalString(baseline.exchange_reported_balance)} ` +
               `plus ${toDecimalString(delta.amount)} of this system's own recorded ` +
               `activity, ${toDecimalString(internal)} was expected. ` +
               `${adjustments.length} unreconciled manual adjustment(s) totalling ` +
               `${toDecimalString(adjustmentTotal)} were subtracted. ` +
               `${toDecimalString(discrepancy)} remains unexplained.`,
-            magnitude: { amount: discrepancy, reference: exchangeTotal },
+            // Step 106, and load-bearing for the zero row above. When an
+            // asset has drained to NOTHING there is no balance left to take a
+            // fraction of, and `exceedsFraction` refuses a non-positive
+            // reference -- so a COMPLETE drain would classify at
+            // `balance_drift`'s `minor` floor and auto-correct silently, which
+            // is precisely the outcome recording the zero exists to prevent.
+            // The honest denominator for "all of it is gone" is what WAS
+            // there. Narrow on purpose: only the case `exceedsFraction`
+            // already declines to judge, so no existing classification moves.
+            magnitude: {
+              amount: discrepancy,
+              reference: exchangeTotal > ZERO ? exchangeTotal : internal,
+            },
           },
         });
       }

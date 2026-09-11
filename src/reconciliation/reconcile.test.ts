@@ -2262,6 +2262,35 @@ describe("when the exchange reports an empty balance set", () => {
     expect(written).toEqual([]);
   });
 
+  it("is reachable on an account that HAS a capital_ledger row", async () => {
+    // ⚠ Step 106. `empty` used to be `assets.size === 0`, and `assets` is a
+    // union with `capital_ledger` -- this system's CONFIGURATION, not an
+    // observation -- so one ledger row made this whole protection unreachable.
+    // Every test above passes only because none of them seeds a ledger, and
+    // `kraken-main`, which has exactly one USDT row, had it dead in production.
+    //
+    // Recording an asset's zero (step 106) is what made this load-bearing:
+    // carrying the previous run's assets into a response that is empty because
+    // it could not be READ would report the entire account as drained and trip
+    // the breaker on it -- the precise failure step 24 built this to prevent.
+    await seedLedger("400");
+    await seedBaseline("USDT", "5000");
+    await seedBaseline("0G", BEFORE);
+    exchange.balances = [];
+
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    expect(result.skipped.some((entry) => entry.includes("NO holdings"))).toBe(true);
+    expect(await alerts({ alert_type: EMPTY_BALANCE_SET_ALERT })).toHaveLength(1);
+    // Unread means unread: no row, no finding, and emphatically no trip.
+    expect(
+      await db.balanceSnapshots.findMany({ where: { reconciliation_run_id: result.runId } }),
+    ).toEqual([]);
+    expect(result.findings).toEqual([]);
+    expect(result.circuitBreakerTripped).toBe(false);
+    expect(halted).toEqual([]);
+  });
+
   it("raises one standing alert, distinct from blindness", async () => {
     await seedBaseline("0G", BEFORE);
     exchange.balances = [];
@@ -2495,5 +2524,261 @@ describe("the activity window is each asset's own baseline", () => {
       result.skipped.some((entry) => entry.includes("balance reconciliation for USDT")),
     ).toBe(false);
     expect(result.findings.some((entry) => entry.asset === "USDT")).toBe(true);
+  });
+});
+
+// ===========================================================================
+// An asset that reached zero, and the bot that sold it (step 106)
+// ===========================================================================
+
+/**
+ * Entry 106: `kraken-main`'s breaker tripped on `-2.59420419 LINK` that was
+ * never missing. Two independent defects compounded.
+ *
+ *   (a) An asset outside `capital_ledger` was snapshotted only while non-zero,
+ *       so reaching EXACTLY zero wrote no row at all and the next non-zero
+ *       reading took its baseline from BEFORE the zero.
+ *   (b) `recordedActivity` was handed the `RECONCILED_STATUSES` bot list, so a
+ *       liquidate-then-close made the selling bot's own closing trade
+ *       permanently invisible.
+ *
+ * ⚠ THE ORDERING BELOW IS THE POINT, and it is not the ordering the incident
+ * took. In production the pass that could have recorded the zero ran 28
+ * seconds BEFORE the bot was archived, so the sale was still visible to it --
+ * which is why either fix alone would have prevented that particular trip.
+ * These tests archive the seller FIRST, the ordering nothing guarantees, and
+ * that is what makes both fixes independently required:
+ *
+ *   revert (a) -> no zero row is written at all; the first two assertions fail
+ *   revert (b) -> the zero row is written carrying -2.59420419 of drift
+ *
+ * The quantities are the real ones, and the re-buy is deliberately a DIFFERENT
+ * number from the sale (0.87215742 against 2.59420419) so that a test which
+ * silently compares the wrong pair of values cannot pass by coincidence.
+ */
+describe("an asset that drops to zero and returns with a different bot", () => {
+  const SELLER = "trail-btc-seller";
+  const BUYER = "trail-btc-buyer";
+  /** 25 minutes before T0 -- the real staleness in entry 106. */
+  const BASELINE_AT = T0 - 1_500_000;
+  const HELD = "2.59420419"; // what the seller held, to the satoshi
+  const REBOUGHT = "0.87215742"; // the replacement bot's single, correct entry
+
+  /** USDT after the sale at 10, and after the re-buy at 10. */
+  const AFTER_SALE = "5025.9420419";
+  const AFTER_REBUY = "5017.2204677";
+
+  beforeEach(async () => {
+    // BTC has NO capital_ledger row, exactly like LINK/BTC/ETH/XRP on
+    // `kraken-main`: the ledger holds the capital asset alone. That is what
+    // lets a base asset leave the reconciled set the moment it hits zero.
+    await seedLedger("400");
+    await seedBot(SELLER, m("400"));
+    await seedBot(BUYER, m("400"));
+    snapshots.set(BUYER, snapshotFor(BUYER));
+
+    await seedBaseline("BTC", HELD, BASELINE_AT);
+    await seedBaseline("USDT", "5000", BASELINE_AT);
+
+    await db.orders.insert(
+      orderRow({
+        id: "ord-sell",
+        client_order_id: `v1-${SELLER}-0`,
+        bot_instance_id: SELLER,
+        side: "sell",
+        status: "filled",
+      }),
+    );
+
+    // The bot is closed BEFORE any pass below. This is the step that used to
+    // make its closing trade unreachable, and doing it first is the ordering
+    // the incident happened not to take.
+    await db.botInstances.update({ id: SELLER }, { status: "stopped", archived: true });
+  });
+
+  /**
+   * The liquidation itself: the seller's entire holding, out in one execution.
+   *
+   * Opt-in rather than part of the fixture, because the two tests below need
+   * the loss to be genuinely UNEXPLAINED -- an asset that vanished with no
+   * trade behind it, which is the withdrawal shape, not the cleanup shape.
+   */
+  async function seedLiquidation(): Promise<void> {
+    await db.trades.insert(
+      tradeRow({
+        id: "trd-sell",
+        order_id: "ord-sell",
+        bot_instance_id: SELLER,
+        price: m("10"),
+        quantity: m(HELD),
+        fee_amount: ZERO,
+        fee_asset: "USDT",
+        fee_reporting_amount: null,
+        fee_reporting_asset: null,
+        fee_conversion_rate: null,
+        executed_at: BASELINE_AT + 60_000,
+      }),
+    );
+  }
+
+  /** Run one pass at `clock`, with BTC absent from the venue's answer. */
+  async function passAtZero(at: number) {
+    clock = at;
+    exchange.balances = [{ asset: "USDT", free: m(AFTER_SALE), locked: ZERO }];
+    return await reconcileAccount(ports(), ACCOUNT);
+  }
+
+  async function btcRows() {
+    return await db.balanceSnapshots.findMany({
+      where: { account_label: ACCOUNT, asset: "BTC" },
+      orderBy: [{ column: "checked_at", direction: "asc" }],
+    });
+  }
+
+  it("records the zero exactly once, and re-baselines a new holding against it", async () => {
+    await seedLiquidation();
+
+    // Pass 1: BTC is gone from the venue entirely. The zero must be RECORDED,
+    // and it must reconcile -- which needs the archived seller's trade.
+    const first = await passAtZero(T0 - 1_200_000);
+    expect(first.findings).toEqual([]);
+    expect(first.circuitBreakerTripped).toBe(false);
+
+    const afterFirst = await btcRows();
+    expect(afterFirst).toHaveLength(2); // the seeded baseline, plus the zero
+    const zero = afterFirst[1]!;
+    expect(zero.exchange_reported_balance).toBe(ZERO);
+    expect(zero.internal_calculated_balance).toBe(ZERO);
+    expect(zero.discrepancy).toBe(ZERO);
+
+    // Passes 2 and 3: the zero is already on record, so the asset drops out
+    // and stops costing a row. This is the termination property -- without it
+    // the carry-forward would write a zero row every five minutes forever.
+    await passAtZero(T0 - 900_000);
+    await passAtZero(T0 - 600_000);
+    expect(await btcRows()).toHaveLength(2);
+
+    // A DIFFERENT bot buys a DIFFERENT quantity.
+    await db.orders.insert(
+      orderRow({
+        id: "ord-buy",
+        client_order_id: `v1-${BUYER}-0`,
+        bot_instance_id: BUYER,
+        side: "buy",
+        status: "filled",
+      }),
+    );
+    await db.trades.insert(
+      tradeRow({
+        id: "trd-buy",
+        order_id: "ord-buy",
+        bot_instance_id: BUYER,
+        exchange_trade_id: "556699",
+        price: m("10"),
+        quantity: m(REBOUGHT),
+        fee_amount: ZERO,
+        fee_asset: "USDT",
+        fee_reporting_amount: null,
+        fee_reporting_asset: null,
+        fee_conversion_rate: null,
+        executed_at: T0 - 400_000,
+      }),
+    );
+
+    clock = T0;
+    exchange.balances = [
+      { asset: "USDT", free: m(AFTER_REBUY), locked: ZERO },
+      { asset: "BTC", free: m(REBOUGHT), locked: ZERO },
+    ];
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    // The whole point: nothing unexplained, no halt, no trip.
+    expect(result.findings).toEqual([]);
+    expect(result.tier).toBeNull();
+    expect(result.circuitBreakerTripped).toBe(false);
+    expect(halted).toEqual([]);
+    expect((await readCircuitBreaker(db, ACCOUNT))?.state).not.toBe("tripped");
+
+    const rows = await db.balanceSnapshots.findMany({
+      where: { reconciliation_run_id: result.runId },
+    });
+    const btc = rows.find((row) => row.asset === "BTC")!;
+    expect(btc.exchange_reported_balance).toBe(m(REBOUGHT));
+    expect(btc.internal_calculated_balance).toBe(m(REBOUGHT));
+    expect(btc.discrepancy).toBe(ZERO);
+    // The quote side of the same two trades has to land as well, or the
+    // widening in (b) is only half applied.
+    expect(rows.find((row) => row.asset === "USDT")!.discrepancy).toBe(ZERO);
+  });
+
+  it("keeps the archived seller's own closing trade visible to the delta", async () => {
+    // Fix (b) in isolation, stated as the arithmetic rather than the outcome:
+    // the zero row's internal balance is the stale baseline PLUS the stopped
+    // bot's sale. Without the widening it is the baseline alone, and the row
+    // is written carrying the entire holding as unexplained.
+    await seedLiquidation();
+    await passAtZero(T0 - 1_200_000);
+
+    const [, zero] = await btcRows();
+    expect(zero!.internal_calculated_balance).toBe(ZERO);
+    expect(zero!.discrepancy).not.toBe(-m(HELD));
+    expect(zero!.discrepancy).toBe(ZERO);
+  });
+
+  it("does not double-count an archived bot's trade the baseline already contains", async () => {
+    // The widening in (b) must not resurrect settled history. `activitySince`
+    // drops every contribution at or before the asset's OWN baseline, and that
+    // cutoff is what makes including stopped bots safe -- so once the zero row
+    // exists, the sale it absorbed must never be added again.
+    await seedLiquidation();
+    await passAtZero(T0 - 1_200_000);
+    const second = await passAtZero(T0 - 900_000);
+
+    // Had the sale been counted twice, USDT's predicted balance would be
+    // 25.9420419 above the venue's and the run would report drift.
+    expect(second.findings).toEqual([]);
+    const usdt = (
+      await db.balanceSnapshots.findMany({ where: { reconciliation_run_id: second.runId } })
+    ).find((row) => row.asset === "USDT")!;
+    expect(usdt.internal_calculated_balance).toBe(m(AFTER_SALE));
+    expect(usdt.discrepancy).toBe(ZERO);
+  });
+
+  it("raises SEVERE when an asset drains to zero with nothing explaining it", async () => {
+    // ⚠ THE REASON FOR THE FIX, and the direction that is not a false alarm.
+    // Before step 106 this produced NOTHING AT ALL -- no finding, no alert,
+    // not even a `skipped` entry -- because the drained asset left the loop
+    // before anything compared it. An unauthorised withdrawal looked exactly
+    // like a clean run. Draining to dust was caught; taking all of it was not.
+    // No `seedLiquidation()`: nothing explains the loss.
+    clock = T0 - 1_200_000;
+    exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const drift = result.findings.find((finding) => finding.asset === "BTC");
+    expect(drift?.kind).toBe("balance_drift");
+    // Not `minor`: a complete drain has no balance left to be a fraction of,
+    // so the reference falls back to what was there. A finding nobody is told
+    // about would be the same blind spot wearing a row in the table.
+    expect(drift?.tier).toBe("severe");
+    expect(drift?.detail).toContain("-2.59420419 remains unexplained");
+    expect(result.circuitBreakerTripped).toBe(true);
+    expect((await readCircuitBreaker(db, ACCOUNT))?.state).toBe("tripped");
+  });
+
+  it("names the baseline's instant and age, and says when it is not the previous run", async () => {
+    // Fix (c). "From the last observation of 2.59420419" was true-sounding and
+    // twenty-five minutes stale, and that wording is what turned entry 106
+    // into an investigation instead of a reading.
+    // No `seedLiquidation()`: an unexplained loss, so a finding is raised at
+    // all and its text can be read.
+    clock = T0 - 1_200_000;
+    exchange.balances = [{ asset: "USDT", free: m("5000"), locked: ZERO }];
+    const result = await reconcileAccount(ports(), ACCOUNT);
+
+    const drift = result.findings.find((finding) => finding.asset === "BTC")!;
+    expect(drift.detail).toContain(new Date(BASELINE_AT).toISOString());
+    expect(drift.detail).toContain("5 minute(s) ago");
+    expect(drift.detail).not.toContain("last observation");
   });
 });
