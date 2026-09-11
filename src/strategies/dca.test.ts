@@ -237,26 +237,26 @@ describe("applyEntry", () => {
 
 describe("decide", () => {
   it("opens the base order when there is no position", () => {
-    expect(decide({ config, position: EMPTY_POSITION, price: m("100"), hasOpenOrder: false })).toEqual({
+    expect(decide({ config, position: EMPTY_POSITION, price: m("100"), hasOutstandingOrder: false })).toEqual({
       kind: "open_base",
       quoteAmount: m("100"),
     });
   });
 
   it("holds instead of re-opening while the base order is still live", () => {
-    expect(decide({ config, position: EMPTY_POSITION, price: m("100"), hasOpenOrder: true })).toEqual({
+    expect(decide({ config, position: EMPTY_POSITION, price: m("100"), hasOutstandingOrder: true })).toEqual({
       kind: "hold",
     });
   });
 
   it("holds while the price sits between the triggers", () => {
     const position = positionAt("100", "1", "100");
-    expect(decide({ config, position, price: m("99"), hasOpenOrder: false })).toEqual({ kind: "hold" });
+    expect(decide({ config, position, price: m("99"), hasOutstandingOrder: false })).toEqual({ kind: "hold" });
   });
 
   it("buys again once the price drops the configured percentage from the last entry", () => {
     const position = positionAt("100", "1", "100");
-    expect(decide({ config, position, price: m("95"), hasOpenOrder: false })).toEqual({
+    expect(decide({ config, position, price: m("95"), hasOutstandingOrder: false })).toEqual({
       kind: "additional_buy",
       index: 0,
       quoteAmount: m("100"),
@@ -266,24 +266,24 @@ describe("decide", () => {
 
   it("does not fire at one tick above the trigger", () => {
     const position = positionAt("100", "1", "100");
-    expect(decide({ config, position, price: m("95.00000001"), hasOpenOrder: false })).toEqual({ kind: "hold" });
+    expect(decide({ config, position, price: m("95.00000001"), hasOutstandingOrder: false })).toEqual({ kind: "hold" });
   });
 
   it("sizes each additional buy by how many have already filled", () => {
     let position = positionAt("100", "1", "100");
     position = applyEntry(position, entry({ price: m("95"), quantity: m("1.05"), cost: m("100") }), true);
-    const action = decide({ config, position, price: m("90.25"), hasOpenOrder: false });
+    const action = decide({ config, position, price: m("90.25"), hasOutstandingOrder: false });
     expect(action).toMatchObject({ kind: "additional_buy", index: 1, quoteAmount: m("150") });
   });
 
   it("suppresses a further buy while an order is outstanding", () => {
     const position = positionAt("100", "1", "100");
-    expect(decide({ config, position, price: m("95"), hasOpenOrder: true })).toEqual({ kind: "hold" });
+    expect(decide({ config, position, price: m("95"), hasOutstandingOrder: true })).toEqual({ kind: "hold" });
   });
 
   it("takes profit once the price rises the configured percentage above average entry", () => {
     const position = positionAt("100", "1", "100");
-    expect(decide({ config, position, price: m("102"), hasOpenOrder: false })).toEqual({
+    expect(decide({ config, position, price: m("102"), hasOutstandingOrder: false })).toEqual({
       kind: "take_profit",
       targetPrice: m("102"),
       quantity: m("1"),
@@ -294,7 +294,7 @@ describe("decide", () => {
     // A risk or profit exit must not wait on a resting limit order that may
     // never fill; the exit path cancels it.
     const position = positionAt("100", "1", "100");
-    expect(decide({ config, position, price: m("102"), hasOpenOrder: true })).toMatchObject({
+    expect(decide({ config, position, price: m("102"), hasOutstandingOrder: true })).toMatchObject({
       kind: "take_profit",
     });
   });
@@ -303,7 +303,7 @@ describe("decide", () => {
     let position = positionAt("100", "1", "100");
     position = applyEntry(position, entry({ price: m("90"), quantity: m("1"), cost: m("90") }), true);
     // Average is 95; the target is 96.9, well below the original 102.
-    expect(decide({ config, position, price: m("96.9"), hasOpenOrder: false })).toMatchObject({
+    expect(decide({ config, position, price: m("96.9"), hasOutstandingOrder: false })).toMatchObject({
       kind: "take_profit",
       targetPrice: m("96.9"),
       quantity: m("2"),
@@ -312,7 +312,7 @@ describe("decide", () => {
 
   it("halts on the stop-loss", () => {
     const position = positionAt("100", "1", "100");
-    const action = decide({ config, position, price: m("80"), hasOpenOrder: false });
+    const action = decide({ config, position, price: m("80"), hasOutstandingOrder: false });
     expect(action).toMatchObject({ kind: "halt", reason: "stop_loss" });
   });
 
@@ -325,7 +325,7 @@ describe("decide", () => {
       config: { ...config, params: wide },
       position,
       price: m("95"),
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
     });
     expect(action).toMatchObject({ kind: "halt", reason: "stop_loss" });
   });
@@ -338,16 +338,16 @@ describe("decide", () => {
     position = applyEntry(position, entry({ price: m("95"), quantity: m("1"), cost: m("95") }), true);
 
     // Average 97.5; stop-loss at 78. Well below the next drop trigger of 90.25.
-    expect(decide({ config: single, position, price: m("90"), hasOpenOrder: false })).toEqual({ kind: "hold" });
-    expect(decide({ config: single, position, price: m("80"), hasOpenOrder: false })).toEqual({ kind: "hold" });
-    expect(decide({ config: single, position, price: m("78"), hasOpenOrder: false })).toMatchObject({
+    expect(decide({ config: single, position, price: m("90"), hasOutstandingOrder: false })).toEqual({ kind: "hold" });
+    expect(decide({ config: single, position, price: m("80"), hasOutstandingOrder: false })).toEqual({ kind: "hold" });
+    expect(decide({ config: single, position, price: m("78"), hasOutstandingOrder: false })).toMatchObject({
       kind: "halt",
       reason: "stop_loss",
     });
   });
 
   it("refuses a non-positive price", () => {
-    expect(() => decide({ config, position: EMPTY_POSITION, price: ZERO, hasOpenOrder: false })).toThrow(DcaError);
+    expect(() => decide({ config, position: EMPTY_POSITION, price: ZERO, hasOutstandingOrder: false })).toThrow(DcaError);
   });
 });
 

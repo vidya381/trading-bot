@@ -70,7 +70,7 @@ function run(
       position: HELD(entry),
       highWaterMark: mark,
       price: p,
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
       entryAttempts: 0,
     });
     if (action.kind === "trailing_exit" && exitedAt === null) exitedAt = price;
@@ -85,7 +85,7 @@ describe("the entry", () => {
       position: FLAT,
       highWaterMark: undefined,
       price: m("100"),
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
       entryAttempts: 0,
     });
     expect(action).toEqual({ kind: "open_entry", quoteAmount: m("1000") });
@@ -97,7 +97,7 @@ describe("the entry", () => {
       position: FLAT,
       highWaterMark: undefined,
       price: m("100"),
-      hasOpenOrder: true,
+      hasOutstandingOrder: true,
       entryAttempts: 0,
     });
     expect(action.kind).toBe("hold");
@@ -110,7 +110,7 @@ describe("the entry", () => {
         position: HELD("100"),
         highWaterMark: m("100"),
         price: ZERO,
-        hasOpenOrder: false,
+        hasOutstandingOrder: false,
         entryAttempts: 0,
       }),
     ).toThrow(/price must be positive/);
@@ -126,7 +126,7 @@ describe("the trail before any new high (22.2 decision 2)", () => {
       position: HELD("100"),
       highWaterMark: undefined,
       price: m("89"),
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
       entryAttempts: 0,
     });
     expect(action.kind).toBe("trailing_exit");
@@ -140,7 +140,7 @@ describe("the trail before any new high (22.2 decision 2)", () => {
       position: HELD("100"),
       highWaterMark: undefined,
       price: m("91"),
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
       entryAttempts: 0,
     });
     expect(action.kind).toBe("hold");
@@ -208,7 +208,7 @@ describe("22.3: a dropped candle does not silently suppress the exit", () => {
       position: HELD("100"),
       highWaterMark: m("120"),
       price: m("90"),
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
       entryAttempts: 0,
     });
     expect(action.kind).toBe("trailing_exit");
@@ -308,7 +308,7 @@ describe("the entry retry cap (22.10)", () => {
     position: FLAT,
     highWaterMark: undefined,
     price: m("100"),
-    hasOpenOrder: false,
+    hasOutstandingOrder: false,
     entryAttempts,
   });
 
@@ -349,16 +349,16 @@ describe("the entry retry cap (22.10)", () => {
       position: HELD("100"),
       highWaterMark: m("120"),
       price: m("90"),
-      hasOpenOrder: false,
+      hasOutstandingOrder: false,
       entryAttempts: MAX_ENTRY_ATTEMPTS + 1,
     });
     expect(action.kind).toBe("trailing_exit");
   });
 
   it("holds, rather than halting, while an entry order is still live at the cap", () => {
-    // `hasOpenOrder` is checked FIRST. An order that is resting has not failed
+    // `hasOutstandingOrder` is checked FIRST. An order that is resting has not failed
     // yet, and halting on it would cancel an entry that might be about to fill.
-    const action = decide({ ...flat(MAX_ENTRY_ATTEMPTS), hasOpenOrder: true });
+    const action = decide({ ...flat(MAX_ENTRY_ATTEMPTS), hasOutstandingOrder: true });
     expect(action.kind).toBe("hold");
   });
 });

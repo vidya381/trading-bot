@@ -232,13 +232,27 @@ export interface DcaDecisionInput {
   /** The latest usable price. Section 5.6 governs what counts as usable. */
   readonly price: Money;
   /**
-   * Whether an order this bot placed is still live.
+   * Whether this bot has ANY exchange business outstanding -- an order believed
+   * live on the book, OR one that was sent and whose outcome is not yet known.
+   *
+   * ⚠ IT COVERS THE UNKNOWN CASE, and the name says so because the previous
+   * name did not. This field was once called `hasOpenOrder` and was fed
+   * `openOrderIds.length > 0`; a `transport` failure writes no `openOrderIds`
+   * entry precisely because the order's fate is unknown -- so "sent, might be
+   * resting, might be filling" arrived here as `false`, indistinguishable from
+   * "nothing was ever sent". bot-q4xcjr placed two DCA base orders on
+   * XRPUSDT one second apart on that reading; both filled.
+   *
+   * The caller owes a POSITIVE claim when it passes `false`: not "I know of no
+   * open order", but "this bot has nothing outstanding". See
+   * `hasOutstandingOrder` in `bot-instance.ts`, which is the only thing that
+   * should ever compute it.
    *
    * Suppresses further BUYS only. A stop-loss or take-profit still fires with
    * an order outstanding, because the halt path cancels open orders anyway and
    * a risk exit must not wait on a resting limit order that may never fill.
    */
-  readonly hasOpenOrder: boolean;
+  readonly hasOutstandingOrder: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +563,7 @@ export function decide(input: DcaDecisionInput): DcaAction {
 
   // No position yet: this is a fresh cycle waiting on its base order.
   if (position.quantity <= ZERO) {
-    return input.hasOpenOrder
+    return input.hasOutstandingOrder
       ? { kind: "hold" }
       : { kind: "open_base", quoteAmount: params.baseOrderSize };
   }
@@ -571,7 +585,7 @@ export function decide(input: DcaDecisionInput): DcaAction {
     return { kind: "take_profit", targetPrice: target, quantity: position.quantity };
   }
 
-  if (position.additionalBuysUsed >= params.maxAdditionalBuys || input.hasOpenOrder) {
+  if (position.additionalBuysUsed >= params.maxAdditionalBuys || input.hasOutstandingOrder) {
     return { kind: "hold" };
   }
 

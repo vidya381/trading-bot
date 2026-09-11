@@ -84,6 +84,24 @@ export class FakeExchange implements RestExchangeClient {
 
   readonly resting = new Map<string, RestingOrder>();
 
+  /**
+   * Set to make the next `placeOrder` REACH the exchange -- recorded, resting
+   * and fillable -- and still return a transport failure to the caller. Cleared
+   * after one use.
+   *
+   * ⚠ THE CASE `nextPlaceFailure` CANNOT MODEL, and the one that actually cost
+   * money. That flag returns a failure and records nothing, i.e. "the order
+   * never arrived" -- which is true of a connection refused, and false of the
+   * HTTP 526 Kraken returned on 2026-09-11. There the orders arrived, rested,
+   * and filled; only the REPLY was lost. A caller that treats those two as the
+   * same thing re-places an order that already exists, which is precisely what
+   * bot-x93xux did three times in six seconds.
+   *
+   * So the distinction is modelled here rather than assumed away, because a
+   * test built on `nextPlaceFailure` would pass against the broken code.
+   */
+  nextPlaceAcceptedButUnreported: { message: string } | null = null;
+
   /** Set to force the next `placeOrder` to fail, then cleared. */
   nextPlaceFailure: { kind: ForcedFailureKind; message: string } | null = null;
   /** Set to force the next `cancelOrder` to fail, then cleared. */
@@ -308,6 +326,24 @@ export class FakeExchange implements RestExchangeClient {
     if (forced !== null) {
       this.nextPlaceFailure = null;
       return failure(forced.message, forced.kind, this.now);
+    }
+
+    // Accepted by the venue, unreported to the caller. Everything the success
+    // path below records still happens -- the order is in `placed`, it is
+    // resting, and `fillFor` can fill it -- and the caller gets `transport`.
+    const lost = this.nextPlaceAcceptedButUnreported;
+    if (lost !== null) {
+      this.nextPlaceAcceptedButUnreported = null;
+      this.placed.push(order);
+      const exchangeOrderId = `E${this.#nextExchangeOrderId}`;
+      this.#nextExchangeOrderId += 1;
+      this.resting.set(order.clientOrderId, {
+        request: order,
+        exchangeOrderId,
+        filledQuantity: ZERO,
+        cancelled: false,
+      });
+      return failure(lost.message, "transport", this.now);
     }
 
     this.placed.push(order);

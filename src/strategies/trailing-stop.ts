@@ -306,7 +306,7 @@ export const ENTRY_CROSS_PCT: Money = fromDecimalString("0.25");
  * and the price, so it re-answers `open_entry` on EVERY candle for as long as
  * the position is flat and no order is live. That is correct for DCA and grid,
  * whose retries are bounded by their own cycle and ladder logic -- a DCA bot
- * with a resting base order has `hasOpenOrder` true and stops asking. It is
+ * with a resting base order has `hasOutstandingOrder` true and stops asking. It is
  * unbounded here, because nothing in this strategy ever concludes that the entry
  * is not going to happen. The live bot placed and lost the same order ten times
  * at the identical price and would have continued indefinitely.
@@ -399,14 +399,29 @@ export interface TrailingStopDecisionInput {
   /** The latest usable price. Section 5.6 governs what counts as usable. */
   readonly price: Money;
   /**
-   * Whether an order this bot placed is still live.
+   * Whether this bot has ANY exchange business outstanding -- an order believed
+   * live on the book, OR one that was sent and whose outcome is not yet known.
+   *
+   * ⚠ IT COVERS THE UNKNOWN CASE, and the name says so because the previous
+   * name did not. This field was once called `hasOpenOrder` and was fed
+   * `openOrderIds.length > 0`; a `transport` failure writes no `openOrderIds`
+   * entry precisely because the order's fate is unknown -- so "sent, might be
+   * resting, might be filling" arrived here as `false`, indistinguishable from
+   * "nothing was ever sent". bot-x93xux placed its single entry three
+   * times in six seconds against a 10.00 USDT allocation on that reading; all
+   * three filled, for 30.195234713 USDT.
+   *
+   * The caller owes a POSITIVE claim when it passes `false`: not "I know of no
+   * open order", but "this bot has nothing outstanding". See
+   * `hasOutstandingOrder` in `bot-instance.ts`, which is the only thing that
+   * should ever compute it.
    *
    * Suppresses the ENTRY only. The trailing exit still fires with an order
    * outstanding, for the reason `dca.ts` gives: a risk exit must not wait on a
    * resting limit order that may never fill, and the halt path cancels open
    * orders anyway.
    */
-  readonly hasOpenOrder: boolean;
+  readonly hasOutstandingOrder: boolean;
   /**
    * How many times the single entry has already been PLACED on the exchange
    * (spec 22.10). Bounds the entry, and nothing else.
@@ -438,7 +453,7 @@ export function decide(input: TrailingStopDecisionInput): TrailingStopAction {
 
   // No position yet: waiting on the single entry.
   if (position.quantity <= ZERO) {
-    if (input.hasOpenOrder) return { kind: "hold" };
+    if (input.hasOutstandingOrder) return { kind: "hold" };
 
     // SPEC 22.10. Checked BEFORE `open_entry` is returned, so the cap bounds
     // placements rather than trailing them by one: at the cap, the next answer

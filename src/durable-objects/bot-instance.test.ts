@@ -833,7 +833,7 @@ describe("halt (section 7.2)", () => {
     expect((await db.botInstances.findOne({ id: BOT_ID }))!.halt_reason).toMatch(/order_rejected/);
   });
 
-  it("leaves an order of unknown outcome unresolved rather than halting or resending", async () => {
+  it("leaves an order of unknown outcome unresolved, and places nothing else meanwhile", async () => {
     await run((bot) => bot.create(creation()));
     await run((bot) => bot.start(ACTOR));
     exchange.nextPlaceFailure = { kind: "transport", message: "socket hang up" };
@@ -843,10 +843,25 @@ describe("halt (section 7.2)", () => {
     // the attempt record stays `attempting` so recovery looks it up.
     expect(result).toMatchObject({ status: "running", action: "unresolved" });
 
-    // The sequence is spent. A retry must NOT re-send under the same id.
+    // ⚠ THIS EXPECTATION CHANGED ON 2026-09-11, and the incident is the reason.
+    // It used to assert `placed-base` under a fresh sequence -- an order of
+    // UNKNOWN outcome followed immediately by a second, real one. That is
+    // precisely what `bot-x93xux` did three times in six seconds while Kraken
+    // returned HTTP 526, for 3.02x its allocation; see
+    // `unconfirmed-order-reentry.test.ts`.
+    //
+    // THE INVARIANT THIS TEST WAS WRITTEN FOR IS UNCHANGED and still asserted
+    // below: the spent sequence is never re-sent, because `beginAttempt`
+    // returns `recover` for any sequence it has already seen. What changed is
+    // that "do not reuse the id" is no longer discharged by "so use a new one".
+    // While the first order's fate is unknown the bot places NOTHING.
     const retry = await run((bot) => bot.onPriceUpdate(priceAt("100")));
-    expect(retry.action).toBe("placed-base");
-    expect(exchange.placed[0]!.clientOrderId).toBe(`v1-${BOT_ID}-1`);
+    expect(retry.action).toBe("hold");
+    expect(exchange.placed).toHaveLength(0);
+
+    // Still spent: the next id this bot would ever use is not the failed one.
+    const snapshot = await run((bot) => bot.snapshot());
+    expect(snapshot.state.nextSequence).toBeGreaterThan(0);
   });
 
   it("skips an order the symbol filters reject, without halting", async () => {
@@ -2599,7 +2614,7 @@ describe("bot.open_orders_checked (what a pass records)", () => {
 
   // The MIXED pass -- one order unreadable and another refused, which is what
   // actually separates `refused` from `skipped` -- needs two simultaneously open
-  // orders. DCA cannot express that (`decide` holds while `hasOpenOrder`), so it
+  // orders. DCA cannot express that (`decide` holds while `hasOutstandingOrder`), so it
   // lives with the ladder, in grid-bot-instance.test.ts.
 });
 
@@ -4530,7 +4545,7 @@ describe("a take-profit exit that fills after the bot has already halted", () =>
 
     // A base buy, filled IN FULL: 0.00166666 at 60000 (100 USDT, floored).
     // Fully, not partly, because a part-filled base order stays in
-    // `openOrderIds` and `decide` holds on `hasOpenOrder` instead of opening the
+    // `openOrderIds` and `decide` holds on `hasOutstandingOrder` instead of opening the
     // additional buy this fixture needs.
     await run((bot) => bot.onPriceUpdate(priceAt("60000")));
     const buyId = exchange.placed[0]!.clientOrderId;
@@ -4545,7 +4560,7 @@ describe("a take-profit exit that fills after the bot has already halted", () =>
     exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
 
     // 2% above the average entry: `decide` returns `take_profit` before it ever
-    // reaches its `hasOpenOrder` hold, so the resting buy does not block the exit.
+    // reaches its `hasOutstandingOrder` hold, so the resting buy does not block the exit.
     await run((bot) => bot.onPriceUpdate(priceAt("61200")));
     const sellId = exchange.placed[2]!.clientOrderId;
 

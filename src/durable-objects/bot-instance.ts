@@ -586,6 +586,35 @@ export interface BotRuntimeState {
   readonly nextSequence: number;
   /** clientOrderIds of orders believed live on the exchange. */
   readonly openOrderIds: readonly string[];
+  /**
+   * clientOrderIds SENT to the exchange whose outcome this object has not
+   * confirmed. Deliberately NOT part of `openOrderIds`.
+   *
+   * ⚠ THE DISTINCTION THIS FIELD EXISTS TO MAKE. `openOrderIds` means "believed
+   * live". Its absence used to mean two incompatible things at once: "there is
+   * definitely nothing outstanding", and "something was sent and this object
+   * does not know what became of it". `hasOutstandingOrder` read the second as
+   * the first, so a strategy asked for a fresh entry while a prior one was
+   * resting -- and filling -- on the book.
+   *
+   * That is not hypothetical. bot-x93xux placed its single trailing-stop entry
+   * THREE times in six seconds against a 10.00 USDT allocation while Kraken was
+   * returning HTTP 526, and all three filled: 30.195234713 USDT spent, 3.02x
+   * the allocation. Only `MAX_ENTRY_ATTEMPTS` stopped it, which is a damage cap
+   * and was never meant to be the thing preventing the spend.
+   *
+   * WRITTEN BEFORE THE SEND, exactly as the attempt record is and for the same
+   * reason: if this object dies between the write and the reply, the id is
+   * still here on the next read. CLEARED ONLY BY A DEFINITE ANSWER -- placed
+   * (it moves to `openOrderIds`), provably-never-sent (`rate_limited`), or
+   * refused outright. A `transport` failure clears nothing, because that is the
+   * case where the order may well exist.
+   *
+   * Optional because bots created before this field exist; every read defaults
+   * it through `outstandingUnconfirmed`, never `state.unconfirmedOrderIds`
+   * directly. Same precedent as `entryAttempts`.
+   */
+  readonly unconfirmedOrderIds?: readonly string[];
   readonly haltReason: string | null;
   readonly haltedAt: Timestamp | null;
   readonly lastPrice: Money | null;
@@ -972,9 +1001,44 @@ const LADDER_VACANT_ALERT_TYPE = "grid_ladder_vacant";
 export function gridOutstanding(state: BotRuntimeState): boolean {
   return (
     state.openOrderIds.length > 0 ||
+    outstandingUnconfirmed(state).length > 0 ||
     state.exitOrderId !== null ||
     (state.pendingReplacements ?? []).length > 0
   );
+}
+
+/**
+ * The ids whose outcome is unknown, defaulted.
+ *
+ * THE ONLY READER of `state.unconfirmedOrderIds`. The field is optional for
+ * bots that predate it, and an `undefined` treated as "nothing outstanding" is
+ * the exact bug this whole mechanism exists to prevent -- so the default lives
+ * in one function rather than at each of the several call sites, none of which
+ * can then forget it.
+ */
+export function outstandingUnconfirmed(state: BotRuntimeState): readonly string[] {
+  return state.unconfirmedOrderIds ?? [];
+}
+
+/**
+ * Whether this bot has ANY exchange business outstanding: an order believed
+ * live, OR one sent whose fate is unknown.
+ *
+ * ⚠ THE ONE EXPRESSION EVERY STRATEGY GATE READS, and the reason it is a
+ * function rather than an inline `||` repeated at three call sites. The bug it
+ * closes was not that any one site computed the wrong thing; it was that
+ * `openOrderIds.length > 0` LOOKED complete at every site that wrote it, on
+ * three strategies, for as long as the transport-failure path was rare. A
+ * second term added to one call site and missed at another would reproduce it
+ * on whichever strategy was missed. There is one term to add because there is
+ * one place to add it.
+ *
+ * `false` here is a POSITIVE claim -- "this bot has nothing outstanding, a new
+ * order is safe" -- and every path that can make that untrue has to pass
+ * through this function to say so.
+ */
+export function hasOutstandingOrder(state: BotRuntimeState): boolean {
+  return state.openOrderIds.length > 0 || outstandingUnconfirmed(state).length > 0;
 }
 
 export interface BotSnapshot {
@@ -1182,6 +1246,12 @@ const BOT_ALERT_SOURCE = "bot-instance";
  */
 export const POLL_STANDING_ALERT_TYPES: ReadonlySet<string> = new Set<string>([
   "unattributable_fill",
+  // An order sent whose outcome no pass has been able to read. Standing for the
+  // same reason as the others: the condition is re-derived on every pass, so an
+  // unconditional insert writes one row per pass for as long as the venue stays
+  // unreadable. It resolves through the same machinery -- the first pass that
+  // adopts or clears the last unknown id does not re-raise it.
+  "entry_suppressed_unconfirmed",
   // Also a finding about the books rather than a poll fault, and standing for
   // the same reason: `#drainReplacements` re-evaluates the queue on every pass,
   // so an unconditional insert would write one row per pass for as long as a
@@ -1792,6 +1862,56 @@ export class BotInstance extends DurableObject<Env> {
   }
 
   /**
+   * Record that `clientOrderId` is about to be sent and its outcome is unknown.
+   *
+   * ⚠ CALLED BEFORE THE SEND, never after, and that ordering is the entire
+   * guarantee. It mirrors `beginAttempt`, which writes its record before the
+   * order leaves for the same reason -- but the attempt record is never read by
+   * the decision path, and this is. Between this write and the exchange's reply
+   * the object may be re-entered by a price update or an alarm (the step 21
+   * probe measured exactly that), and every one of those re-entries must see
+   * that something is outstanding. Marking AFTER the reply would leave the
+   * window open that let bot-q4xcjr place a second base order one second after
+   * the first.
+   */
+  async #markUnconfirmed(clientOrderId: string): Promise<void> {
+    await this.#mutateState((current) => ({
+      ...current,
+      unconfirmedOrderIds: [...outstandingUnconfirmed(current), clientOrderId],
+    }));
+  }
+
+  /**
+   * Drop an id whose outcome IS now definitely known to be "no order exists".
+   *
+   * ONLY for `rate_limited` (section 5.4 refused the budget, so nothing reached
+   * the network) and an outright exchange refusal. NOT for `transport`: that is
+   * the case this mechanism exists for, and clearing it there would restore the
+   * bug exactly.
+   */
+  async #clearUnconfirmed(clientOrderId: string): Promise<void> {
+    await this.#mutateState((current) => ({
+      ...current,
+      unconfirmedOrderIds: outstandingUnconfirmed(current).filter((id) => id !== clientOrderId),
+    }));
+  }
+
+  /**
+   * Promote an id from "unknown" to "believed live", in ONE mutation.
+   *
+   * The single write matters: as two, a re-entry landing between them would see
+   * the order in neither list and read the bot as having nothing outstanding --
+   * which is the precise state this change exists to make unreachable.
+   */
+  async #confirmPlaced(clientOrderId: string): Promise<void> {
+    await this.#mutateState((current) => ({
+      ...current,
+      unconfirmedOrderIds: outstandingUnconfirmed(current).filter((id) => id !== clientOrderId),
+      openOrderIds: [...current.openOrderIds, clientOrderId],
+    }));
+  }
+
+  /**
    * The same discipline for the poll's schedule, which has the same exposure.
    *
    * `#recordPollFailure` reads the schedule, raises a standing alert -- a D1
@@ -2329,7 +2449,10 @@ export class BotInstance extends DurableObject<Env> {
         config,
         position: state.position,
         price: price.price,
-        hasOpenOrder: state.openOrderIds.length > 0,
+        // `hasOutstandingOrder`, not `openOrderIds.length > 0`. Two DCA base
+        // orders went onto XRPUSDT a second apart on bot-q4xcjr because the
+        // second decision read the first placement as "nothing outstanding".
+        hasOutstandingOrder: hasOutstandingOrder(state),
       });
 
       switch (action.kind) {
@@ -3346,7 +3469,21 @@ export class BotInstance extends DurableObject<Env> {
       state = await this.#state();
     }
 
-    if (state.openOrderIds.length === 0) {
+    // ⚠ THE WORKLIST INCLUDES THE UNKNOWN ONES, and that is what makes
+    // `unconfirmedOrderIds` a recoverable state rather than a permanent stall.
+    // An id whose placement failed in transport has no `openOrderIds` entry by
+    // construction -- that is the whole point of it -- so a poll reading only
+    // `openOrderIds` would never ask about the one order the bot most needs an
+    // answer for, and the gate it holds shut would never reopen.
+    //
+    // `getOrderStatus` takes a clientOrderId, which this object chose and
+    // recorded before sending, so it can ask about an order it never got a
+    // reply for. Deduplicated because a promoted id is briefly in both lists.
+    const unknownIds = outstandingUnconfirmed(state).filter(
+      (id) => !state.openOrderIds.includes(id),
+    );
+    const pollable = [...state.openOrderIds, ...unknownIds];
+    if (pollable.length === 0) {
       return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: false };
     }
 
@@ -3359,7 +3496,7 @@ export class BotInstance extends DurableObject<Env> {
     }
 
     const exchange = this.#exchange(config, "routine");
-    const clientOrderIds = [...state.openOrderIds];
+    const clientOrderIds = pollable;
 
     // READ EVERY ORDER AT ONCE, then apply them one at a time. The split is the
     // whole of this change, and each half is load-bearing for its own reason.
@@ -3441,6 +3578,66 @@ export class BotInstance extends DurableObject<Env> {
     // deferred pass did not do is FINISH, and `deferred` is what says so.
     if (this.#passesInFlight > 0) {
       return { applied, skipped, closed, refused, standing, reads, unreadable, deferred: true };
+    }
+
+    // ADOPTION, BEFORE THE APPLY LOOP. A readable unknown order is an order
+    // this bot really placed and really owns; the only thing missing is the
+    // local record, because the reply that would have written it was lost.
+    // `OrderStatus` carries every field `createOrder` needs, so the record is
+    // reconstructed from the venue's own answer rather than guessed.
+    //
+    // Once adopted the id is in `openOrderIds` and has a `TrackedOrder`, so the
+    // loop below, `#foldTerminalState` and the fill machinery all handle it with
+    // no special case -- including folding the fills it took while this object
+    // did not know it existed. That is the repair tonight's incident needed.
+    for (const { clientOrderId, remote } of readable) {
+      if (!unknownIds.includes(clientOrderId)) continue;
+      if ((await this.#order(clientOrderId)) !== undefined) continue;
+      const adopted = createOrder({
+        clientOrderId,
+        pair: config.pair,
+        side: remote.side,
+        price: remote.price,
+        quantity: remote.quantity,
+        at: this.#now(),
+      });
+      await this.#putOrder(adopted);
+      await this.#confirmPlaced(clientOrderId);
+      await this.#mirrorOrderInsert(config, adopted, remote.exchangeOrderId);
+      await this.#alert(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "unconfirmed_order_adopted",
+        message:
+          `${clientOrderId} was placed but its acknowledgement was lost in transport; the ` +
+          `exchange reports it as ${remote.state} with ` +
+          `${toDecimalString(remote.filledQuantity)} filled. It has been adopted into this ` +
+          `bot's records and its fills will be applied. No new order was placed in the ` +
+          `meantime, which is the behaviour bot-x93xux lacked.`,
+      });
+    }
+
+    // WHAT SURVIVED ADOPTION is the genuinely stuck set: sent, unreadable, and
+    // still holding every strategy gate on this bot shut. Raised HERE rather
+    // than from the price path that feels the effect, because a standing alert
+    // must be raised and resolved by the same owner -- and the poll is the only
+    // thing that can resolve this one. `resolveClearedStandingAlerts` closes it
+    // on the first pass that finds nothing outstanding, with no human action.
+    const stillUnknown = outstandingUnconfirmed(await this.#state());
+    if (stillUnknown.length > 0) {
+      standing.add(standingAlertKey("entry_suppressed_unconfirmed", config.botInstanceId));
+      await this.#raiseStanding(config, {
+        severity: "warning",
+        category: "trading",
+        alertType: "entry_suppressed_unconfirmed",
+        message:
+          `this bot is holding rather than placing orders because ` +
+          `${stillUnknown.length} order(s) it sent (${stillUnknown.join(", ")}) have no ` +
+          `confirmed outcome: the placement failed in transport, so they may be resting or ` +
+          `filling on the exchange, and this pass could not read them either. It will NOT ` +
+          `place another until that is settled -- re-entering blind is what committed 3.02x ` +
+          `an allocation on bot-x93xux. Check these ids on the exchange.`,
+      });
     }
 
     for (const { clientOrderId, remote } of readable) {
@@ -4914,6 +5111,12 @@ export class BotInstance extends DurableObject<Env> {
       };
     }
 
+    // BEFORE THE SEND. From here until a definite answer arrives, this bot has
+    // exchange business outstanding, and `hasOutstandingOrder` says so to every
+    // strategy gate -- including one evaluated by a re-entry while this await
+    // is parked.
+    await this.#markUnconfirmed(decision.clientOrderId);
+
     const outcome = await this.#exchange(config, "routine").placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
@@ -4941,6 +5144,11 @@ export class BotInstance extends DurableObject<Env> {
         // position and the price, so the next price update re-evaluates it and
         // places the order then if it is still the right thing to do.
         await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        // Provably not on the exchange, so it is not outstanding. This is the
+        // one failure kind that may clear the mark, and `FailureKind` exists as
+        // three values rather than two precisely so this case can be told apart
+        // from `transport` here.
+        await this.#clearUnconfirmed(decision.clientOrderId);
         await this.#alert(config, {
           severity: "warning",
           category: "system",
@@ -4953,6 +5161,13 @@ export class BotInstance extends DurableObject<Env> {
         // Section 5.6 and 5.1 together: the order's fate is unknown, so the
         // attempt record stays `attempting` and recovery looks it up by
         // clientOrderId. It must never be re-sent.
+        //
+        // ⚠ THE MARK IS DELIBERATELY NOT CLEARED. This is the path that spent
+        // 3.02x bot-x93xux's allocation: Kraken returned 526, the order was in
+        // fact resting and filling, and because no `openOrderIds` entry was
+        // written the next candle read the bot as idle and entered again. The
+        // id stays in `unconfirmedOrderIds` until the poll gets a real answer
+        // for it, and `hasOutstandingOrder` refuses a new entry until then.
         return {
           status: "running",
           action: "unresolved",
@@ -4960,6 +5175,8 @@ export class BotInstance extends DurableObject<Env> {
         };
       }
       await guard.markFailed(decision.clientOrderId, outcome.message, now);
+      // The exchange understood and refused: no order exists.
+      await this.#clearUnconfirmed(decision.clientOrderId);
       return await this.#halt(config, "order_rejected", `exchange refused the order: ${outcome.message}`, "system");
     }
 
@@ -4983,10 +5200,7 @@ export class BotInstance extends DurableObject<Env> {
     // terminal order, so it is re-read on every pass forever, the alarm never
     // disarms, and `hasOpenOrder` stays true so `decide` can never return
     // `open_base` or `additional_buy` again. A permanently wedged bot.
-    await this.#mutateState((current) => ({
-      ...current,
-      openOrderIds: [...current.openOrderIds, decision.clientOrderId],
-    }));
+    await this.#confirmPlaced(decision.clientOrderId);
     await this.#mirrorOrderInsert(config, order, result.exchangeOrderId);
 
     // A limit order can come back with executions already attached.
@@ -5062,6 +5276,10 @@ export class BotInstance extends DurableObject<Env> {
       };
     }
 
+    // BEFORE THE SEND -- see `#markUnconfirmed`. Until a definite answer
+    // arrives this bot has outstanding business, and every re-entry must see it.
+    await this.#markUnconfirmed(decision.clientOrderId);
+
     const outcome = await this.#exchange(config, "risk-exit").placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
@@ -5081,6 +5299,8 @@ export class BotInstance extends DurableObject<Env> {
         // is worth a human seeing. The exit is re-attempted on the next price
         // update, because `decide()` will still return `take_profit`.
         await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        // Nothing reached the network; not outstanding.
+        await this.#clearUnconfirmed(decision.clientOrderId);
         await this.#alert(config, {
           severity: "critical",
           category: "system",
@@ -5096,6 +5316,8 @@ export class BotInstance extends DurableObject<Env> {
         return { status: "running", action: "unresolved", detail: outcome.message };
       }
       await guard.markFailed(decision.clientOrderId, outcome.message, now);
+      // The exchange understood and refused: no order exists.
+      await this.#clearUnconfirmed(decision.clientOrderId);
       return await this.#halt(config, "order_rejected", `exit order refused: ${outcome.message}`, "system");
     }
 
@@ -5121,6 +5343,9 @@ export class BotInstance extends DurableObject<Env> {
       openOrderIds: [...current.openOrderIds, decision.clientOrderId],
       exitOrderId: decision.clientOrderId,
       exitKind: "take_profit",
+      unconfirmedOrderIds: outstandingUnconfirmed(current).filter(
+        (id) => id !== decision.clientOrderId,
+      ),
     }));
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
 
@@ -5697,7 +5922,10 @@ export class BotInstance extends DurableObject<Env> {
       // implementation of the rule, free to disagree with the stored one.
       highWaterMark: state.highWaterMark,
       price: price.price,
-      hasOpenOrder: state.openOrderIds.length > 0,
+      // `hasOutstandingOrder`, not `openOrderIds.length > 0`. The entry that
+      // was placed three times on bot-x93xux was outstanding on every one of
+      // those decisions; only `openOrderIds` could not say so.
+      hasOutstandingOrder: hasOutstandingOrder(state),
       // Spec 22.10. The ONE place the optional stored field is defaulted; the
       // rule itself takes a required number, so nothing else can forget it.
       entryAttempts: state.entryAttempts ?? 0,
@@ -5848,6 +6076,10 @@ export class BotInstance extends DurableObject<Env> {
       return { status: abandoned, action: "abandoned", detail: "status changed" };
     }
 
+    // BEFORE THE SEND -- see `#markUnconfirmed`. Until a definite answer
+    // arrives this bot has outstanding business, and every re-entry must see it.
+    await this.#markUnconfirmed(decision.clientOrderId);
+
     const outcome = await this.#exchange(config, "risk-exit").placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
@@ -5881,6 +6113,9 @@ export class BotInstance extends DurableObject<Env> {
       exitOrderId: decision.clientOrderId,
       exitKind: "trailing_stop",
       openOrderIds: [...current.openOrderIds, decision.clientOrderId],
+      unconfirmedOrderIds: outstandingUnconfirmed(current).filter(
+        (id) => id !== decision.clientOrderId,
+      ),
     }));
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
 
@@ -6348,6 +6583,10 @@ export class BotInstance extends DurableObject<Env> {
       };
     }
 
+    // BEFORE THE SEND -- see `#markUnconfirmed`. Until a definite answer
+    // arrives this bot has outstanding business, and every re-entry must see it.
+    await this.#markUnconfirmed(decision.clientOrderId);
+
     const outcome = await this.#exchange(config, priority).placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
@@ -6360,6 +6599,8 @@ export class BotInstance extends DurableObject<Env> {
     if (!isUsable(outcome)) {
       if (outcome.kind === "rate_limited") {
         await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        // Nothing reached the network; not outstanding.
+        await this.#clearUnconfirmed(decision.clientOrderId);
         await this.#alert(config, {
           severity: priority === "risk-exit" ? "critical" : "warning",
           category: "system",
@@ -6372,6 +6613,8 @@ export class BotInstance extends DurableObject<Env> {
         return { status: "running", action: "unresolved", detail: outcome.message };
       }
       await guard.markFailed(decision.clientOrderId, outcome.message, now);
+      // The exchange understood and refused: no order exists.
+      await this.#clearUnconfirmed(decision.clientOrderId);
       return await this.#halt(config, "order_rejected", `exchange refused the order: ${outcome.message}`, "system");
     }
 
@@ -6451,7 +6694,16 @@ export class BotInstance extends DurableObject<Env> {
       const retained = current.openOrderIds.filter(
         (id) => id !== displaced && !slotIds.includes(id),
       );
-      return { ...current, ladder, openOrderIds: [...slotIds, ...retained] };
+      return {
+        ...current,
+        ladder,
+        openOrderIds: [...slotIds, ...retained],
+        // Promoted from unknown to slot-backed in the SAME write, so no
+        // re-entry can observe it in neither list.
+        unconfirmedOrderIds: outstandingUnconfirmed(current).filter(
+          (id) => id !== decision.clientOrderId,
+        ),
+      };
     });
     if (evicted !== null) {
       const lost = evicted as GridSlot;
@@ -7005,6 +7257,10 @@ export class BotInstance extends DurableObject<Env> {
       return;
     }
 
+    // BEFORE THE SEND -- see `#markUnconfirmed`. Until a definite answer
+    // arrives this bot has outstanding business, and every re-entry must see it.
+    await this.#markUnconfirmed(decision.clientOrderId);
+
     const outcome = await this.#exchange(config, "risk-exit").placeOrder({
       pair: config.pair,
       clientOrderId: decision.clientOrderId,
@@ -7017,6 +7273,8 @@ export class BotInstance extends DurableObject<Env> {
     if (!isUsable(outcome)) {
       if (outcome.kind === "rate_limited") {
         await guard.markFailed(decision.clientOrderId, outcome.message, now);
+        // Nothing reached the network; not outstanding.
+        await this.#clearUnconfirmed(decision.clientOrderId);
         await this.#alert(config, {
           severity: "critical",
           category: "system",
@@ -7064,6 +7322,9 @@ export class BotInstance extends DurableObject<Env> {
       exitOrderId: decision.clientOrderId,
       exitKind: "liquidation",
       openOrderIds: [...current.openOrderIds, decision.clientOrderId],
+      unconfirmedOrderIds: outstandingUnconfirmed(current).filter(
+        (id) => id !== decision.clientOrderId,
+      ),
     }));
     await this.#mirrorOrderInsert(config, order, outcome.value.exchangeOrderId);
 
