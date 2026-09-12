@@ -60,12 +60,45 @@ export type KrakenTier = "starter" | "intermediate" | "pro";
 /**
  * The tier this system assumes until a real account says otherwise.
  *
- * ⚠ CHOSEN, NOT OBSERVED. No real Kraken account exists yet, so no tier has been
- * confirmed. Starter is the most conservative REAL tier -- the smallest counter
- * and the slowest decay on both budgets -- which makes every cost model built on
- * it an over-estimate for any account that turns out to be higher, and never an
+ * ⚠ STILL CHOSEN, NOT OBSERVED -- BUT THE REASON HAS CHANGED, AND THE OLD ONE
+ * WAS A STATEMENT THAT IS NOW FALSE. This docblock used to read "No real Kraken
+ * account exists yet, so no tier has been confirmed." A real, funded
+ * `kraken-main` has been trading since 2026-09-10. The account exists; its tier
+ * is simply still unknown, which is a different claim and a weaker one.
+ *
+ * ⚠ AND IT CANNOT BE CLOSED FROM HERE. Re-checked against the live venue on
+ * 2026-09-12, in both places it could plausibly live:
+ *
+ *   - NO REST ENDPOINT REPORTS IT. Kraken publishes no account-verification or
+ *     rate-limit-tier endpoint at all. `TradeVolume` is the near miss and is a
+ *     different quantity: it returns the FEE tier, derived from 30-day volume,
+ *     where rate limits are keyed to the VERIFICATION level. Reading one for the
+ *     other would be a guess wearing an API call's clothes.
+ *   - NO RESPONSE HEADER CARRIES IT. Already established live by the session
+ *     that wrote this file: Kraken sends no rate-limit headers on any response,
+ *     public or authenticated, and `access-control-expose-headers` lists nothing
+ *     rate-related, so there is not even a hidden one.
+ *
+ * The `maxratecount` seam in `durable-objects/rate-limiter.ts` does NOT close it
+ * either, and it is the obvious thing to reach for. That field is published on
+ * the WebSocket v2 `executions` feed and describes the TRADING-ENGINE counter,
+ * per pair. The counter this file's `KRAKEN_REST_TIERS` sizes -- the one that
+ * actually refused `getOrderStatus` in production -- has no such feed.
+ *
+ * ⚠ SO THIS CONSTANT IS DELIBERATELY LEFT AT `starter` AND NEEDS AN OPERATOR.
+ * Confirming it is a human reading their own Kraken dashboard, and nothing here
+ * should move until they have: raising it on a hunch would hand every budget in
+ * this file headroom the venue may not honour, and the failure lands mid-halt.
+ * Starter is the most conservative REAL tier -- the smallest counter and the
+ * slowest decay on both budgets -- which makes every cost model built on it an
+ * over-estimate for any account that turns out to be higher, and never an
  * under-estimate. Over-estimating throttles; under-estimating gets the account
  * rate-limited mid-halt.
+ *
+ * WHERE THE OPERATOR LOOKS: Kraken → Settings → Verification. "Intermediate"
+ * (or its current name, "Standard") and "Pro" both mean `maxCounter` 20 rather
+ * than 15, which is the difference between a 13-unit and a 17-unit routine
+ * ceiling -- and 17 is above the 13.92 that production was refusing at.
  *
  * This is a single constant precisely so that confirming the real tier is a
  * one-line change with a test that fails if the tables stop agreeing with it.
@@ -478,3 +511,116 @@ export const KRAKEN_OPEN_ORDER_CEILINGS: Readonly<Record<KrakenTier, number>> = 
 export function krakenOpenOrderCeiling(tier: KrakenTier = KRAKEN_DEFAULT_TIER): number {
   return KRAKEN_OPEN_ORDER_CEILINGS[tier];
 }
+
+// ---------------------------------------------------------------------------
+// What a request ACTUALLY cost, as opposed to what it might have cost
+// ---------------------------------------------------------------------------
+
+/**
+ * The REST counter cost of one real request, keyed by the endpoint path.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS EXISTS BESIDE `KRAKEN_METHOD_COSTS` RATHER THAN INSTEAD OF IT
+ * ---------------------------------------------------------------------------
+ * The two tables answer different questions and both are needed.
+ *
+ * `KRAKEN_METHOD_COSTS` prices a call BEFORE it is made, which is the only
+ * thing a gate can do: it must decide whether to let the call through, and at
+ * that moment nothing knows which branches the client will take. Its
+ * `getOrderStatus` row therefore priced the WORST case -- `OpenOrders` +
+ * `ClosedOrders` + `QueryTrades`, 1 + 4 + 2 = 7 -- and said so in its own
+ * docblock: "A gate prices a call before it is made and cannot know which
+ * branch it will take."
+ *
+ * ⚠ THAT WAS SOUND REASONING AND IT WAS COSTING PRODUCTION REAL OBSERVABILITY.
+ * `KrakenClient.getOrderStatus` returns after `OpenOrders` ALONE whenever the
+ * order is still resting, and `#withFills` skips `QueryTrades` entirely when
+ * the record carries no trade ids. A resting, unfilled rung -- the
+ * overwhelmingly common thing a poll reads -- genuinely costs the venue ONE
+ * unit. It was being charged seven.
+ *
+ * On the starter tier that is not a rounding error. Routine traffic may draw on
+ * `15 - 2 = 13`, so two 7-unit reads cannot coexist under the ceiling at all:
+ * `bot-8p41ol`, resting three rungs, had its third read refused at
+ * `6.92 used` -- 46% of a counter that was nowhere near full -- because
+ * `6.92 + 7 = 13.92 > 13`. Five consecutive such passes raised `poll_blind` on
+ * a venue that would have answered every one of those reads.
+ *
+ * This table answers the OTHER question, and it can only be asked afterwards:
+ * what did this call actually spend? The client reports each request as it
+ * issues it, the gate acquires the guaranteed floor and RECORDS the rest
+ * (`Budget.record`, which exists for exactly this "charge unconditionally,
+ * after the fact" case). Nothing is under-charged: a call that really does walk
+ * all three endpoints still lands on 7.
+ *
+ * ---------------------------------------------------------------------------
+ * KEYED BY PATH, NOT BY THE `context` STRING
+ * ---------------------------------------------------------------------------
+ * `RequestSpec.context` is free-form prose for error messages -- two of its
+ * values interpolate a ticker (`Ticker for XBTUSDT`) -- so keying cost off it
+ * would be keying cost off a label anyone may reword. `path` comes from
+ * `KRAKEN_ENDPOINTS` and is the endpoint itself. `rate-limits.test.ts` asserts
+ * that every value in `KRAKEN_ENDPOINTS` has a row here, so ADDING AN ENDPOINT
+ * AND NOT PRICING IT IS A TEST FAILURE rather than a silent zero.
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠ WHY PUBLIC ENDPOINTS ARE 0 HERE AND 1 IN `KRAKEN_METHOD_COSTS`
+ * ---------------------------------------------------------------------------
+ * Not an inconsistency, and the difference is the whole distinction above.
+ * Kraken's private counter does not count public endpoints at all -- they are
+ * limited by IP instead -- so 0 is the honest answer to "what did this spend".
+ * `KRAKEN_REST_COUNTER_COSTS.publicRequest` floors the GATING price at 1 for a
+ * different reason, stated in its own docblock: a zero-cost call is a path
+ * through the gate that is unmeasured, and the gate refuses to be decorative.
+ * A floor that protects the gate has no business inflating a measurement.
+ */
+const KRAKEN_COUNTER_COST_BY_PATH: Readonly<Record<string, number>> = Object.freeze({
+  // Public: IP-limited, not counted against the private REST counter.
+  "/0/public/Time": 0,
+  "/0/public/AssetPairs": 0,
+  "/0/public/Assets": 0,
+  "/0/public/Ticker": 0,
+  "/0/public/OHLC": 0,
+
+  // Private, ordinary rate.
+  "/0/private/OpenOrders": KRAKEN_REST_COUNTER_COSTS.standardPrivate,
+  "/0/private/BalanceEx": KRAKEN_REST_COUNTER_COSTS.standardPrivate,
+
+  // Private, account history. See the +2/+4 contradiction above.
+  "/0/private/ClosedOrders": KRAKEN_REST_COUNTER_COSTS.accountHistory,
+
+  // Private, trade history.
+  "/0/private/QueryTrades": KRAKEN_REST_COUNTER_COSTS.tradeHistoryQuery,
+
+  // The matching engine's counter, not this one. Priced through
+  // `KRAKEN_METHOD_COSTS.placeOrder` / `.cancelOrder` instead.
+  "/0/private/AddOrder": KRAKEN_REST_COUNTER_COSTS.trading,
+  "/0/private/CancelOrder": KRAKEN_REST_COUNTER_COSTS.trading,
+  "/0/private/CancelOrderBatch": KRAKEN_REST_COUNTER_COSTS.trading,
+});
+
+/**
+ * What one issued request added to the REST counter.
+ *
+ * ⚠ AN UNKNOWN PRIVATE PATH IS CHARGED THE MOST EXPENSIVE ROW, not zero, and
+ * that direction is this file's standing rule rather than a new decision:
+ * "Over-estimating throttles; under-estimating spends a counter of 15 twice as
+ * fast as the venue is counting it, on the exact path a halt runs down." A
+ * measurement that silently answers 0 for an endpoint nobody priced would
+ * reintroduce the unmeasured path this whole mechanism exists to close -- and
+ * it would do it invisibly, which is worse than doing it loudly.
+ *
+ * An unknown PUBLIC path is 0, because `/0/public/` is a fact about the
+ * endpoint rather than a guess about it: Kraken counts none of them.
+ */
+export function krakenCounterCostForPath(path: string): number {
+  const known = KRAKEN_COUNTER_COST_BY_PATH[path];
+  if (known !== undefined) return known;
+  if (path.startsWith("/0/public/")) return 0;
+  return KRAKEN_REST_COUNTER_COSTS.accountHistory;
+}
+
+/** Every path this table prices, for the source-level guard in the tests. */
+export const KRAKEN_COUNTER_COSTED_PATHS: readonly string[] = Object.freeze(
+  Object.keys(KRAKEN_COUNTER_COST_BY_PATH),
+);

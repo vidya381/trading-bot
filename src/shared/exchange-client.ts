@@ -341,6 +341,49 @@ export interface Balance {
 }
 
 /**
+ * Told what a request ACTUALLY cost, as the client issues it.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY A CALL REPORTS ITS OWN SPEND AT ALL
+ * ---------------------------------------------------------------------------
+ * A gate has to price a call BEFORE making it, so for any method whose cost
+ * depends on a branch the gate cannot see, it can only charge the worst case.
+ * For most methods on most venues that is exact and this is never used. For
+ * Kraken's `getOrderStatus` it was seven units against a true common-case cost
+ * of one, which refused real reads on a counter that was 54% empty -- see
+ * `krakenCounterCostForPath`.
+ *
+ * So the gate acquires the floor the call ALWAYS incurs, the client reports each
+ * request as it issues it, and the gate records the difference afterwards. The
+ * difference, not the total: the floor is already spent, and charging it twice
+ * would trade an over-charge for a subtler one.
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠ WHY THIS IS A PER-CALL ARGUMENT AND NOT A FIELD ON THE CLIENT
+ * ---------------------------------------------------------------------------
+ * Because the poll issues N of these CONCURRENTLY on ONE client instance
+ * (`Promise.all` over a ladder's rungs, in `#pollOpenOrders`). A meter hanging
+ * off the client would be one accumulator shared by every in-flight call, and
+ * attributing units back to the call that spent them would be guesswork the
+ * moment two overlapped. A sink passed into the call is owned by that call's own
+ * invocation, so there is nothing to attribute and nothing to race.
+ *
+ * ⚠ AND WHY IT IS OPTIONAL RATHER THAN REQUIRED. A venue that has no branch to
+ * report -- Binance and Gemini both price this method flat -- must not be made
+ * to accept an argument it would only ignore, and an interface that forced one
+ * would be the "lie with a signature" `BatchCancellingClient` exists to avoid.
+ * An implementation simply declares fewer parameters.
+ *
+ * ⚠ IT REPORTS EVERY REQUEST, INCLUDING THE FLOOR. It is tempting to have the
+ * client report only the SUPPLEMENTARY endpoints, since those are the ones being
+ * recorded -- but that would make the client responsible for knowing what the
+ * gate already charged, which is the gate's business and would have to be kept
+ * in step by hand. Reporting everything keeps the subtraction in the one place
+ * that knows both numbers.
+ */
+export type CounterMeter = (units: number, endpoint: string) => void;
+
+/**
  * The exchange interface: everything reachable over REST, and the whole surface
  * a strategy needs in order to act.
  *
@@ -412,10 +455,18 @@ export interface RestExchangeClient {
    */
   cancelOrder(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>>;
 
-  /** Look up an order by the bot's own id -- the idempotency recovery path. */
+  /**
+   * Look up an order by the bot's own id -- the idempotency recovery path.
+   *
+   * `meter` is OPTIONAL ON BOTH SIDES and is the seam that let this call stop
+   * being priced at its worst case. See `CounterMeter`: a venue whose cost is
+   * decided entirely by the method ignores the argument and implements this
+   * with two parameters, exactly as Binance's and Gemini's clients do.
+   */
   getOrderStatus(
     pair: Pair,
     clientOrderId: string,
+    meter?: CounterMeter,
   ): Promise<ExchangeOutcome<OrderStatus>>;
 
   getOpenOrders(pair: Pair): Promise<ExchangeOutcome<OrderStatus[]>>;

@@ -68,6 +68,13 @@ class RecordingLimiter implements RateLimiterPort {
   async release(ticketId: string): Promise<void> {
     this.released.push(ticketId);
   }
+
+  /** What was charged AFTER the fact, per call. See `RateLimiter.record`. */
+  readonly recorded: { exchange: string; units: number }[] = [];
+
+  async record(exchange: string, units: number): Promise<void> {
+    this.recorded.push({ exchange, units });
+  }
 }
 
 function denial(overrides: Partial<Extract<AcquireResult, { granted: false }>> = {}) {
@@ -551,29 +558,24 @@ describe("the Kraken cost model, through the gate", () => {
     });
   });
 
-  it("charges the status read for ALL THREE endpoints it may call, not just the first", async () => {
-    // `OpenOrders` always, `ClosedOrders` only if the order has stopped resting,
-    // `QueryTrades` only if it has executions to read. A gate prices a call
-    // before it is made and cannot know which branch runs -- and the dearest
-    // branch is the one that runs when an order has just filled, which is when a
-    // strategy is most likely to be asking.
+  it("gates the status read on its FLOOR, the one endpoint it always calls", async () => {
+    // ⚠ THIS ASSERTED 7 UNTIL 2026-09-12, and the number was right about the
+    // worst case and wrong about the common one. `OpenOrders` always;
+    // `ClosedOrders` only if the order has stopped resting; `QueryTrades` only
+    // if it has executions to read. Charging all three up front meant two status
+    // reads could never be outstanding together under the 13-unit routine
+    // ceiling -- which refused `bot-8p41ol`'s third rung at `6.92 used`, on a
+    // counter 54% empty, and raised `poll_blind` against a venue that would have
+    // answered.
     //
-    // ⚠ THIS WAS 5 UNTIL 2026-09-10, when `getOrderStatus` gained its trades
-    // leg. Following it here is not bookkeeping: leaving the gate at 5 would
-    // under-charge the account-wide counter on precisely the call a fill
-    // provokes, which is the failure this test's own "charge for both" rule was
-    // written to prevent, one endpoint later.
-    //
-    // 1 (standardPrivate) + 4 (accountHistory, for ClosedOrders) + 2
-    // (tradeHistoryQuery, for QueryTrades). The trades leg is 2 rather than 4 on
-    // evidence rather than analogy, and because at 4 this method would cost 9 of
-    // the 13 units routine traffic may touch -- starving the repair path that
-    // walks a halted bot's orders one status read at a time. The constant's own
-    // docblock carries the argument.
+    // What the gate acquires is now the floor alone. The rest is RECORDED after
+    // the fact from what the client reports issuing, so nothing is under-charged
+    // -- the two tests below hold that end down, and the full path still lands
+    // on 7.
     const client = gated({ exchange: "kraken" });
     await client.getOrderStatus(TEST_PAIR, "bot-1toiyz-0001");
 
-    expect(limiter.requests[0]!.cost).toEqual({ rest: 7 });
+    expect(limiter.requests[0]!.cost).toEqual({ rest: 1 });
   });
 
   it("prices the public market-data calls at the honest minimum", async () => {
@@ -937,5 +939,108 @@ describe("the batch-cancel capability, which only one venue has", () => {
       expect(BATCH_CANCEL_COSTS).toHaveProperty(exchange);
     }
     expect(Object.keys(BATCH_CANCEL_COSTS).sort()).toEqual([...EXCHANGE_IDS].sort());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The production incident, reproduced against the real limiter
+// ---------------------------------------------------------------------------
+
+/**
+ * `bot-8p41ol` and `bot-wfemoo`, against the REAL `RateLimiter` Durable Object.
+ *
+ * Both bots rested a grid ladder on `kraken-main` and polled it every 45s.
+ * Every rung is one `getOrderStatus`, and a pass fires them CONCURRENTLY
+ * (`Promise.all` in `#pollOpenOrders`). At 7 units each against a 13-unit
+ * routine ceiling, the second read in a pass could not fit beside the first at
+ * all -- the live refusal read `could not obtain 7 account-counter units within
+ * 60000ms (budget_exhausted, 6.919279999999997 used, queue position 2)`, and
+ * five such passes raised `poll_blind` on a counter less than half spent.
+ *
+ * These are the two halves of that, measured rather than argued: the old cost
+ * vector still fails on this limiter, and the new one does not.
+ */
+describe("the kraken-main poll, end to end on the real limiter", () => {
+  /** Starter tier, which is what production is pinned to. 15 cap, 0.33/s decay. */
+  const CEILING = 13;
+
+  it("REPRODUCES the refusal at the old flat cost of 7 per read", async () => {
+    const account = `kraken-old-${Math.random()}`;
+    await inLimiter(account, async (object) => {
+      object.attach({ now: () => NOW });
+    });
+    const limiterStub = rateLimiterStub(account);
+
+    // bot-8p41ol's three rungs, priced the way they were before this fix.
+    const results = await Promise.all(
+      [0, 1, 2].map(() =>
+        limiterStub.acquire({ exchange: "kraken", cost: { rest: 7 }, priority: "routine" }),
+      ),
+    );
+
+    const granted = results.filter((r) => r.granted);
+    // ONE fits. The ceiling is 13 and two reads want 14, so the ladder cannot be
+    // read in a single pass however briefly the venue is idle.
+    expect(granted).toHaveLength(1);
+    expect(7 * 2).toBeGreaterThan(CEILING);
+
+    // And the two that did not fit are told to wait, not told to give up --
+    // which is the shape that burns the poll's 60s budget and ends in
+    // `poll_blind` once anything else on the account interleaves.
+    for (const refused of results.filter((r) => !r.granted)) {
+      expect(refused).toMatchObject({ granted: false, reason: "budget_exhausted" });
+    }
+  });
+
+  it("reads the WHOLE ladder in one pass at the metered floor", async () => {
+    const account = `kraken-new-${Math.random()}`;
+    await inLimiter(account, async (object) => {
+      object.attach({ now: () => NOW });
+    });
+    const limiterStub = rateLimiterStub(account);
+
+    // The same three rungs, at what `KRAKEN_METHOD_COSTS.getOrderStatus` now
+    // acquires. A resting, unfilled rung records nothing afterwards, so this is
+    // the whole cost of the pass.
+    const floor = METHOD_COSTS.kraken.getOrderStatus({ pair: TEST_PAIR, orderAgeMs: null }).rest;
+    expect(floor).toBe(1);
+
+    const results = await Promise.all(
+      [0, 1, 2].map(() =>
+        limiterStub.acquire({ exchange: "kraken", cost: { rest: floor }, priority: "routine" }),
+      ),
+    );
+
+    // All three, together, with room to spare -- and bot-wfemoo's two rungs and
+    // reconciliation's reads all still fit in what is left.
+    expect(results.every((r) => r.granted)).toBe(true);
+    expect(3 * floor).toBeLessThan(CEILING);
+  });
+
+  it("still refuses when a whole ladder's reads REALLY do cost what they used to", async () => {
+    // ⚠ THE GATE HAS NOT BEEN WEAKENED, only told the truth. If every rung of a
+    // three-rung ladder genuinely walked all three endpoints -- every order
+    // terminal, every one carrying fills -- the account really would owe 21
+    // units, and this limiter really does still refuse to hand them out at once.
+    const account = `kraken-full-${Math.random()}`;
+    await inLimiter(account, async (object) => {
+      object.attach({ now: () => NOW });
+      // The floors, as the gate would acquire them.
+      for (const _ of [0, 1, 2]) {
+        await object.acquire({ exchange: "kraken", cost: { rest: 1 }, priority: "routine" });
+      }
+      // Then the excess each one reported, recorded after the fact: 6 apiece.
+      for (const _ of [0, 1, 2]) {
+        await object.record("kraken", 6);
+      }
+      // 3 + 18 = 21, which is over the ceiling -- exactly where the venue's own
+      // counter would be. The next routine read must now wait it out.
+      const next = await object.acquire({
+        exchange: "kraken",
+        cost: { rest: 1 },
+        priority: "routine",
+      });
+      expect(next).toMatchObject({ granted: false, reason: "budget_exhausted" });
+    });
   });
 });

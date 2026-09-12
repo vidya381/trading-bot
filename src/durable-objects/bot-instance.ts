@@ -118,7 +118,7 @@ import {
   checkOpenOrderCeiling,
   describeOpenOrderCeilingViolation,
 } from "../exchange/open-orders";
-import type { PriceFeedConfig, PriceFeedPort } from "./price-feed";
+import type { PriceFeedConfig, PriceFeedPort, PriceFeedStatus } from "./price-feed";
 import type { RequestPriority } from "../shared/rate-limiter";
 import { convertFillFee, type RateLookup } from "../shared/fees";
 import { assertAccountArmed } from "../reconciliation/circuit-breaker";
@@ -4149,6 +4149,39 @@ export class BotInstance extends DurableObject<Env> {
     const age = this.#now() - state.lastPriceAt;
     if (age < PRICE_STALENESS_MS) return;
 
+    // ⚠ THE TIMEOUT IS NOW A TRIGGER, NOT A VERDICT, and everything below is the
+    // difference. Reaching here means only "this bot has not been handed a price
+    // in a while", which was the whole of the old test and is a claim about two
+    // quite different worlds at once. The feed is the only thing that can say
+    // which one this is.
+    const verdict = await this.#deliveryVerdict(config, state);
+
+    if (verdict.kind === "quiet") {
+      // THE FALSE ALARM THIS CLOSES. The feed forwarded nothing to ANYBODY --
+      // there was nothing to forward. `PRICE_STALENESS_MS` was sized against a
+      // cadence "measured" on BTC (one closed candle every 35-70s), and Kraken
+      // emits an ohlc frame only on real activity, so a genuinely quiet ten
+      // minutes on a thinner pair produced no update and tripped an alert that
+      // said this bot was blind. It was not blind; the market was asleep. Five
+      // such rows went to `bot-wfemoo` on SOLUSDT overnight.
+      //
+      // ⚠ AND THIS DELIBERATELY DOES NOT ADD TO `standing`, so any row already
+      // open is RESOLVED by this pass rather than merely left alone. A condition
+      // that has been shown not to hold should not need a second mechanism to
+      // clear it.
+      //
+      // The case this drops -- a subscription that died silently while the
+      // socket kept heartbeating -- is NOT left uncovered, and dropping it here
+      // without that would be trading a false positive for a false negative. It
+      // is a fact about the FEED rather than about any one bot (every subscriber
+      // sees it simultaneously, and a bot has no independent evidence about the
+      // market), so it belongs to something that can compare the feed against a
+      // second source: `reconciliation/feed-silence.ts`, which reads the venue's
+      // REST candles and alerts when the market traded and this feed forwarded
+      // none of it.
+      return;
+    }
+
     standing.add(standingAlertKey("price_updates_stale", config.botInstanceId));
     await this.#raiseStanding(config, {
       severity: "warning",
@@ -4157,13 +4190,102 @@ export class BotInstance extends DurableObject<Env> {
       message:
         `bot ${config.botInstanceId} has received no live price for ` +
         `${Math.round(age / 60_000)} minutes (last at ${new Date(state.lastPriceAt).toISOString()}), ` +
-        `against a measured feed cadence of one closed candle every 35-70s. It is RUNNING, so its ` +
-        `stop-loss and take-profit are evaluated on price updates that are not arriving, and any ` +
-        `fill this poll observes waits for a tick that may never come. The feed's own ` +
-        `price_feed_blind alert cannot cover this: its staleness clock is advanced by heartbeats, ` +
-        `so a socket that heartbeats while delivering no candles looks healthy from there. Check ` +
-        `whether this bot is still subscribed to its price feed.`,
+        `${verdict.detail} It is RUNNING, so its stop-loss and take-profit are evaluated on price ` +
+        `updates that are not arriving, and any fill this poll observes waits for a tick that may ` +
+        `never come. The feed's own price_feed_blind alert cannot cover this: its staleness clock ` +
+        `is advanced by heartbeats, so a socket that heartbeats while delivering no candles looks ` +
+        `healthy from there.`,
     });
+  }
+
+  /**
+   * Why this bot has no price: because nothing was sent, or because nothing
+   * reached IT.
+   *
+   * ---------------------------------------------------------------------------
+   * WHAT MAKES THIS ANSWERABLE AT ALL
+   * ---------------------------------------------------------------------------
+   * `PriceFeedStatus.lastForwardAt` -- receipt time of the last candle the feed
+   * handed to ANY subscriber. Set against this bot's own `lastPriceAt`, on the
+   * same clock (which is why the feed records a receipt time rather than letting
+   * a caller reuse `watermark`; see that field).
+   *
+   *   feed forwarded recently, this bot did not receive it
+   *       -> a REAL per-bot delivery failure. It is the fault
+   *          `price_updates_stale` was built for, and this catches it on
+   *          EVIDENCE rather than on a timeout: fan-out failing, the bot missing
+   *          from the registry, an `unsubscribe` that landed when it should not
+   *          have. Each of those is invisible from the feed's side -- an RPC
+   *          returning `"ignored"` is a successful RPC, and a bot absent from
+   *          the registry is not a bot the feed knows to miss.
+   *
+   *   feed forwarded nothing either
+   *       -> QUIET. Not this bot's problem, and not a per-bot alert.
+   *
+   * ---------------------------------------------------------------------------
+   * ⚠ EVERY UNCERTAINTY RESOLVES TOWARDS ALERTING, NOT AWAY FROM IT
+   * ---------------------------------------------------------------------------
+   * Section 5.6's rule, applied to an alert lifecycle: a check that could not
+   * reach an answer has not earned the right to suppress one. So an unreachable
+   * feed, a feed that has never forwarded anything, and a thrown RPC all fall
+   * through to the alert, carrying what went wrong in the message. The only path
+   * that suppresses is the one where the feed answered and its answer was
+   * positive evidence of silence.
+   *
+   * ⚠ IT ALSO CHECKS THE SUBSCRIBER REGISTRY, because "quiet" is only an
+   * innocent explanation for a bot the feed would have delivered to. A bot that
+   * has fallen OUT of the registry is not receiving prices for a reason that has
+   * nothing to do with how quiet the market is, and a quiet market must not be
+   * allowed to excuse it -- that is precisely the pruned-subscriber case, where
+   * the feed is healthy and this bot is getting nothing, forever.
+   */
+  async #deliveryVerdict(
+    config: BotConfig,
+    state: BotRuntimeState,
+  ): Promise<{ kind: "quiet" } | { kind: "raise"; detail: string }> {
+    let status: PriceFeedStatus;
+    try {
+      status = await this.#feed(config.exchange, config.pair).status();
+    } catch (error) {
+      return {
+        kind: "raise",
+        detail:
+          `and its price feed could not be asked why ` +
+          `(${error instanceof Error ? error.message : String(error)}).`,
+      };
+    }
+
+    if (!status.subscribers.some((row) => row.botInstanceId === config.botInstanceId)) {
+      // Checked BEFORE the silence branch, so a quiet market can never explain
+      // away a bot the feed is no longer delivering to at all.
+      return {
+        kind: "raise",
+        detail:
+          `and it is NOT in its price feed's subscriber registry, so no amount of market ` +
+          `activity would reach it. It needs to be resumed, which re-subscribes it.`,
+      };
+    }
+
+    if (status.lastForwardAt === null) {
+      return {
+        kind: "raise",
+        detail: `and its price feed has never forwarded a single candle to anyone.`,
+      };
+    }
+
+    if (status.lastForwardAt > state.lastPriceAt!) {
+      // THE POSITIVE FINDING. The feed sent something after this bot last
+      // received something, so the gap is this bot's alone.
+      return {
+        kind: "raise",
+        detail:
+          `while its price feed last forwarded a candle to its subscribers at ` +
+          `${new Date(status.lastForwardAt).toISOString()} -- so the feed is delivering and this ` +
+          `bot specifically is not receiving.`,
+      };
+    }
+
+    return { kind: "quiet" };
   }
 
   /**

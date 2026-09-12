@@ -30,7 +30,15 @@ import type {
 } from "./bot-instance";
 import { BotInstanceError, POLL_TIER_INTERVAL_MS } from "./bot-instance";
 import { FakeExchange, TEST_PAIR, testFilters } from "./fake-exchange";
-import { inBot, inLimiter, noopFeed, rateLimiterStub, recordingFeed } from "./test-helpers";
+import {
+  healthyFeedStatus,
+  inBot,
+  inLimiter,
+  mutableFeed,
+  noopFeed,
+  rateLimiterStub,
+  recordingFeed,
+} from "./test-helpers";
 import type { PriceFeedPort } from "./price-feed";
 import type { AcquireRequest, AcquireResult } from "./rate-limiter";
 import {
@@ -2626,10 +2634,43 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
   /** Ten minutes: 4.6x the measured 130s worst-case gap between closed candles. */
   const STALE_MS = 600_000;
 
+  /**
+   * ⚠ EVERY TEST BELOW NOW STATES WHICH WORLD IT IS IN, and that is the change
+   * rather than an addition to it.
+   *
+   * The threshold alone used to decide this alert, so a test only had to move
+   * the clock. It no longer does: reaching the threshold is a trigger, and the
+   * verdict comes from comparing this bot against its feed. "Ten minutes with no
+   * price" is now two different situations and they get different answers, so a
+   * test that does not say which one it means is not testing anything.
+   *
+   * `feed` is the DELIVERING one -- it forwarded a candle to its subscribers
+   * after this bot last received one, and this bot is in its registry. That is
+   * the world every pre-existing test here was written against, where a silent
+   * bot is a real per-bot fault.
+   */
+  let feed: ReturnType<typeof mutableFeed>;
+
+  /** The feed is delivering, and this bot is a subscriber it is delivering to. */
+  function delivering(forwardedAt: number): void {
+    feed.status = healthyFeedStatus({
+      lastForwardAt: forwardedAt,
+      subscribers: [{ botInstanceId: BOT_ID, consecutiveFailures: 0 }],
+      subscriberCount: 1,
+    });
+  }
+
+  beforeEach(() => {
+    feed = mutableFeed();
+    delivering(T0);
+  });
+
+  const runF = <T>(body: (bot: BotInstance) => Promise<T>) => run(body, feed.port);
+
   async function runningWithRestingOrder(): Promise<string> {
-    await run((bot) => bot.create(creation()));
-    await run((bot) => bot.start(ACTOR));
-    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    await runF((bot) => bot.create(creation()));
+    await runF((bot) => bot.start(ACTOR));
+    await runF((bot) => bot.onPriceUpdate(priceAt("100")));
     return exchange.placed[0]!.clientOrderId;
   }
 
@@ -2655,12 +2696,15 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     for (let elapsed = 30_000; elapsed <= 130_000; elapsed += 30_000) {
       clock = T0 + elapsed;
       exchange.now = clock;
-      await run((bot) => bot.checkOpenOrders(ACTOR));
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
+      await runF((bot) => bot.checkOpenOrders(ACTOR));
       expect(await staleAlerts()).toHaveLength(0);
     }
 
     // And the tick that finally arrives at the far end of that gap is normal.
-    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    await runF((bot) => bot.onPriceUpdate(priceAt("100")));
     expect(await staleAlerts()).toHaveLength(0);
   });
 
@@ -2668,8 +2712,11 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS - 1000;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     expect(await staleAlerts()).toHaveLength(0);
   });
@@ -2680,8 +2727,11 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     const rows = await staleAlerts();
     expect(rows).toHaveLength(1);
@@ -2697,8 +2747,11 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    for (let i = 0; i < 10; i++) await run((bot) => bot.checkOpenOrders(ACTOR));
+    for (let i = 0; i < 10; i++) await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     expect(await staleAlerts()).toHaveLength(1);
   });
@@ -2707,13 +2760,19 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
     expect((await staleAlerts())[0]!.resolved).toBe(false);
 
     clock += 1000;
     exchange.now = clock;
-    await run((bot) => bot.onPriceUpdate(priceAt("100")));
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
+    await runF((bot) => bot.onPriceUpdate(priceAt("100")));
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     const rows = await staleAlerts();
     expect(rows).toHaveLength(1);
@@ -2725,11 +2784,14 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     // any status but running. Checking a halted bot would alert on every one of
     // them, forever, for behaving exactly as specified.
     await runningWithRestingOrder();
-    await run((bot) => bot.halt("manual", "operator halted it", ACTOR));
+    await runF((bot) => bot.halt("manual", "operator halted it", ACTOR));
     clock += STALE_MS * 3;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     expect(await staleAlerts()).toHaveLength(0);
   });
@@ -2744,13 +2806,16 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
     expect((await staleAlerts())[0]!.resolved).toBe(false);
 
     exchange.cancelFailure = { kind: "transport", message: "cancel unreachable" };
-    await run((bot) => bot.halt("manual", "operator halted it", ACTOR));
+    await runF((bot) => bot.halt("manual", "operator halted it", ACTOR));
     exchange.cancelFailure = null;
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     expect((await staleAlerts())[0]!.resolved).toBe(true);
   });
@@ -2762,13 +2827,19 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     clock += 1000;
     exchange.now = clock;
-    await run((bot) => bot.onPriceUpdate(priceAt("100")));
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
+    await runF((bot) => bot.onPriceUpdate(priceAt("100")));
     exchange.orderStatusFailure = { kind: "transport", message: "connection reset" };
-    await run((bot) => bot.checkOpenOrders(ACTOR));
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     expect((await staleAlerts())[0]!.resolved).toBe(false);
   });
@@ -2778,12 +2849,15 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     // measure against, and the scheduled path cannot reach this state anyway
     // (an order is only ever placed from inside `onPriceUpdate`, which writes
     // the timestamp first, and a bot with no order arms no alarm).
-    await run((bot) => bot.create(creation()));
-    await run((bot) => bot.start(ACTOR));
+    await runF((bot) => bot.create(creation()));
+    await runF((bot) => bot.start(ACTOR));
     clock += STALE_MS * 5;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    const result = await run((bot) => bot.checkOpenOrders(ACTOR));
+    const result = await runF((bot) => bot.checkOpenOrders(ACTOR));
 
     expect(result.applied).toEqual([]);
     expect(await staleAlerts()).toHaveLength(0);
@@ -2795,8 +2869,11 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    await run((bot) => bot.alarm());
+    await runF((bot) => bot.alarm());
 
     expect(await staleAlerts()).toHaveLength(1);
   });
@@ -2809,14 +2886,131 @@ describe("price_updates_stale (the first real read of lastPriceAt)", () => {
     await runningWithRestingOrder();
     clock += STALE_MS;
     exchange.now = clock;
+    // The feed kept delivering to everyone else; this bot is the one not
+    // receiving. That is the fault this alert names, and it must be stated.
+    delivering(clock);
 
-    await run((bot) => bot.alarm());
+    await runF((bot) => bot.alarm());
 
     const schedule = await inBot(objectName, async (_bot, state) => {
       return (await state.storage.get("poll-schedule")) as { failures: number };
     });
     expect(schedule.failures).toBe(0);
     expect(await db.alerts.count({ alert_type: "poll_blind" })).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // Quiet market vs. broken delivery -- the distinction the threshold could not
+  // make on its own
+  // -------------------------------------------------------------------------
+
+  it("raises NOTHING when the feed forwarded nothing to ANYONE either", async () => {
+    // ⚠ THE FALSE ALARM THIS CLOSES, and it is the exact production shape.
+    // `bot-wfemoo` took five of these overnight on SOLUSDT. `PRICE_STALENESS_MS`
+    // was sized against a cadence measured on BTC -- "one closed candle every
+    // 35-70s" -- and Kraken emits an ohlc frame only on real activity. Ten quiet
+    // minutes on a thinner pair is not a dead feed, it is an honest silence, and
+    // the old check could not tell the two apart because it only ever looked at
+    // one of them.
+    await runningWithRestingOrder();
+    clock += STALE_MS * 3;
+    exchange.now = clock;
+    // The feed has had nothing to send since this bot's last tick either.
+    delivering(T0);
+
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect(await staleAlerts()).toHaveLength(0);
+  });
+
+  it("resolves a row already open once the silence turns out to be the market's", async () => {
+    // A row raised while the feed was delivering must not outlive the evidence
+    // for it. The quiet branch withholds the key from `standing`, so the pass's
+    // ordinary resolution closes it rather than needing a mechanism of its own.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    delivering(clock);
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
+    expect((await staleAlerts())[0]!.resolved).toBe(false);
+
+    clock += 1000;
+    exchange.now = clock;
+    delivering(T0);
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect((await staleAlerts())[0]!.resolved).toBe(true);
+  });
+
+  it("names the feed's own last forward, so the row says WHY it is this bot's fault", async () => {
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    delivering(clock);
+
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await staleAlerts();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.message).toMatch(/the feed is delivering and this bot specifically is not/);
+    expect(rows[0]!.message).toContain(new Date(clock).toISOString());
+  });
+
+  it("raises however quiet the market is, if this bot has fallen out of the registry", async () => {
+    // ⚠ THE ORDERING THAT MAKES THE QUIET BRANCH SAFE. A pruned subscriber gets
+    // nothing forever, and the feed it was pruned from can be as idle as it
+    // likes -- so "nothing was forwarded to anyone" must never be allowed to
+    // explain away a bot that is not on the list at all. `#fanOut` prunes after
+    // 10 consecutive failures, which is a real path, not a hypothetical one.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    feed.status = healthyFeedStatus({
+      lastForwardAt: T0,
+      subscribers: [],
+      subscriberCount: 0,
+    });
+
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
+
+    const rows = await staleAlerts();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.message).toMatch(/NOT in its price feed's subscriber registry/);
+  });
+
+  it("raises when the feed has never forwarded anything at all", async () => {
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    feed.status = healthyFeedStatus({
+      lastForwardAt: null,
+      subscribers: [{ botInstanceId: BOT_ID, consecutiveFailures: 0 }],
+    });
+
+    await runF((bot) => bot.checkOpenOrders(ACTOR));
+
+    expect((await staleAlerts())[0]!.message).toMatch(/never forwarded a single candle/);
+  });
+
+  it("raises rather than suppresses when the feed cannot be asked", async () => {
+    // ⚠ SECTION 5.6 ON THE ALERT LIFECYCLE. A check that could not reach an
+    // answer has not earned the right to withhold one. An unreachable feed is
+    // the one case where suppressing would be indistinguishable from this
+    // check's own machinery being broken.
+    await runningWithRestingOrder();
+    clock += STALE_MS;
+    exchange.now = clock;
+    const unreachable: PriceFeedPort = {
+      subscribe: async () => {},
+      unsubscribe: async () => {},
+      status: async () => {
+        throw new Error("price feed unreachable");
+      },
+    };
+
+    await run((bot) => bot.checkOpenOrders(ACTOR), unreachable);
+
+    expect((await staleAlerts())[0]!.message).toMatch(/could not be asked why/);
   });
 });
 
@@ -4387,6 +4581,7 @@ describe("halt and close cleanup survives a throw in one step", () => {
     let failNext = true;
     const flaky: PriceFeedPort = {
       subscribe: feed.port.subscribe,
+      status: feed.port.status,
       unsubscribe: async (botInstanceId) => {
         if (failNext) {
           failNext = false;

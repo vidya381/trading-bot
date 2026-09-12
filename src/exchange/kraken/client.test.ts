@@ -3,7 +3,14 @@ import { isUsable } from "../../shared/downtime";
 import type { OrderRequest } from "../../shared/exchange-client";
 import { fromDecimalString as m, ZERO } from "../../shared/money";
 import { fakeKrakenCredentialProvider } from "../credentials";
-import { METHOD_COSTS } from "../rate-limited";
+import { METHOD_COSTS, withRateLimit, type RateLimiterPort } from "../rate-limited";
+import type { AcquireRequest, AcquireResult } from "../../durable-objects/rate-limiter";
+import {
+  KRAKEN_COUNTER_COSTED_PATHS,
+  KRAKEN_QUERY_TRADES_MAX_IDS,
+  KRAKEN_REST_COUNTER_COSTS,
+  krakenCounterCostForPath,
+} from "./rate-limits";
 import { KrakenCatalogueCache } from "./catalogue";
 import {
   KrakenClient,
@@ -1889,5 +1896,319 @@ describe("the batch cancel's request count, which the method table cannot hold",
       needsCatalogue: true,
     });
     expect(KRAKEN_REQUEST_COSTS).not.toHaveProperty("cancelOrderBatch");
+  });
+});
+
+// --------------------------------------------------------------------------
+// What a status read ACTUALLY costs the REST counter
+// --------------------------------------------------------------------------
+
+/**
+ * The gate's two-part pricing of `getOrderStatus`, end to end against the real
+ * client rather than a double.
+ *
+ * ⚠ THESE RUN AGAINST `KrakenClient` DELIBERATELY, not `FakeExchange`. The whole
+ * claim under test is which ENDPOINTS the client chooses to call for a given
+ * order, and a fake would be agreeing with a branch it does not have. The fetch
+ * stub records every real request, so the assertions below compare what the
+ * budget was told against what actually went out.
+ *
+ * The scenario each one is named for is real: `bot-8p41ol` rested three grid
+ * rungs and `bot-wfemoo` two, and the poll reads every rung on every pass.
+ */
+describe("the REST counter cost of a status read", () => {
+  /** A limiter that records both halves: what was acquired, and what was charged after. */
+  class MeteringLimiter implements RateLimiterPort {
+    readonly acquired: number[] = [];
+    readonly recorded: number[] = [];
+
+    async acquire(request: AcquireRequest): Promise<AcquireResult> {
+      this.acquired.push(request.cost.rest);
+      return {
+        granted: true,
+        cost: request.cost,
+        usedWeight: request.cost.rest,
+        usedTrading: null,
+        remainingForPriority: 13,
+        at: AT,
+      };
+    }
+
+    async release(): Promise<void> {}
+
+    async record(_exchange: string, units: number): Promise<void> {
+      this.recorded.push(units);
+    }
+  }
+
+  function gatedKraken(handler: Handler): {
+    client: ReturnType<typeof withRateLimit>;
+    limiter: MeteringLimiter;
+    requests: Recorded[];
+  } {
+    const { client, requests } = catalogued(handler);
+    const limiter = new MeteringLimiter();
+    return {
+      client: withRateLimit(client, limiter, { exchange: "kraken", now: () => AT }),
+      limiter,
+      requests,
+    };
+  }
+
+  /** Total units the counter was told about, however they were split. */
+  const spent = (limiter: MeteringLimiter): number =>
+    limiter.acquired.reduce((a, b) => a + b, 0) + limiter.recorded.reduce((a, b) => a + b, 0);
+
+  it("charges ONE unit for a resting, unfilled rung -- the case the poll reads most", async () => {
+    // THE SCENARIO THIS FIX EXISTS FOR. An untouched grid rung sitting on the
+    // book: `OpenOrders` finds it, so `ClosedOrders` is never reached, and it
+    // carries no trade ids, so `QueryTrades` is never reached either. The venue
+    // counts exactly one call. It was being charged seven.
+    const { client, limiter, requests } = gatedKraken((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) {
+        return envelope({
+          open: {
+            "OQCLML-BW3P3-BUCMWZ": orderRecord({ trades: [], vol_exec: "0.00000000" }),
+          },
+        });
+      }
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+
+    const outcome = await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
+    expect(outcome.ok).toBe(true);
+
+    // The client really did make exactly one private call.
+    expect(paths(requests).filter((p) => p.startsWith("/0/private/"))).toEqual([
+      KRAKEN_ENDPOINTS.openOrders,
+    ]);
+    // And the budget was told exactly that: one unit acquired, nothing recorded.
+    expect(limiter.acquired).toEqual([1]);
+    expect(limiter.recorded).toEqual([]);
+    expect(spent(limiter)).toBe(1);
+  });
+
+  it("charges three for a resting rung that has started filling", async () => {
+    // Partially filled but still on the book: `OpenOrders` (1) finds it, and its
+    // trade ids pull `QueryTrades` (2). `ClosedOrders` is still never reached.
+    const { client, limiter, requests } = gatedKraken((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) {
+        return envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord() } });
+      }
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) return envelope(QUERY_TRADES_RESULT);
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+
+    expect((await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID)).ok).toBe(true);
+
+    expect(paths(requests).filter((p) => p.startsWith("/0/private/"))).toEqual([
+      KRAKEN_ENDPOINTS.openOrders,
+      KRAKEN_ENDPOINTS.queryTrades,
+    ]);
+    expect(limiter.acquired).toEqual([1]);
+    expect(limiter.recorded).toEqual([2]);
+    expect(spent(limiter)).toBe(3);
+  });
+
+  it("STILL charges the full seven when the read really does walk all three endpoints", async () => {
+    // ⚠ THE TEST THAT HOLDS THE UNSAFE DIRECTION DOWN. Everything above is about
+    // charging less; this is the one that says the fix cannot charge less than
+    // the truth. A filled order that has left the book costs `OpenOrders` (1) +
+    // `ClosedOrders` (4) + `QueryTrades` (2) = 7 -- the exact figure the gate
+    // used to charge unconditionally, now reached only by a call that earns it.
+    const { client, limiter, requests } = gatedKraken((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) return envelope({ open: {} });
+      if (recorded.path === KRAKEN_ENDPOINTS.closedOrders) {
+        return envelope({
+          closed: {
+            "OQCLML-BW3P3-BUCMWZ": orderRecord({
+              status: "closed",
+              closetm: 1688666600.1234,
+              vol_exec: "1.25000000",
+            }),
+          },
+          count: 1,
+        });
+      }
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) return envelope(QUERY_TRADES_RESULT);
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+
+    expect((await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID)).ok).toBe(true);
+
+    expect(paths(requests).filter((p) => p.startsWith("/0/private/"))).toEqual([
+      KRAKEN_ENDPOINTS.openOrders,
+      KRAKEN_ENDPOINTS.closedOrders,
+      KRAKEN_ENDPOINTS.queryTrades,
+    ]);
+    expect(limiter.acquired).toEqual([1]);
+    expect(limiter.recorded).toEqual([6]);
+    // The number that must not move.
+    expect(spent(limiter)).toBe(7);
+  });
+
+  it("charges a request the venue counted even when that request FAILED", async () => {
+    // A `ClosedOrders` read that came back an error still reached Kraken and
+    // still moved Kraken's counter. Metering before the transport is what makes
+    // this hold; metering the parsed outcome would quietly hand back four units
+    // the account no longer has, on the exact path an incident runs down.
+    const { client, limiter } = gatedKraken((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) return envelope({ open: {} });
+      if (recorded.path === KRAKEN_ENDPOINTS.closedOrders) return failure("EGeneral:Temporary lockout");
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+
+    expect((await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID)).ok).toBe(false);
+
+    expect(limiter.acquired).toEqual([1]);
+    expect(limiter.recorded).toEqual([4]);
+    expect(spent(limiter)).toBe(5);
+  });
+
+  it("never refunds the floor when the call issues nothing at all", async () => {
+    // An unresolvable pair returns before any request goes out. `metered` is 0,
+    // which must mean "record nothing", never "give back the unit the gate
+    // already spent" -- a run of these would otherwise manufacture headroom.
+    const { client, limiter } = gatedKraken(() => {
+      throw new Error("no request should be issued for an unknown pair");
+    });
+
+    expect((await client.getOrderStatus("NOTAPAIR" as never, CLIENT_ORDER_ID)).ok).toBe(false);
+
+    expect(limiter.acquired).toEqual([1]);
+    expect(limiter.recorded).toEqual([]);
+    expect(spent(limiter)).toBe(1);
+  });
+
+  it("prices a multi-page trades read per page, which the flat charge could not", async () => {
+    // `#withFills` pages `tradeIds` by `KRAKEN_QUERY_TRADES_MAX_IDS`, so an order
+    // with more fills than one page issues more than one `QueryTrades`. The old
+    // flat 7 assumed exactly one and under-charged every order past 20 fills.
+    // Metering what was issued gets this right without anyone having modelled it.
+    const ids = Array.from({ length: KRAKEN_QUERY_TRADES_MAX_IDS + 1 }, (_, i) => `T-${i}`);
+    const { client, limiter, requests } = gatedKraken((recorded) => {
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) {
+        return envelope({ open: { "OQCLML-BW3P3-BUCMWZ": orderRecord({ trades: ids }) } });
+      }
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) return envelope({});
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+
+    await client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID);
+
+    expect(requests.filter((r) => r.path === KRAKEN_ENDPOINTS.queryTrades)).toHaveLength(2);
+    // ONE `record` per CALL, not per page: the meter accumulates across every
+    // request the call issues and the gate writes the total excess once. Two
+    // pages at 2 each is therefore a single 4, which is also one storage write
+    // on the Durable Object rather than two.
+    expect(limiter.acquired).toEqual([1]);
+    expect(limiter.recorded).toEqual([4]);
+    expect(spent(limiter)).toBe(5);
+  });
+
+  it("meters each of a ladder's concurrent reads separately", async () => {
+    // ⚠ THE CONCURRENCY PROPERTY, and the reason the meter is a per-call closure
+    // rather than a field on the client. `#pollOpenOrders` reads a whole ladder
+    // through one `Promise.all` on ONE client instance. A shared accumulator
+    // would let a rung that walked all three endpoints charge its six units to
+    // whichever sibling happened to finish next.
+    //
+    // Two rungs, one resting clean and one closed with fills, read together:
+    // the totals must stay 1 and 7 rather than averaging or swapping.
+    const restingId = "v1-bot-8p41ol-resting";
+    const { client, limiter } = gatedKraken((recorded) => {
+      const body = Object.fromEntries(recorded.body);
+      const isResting = body["cl_ord_id"] === restingId;
+      if (recorded.path === KRAKEN_ENDPOINTS.openOrders) {
+        return isResting
+          ? envelope({
+              open: {
+                "OQCLML-BW3P3-BUCMWZ": orderRecord({
+                  cl_ord_id: restingId,
+                  trades: [],
+                  vol_exec: "0.00000000",
+                }),
+              },
+            })
+          : envelope({ open: {} });
+      }
+      if (recorded.path === KRAKEN_ENDPOINTS.closedOrders) {
+        return envelope({
+          closed: {
+            "OQCLML-BW3P3-BUCMWZ": orderRecord({
+              status: "closed",
+              closetm: 1688666600.1234,
+              vol_exec: "1.25000000",
+            }),
+          },
+          count: 1,
+        });
+      }
+      if (recorded.path === KRAKEN_ENDPOINTS.queryTrades) return envelope(QUERY_TRADES_RESULT);
+      throw new Error(`unexpected path ${recorded.path}`);
+    });
+
+    await Promise.all([
+      client.getOrderStatus("BTCUSD", restingId),
+      client.getOrderStatus("BTCUSD", CLIENT_ORDER_ID),
+    ]);
+
+    // One unit acquired per call, whichever order they interleaved in.
+    expect(limiter.acquired).toEqual([1, 1]);
+    // Exactly one call recorded an excess, and it recorded the WHOLE of it.
+    expect(limiter.recorded).toEqual([6]);
+    expect(spent(limiter)).toBe(8);
+  });
+});
+
+// --------------------------------------------------------------------------
+// The path cost table itself
+// --------------------------------------------------------------------------
+
+describe("krakenCounterCostForPath", () => {
+  it("prices every endpoint this client can call", () => {
+    // ⚠ THE SOURCE-LEVEL GUARD. Metering is only trustworthy if a new endpoint
+    // cannot slip through unpriced, and `#request` prices by path. Adding a row
+    // to `KRAKEN_ENDPOINTS` without one to the cost table fails HERE rather than
+    // charging zero in production.
+    const priced = new Set(KRAKEN_COUNTER_COSTED_PATHS);
+    const unpriced = Object.values(KRAKEN_ENDPOINTS).filter((path) => !priced.has(path));
+    expect(unpriced).toEqual([]);
+  });
+
+  it("counts no public endpoint, which is what the venue does", () => {
+    // Kraken limits public endpoints by IP and does not count them against the
+    // private counter at all. `KRAKEN_REST_COUNTER_COSTS.publicRequest` floors
+    // the GATING price at 1 for a different reason -- an uncosted call is an
+    // unmeasured path through the gate -- and that floor has no business
+    // inflating a measurement of what was spent.
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.time)).toBe(0);
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.ticker)).toBe(0);
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.ohlc)).toBe(0);
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.assetPairs)).toBe(0);
+  });
+
+  it("charges the dearest row for an unknown PRIVATE path, never zero", () => {
+    // The direction this file has always failed in: over-estimating throttles,
+    // under-estimating spends a counter of 15 twice as fast as the venue counts
+    // it. An unpriced private endpoint answering 0 would be the unmeasured path
+    // all over again, and silently.
+    expect(krakenCounterCostForPath("/0/private/SomethingNobodyPriced")).toBe(
+      KRAKEN_REST_COUNTER_COSTS.accountHistory,
+    );
+    // A public one is 0 on a FACT about the prefix, not a guess.
+    expect(krakenCounterCostForPath("/0/public/SomethingNew")).toBe(0);
+  });
+
+  it("agrees with the account-history and ordinary rates it is built from", () => {
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.openOrders)).toBe(
+      KRAKEN_REST_COUNTER_COSTS.standardPrivate,
+    );
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.closedOrders)).toBe(
+      KRAKEN_REST_COUNTER_COSTS.accountHistory,
+    );
+    expect(krakenCounterCostForPath(KRAKEN_ENDPOINTS.queryTrades)).toBe(
+      KRAKEN_REST_COUNTER_COSTS.tradeHistoryQuery,
+    );
   });
 });

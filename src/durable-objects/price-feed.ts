@@ -58,6 +58,24 @@ export interface PriceFeedConfig {
 export interface PriceFeedPort {
   subscribe(botInstanceId: string, config: PriceFeedConfig): Promise<void>;
   unsubscribe(botInstanceId: string): Promise<void>;
+  /**
+   * What this feed knows about itself, READ-ONLY.
+   *
+   * ⚠ WHY A SUBSCRIBER MAY NOW ASK. `price_updates_stale` used to be decided
+   * from a bot's own `lastPriceAt` and a flat ten-minute constant, which cannot
+   * tell two very different things apart: this bot is not being delivered to
+   * (real, and the fault the alert was built for), and nothing has traded so
+   * there was nothing to deliver (honest silence, and not a fault at all).
+   *
+   * Those are only distinguishable by comparing the bot against THE FEED --
+   * `lastForwardAt` answers "did you have anything to send anyone", and the
+   * subscriber list answers "and am I still someone you send to". Neither is
+   * knowable from inside a bot, which is why the port carries this now.
+   *
+   * Read-only by construction: `PriceFeedStatus` is data, and nothing a caller
+   * does with it can reach back into the feed.
+   */
+  status(): Promise<PriceFeedStatus>;
 }
 
 /** One subscriber's registry row, as `status()` reports it. */
@@ -86,6 +104,8 @@ export interface PriceFeedStatus {
   /** Whether `stopFeed` has latched this feed against self-reconnect. */
   readonly stopped: boolean;
   readonly watermark: number | null;
+  /** Receipt time of the last forward to anybody. See `PersistedFeedState`. */
+  readonly lastForwardAt: number | null;
   readonly reconnectAttempts: number;
   readonly blindSince: number | null;
   readonly escalated: boolean;
@@ -102,6 +122,26 @@ interface PersistedFeedState {
   config: PriceFeedConfig | null;
   /** Close time of the last candle forwarded; dedups across reconnects. */
   watermark: number | null;
+  /**
+   * RECEIPT time of the last candle forwarded to anybody. Null until the first.
+   *
+   * ⚠ NOT A DUPLICATE OF `watermark`, AND THE DIFFERENCE IS THE WHOLE REASON IT
+   * EXISTS. `watermark` is a candle's `closeTime` -- MARKET time, chosen because
+   * its job is deduplicating candles across a reconnect, where comparing against
+   * the market's own clock is exactly right.
+   *
+   * A subscriber's `lastPriceAt`, by contrast, is RECEIPT time: `#forwardClosed`
+   * stamps every `Price` with `at`. Comparing one against the other would be
+   * subtracting two different clocks, and the error is not small or constant --
+   * a candle is forwarded only when a NEWER one arrives, so on a quiet pair its
+   * `closeTime` can trail receipt by minutes. Worse, the drift is largest on
+   * exactly the quiet pairs this comparison exists to judge.
+   *
+   * So the feed records, in the subscriber's own clock, when it last had
+   * anything to send. That is the only figure a bot can honestly compare itself
+   * against.
+   */
+  lastForwardAt: number | null;
   /** Consecutive failed connect attempts, for the backoff schedule. */
   reconnectAttempts: number;
   /** When the feed exhausted its fast reconnect cycle and went blind. */
@@ -132,6 +172,7 @@ interface PersistedFeedState {
 const INITIAL_STATE: PersistedFeedState = {
   config: null,
   watermark: null,
+  lastForwardAt: null,
   reconnectAttempts: 0,
   blindSince: null,
   escalated: false,
@@ -584,6 +625,7 @@ export class PriceFeed extends DurableObject<Env> {
       alarmAt: await this.ctx.storage.getAlarm(),
       stopped: this.#stopped,
       watermark: this.#state.watermark,
+      lastForwardAt: this.#state.lastForwardAt,
       reconnectAttempts: this.#state.reconnectAttempts,
       blindSince: this.#state.blindSince,
       escalated: this.#state.escalated,
@@ -716,7 +758,9 @@ export class PriceFeed extends DurableObject<Env> {
     // and says so; what to do about it is a human's call.
     await this.#trackFrozenValue(candle, at);
 
-    this.#state = { ...this.#state, watermark: candle.closeTime };
+    // BOTH CLOCKS, ON THE SAME WRITE. Setting one without the other would let a
+    // bot compare itself against a figure the feed had already moved past.
+    this.#state = { ...this.#state, watermark: candle.closeTime, lastForwardAt: at };
     await this.#persist();
   }
 

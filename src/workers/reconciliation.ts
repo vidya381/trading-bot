@@ -129,9 +129,13 @@ import { withRateLimit, type RateLimiterPort } from "../exchange/rate-limited";
 import {
   crossCheckRunsIn,
   reconcileAccount,
+  runFeedSilenceCheck,
   runPriceCrossCheck,
   type CrossCheckPorts,
   type CrossCheckResult,
+  type FeedSilencePorts,
+  type FeedSilenceResult,
+  type FeedSnapshot,
   type DriftThresholds,
   type HaltBotOutcome,
   type ReconciliationRunResult,
@@ -222,6 +226,14 @@ export interface ScheduledOptions {
    * is a real, unauthenticated call to `api.kraken.com`. The production default
    * pairs the account's own gated client with `krakenPublicClient`.
    */
+  /**
+   * Test seam for the feed-silence check's two sources. See `crossCheckPortsFor`.
+   */
+  readonly feedSilencePortsFor?: (
+    accountLabel: string,
+    exchange: ExchangeId,
+    primary: RestExchangeClient,
+  ) => FeedSilencePorts;
   readonly crossCheckPortsFor?: (
     accountLabel: string,
     exchange: ExchangeId,
@@ -243,6 +255,14 @@ export interface ScheduledResult {
    * reach Kraken must not both read as "clean".
    */
   readonly crossChecks: readonly CrossCheckResult[];
+  /**
+   * One per account whose feeds were examined for a silent subscription.
+   *
+   * Separate from `crossChecks` because it is a different question with a
+   * different answer shape: that one asks whether a price is TRUE, this one asks
+   * whether a price is ARRIVING AT ALL.
+   */
+  readonly feedSilences: readonly FeedSilenceResult[];
 }
 
 /** An account to reconcile, and the venue its funds actually live on. */
@@ -324,6 +344,7 @@ export async function runScheduledReconciliation(
         "cannot be enforced. Only testnet and production declare one.",
       runs: [],
       crossChecks: [],
+      feedSilences: [],
     };
   }
   const limiterFor =
@@ -343,6 +364,7 @@ export async function runScheduledReconciliation(
         "declare one; a deploy with no --env has neither a database nor any bots.",
       runs: [],
       crossChecks: [],
+      feedSilences: [],
     };
   }
 
@@ -362,6 +384,7 @@ export async function runScheduledReconciliation(
         "docs/d1-provisioning.md.",
       runs: [],
       crossChecks: [],
+      feedSilences: [],
     };
   }
 
@@ -369,6 +392,7 @@ export async function runScheduledReconciliation(
   const labels = accounts.map((account) => account.label);
   const runs: ReconciliationRunResult[] = [];
   const crossChecks: CrossCheckResult[] = [];
+  const feedSilences: FeedSilenceResult[] = [];
   const unresolvable: string[] = [];
 
   // Whether the price cross-check runs at all in this environment, decided ONCE
@@ -519,6 +543,22 @@ export async function runScheduledReconciliation(
       );
       if (crossCheck !== null) crossChecks.push(crossCheck);
     }
+
+    // A FOURTH question, and one the other three structurally cannot ask: is
+    // this account's price feed still DELIVERING? Unlike the cross-check this is
+    // NOT production-gated -- it compares a feed against the SAME venue's REST
+    // candles rather than against a second venue's prices, so the entry 86
+    // argument for gating (a simulator's prices are not the market's) does not
+    // apply: both sides come from whichever venue this deployment points at.
+    const feedSilence = await checkAccountFeedSilence(
+      db,
+      env,
+      options,
+      { label: accountLabel, exchange: account.exchange },
+      gatedExchange,
+      now(),
+    );
+    if (feedSilence !== null) feedSilences.push(feedSilence);
   }
 
   if (labels.length > 0 && runs.length === 0) {
@@ -533,10 +573,11 @@ export async function runScheduledReconciliation(
         (unresolvable.length > 0 ? `: ${unresolvable.join("; ")}` : "."),
       runs: [],
       crossChecks,
+      feedSilences,
     };
   }
 
-  return { ran: true, runs, crossChecks };
+  return { ran: true, runs, crossChecks, feedSilences };
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +705,91 @@ async function runningPairsFor(db: Database, accountLabel: string): Promise<Pair
     where: { account_label: accountLabel, status: "running" },
   });
   return [...new Set(bots.map((bot) => bot.pair))].sort();
+}
+
+/**
+ * Ask each of an account's feeds whether its silence is the market's or its own.
+ *
+ * ⚠ THE REFERENCE IS THE ACCOUNT'S OWN VENUE, OVER REST, AND THAT IS THE DESIGN
+ * RATHER THAN A SHORTCUT. `price-cross-check.ts` refuses to run when the primary
+ * venue is the reference venue, because a venue cannot corroborate its own
+ * PRICES. This check is not asking whether a price is right; it is asking
+ * whether the market traded at all, and the fault it is looking for lives in ONE
+ * TRANSPORT -- a WebSocket subscription that stopped delivering while its socket
+ * kept heartbeating. REST on the same venue does not share that subscription and
+ * cannot fail with it, so it is the correct second opinion here.
+ *
+ * `primary` rather than a fresh public client, deliberately: it is the same
+ * gated client reconciliation reads balances with, so these candle reads are
+ * charged to the account's rate-limit budget like everything else rather than
+ * going around it.
+ *
+ * ⚠ CANNOT THROW INTO THE RECONCILIATION PASS, for the reason
+ * `crossCheckAccountPrices` documents at length: this is an observer riding on a
+ * risk control, and a bug in the observer must never stop the thing observed.
+ */
+async function checkAccountFeedSilence(
+  db: Database,
+  env: Env,
+  options: ScheduledOptions,
+  account: { readonly label: string; readonly exchange: ExchangeId },
+  primary: RestExchangeClient,
+  at: Timestamp,
+): Promise<FeedSilenceResult | null> {
+  try {
+    const pairs = await runningPairsFor(db, account.label);
+    if (pairs.length === 0) return null;
+
+    const ports =
+      options.feedSilencePortsFor?.(account.label, account.exchange, primary) ??
+      defaultFeedSilencePorts(env, account.exchange, primary);
+
+    return await runFeedSilenceCheck(db, options.newId ?? (() => crypto.randomUUID()), ports, {
+      accountLabel: account.label,
+      pairs,
+      at,
+    });
+  } catch (error) {
+    console.error(
+      `feed-silence check for account ${account.label} failed unexpectedly and was ` +
+        `abandoned for this pass (${(error as Error).message}). Reconciliation itself ` +
+        `is unaffected. This is a bug in the check, not evidence about the feed.`,
+    );
+    return null;
+  }
+}
+
+/**
+ * The real sources: the `PRICE_FEED` Durable Object, and the venue's own REST.
+ *
+ * The feed is addressed exactly as `BotInstance` addresses it -- `idFromName` on
+ * `${exchange}:${pair}` -- because a different naming rule here would silently
+ * inspect a DIFFERENT feed object from the one the bots are subscribed to, and
+ * every answer would be about a feed nobody uses.
+ */
+function defaultFeedSilencePorts(
+  env: Env,
+  exchange: ExchangeId,
+  primary: RestExchangeClient,
+): FeedSilencePorts {
+  return {
+    feedStatus: async (pair) => {
+      const namespace = env.PRICE_FEED;
+      if (namespace === undefined) return null;
+      const stub = namespace.get(namespace.idFromName(`${exchange}:${pair}`));
+      const status = await stub.status();
+      const snapshot: FeedSnapshot = {
+        connected: status.connected,
+        stopped: status.stopped,
+        subscriberCount: status.subscriberCount,
+        lastForwardAt: status.lastForwardAt,
+      };
+      return snapshot;
+    },
+    // One-minute candles, matching the interval the feeds themselves subscribe
+    // to. A coarser interval would hide exactly the minutes this is counting.
+    referenceCandles: async (pair, since) => await primary.getCandles(pair, "1m", since),
+  };
 }
 
 /**

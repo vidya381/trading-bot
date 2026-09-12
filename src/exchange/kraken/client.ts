@@ -74,6 +74,7 @@ import type {
   BatchCancelResult,
   Candle,
   CandleInterval,
+  CounterMeter,
   Fill,
   OrderRequest,
   OrderResult,
@@ -121,7 +122,11 @@ import {
   type KrakenCancelResult,
   type KrakenOrderRecord,
 } from "./parse";
-import { KRAKEN_BATCH_CANCEL_MAX_IDS, KRAKEN_QUERY_TRADES_MAX_IDS } from "./rate-limits";
+import {
+  KRAKEN_BATCH_CANCEL_MAX_IDS,
+  KRAKEN_QUERY_TRADES_MAX_IDS,
+  krakenCounterCostForPath,
+} from "./rate-limits";
 import {
   KRAKEN_FORM_CONTENT_TYPE,
   KRAKEN_JSON_CONTENT_TYPE,
@@ -358,6 +363,13 @@ interface RequestSpec<T> {
   json?: readonly (readonly [string, JsonBodyValue | undefined])[];
   /** Names the call in an error message, e.g. `"Ticker"`. */
   context: string;
+  /**
+   * Told what this request cost the REST counter, as it is issued.
+   *
+   * Optional, and absent on every call whose price the gate already knows
+   * exactly. See `CounterMeter` and `krakenCounterCostForPath`.
+   */
+  meter?: CounterMeter;
   /**
    * Receives the envelope's `result`, NEVER the raw body.
    *
@@ -910,6 +922,7 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
   async getOrderStatus(
     pair: Pair,
     clientOrderId: string,
+    meter?: CounterMeter,
   ): Promise<ExchangeOutcome<OrderStatus>> {
     const resolved = await this.#resolvePair<OrderStatus>(pair);
     if (!resolved.ok) return resolved.outcome;
@@ -919,6 +932,7 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
       path: KRAKEN_ENDPOINTS.openOrders,
       signed: true,
       context: "OpenOrders",
+      ...(meter === undefined ? {} : { meter }),
       params: [
         ["cl_ord_id", clientOrderId],
         // TRUE, and it is what makes `fills` reachable at all: Kraken populates
@@ -935,13 +949,14 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
     const resting = this.#singleRecord(open.value, clientOrderId, kraken, open.at);
     if (resting !== undefined) {
       if (!resting.ok) return resting;
-      return await this.#withFills(resting.value, catalogue, open.at);
+      return await this.#withFills(resting.value, catalogue, open.at, meter);
     }
 
     const closed = await this.#request<KrakenOrderRecord[]>({
       path: KRAKEN_ENDPOINTS.closedOrders,
       signed: true,
       context: "ClosedOrders",
+      ...(meter === undefined ? {} : { meter }),
       params: [
         ["cl_ord_id", clientOrderId],
         ["trades", true],
@@ -953,7 +968,7 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
     const terminated = this.#singleRecord(closed.value, clientOrderId, kraken, closed.at);
     if (terminated !== undefined) {
       if (!terminated.ok) return terminated;
-      return await this.#withFills(terminated.value, catalogue, closed.at);
+      return await this.#withFills(terminated.value, catalogue, closed.at, meter);
     }
 
     return this.#refused<OrderStatus>(
@@ -1340,6 +1355,7 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
     record: KrakenOrderRecord,
     catalogue: KrakenCatalogue,
     at: Timestamp,
+    meter?: CounterMeter,
   ): Promise<ExchangeOutcome<OrderStatus>> {
     if (record.tradeIds.length === 0) return ok(record.status, at);
 
@@ -1350,6 +1366,7 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
         path: KRAKEN_ENDPOINTS.queryTrades,
         signed: true,
         context: "QueryTrades",
+        ...(meter === undefined ? {} : { meter }),
         params: [["txid", page.join(",")]],
         // `oflags` is the ORDER's, passed down because a trade record has no
         // currency field anywhere in it (DECISION 4). This system sends
@@ -1442,6 +1459,25 @@ export class KrakenClient implements RestExchangeClient, BatchCancellingClient {
    * passed through only when the transport genuinely produced a failing one.
    */
   async #request<T>(spec: RequestSpec<T>): Promise<ExchangeOutcome<T>> {
+    // ⚠ METERED BEFORE THE TRANSPORT, NOT AFTER IT, and the ordering is the
+    // whole safety of the measurement.
+    //
+    // Kraken charges its counter for a request it RECEIVED, and from here there
+    // is no way to tell a request that never left from one whose reply was lost
+    // -- that is the same `transport` ambiguity section 5.1 refuses to guess
+    // about anywhere else. Metering first charges both. The one it over-charges
+    // is a request the venue never counted, which costs throttling; the one it
+    // would under-charge by metering afterwards is a request the venue DID
+    // count, which is budget this system believes it has and does not.
+    //
+    // It is also why this sits in `#request` rather than at the three call sites
+    // that currently need it: every real HTTP request this client makes passes
+    // through here, so an endpoint added later is metered whether or not anyone
+    // remembers to meter it. That is the property that makes this safe to rely
+    // on -- the same reason `#syncAlarm` hangs off `#putState` rather than off
+    // each of the six mutations that need it.
+    spec.meter?.(krakenCounterCostForPath(spec.path), spec.path);
+
     const transport = await this.#transport(spec);
 
     if (!transport.reached) {

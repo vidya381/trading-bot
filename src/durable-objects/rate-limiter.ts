@@ -810,6 +810,62 @@ export class RateLimiter extends DurableObject<Env> {
     this.#drop(ticketId);
   }
 
+  /**
+   * Charge the account counter for units ALREADY SPENT at the venue.
+   *
+   * ---------------------------------------------------------------------------
+   * ⚠ THIS REFUSES NOTHING, AND THAT IS NOT A LOOPHOLE IN THE GATE
+   * ---------------------------------------------------------------------------
+   * It is the same distinction `Budget.record` was written for, one caller
+   * further out. `acquire` decides whether a call MAY be made; this records what
+   * a call that HAS been made cost. Refusing here would be refusing the past --
+   * the request is gone, the venue has already counted it, and declining to
+   * write it down would not un-send it. It would only leave this object
+   * believing the account holds budget it does not, which is the one direction
+   * that gets an account rate-limited rather than merely throttled.
+   *
+   * So the counter may be pushed OVER its ceiling by this, exactly as
+   * `Budget.record` documents, and everything downstream already copes:
+   * `usedWeight` decays whatever value it holds, `remainingFor` floors at zero,
+   * and `waitFor` walks the decay from the real value. The next ordinary call
+   * correctly waits out the overshoot instead of being granted budget the venue
+   * no longer has.
+   *
+   * ---------------------------------------------------------------------------
+   * WHY THE GATE IS STILL A GATE
+   * ---------------------------------------------------------------------------
+   * Because nothing reaches here without having gone through `acquire` first.
+   * The one caller is `RateLimitedExchange`, which acquires the floor a call
+   * ALWAYS incurs and records only the excess its own client reported spending.
+   * A method whose entire cost was routed through this would be ungated, which
+   * is why `#chargesFor` still refuses a cost vector with no gating component --
+   * that check is what keeps this from becoming a way around the budget rather
+   * than a way of telling it the truth.
+   *
+   * `units` of zero is the common case (a resting order needed no supplementary
+   * read) and is a no-op rather than an error: the caller subtracting a floor
+   * from a total should not have to special-case the answer being nothing.
+   */
+  async record(exchange: ExchangeId, units: number): Promise<void> {
+    if (!Number.isFinite(units) || units < 0) {
+      throw new RateLimiterError(`recorded units must be non-negative, got ${units}`);
+    }
+    if (units === 0) return;
+    if (!this.#adoptExchange(exchange)) {
+      // Same refusal `acquire` gives a mis-wired limiter, and for the same
+      // reason: spending one venue's counter on another venue's traffic would
+      // corrupt both. Thrown rather than returned because, unlike an acquire,
+      // there is no decision for the caller to act on -- the units are already
+      // spent and this object is the wrong place to record them.
+      throw new RateLimiterError(
+        `cannot record ${units} units of ${exchange} traffic against a limiter ` +
+          `serving ${this.#exchange}`,
+      );
+    }
+    this.#budget.record(units, this.#dependencies.now());
+    await this.#persist();
+  }
+
   // -------------------------------------------------------------------------
   // Learning the truth from the exchange (section 5.4)
   // -------------------------------------------------------------------------

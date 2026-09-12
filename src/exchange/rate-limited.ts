@@ -64,6 +64,7 @@ import type {
   BatchCancelResult,
   Candle,
   CandleInterval,
+  CounterMeter,
   OrderRequest,
   OrderResult,
   OrderStatus,
@@ -95,6 +96,15 @@ import {
 export interface RateLimiterPort {
   acquire(request: AcquireRequest): Promise<AcquireResult>;
   release(ticketId: string): Promise<void>;
+  /**
+   * Charge for units a call has ALREADY spent. See `RateLimiter.record`.
+   *
+   * OPTIONAL ON THE PORT, so the many test doubles and the one production stub
+   * that never meter anything are not all forced to grow a method they would
+   * only stub. The gate calls it only when a client actually reported spending
+   * more than was acquired, which on the venues that price flat is never.
+   */
+  record?(exchange: ExchangeId, units: number): Promise<void>;
 }
 
 /**
@@ -327,30 +337,46 @@ export const KRAKEN_METHOD_COSTS: MethodCosts = {
    * `OpenOrders`, then `ClosedOrders` only if the order is no longer resting,
    * then `QueryTrades` whenever the order has executions to read.
    *
-   * Charged for ALL THREE every time. A gate prices a call before it is made and
-   * cannot know which branch it will take, and the branch that costs more is the
-   * one that runs when an order has just filled -- the moment a strategy is most
-   * likely to be asking.
+   * ⚠ THIS IS THE FLOOR, NOT THE WHOLE PRICE, AND IT IS THE ONLY ROW IN THIS
+   * TABLE THAT IS. The other two endpoints are charged through
+   * `RateLimitedExchange.getOrderStatus`, which records what the client reports
+   * actually issuing. A call that walks all three still costs 1 + 4 + 2 = 7.
+   *
+   * ---------------------------------------------------------------------------
+   * WHAT THIS ROW USED TO SAY, AND WHY IT WAS BOTH RIGHT AND UNAFFORDABLE
+   * ---------------------------------------------------------------------------
+   * It charged all three every time, on reasoning that is still correct as far
+   * as it goes: "A gate prices a call before it is made and cannot know which
+   * branch it will take, and the branch that costs more is the one that runs
+   * when an order has just filled -- the moment a strategy is most likely to be
+   * asking."
+   *
+   * What that misses is how rarely the expensive branch runs and how small this
+   * venue's counter is. `KrakenClient.getOrderStatus` returns after `OpenOrders`
+   * ALONE for an order that is still resting, which is what a poll finds almost
+   * every time it looks. Seven units of a 13-unit routine ceiling meant two
+   * status reads could not be outstanding together AT ALL -- so a three-rung
+   * ladder's third read was refused at `6.92 used`, on a counter 54% empty, and
+   * five such passes raised `poll_blind` on `bot-8p41ol` against a venue that
+   * would have answered every one of them. The gate was the only thing refusing.
+   *
+   * The premise that a gate cannot know the branch IN ADVANCE still holds. What
+   * changed is that it no longer has to: it can know afterwards, and a counter
+   * that decays continuously does not care whether a unit was charged at the
+   * start of a call or at its end.
    *
    * ⚠ THE THIRD TERM ARRIVED WITH THE FILLS. `getOrderStatus` gained a
    * `QueryTrades` leg on 2026-09-10 (see the method), and a cost model that did
    * not follow it would under-charge the account-wide counter on precisely the
-   * call a fill provokes -- the same failure this table's own "charge for both"
-   * rule was written to avoid, one endpoint later.
+   * call a fill provokes. Metering closes that class of gap for good rather than
+   * one endpoint at a time: `krakenCounterCostForPath` prices what was ISSUED,
+   * so a fourth leg added later is charged whether or not anyone updates a table.
    *
    * `tradeHistoryQuery` for that leg, NOT `accountHistory` -- 2 rather than 4,
    * on evidence rather than on the analogy to `ClosedOrders`. That constant's
-   * own docblock carries the argument and the reason the cautious reading is the
-   * wrong one HERE specifically: at 4 this method costs 9 of the 13 units routine
-   * traffic may touch, which does not protect anything and starves the repair
-   * path that walks a halted bot's orders one status read at a time.
+   * own docblock carries the argument.
    */
-  getOrderStatus: () => ({
-    rest:
-      KRAKEN_REST_COUNTER_COSTS.standardPrivate +
-      KRAKEN_REST_COUNTER_COSTS.accountHistory +
-      KRAKEN_REST_COUNTER_COSTS.tradeHistoryQuery,
-  }),
+  getOrderStatus: () => ({ rest: KRAKEN_REST_COUNTER_COSTS.standardPrivate }),
 
   /** `POST /0/private/OpenOrders`. Not account history; the ordinary rate. */
   getOpenOrders: () => ({ rest: KRAKEN_REST_COUNTER_COSTS.standardPrivate }),
@@ -686,10 +712,62 @@ export class RateLimitedExchange implements RestExchangeClient {
     );
   }
 
+  /**
+   * ⚠ THE ONE METHOD THAT IS PRICED IN TWO PARTS. See `CounterMeter`.
+   *
+   * `KRAKEN_METHOD_COSTS.getOrderStatus` now declares only the floor this call
+   * always incurs -- one `OpenOrders` read -- and the client reports what it
+   * really issued. Whatever it spent beyond the floor is recorded afterwards,
+   * so an order that had to be chased into `ClosedOrders` and `QueryTrades`
+   * still lands on the full 7 while a resting one costs the 1 it actually cost.
+   *
+   * The meter is a FRESH CLOSURE PER CALL, which is what makes this safe under
+   * the ladder-wide `Promise.all` in `#pollOpenOrders`: three concurrent reads
+   * hold three separate counters and cannot see each other's units.
+   */
   async getOrderStatus(pair: Pair, clientOrderId: string): Promise<ExchangeOutcome<OrderStatus>> {
-    return this.#gate("getOrderStatus", clientOrderId, pair, () =>
-      this.#inner.getOrderStatus(pair, clientOrderId),
+    let metered = 0;
+    const meter: CounterMeter = (units) => {
+      metered += units;
+    };
+
+    const outcome = await this.#gate("getOrderStatus", clientOrderId, pair, () =>
+      this.#inner.getOrderStatus(pair, clientOrderId, meter),
     );
+
+    // AFTER THE GATE, AND DELIBERATELY OUTSIDE ITS FAILURE BRANCHES. `metered`
+    // is zero when the gate refused the call outright -- nothing was issued, so
+    // nothing was spent, and `#recordExcess` writes nothing. When the call WAS
+    // made it is non-zero whether the call succeeded or failed, because the
+    // venue counted the request either way: an `exchange_error` from
+    // `ClosedOrders` cost the same four units a success would have.
+    await this.#recordExcess(metered);
+    return outcome;
+  }
+
+  /**
+   * Tell the budget about units this call spent beyond what it acquired.
+   *
+   * SUBTRACTS THE FLOOR, because `#spend` already charged it. The client reports
+   * every request it issues -- see `CounterMeter` on why it does not try to
+   * report only the excess -- so the arithmetic belongs here, at the one place
+   * that knows both what was acquired and what was spent.
+   *
+   * FLOORED AT ZERO rather than allowed to go negative, and the clamp is doing
+   * real work rather than being defensive: a call that came in UNDER its floor
+   * (a Kraken `getOrderStatus` whose pair could not be resolved returns before
+   * issuing anything) must not hand the budget a refund. The floor was spent
+   * from the counter's point of view the moment the gate granted it, and
+   * crediting it back would let a run of failures manufacture headroom.
+   */
+  async #recordExcess(metered: number): Promise<void> {
+    if (metered <= 0) return;
+    const { exchange, costs } = this.#options;
+    const acquired = costs.getOrderStatus({ pair: null, orderAgeMs: null }).rest;
+    const excess = metered - acquired;
+    if (excess <= 0) return;
+    // Absent on the doubles that never meter; see `RateLimiterPort.record`.
+    await this.#limiter.record?.(exchange, excess);
   }
 
   async getOpenOrders(pair: Pair): Promise<ExchangeOutcome<OrderStatus[]>> {

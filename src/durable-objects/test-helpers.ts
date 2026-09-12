@@ -8,7 +8,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import type { BotInstance } from "./bot-instance";
 import type { RateLimiter } from "./rate-limiter";
-import type { PriceFeed, PriceFeedConfig, PriceFeedPort } from "./price-feed";
+import type { PriceFeed, PriceFeedConfig, PriceFeedPort, PriceFeedStatus } from "./price-feed";
 
 /**
  * A price-feed port that does nothing — for tests that drive a bot's lifecycle
@@ -19,7 +19,63 @@ import type { PriceFeed, PriceFeedConfig, PriceFeedPort } from "./price-feed";
 export const noopFeed: PriceFeedPort = {
   subscribe: async () => {},
   unsubscribe: async () => {},
+  status: async () => healthyFeedStatus(),
 };
+
+/**
+ * A feed that is connected, subscribed, and has JUST forwarded something.
+ *
+ * ⚠ THE DEFAULT IS DELIBERATELY THE ONE THAT SUPPRESSES NOTHING. A bot's
+ * staleness check now asks the feed whether it had anything to send; a double
+ * answering "I have never forwarded anything" would silence
+ * `price_updates_stale` across every test that injects a feed without caring
+ * about one, including the tests that exist to prove the alert still fires.
+ *
+ * So the default says the feed is healthy AND current, which is the reading
+ * under which the bot's own staleness is entirely the bot's own problem -- the
+ * behaviour every pre-existing test was written against. A test that wants the
+ * other case asks for it explicitly.
+ */
+export function healthyFeedStatus(overrides: Partial<PriceFeedStatus> = {}): PriceFeedStatus {
+  return {
+    config: null,
+    connected: true,
+    alarmAt: null,
+    stopped: false,
+    watermark: null,
+    // `Date.now()` rather than a fixed instant: a bot compares this against its
+    // own clock, and a constant would age into the past as a suite runs.
+    lastForwardAt: Date.now(),
+    reconnectAttempts: 0,
+    blindSince: null,
+    escalated: false,
+    subscriberCount: 1,
+    subscribers: [],
+    ...overrides,
+  };
+}
+
+/**
+ * A feed whose `status()` a test can move between passes.
+ *
+ * For the staleness verdict, which is now a COMPARISON between a bot and its
+ * feed rather than a timeout on the bot alone. A fixed double could only ever
+ * express one side of that, so the tests that care set this directly.
+ */
+export function mutableFeed(initial: Partial<PriceFeedStatus> = {}): {
+  readonly port: PriceFeedPort;
+  status: PriceFeedStatus;
+} {
+  const holder: { port: PriceFeedPort; status: PriceFeedStatus } = {
+    status: healthyFeedStatus(initial),
+    port: {
+      subscribe: async () => {},
+      unsubscribe: async () => {},
+      status: async () => holder.status,
+    },
+  };
+  return holder;
+}
 
 /** A recording price-feed port, for the step 14 D wiring tests. */
 export function recordingFeed(): {
@@ -35,6 +91,7 @@ export function recordingFeed(): {
     port: {
       subscribe: async (botInstanceId, config) => void subscribes.push({ botInstanceId, config }),
       unsubscribe: async (botInstanceId) => void unsubscribes.push(botInstanceId),
+      status: async () => healthyFeedStatus(),
     },
   };
 }
