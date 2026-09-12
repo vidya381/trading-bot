@@ -1551,8 +1551,24 @@ describe("a PARTIALLY placed ladder is not vacant, and still completes via `!pla
     await run((bot) => bot.createGrid(creation()));
     await run((bot) => bot.start(ACTOR));
 
-    // The first order of the pass (level 0, price 90) cannot be sent.
-    exchange.nextPlaceFailure = { kind: "transport", message: "socket hang up" };
+    // ⚠ THIS FAILURE KIND CHANGED ON 2026-09-11, and the incident is the reason.
+    // It used to be `transport`, and the assertion below then required the next
+    // tick to re-send level 0 -- an order of UNKNOWN outcome followed by a
+    // second, real one for the same rung. That is exactly what `bot-wfemoo` did
+    // with `v1-bot-wfemoo-5` and `v1-bot-wfemoo-8`: 12.50 USDT twice on one
+    // level, its whole 25.00 allocation. The same expectation was corrected for
+    // the entry path in `bot-instance.test.ts` on the same night and for the
+    // same reason; this was the one place it was missed. The `transport` case
+    // now lives in `grid-slot-reentry.test.ts`, where the bot correctly places
+    // NOTHING for that level until the outcome is settled.
+    //
+    // THE INVARIANT THIS TEST WAS WRITTEN FOR IS UNCHANGED and is still what it
+    // asserts: a partial ladder has non-null slots, so `vacantLadder` is false,
+    // and only `!placed` brings the bot back to finish the refused rungs.
+    // `rate_limited` is the right failure for that: section 5.4 refused the
+    // budget, so nothing reached the network, the level is provably free, and
+    // completing it on the next tick is correct rather than a duplicate.
+    exchange.nextPlaceFailure = { kind: "rate_limited", message: "budget exhausted" };
     const first = await run((bot) => bot.onPriceUpdate(priceAt("100")));
     expect(first.action).toBe("initial_ladder_partial");
 

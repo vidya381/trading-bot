@@ -561,6 +561,21 @@ export interface PostHaltEvent {
  */
 const POST_HALT_EVENT_LIMIT = 10;
 
+/**
+ * What a grid placement was sent FOR, held only while its outcome is unknown.
+ *
+ * The two things the venue cannot tell us on the way back: which ladder level
+ * the order belongs to, and -- for a replace-on-fill sell -- the buy price it
+ * replaced. Both are known at send time and both are lost with a dropped
+ * acknowledgement, so they are written down before the send and read back by
+ * whichever path resolves the order. See `BotRuntimeState.unconfirmedGridLevels`.
+ */
+export interface UnconfirmedGridPlacement {
+  readonly levelIndex: number;
+  /** For a sell: the buy price it replaces. For a buy: `null`. */
+  readonly costBasis: Money | null;
+}
+
 export interface BotRuntimeState {
   readonly schemaVersion: number;
   readonly status: BotStatus;
@@ -615,6 +630,51 @@ export interface BotRuntimeState {
    * directly. Same precedent as `entryAttempts`.
    */
   readonly unconfirmedOrderIds?: readonly string[];
+  /**
+   * GRID ONLY: the ladder level each unconfirmed placement was sent FOR, keyed
+   * by clientOrderId.
+   *
+   * ⚠ WHY `unconfirmedOrderIds` COULD NOT SIMPLY BE REUSED. That field answers
+   * "does this bot have anything outstanding?", which is the whole question for
+   * a trailing-stop or DCA entry: there is ONE entry, so one outstanding id
+   * means do not place. A grid places N orders across N levels concurrently, so
+   * the question it has to ask is narrower -- "is anything outstanding FOR THIS
+   * LEVEL?" -- and a flat list of ids cannot answer it. `levelOf` cannot supply
+   * the missing half either: it resolves a level from the ladder SLOTS, and an
+   * unconfirmed order has no slot by construction (that is what makes it
+   * unconfirmed). So the level has to be recorded at send time or it is not
+   * recoverable at all.
+   *
+   * ⚠ NOT THE AUTHORITY ON WHAT IS OUTSTANDING -- `unconfirmedOrderIds` remains
+   * that, and `gridLevelUnconfirmed` intersects the two. This map only
+   * ATTRIBUTES an already-outstanding id to a level. A stale entry whose id has
+   * since been resolved therefore cannot block a placement, which is what makes
+   * it safe not to hunt down every clear site in the object.
+   *
+   * ⚠ THE INCIDENT. `bot-wfemoo`, a SOLUSDT grid bot, placed `v1-bot-wfemoo-5`
+   * and `v1-bot-wfemoo-8` against grid level 0 ($92.00, 0.13586956 SOL) in one
+   * window, 12.50 USDT each against a 25.00 USDT allocation -- the whole
+   * allocation on one duplicated rung. A `transport` outcome on the first left
+   * its slot unclaimed and `placed` false, so the next tick's ladder pass saw a
+   * free level and sent again. Same class as the `bot-x93xux` over-entry that
+   * produced `unconfirmedOrderIds` itself, in the one place that fix did not
+   * reach.
+   *
+   * ⚠ CARRIES `costBasis`, NOT JUST THE LEVEL, because the poll's adoption path
+   * is the consumer that needs it. An adopted order's record is rebuilt from the
+   * VENUE's answer, and the venue knows a price and a quantity but has never
+   * heard of a grid: for a replacement sell, the buy price it replaced exists
+   * only here, in this object, and is lost with the acknowledgement. Recording
+   * it at send time is what lets an adopted sell realize the right profit
+   * instead of an invented one. `null` on a buy, exactly as `GridSlot.costBasis`
+   * is.
+   *
+   * Optional for the same additive reason `highWaterMark` and `entryAttempts`
+   * are: live bots have stored state without this key. ABSENT means no grid
+   * placement is in flight. Read through `unconfirmedGridLevels`, never
+   * directly.
+   */
+  readonly unconfirmedGridLevels?: Readonly<Record<string, UnconfirmedGridPlacement>>;
   readonly haltReason: string | null;
   readonly haltedAt: Timestamp | null;
   readonly lastPrice: Money | null;
@@ -1018,6 +1078,78 @@ export function gridOutstanding(state: BotRuntimeState): boolean {
  */
 export function outstandingUnconfirmed(state: BotRuntimeState): readonly string[] {
   return state.unconfirmedOrderIds ?? [];
+}
+
+/**
+ * The clientOrderId -> grid level map, defaulted.
+ *
+ * THE ONLY READER of `state.unconfirmedGridLevels`, for the same reason
+ * `outstandingUnconfirmed` is the only reader of its field: the default belongs
+ * in one place rather than at each call site.
+ */
+export function unconfirmedGridLevels(
+  state: BotRuntimeState,
+): Readonly<Record<string, UnconfirmedGridPlacement>> {
+  return state.unconfirmedGridLevels ?? {};
+}
+
+/**
+ * What an in-flight placement was sent for, or `undefined` if this id has no
+ * unresolved grid placement.
+ *
+ * ⚠ READ IT BEFORE RESOLVING THE ID, never after. Every path that settles an
+ * order clears this entry in the same write that clears the id, which is
+ * deliberate -- a resolved order's attribution belongs on its slot and its
+ * `TrackedOrder`, not here. The adoption path therefore has exactly one chance
+ * to read it, and reading it afterwards returns `undefined` and silently adopts
+ * a grid order as if it had no level.
+ */
+export function unconfirmedPlacementFor(
+  state: BotRuntimeState,
+  clientOrderId: string,
+): UnconfirmedGridPlacement | undefined {
+  return unconfirmedGridLevels(state)[clientOrderId];
+}
+
+/**
+ * The clientOrderId of an order SENT for `levelIndex` whose outcome is still
+ * unknown, or `null` if that level has nothing in flight.
+ *
+ * ⚠ DRIVEN BY `outstandingUnconfirmed`, NOT by the map's own keys, and the
+ * direction matters. `unconfirmedOrderIds` is the authority on what is
+ * outstanding and is maintained by every path that resolves an order; the map
+ * only says which level an id belongs to. Iterating the outstanding ids and
+ * looking each one up means a map entry left behind by some path that cleared
+ * the id without clearing the map is inert -- it names an id that is no longer
+ * outstanding, so it can never block a placement. The reverse (iterating the
+ * map) would turn every such leftover into a permanently dead grid level, which
+ * is the `GridLadder.placed` one-way-latch failure wearing a different hat.
+ */
+/**
+ * The level map with one id dropped, for the paths that resolve a placement.
+ *
+ * Returns the state's EXISTING value untouched when the id is not in the map,
+ * so a non-grid bot -- whose state has no such key at all -- keeps `undefined`
+ * rather than gaining an empty object on every order it ever resolves. That
+ * keeps the stored shape of a DCA or trailing-stop bot byte-identical to what it
+ * was before this field existed.
+ */
+function withoutGridLevel(
+  current: BotRuntimeState,
+  clientOrderId: string,
+): Readonly<Record<string, UnconfirmedGridPlacement>> | undefined {
+  const levels = unconfirmedGridLevels(current);
+  if (!(clientOrderId in levels)) return current.unconfirmedGridLevels;
+  const { [clientOrderId]: _resolved, ...rest } = levels;
+  return rest;
+}
+
+export function gridLevelUnconfirmed(state: BotRuntimeState, levelIndex: number): string | null {
+  const levels = unconfirmedGridLevels(state);
+  for (const id of outstandingUnconfirmed(state)) {
+    if (levels[id]?.levelIndex === levelIndex) return id;
+  }
+  return null;
 }
 
 /**
@@ -1874,10 +2006,25 @@ export class BotInstance extends DurableObject<Env> {
    * window open that let bot-q4xcjr place a second base order one second after
    * the first.
    */
-  async #markUnconfirmed(clientOrderId: string): Promise<void> {
+  async #markUnconfirmed(
+    clientOrderId: string,
+    placement?: UnconfirmedGridPlacement,
+  ): Promise<void> {
     await this.#mutateState((current) => ({
       ...current,
       unconfirmedOrderIds: [...outstandingUnconfirmed(current), clientOrderId],
+      // GRID ONLY, and written in the SAME mutation as the id itself so no
+      // re-entry can observe an outstanding id whose level is not yet recorded
+      // -- that window would read as "this level is free" and is the entire bug.
+      // Left untouched for every other strategy, whose state keeps no such key.
+      ...(placement === undefined
+        ? {}
+        : {
+            unconfirmedGridLevels: {
+              ...unconfirmedGridLevels(current),
+              [clientOrderId]: placement,
+            },
+          }),
     }));
   }
 
@@ -1893,6 +2040,7 @@ export class BotInstance extends DurableObject<Env> {
     await this.#mutateState((current) => ({
       ...current,
       unconfirmedOrderIds: outstandingUnconfirmed(current).filter((id) => id !== clientOrderId),
+      unconfirmedGridLevels: withoutGridLevel(current, clientOrderId),
     }));
   }
 
@@ -1909,6 +2057,87 @@ export class BotInstance extends DurableObject<Env> {
       unconfirmedOrderIds: outstandingUnconfirmed(current).filter((id) => id !== clientOrderId),
       openOrderIds: [...current.openOrderIds, clientOrderId],
     }));
+  }
+
+  /**
+   * `#confirmPlaced` for a GRID order: promote it AND give it back its rung.
+   *
+   * ⚠ WHY THE PLAIN VERSION IS WRONG HERE, which is the defect this exists to
+   * close. `#confirmPlaced` puts the id in `openOrderIds` and stops. For every
+   * other strategy that is the whole truth, but a grid's ladder is a second,
+   * independent record of what is live, and the per-level placement checks read
+   * THAT one. An order adopted into `openOrderIds` with no slot leaves its level
+   * reading empty to `#placeGridOrder`, so the next ladder pass places a second
+   * order for a rung that demonstrably already holds one -- the same duplicate
+   * `unconfirmedGridLevels` was built to prevent, arriving one poll later.
+   * Measured on a probe before this was written: `slots[0]` null after adoption,
+   * and the following tick took `exchange.placed` from 1 to 2.
+   *
+   * ONE MUTATION, for the reason `#confirmPlaced`'s own comment gives: split in
+   * two, a re-entry landing between them sees the order in neither the
+   * unconfirmed list nor a slot, and reads the level as free.
+   *
+   * ⚠ AN OCCUPIED LEVEL IS NOT EVICTED HERE, and this deliberately differs from
+   * `#placeGridOrder`, which does evict. That path has just created the order it
+   * is placing and its slot is the only record the order exists. This one is a
+   * REPAIR running against a ladder that has been trading in the meantime, and
+   * the occupant is an order with its own real history. Dropping it would leak
+   * it onto the exchange unpolled and uncancellable -- exactly what `claimSlot`
+   * was written to stop. The adopted id is instead kept through `retained`, so
+   * it is still polled, still cancellable, and the collision is reported for a
+   * human rather than resolved by guessing which of two real orders matters
+   * less.
+   */
+  async #adoptGridSlot(
+    config: BotConfig,
+    clientOrderId: string,
+    placement: UnconfirmedGridPlacement,
+    remote: { side: OrderSide; quantity: Money },
+  ): Promise<void> {
+    const slot: GridSlot = {
+      side: remote.side,
+      clientOrderId,
+      costBasis: placement.costBasis,
+      // The VENUE's quantity, not the intent's: this is a repair, and the
+      // exchange's own number is the one that is actually resting.
+      quantity: remote.quantity,
+    };
+
+    let blockedBy: GridSlot | null = null;
+    await this.#mutateState((current) => {
+      const claim = claimSlot(current.ladder!, placement.levelIndex, slot);
+      if (claim.kind === "occupied") blockedBy = claim.by;
+      const ladder = claim.kind === "claimed" ? claim.ladder : current.ladder!;
+      // MAINTAINED, NOT RE-DERIVED, the same rule `#placeGridOrder` uses: an id
+      // with no rung is not an id that ended. This is what keeps a refused
+      // adoption tracked instead of dropped.
+      const slotIds = ladderOpenOrderIds(ladder);
+      const retained = current.openOrderIds
+        .concat(slotIds.includes(clientOrderId) ? [] : [clientOrderId])
+        .filter((id) => !slotIds.includes(id));
+      return {
+        ...current,
+        ladder,
+        openOrderIds: [...slotIds, ...retained],
+        unconfirmedOrderIds: outstandingUnconfirmed(current).filter((id) => id !== clientOrderId),
+        unconfirmedGridLevels: withoutGridLevel(current, clientOrderId),
+      };
+    });
+
+    if (blockedBy !== null) {
+      const occupant = blockedBy as GridSlot;
+      await this.#alert(config, {
+        severity: "critical",
+        category: "trading",
+        alertType: "grid_slot_collision",
+        message:
+          `${clientOrderId} was adopted for grid level ${placement.levelIndex} after its ` +
+          `acknowledgement was lost, but that level already holds ${occupant.side} ` +
+          `${occupant.clientOrderId}. The adopted order is REAL and resting on the exchange; ` +
+          `it is tracked and will be polled and cancelled, but it has no rung. Two live orders ` +
+          `sit against one level -- reconcile them on the venue.`,
+      });
+    }
   }
 
   /**
@@ -3593,6 +3822,11 @@ export class BotInstance extends DurableObject<Env> {
     for (const { clientOrderId, remote } of readable) {
       if (!unknownIds.includes(clientOrderId)) continue;
       if ((await this.#order(clientOrderId)) !== undefined) continue;
+      // ⚠ READ BEFORE RESOLVING, and this ordering is the whole fix. Both the
+      // grid branch below and `#confirmPlaced` clear this entry; reading it
+      // afterwards returns `undefined` and adopts a grid order as a level-less
+      // one, which is the defect. See `unconfirmedPlacementFor`.
+      const placement = unconfirmedPlacementFor(await this.#state(), clientOrderId);
       const adopted = createOrder({
         clientOrderId,
         pair: config.pair,
@@ -3600,9 +3834,18 @@ export class BotInstance extends DurableObject<Env> {
         price: remote.price,
         quantity: remote.quantity,
         at: this.#now(),
+        // Restored from what this object recorded at send time, NOT guessed
+        // from the venue's answer -- the venue has never heard of a grid.
+        ...(placement === undefined
+          ? {}
+          : { levelIndex: placement.levelIndex, costBasis: placement.costBasis }),
       });
       await this.#putOrder(adopted);
-      await this.#confirmPlaced(clientOrderId);
+      if (placement === undefined) {
+        await this.#confirmPlaced(clientOrderId);
+      } else {
+        await this.#adoptGridSlot(config, clientOrderId, placement, remote);
+      }
       await this.#mirrorOrderInsert(config, adopted, remote.exchangeOrderId);
       await this.#alert(config, {
         severity: "warning",
@@ -6355,16 +6598,33 @@ export class BotInstance extends DurableObject<Env> {
    * the stop-loss check at all. With the exits evaluated first, that bot halts.
    */
   async #placeInitialLadder(config: GridConfig, orders: readonly GridOrderIntent[]): Promise<PipelineResult> {
-    let throttled = false;
+    let incomplete = false;
     for (const intent of orders) {
       const current = await this.#state();
       if (current.ladder!.slots[intent.levelIndex] != null) continue; // already placed
       const result = await this.#placeGridOrder(config, intent, intent.price, "routine");
       if (result.status === "halted") return result; // a hard rejection halted the bot
-      if (result.action === "throttled" || result.action === "unresolved") throttled = true;
+      // ⚠ `slot_unconfirmed` BELONGS IN THIS LIST, and leaving it out is a
+      // one-way latch. All three mean the same thing to the latch: this level
+      // wanted an order and does not have a confirmed one. If a level refused
+      // for an in-flight sibling did NOT set this, a pass that placed every
+      // OTHER level would set `placed: true` while that level stayed empty --
+      // and should the in-flight order then turn out never to have existed, no
+      // later pass would reopen the gate (`placed` is true, and the ladder is
+      // not `vacant` because the other levels hold slots). The level would be
+      // dead for the life of the bot. That is `grid-ladder-placed-latch`
+      // exactly, which is a documented open item and not a thing to re-create
+      // while fixing something else.
+      if (
+        result.action === "throttled" ||
+        result.action === "unresolved" ||
+        result.action === "slot_unconfirmed"
+      ) {
+        incomplete = true;
+      }
     }
 
-    if (!throttled && orders.length > 0) {
+    if (!incomplete && orders.length > 0) {
       await this.#mutateState((latest) => ({
         ...latest,
         ladder: { ...latest.ladder!, placed: true },
@@ -6372,7 +6632,7 @@ export class BotInstance extends DurableObject<Env> {
     }
     return {
       status: "running",
-      action: throttled ? "initial_ladder_partial" : "placed_initial_ladder",
+      action: incomplete ? "initial_ladder_partial" : "placed_initial_ladder",
       detail: `${orders.length} buy levels below spot`,
     };
   }
@@ -6550,6 +6810,32 @@ export class BotInstance extends DurableObject<Env> {
       };
     }
 
+    // THE SAME QUESTION THE SLOT CANNOT ANSWER. An order sent for this level
+    // whose outcome came back `transport` has NO slot -- `#placeGridOrder`
+    // claims the slot only on a usable outcome -- so the check above sees a free
+    // level and the ladder pass sends a second order for it. That is exactly
+    // what `bot-wfemoo` did with `v1-bot-wfemoo-5` and `v1-bot-wfemoo-8`: two
+    // buys for level 0, 12.50 USDT each, the bot's whole 25.00 allocation on one
+    // rung. See `BotRuntimeState.unconfirmedGridLevels`.
+    //
+    // NOT A `placed-` ACTION, so `gridOrderWasPlaced` reads false and the caller
+    // treats the level as still wanting an order: `#placeInitialLadder` leaves
+    // `placed` untouched and the queue retains the intent. The retry is then
+    // driven by the POLL resolving the unconfirmed id -- which either promotes
+    // it to a real slot (the level is legitimately taken) or clears it (the
+    // level is free again and the next tick fills it). Refusing here is
+    // therefore a WAIT, not a drop.
+    const inFlight = gridLevelUnconfirmed(state, intent.levelIndex);
+    if (inFlight !== null) {
+      return {
+        status: state.status,
+        action: "slot_unconfirmed",
+        detail:
+          `${intent.side} at grid level ${intent.levelIndex} not sent: ${inFlight} was already ` +
+          `sent for that level and its outcome is still unknown`,
+      };
+    }
+
     const filters = await this.#ensureFilters(config, state, now, priority);
     state = await this.#state();
 
@@ -6608,9 +6894,41 @@ export class BotInstance extends DurableObject<Env> {
       };
     }
 
+    // THE LEVEL CHECK, AGAIN, ON THE FRESHEST STATE THERE IS. The check at the
+    // top of this method reads state from BEFORE the filter fetch, the sequence
+    // allocation, the attempt record and the pre-send validation -- four awaits,
+    // into every one of which this object accepts a price tick or an alarm (see
+    // `#outsidePoll`). Re-reading here costs one storage read and collapses that
+    // window to the single unawaited step between this line and the mark below.
+    //
+    // The same shape as `#statusChangedFrom` immediately above, and refused the
+    // same way: the sequence is released through `markFailed` rather than burned
+    // by a decision to send nothing.
+    const raced = gridLevelUnconfirmed(await this.#state(), intent.levelIndex);
+    if (raced !== null) {
+      await guard.markFailed(
+        decision.clientOrderId,
+        `${raced} was already outstanding for grid level ${intent.levelIndex}`,
+        now,
+      );
+      return {
+        status: "running",
+        action: "slot_unconfirmed",
+        detail:
+          `${intent.side} at grid level ${intent.levelIndex} not sent: ${raced} was sent for that ` +
+          `level while this one was being prepared, and its outcome is still unknown`,
+      };
+    }
+
     // BEFORE THE SEND -- see `#markUnconfirmed`. Until a definite answer
     // arrives this bot has outstanding business, and every re-entry must see it.
-    await this.#markUnconfirmed(decision.clientOrderId);
+    // The level goes in the SAME write, so no re-entry can see the id
+    // outstanding without also seeing which level it belongs to. `costBasis`
+    // rides along for the adoption path -- see `UnconfirmedGridPlacement`.
+    await this.#markUnconfirmed(decision.clientOrderId, {
+      levelIndex: intent.levelIndex,
+      costBasis: intent.costBasis,
+    });
 
     const outcome = await this.#exchange(config, priority).placeOrder({
       pair: config.pair,
@@ -6728,6 +7046,10 @@ export class BotInstance extends DurableObject<Env> {
         unconfirmedOrderIds: outstandingUnconfirmed(current).filter(
           (id) => id !== decision.clientOrderId,
         ),
+        // And its level attribution goes with it: the SLOT now records where
+        // this order lives, so the in-flight map has nothing left to say about
+        // it. Dropped in the same write for the same reason.
+        unconfirmedGridLevels: withoutGridLevel(current, decision.clientOrderId),
       };
     });
     if (evicted !== null) {
