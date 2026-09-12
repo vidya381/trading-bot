@@ -1019,6 +1019,34 @@ export async function resumeBot(ctx: ApiContext): Promise<Response> {
  * not resume the bot -- the response's `bot` still shows `halted`, and resuming
  * remains a separate, explicit action.
  */
+/**
+ * POST /api/bots/:id/cancel-orphaned-orders -- the corrective action for
+ * `/api/integrity/inactive-bots-with-open-orders`.
+ *
+ * Thin, the same shape as `applyMissedFills`: `cancelOrphanedOrders` owns every
+ * rule, including the `halted`-or-`stopped` gate and the definition of what
+ * counts as orphaned. See that method for why re-halting -- the remedy this
+ * report used to recommend -- could never have done this.
+ *
+ * Failure surface, from the DO:
+ *   - `not_created` (404)    -- the object holds no config.
+ *   - `invalid_status` (409) -- the bot is `created` or `running`. Orders are
+ *     never cancelled from under a live pipeline; halt it first.
+ *
+ * A bot with no orphans is NOT an error: the sweep returns empty lists and
+ * changes nothing, so this is safe to call on a healthy bot and safe to retry.
+ */
+export async function cancelOrphanedOrders(ctx: ApiContext): Promise<Response> {
+  const id = ctx.params.id!;
+  const result = await botStub(ctx, id).cancelOrphanedOrders(ctx.actor);
+  const [row, snapshot, fees] = await Promise.all([
+    ctx.db.botInstances.findOne({ id }),
+    snapshotOf(ctx, id),
+    feesFor(ctx, id),
+  ]);
+  return ok({ result, bot: row === null ? null : botSummary(row, snapshot, fees) });
+}
+
 export async function applyMissedFills(ctx: ApiContext): Promise<Response> {
   const id = ctx.params.id!;
   const result = await botStub(ctx, id).applyMissedFills(ctx.actor);
@@ -3636,10 +3664,28 @@ export async function listPriceFeeds(ctx: ApiContext): Promise<Response> {
  * is woken, no exchange is called -- which is what makes it safe to hit at any
  * time and what makes it able to see the stopped bots nothing else does.
  *
- * READ-ONLY, AND IT CORRECTS NOTHING. See `/src/db/integrity.ts`: the
- * corrective action is an operator re-halting the bot, which now completes the
- * cleanup its first halt skipped. Doing that automatically here would cancel
- * live orders from a GET.
+ * READ-ONLY, AND IT CORRECTS NOTHING. Doing so automatically would cancel live
+ * orders from a GET. The corrective action is
+ * `POST /api/bots/:id/cancel-orphaned-orders`.
+ *
+ * ⚠ THAT REMEDY WAS WRONG UNTIL 2026-09-12, and the correction is worth stating
+ * because the old one read as authoritative. This block used to say the fix was
+ * "an operator re-halting the bot, which now completes the cleanup its first
+ * halt skipped". `#halt` does not do that and never did: on an already-halted
+ * bot it self-heals the feed subscription and returns `already_halted`, having
+ * excluded the cancel sweep DELIBERATELY -- sweeping on every kill-switch pass
+ * over every halted bot would spend risk-exit rate budget on nothing. So the
+ * one action this report told an operator to take was the one action that could
+ * not work, and a bot re-halted on its advice came back reporting the same
+ * finding with the same order still resting.
+ *
+ * The gap was real and had no owner: an order that leaves `openOrderIds` while
+ * still live is invisible to the halt sweep, to the 30-second poll, and to
+ * reconciliation's mirror comparison alike. `cancelOrphanedOrders` is that
+ * owner. `bot-wfemoo`'s `v1-bot-wfemoo-5` is the order that proved it -- evicted
+ * from its grid level by a racing placement, dropped from `openOrderIds` by the
+ * `grid_slot_collision` path exactly as that path documents, and left `pending`
+ * on Kraken through a halt that cancelled its duplicate and never saw it.
  *
  * NOT SCHEDULED. Wiring it into the reconciliation cron would mean widening
  * `RECONCILED_STATUSES` to include `stopped`, which changes what that job

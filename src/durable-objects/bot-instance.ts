@@ -885,6 +885,23 @@ export interface AppliedFill {
 }
 
 /** The outcome of a `applyMissedFills` repair. */
+/** What `cancelOrphanedOrders` found and what became of it. */
+export interface OrphanedOrderResult {
+  /** Always the status it started with: this operation never resumes a bot. */
+  readonly status: BotStatus;
+  /**
+   * clientOrderIds that were resting locally, owned by nothing, and have now
+   * been through the halt's own cancel sweep.
+   */
+  readonly swept: readonly string[];
+  /**
+   * Orphans the sweep could not confirm cancelled. Each has raised its own
+   * `cancel_failed`, and each is STILL tracked, so a later attempt can retry.
+   * Non-empty means the repair is incomplete, reported rather than swallowed.
+   */
+  readonly unresolved: readonly string[];
+}
+
 export interface MissedFillsResult {
   /** Always the status it started with: this operation never resumes a bot. */
   readonly status: BotStatus;
@@ -2804,6 +2821,120 @@ export class BotInstance extends DurableObject<Env> {
    */
   async applyMissedFills(actor: string): Promise<MissedFillsResult> {
     return await this.#outsidePoll(() => this.#applyMissedFillsPass(actor));
+  }
+
+  /**
+   * Cancel this bot's orders that are resting locally but owned by NOTHING.
+   *
+   * ── THE GAP THIS FILLS, AND WHY NOTHING ELSE COULD ──
+   *
+   * `#cancelOpenOrders` iterates `state.openOrderIds`, so an order that has left
+   * that list while still live is invisible to every halt, now and in future.
+   * The 30-second poll reads the same list. Reconciliation compares the object's
+   * list against D1 rather than asking whether an order should exist at all. The
+   * adoption path in `#checkOpenOrdersPass` repairs only ids in
+   * `unconfirmedOrderIds`. An id in NONE of those lists has no owner anywhere in
+   * this system, and `/api/integrity/inactive-bots-with-open-orders` could
+   * report it but not fix it.
+   *
+   * ⚠ THE DOCUMENTED REMEDY FOR THAT REPORT WAS IMPOSSIBLE. It told an operator
+   * to re-halt the bot, "which now completes the cleanup its first halt
+   * skipped". `#halt` does no such thing: on an already-halted bot it
+   * self-heals the feed subscription and returns `already_halted`, and its own
+   * comment says the cancel sweep is excluded DELIBERATELY, because sweeping on
+   * every kill-switch pass over every halted bot would spend risk-exit budget
+   * on nothing. Both halves are right; the remedy was the thing that was wrong,
+   * and it named the one action guaranteed not to work. This method is the
+   * action that does, kept separate precisely so `#halt` stays cheap.
+   *
+   * ⚠ IT HAPPENED, AND THIS IS THE ORDER THAT PRODUCED IT. `bot-wfemoo`'s
+   * `v1-bot-wfemoo-5` was placed, claimed grid level 0, and was then DISPLACED
+   * from that level by `v1-bot-wfemoo-8` when the two raced -- the
+   * `grid_slot_collision` path, which drops the evicted id from `openOrderIds`
+   * by design and says so. The bot was later halted; the sweep read
+   * `openOrderIds`, which no longer named `-5`; and `-5` is still `pending` on
+   * Kraken with nothing in this system watching it. `-8`, still tracked, was
+   * cancelled by that same halt. One order, one list, two fates.
+   *
+   * ── WHY IT IS SAFE ──
+   *
+   * It refuses a `running` bot outright, so it can never cancel from under a
+   * live pipeline. It derives its own candidates from THIS object's storage
+   * rather than taking ids from the caller. It excludes everything that already
+   * has an owner -- `openOrderIds`, `unconfirmedOrderIds` (whose fate is
+   * unknown; cancelling on a guess is what section 5.6 forbids) and
+   * `exitOrderId`. And it does not cancel anything itself: it puts the orphans
+   * back on `openOrderIds` and runs the EXISTING sweep, so a cancellation here
+   * is judged, recorded, alerted and mirrored by exactly the code a halt uses.
+   * An orphan the venue will not confirm stays tracked and raises
+   * `cancel_failed`, which is the correct outcome and the one that makes a
+   * retry meaningful.
+   */
+  async cancelOrphanedOrders(actor: string): Promise<OrphanedOrderResult> {
+    return await this.#outsidePoll(() => this.#cancelOrphanedOrdersPass(actor));
+  }
+
+  async #cancelOrphanedOrdersPass(actor: string): Promise<OrphanedOrderResult> {
+    const config = await this.#config();
+    const state = await this.#state();
+
+    // The same gate `applyMissedFills` uses, widened by one status. `stopped` is
+    // included because it is the WORSE half of the integrity finding: nothing
+    // polls a stopped bot and reconciliation does not read one, so an order
+    // stranded there is observed by nothing at all.
+    if (state.status !== "halted" && state.status !== "stopped") {
+      throw new BotInstanceError(
+        "invalid_status",
+        `orphaned orders can only be swept on a halted or stopped bot; this one is ` +
+          `${JSON.stringify(state.status)}. Halt it first, so orders are not cancelled ` +
+          `underneath a live pipeline.`,
+      );
+    }
+
+    const owned = new Set<string>([
+      ...state.openOrderIds,
+      ...outstandingUnconfirmed(state),
+      ...(state.exitOrderId === null ? [] : [state.exitOrderId]),
+    ]);
+    const stored = await this.ctx.storage.list<TrackedOrder>({ prefix: ORDER_KEY_PREFIX });
+    const orphans = [...stored.values()].filter(
+      (order) => !isTerminal(order.state) && !owned.has(order.clientOrderId),
+    );
+
+    if (orphans.length === 0) {
+      return { status: state.status, swept: [], unresolved: [] };
+    }
+
+    const orphanIds = orphans.map((order) => order.clientOrderId);
+    // ADOPT, THEN SWEEP. Putting them on the list first is what lets the
+    // existing sweep do the work -- and it is also what makes a FAILED
+    // cancellation recoverable, because `#cancelOpenOrders` removes only what it
+    // resolved. An orphan the venue would not confirm stays on `openOrderIds`
+    // from here on, which means the poll sees it too and it is an orphan no
+    // longer, whatever happens next.
+    await this.#mutateState((current) => ({
+      ...current,
+      openOrderIds: [
+        ...current.openOrderIds,
+        ...orphanIds.filter((id) => !current.openOrderIds.includes(id)),
+      ],
+    }));
+
+    await this.#cancelOpenOrders(config, await this.#state());
+
+    const after = await this.#state();
+    const unresolved = orphanIds.filter((id) => after.openOrderIds.includes(id));
+    const swept = orphanIds.filter((id) => !after.openOrderIds.includes(id));
+
+    await this.#audit(
+      config,
+      "bot.orphaned_orders_swept",
+      actor,
+      { swept, unresolved },
+      this.#now(),
+    );
+
+    return { status: after.status, swept, unresolved };
   }
 
   async #applyMissedFillsPass(actor: string): Promise<MissedFillsResult> {

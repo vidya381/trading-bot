@@ -53,6 +53,10 @@ const ROUTES: readonly Route[] = [
   // in production. Capital could be allocated and never returned.
   route("POST", "/api/bots/:id/close", handlers.closeBot),
   route("POST", "/api/bots/:id/apply-missed-fills", handlers.applyMissedFills),
+  // The corrective action for `/api/integrity/inactive-bots-with-open-orders`,
+  // which until now reported a defect whose documented remedy -- re-halting the
+  // bot -- provably could not fix it. See `BotInstance.cancelOrphanedOrders`.
+  route("POST", "/api/bots/:id/cancel-orphaned-orders", handlers.cancelOrphanedOrders),
   route("POST", "/api/bots/:id/repair-position", handlers.repairPosition),
   route("POST", "/api/bots/:id/check-open-orders", handlers.checkOpenOrders),
   route("POST", "/api/bots/:id/archive", handlers.archiveBot),
